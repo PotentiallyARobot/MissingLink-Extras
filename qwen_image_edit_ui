@@ -1,0 +1,929 @@
+"""
+Missing Link — Qwen Image Edit 2511 — Artist Workbench
+Model loads eagerly before the UI launches.
+
+Usage (single Colab cell):
+  %run qwen_image_edit_ui.py
+"""
+
+import math, os, io, gc, json, uuid, base64, threading, time, traceback, shutil
+from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+
+import torch
+from PIL import Image
+from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPlusPipeline
+from diffusers.utils import load_image
+from nunchaku import NunchakuQwenImageTransformer2DModel
+from nunchaku.utils import get_gpu_memory, get_precision
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+PIPELINE = None
+TRANSFORMER = None
+LOADED_LORAS: dict[str, float] = {}
+GENERATION_STATUS = {
+    "running": False, "progress": 0, "step": 0, "total_steps": 0,
+    "message": "", "results": [], "error": None,
+}
+INTERRUPT_FLAG = False
+HISTORY: list[dict] = []
+OUTPUT_DIR = Path("/tmp/qwen_edit_outputs")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+LOGO_URL = "https://raw.githubusercontent.com/PotentiallyARobot/MissingLink/main/missing_link_logo_final_crop.png"
+
+# ---------------------------------------------------------------------------
+# CONFIG — tweak these before running
+# ---------------------------------------------------------------------------
+LOCAL_TR_DIR = "/content/models/nunchaku-qwen-image-edit-2512-transformer"
+RANK = 32
+# NOTE: The QuantFunc Nunchaku model is NOT a Lightning-distilled model.
+# It requires the STANDARD Qwen-Image-Edit settings:
+#   - true_cfg_scale=4.0 with negative_prompt=" "
+#   - num_inference_steps=40 (NOT 8; 8 only works with baked-in Lightning LoRA)
+#   - guidance_scale=1.0
+# Using 8 steps with this model produces poor results.
+DEFAULT_STEPS = 40
+DEFAULT_TRUE_CFG = 4.0
+
+# ---------------------------------------------------------------------------
+# Model loading — user's exact code
+# ---------------------------------------------------------------------------
+
+def load_pipeline():
+    global PIPELINE, TRANSFORMER
+
+    # Scheduler — standard (NOT Lightning) config for QuantFunc 2511
+    # No shift overrides — let the pipeline use its defaults
+    scheduler_config = {
+        "base_image_seq_len": 256,
+        "base_shift": math.log(3),
+        "invert_sigmas": False,
+        "max_image_seq_len": 8192,
+        "max_shift": math.log(3),
+        "num_train_timesteps": 1000,
+        "shift": 1.0,
+        "shift_terminal": None,
+        "stochastic_sampling": False,
+        "time_shift_type": "exponential",
+        "use_beta_sigmas": False,
+        "use_dynamic_shifting": True,
+        "use_exponential_sigmas": False,
+        "use_karras_sigmas": False,
+    }
+    scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # --- Load transformer: local dir -> HF fallback ---
+    transformer_src = None
+    if LOCAL_TR_DIR and os.path.isdir(LOCAL_TR_DIR):
+        print(f"  Loading transformer from local: {LOCAL_TR_DIR}")
+        TRANSFORMER = NunchakuQwenImageTransformer2DModel.from_pretrained(LOCAL_TR_DIR)
+        transformer_src = f"local: {LOCAL_TR_DIR}"
+    else:
+        precision = get_precision()
+        if "int4" in precision:
+            precision = "int4"
+        elif "fp4" in precision:
+            precision = "fp4"
+        variant_by_rank = {32: "ultimate_speed", 128: "balance", 256: "best_quality"}
+        variant = variant_by_rank.get(RANK, "ultimate_speed")
+        hf_path = (
+            f"QuantFunc/Nunchaku-Qwen-Image-EDIT-2511/"
+            f"nunchaku_qwen_image_edit_2511_{variant}_{precision}.safetensors"
+        )
+        print(f"  Loading transformer from HF: {hf_path}")
+        TRANSFORMER = NunchakuQwenImageTransformer2DModel.from_pretrained(hf_path)
+        transformer_src = f"hf: {hf_path}"
+
+    print("  Loading pipeline: Qwen/Qwen-Image-Edit-2511")
+    PIPELINE = QwenImageEditPlusPipeline.from_pretrained(
+        "Qwen/Qwen-Image-Edit-2511",
+        transformer=TRANSFORMER,
+        scheduler=scheduler,
+        torch_dtype=torch.bfloat16,
+    )
+
+    gpu_mem = get_gpu_memory()
+    if gpu_mem > 18:
+        print(f"  GPU: {gpu_mem:.1f}GB — model CPU offload")
+        PIPELINE.enable_model_cpu_offload()
+    else:
+        print(f"  GPU: {gpu_mem:.1f}GB — sequential CPU offload")
+        TRANSFORMER.set_offload(True, use_pin_memory=False, num_blocks_on_gpu=1)
+        PIPELINE._exclude_from_cpu_offload.append("transformer")
+        PIPELINE.enable_sequential_cpu_offload()
+
+    print(f"  ✅ Pipeline ready | transformer: {transformer_src}")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# LoRA
+# ---------------------------------------------------------------------------
+def apply_lora(lora_path, weight=1.0, adapter_name=None):
+    global LOADED_LORAS
+    if not PIPELINE: return False, "Pipeline not loaded"
+    name = adapter_name or Path(lora_path).stem
+    try:
+        PIPELINE.load_lora_weights(lora_path, adapter_name=name)
+        LOADED_LORAS[name] = weight
+        if LOADED_LORAS:
+            PIPELINE.set_adapters(list(LOADED_LORAS.keys()), list(LOADED_LORAS.values()))
+        return True, f"LoRA '{name}' loaded @ {weight}"
+    except Exception as e: return False, str(e)
+
+def remove_lora(adapter_name):
+    global LOADED_LORAS
+    if not PIPELINE: return False, "Pipeline not loaded"
+    try:
+        PIPELINE.delete_adapters([adapter_name])
+        LOADED_LORAS.pop(adapter_name, None)
+        if LOADED_LORAS:
+            PIPELINE.set_adapters(list(LOADED_LORAS.keys()), list(LOADED_LORAS.values()))
+        return True, f"Removed '{adapter_name}'"
+    except Exception as e: return False, str(e)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def img_to_b64_thumb(img, sz=128):
+    t = img.copy(); t.thumbnail((sz, sz))
+    buf = io.BytesIO(); t.save(buf, format="JPEG", quality=60)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+def img_to_b64(img):
+    buf = io.BytesIO(); img.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+# ---------------------------------------------------------------------------
+# Generation
+# ---------------------------------------------------------------------------
+def run_generation(params):
+    global GENERATION_STATUS, HISTORY, INTERRUPT_FLAG
+    INTERRUPT_FLAG = False
+    GENERATION_STATUS = {"running": True, "progress": 0, "step": 0, "total_steps": 0, "message": "Preparing...", "results": [], "error": None}
+    try:
+        images_dict = params.get("images", {})
+        images, input_thumbs = [], []
+        for key in sorted(images_dict.keys(), key=lambda k: int(k)):
+            d = images_dict[key]
+            if not d: continue
+            if d.startswith("data:"):
+                _, b = d.split(",", 1)
+                img = Image.open(io.BytesIO(base64.b64decode(b))).convert("RGB")
+            elif d.startswith("http"):
+                img = load_image(d).convert("RGB")
+            else:
+                img = Image.open(d).convert("RGB")
+            images.append(img)
+            input_thumbs.append(img_to_b64_thumb(img))
+
+        if not images:
+            GENERATION_STATUS = {**GENERATION_STATUS, "running": False, "error": "Upload at least one image."}
+            return
+
+        print(f"  🖼️  Images received: {len(images)} | Sizes: {[img.size for img in images]}")
+        GENERATION_STATUS["message"] = f"Loaded {len(images)} image(s)..."
+
+        steps = params.get("num_inference_steps", DEFAULT_STEPS)
+        GENERATION_STATUS["total_steps"] = steps
+        GENERATION_STATUS["message"] = "Running inference..."
+
+        pipe_kwargs = {
+            "image": images if len(images) > 1 else images[0],
+            "prompt": params.get("prompt", ""),
+            "num_inference_steps": steps,
+            "true_cfg_scale": params.get("true_cfg_scale", DEFAULT_TRUE_CFG),
+            "num_images_per_prompt": params.get("num_images_per_prompt", 1),
+        }
+
+        # Negative prompt — required for true CFG to work
+        neg = params.get("negative_prompt", "").strip()
+        if neg or pipe_kwargs["true_cfg_scale"] > 1.0:
+            pipe_kwargs["negative_prompt"] = neg if neg else " "
+
+        if params.get("guidance_scale") is not None:
+            pipe_kwargs["guidance_scale"] = params["guidance_scale"]
+        if params.get("height") and params["height"] > 0:
+            pipe_kwargs["height"] = params["height"]
+        if params.get("width") and params["width"] > 0:
+            pipe_kwargs["width"] = params["width"]
+        if params.get("max_sequence_length") and params["max_sequence_length"] > 0:
+            pipe_kwargs["max_sequence_length"] = params["max_sequence_length"]
+        seed = params.get("seed", -1)
+        if seed >= 0:
+            pipe_kwargs["generator"] = torch.Generator().manual_seed(seed)
+
+        def step_cb(pipe, step, timestep, cb_kwargs):
+            GENERATION_STATUS["step"] = step + 1
+            GENERATION_STATUS["progress"] = int(((step + 1) / steps) * 100)
+            GENERATION_STATUS["message"] = f"Step {step+1}/{steps}"
+            if INTERRUPT_FLAG:
+                pipe._interrupt = True
+                GENERATION_STATUS["message"] = "Stopping..."
+            return cb_kwargs
+        pipe_kwargs["callback_on_step_end"] = step_cb
+
+        img_param = pipe_kwargs["image"]
+        if isinstance(img_param, list):
+            print(f"  📤 Passing {len(img_param)} images to pipeline")
+        else:
+            print(f"  📤 Passing 1 image to pipeline ({img_param.size})")
+
+        output = PIPELINE(**pipe_kwargs)
+
+        # Check if interrupted
+        if INTERRUPT_FLAG:
+            INTERRUPT_FLAG = False
+            GENERATION_STATUS = {"running": False, "progress": 0, "step": 0, "total_steps": 0, "message": "", "results": [], "error": "Generation stopped by user."}
+            return
+
+        results = []
+        # If a mask was provided, composite output with original using the mask
+        mask_data = params.get("mask")
+        blur_radius = params.get("mask_blur", 0)
+        if mask_data and images:
+            from PIL import ImageFilter
+            # Decode mask (white = edit region, black = keep original)
+            if mask_data.startswith("data:"):
+                _, mb = mask_data.split(",", 1)
+            else:
+                mb = mask_data
+            mask_img = Image.open(io.BytesIO(base64.b64decode(mb))).convert("L")
+            original = images[0]  # composite against first input image
+            for out_img in output.images:
+                # Resize mask to match output size
+                m = mask_img.resize(out_img.size, Image.LANCZOS)
+                if blur_radius > 0:
+                    m = m.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+                # Composite: where mask is white use output, where black use original
+                orig_resized = original.resize(out_img.size, Image.LANCZOS)
+                composited = Image.composite(out_img, orig_resized, m)
+                results.append(img_to_b64(composited))
+                composited.save(str(OUTPUT_DIR / f"output_{uuid.uuid4().hex[:8]}.png"))
+        else:
+            for out_img in output.images:
+                results.append(img_to_b64(out_img))
+                out_img.save(str(OUTPUT_DIR / f"output_{uuid.uuid4().hex[:8]}.png"))
+
+        # Store full input images so history can reload them into slots
+        input_full = []
+        for img in images:
+            input_full.append(img_to_b64(img))
+
+        HISTORY.insert(0, {
+            "id": uuid.uuid4().hex[:8], "prompt": params.get("prompt", ""),
+            "negative_prompt": neg,
+            "params": {k: v for k, v in params.items() if k != "images"},
+            "input_thumbs": input_thumbs, "input_images": input_full,
+            "outputs": results,
+            "timestamp": time.strftime("%H:%M:%S"),
+        })
+        if len(HISTORY) > 50: HISTORY[:] = HISTORY[:50]
+
+        GENERATION_STATUS = {"running": False, "progress": 100, "step": steps, "total_steps": steps, "message": "Done!", "results": results, "error": None}
+    except Exception as e:
+        traceback.print_exc()
+        GENERATION_STATUS = {"running": False, "progress": 0, "step": 0, "total_steps": 0, "message": "", "results": [], "error": str(e)}
+    finally:
+        gc.collect()
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+
+# ---------------------------------------------------------------------------
+# Logo
+# ---------------------------------------------------------------------------
+def get_logo_b64():
+    for c in ["/content/missing_link_logo_final_crop_small.png", "/content/missing_link_logo_final_crop.png"]:
+        if Path(c).exists():
+            return base64.b64encode(Path(c).read_bytes()).decode()
+    try:
+        p = Path(__file__).parent / "missing_link_logo_final_crop_small.png"
+        if p.exists(): return base64.b64encode(p.read_bytes()).decode()
+    except NameError: pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# HTML
+# ---------------------------------------------------------------------------
+HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Missing Link — Qwen Image Edit 2511</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@300;400;500;600;700&family=Barlow:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#070709;--surface:#111114;--surface2:#18181c;--surface3:#222228;--border:#2a2a30;--border-hover:#3a3a44;--gold:#d4a017;--gold-light:#f0c840;--gold-dim:#8a6a10;--gold-glow:rgba(212,160,23,.12);--text:#ddd;--text-dim:#888;--text-muted:#555;--danger:#c0392b;--radius:5px;--fd:'Oswald',sans-serif;--fb:'Barlow',sans-serif;--fm:'JetBrains Mono',monospace}
+html{font-size:14px}body{background:var(--bg);color:var(--text);font-family:var(--fb);line-height:1.5;overflow:hidden;height:100vh}
+::-webkit-scrollbar{width:5px}::-webkit-scrollbar-thumb{background:var(--border-hover);border-radius:3px}
+
+.app{display:grid;grid-template-rows:auto 1fr;height:100vh}
+header{display:flex;align-items:center;gap:14px;padding:8px 20px;background:var(--surface);border-bottom:1px solid var(--border);z-index:100}
+header .logo{height:36px}header h1{font-family:var(--fd);font-size:1.1rem;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;color:var(--gold)}
+header .ver{font-size:.65rem;color:var(--text-muted);font-family:var(--fm);margin-left:-8px;margin-top:2px}
+header .tagline{font-size:.7rem;color:var(--text-muted);letter-spacing:.5px;font-family:var(--fd);text-transform:uppercase}
+header .spacer{flex:1}header .pill{font-size:.7rem;padding:3px 10px;border-radius:10px;font-family:var(--fm);background:var(--surface2);border:1px solid var(--border);color:var(--text-dim)}
+header .pill.run{border-color:var(--gold-dim);color:var(--gold);animation:pulse 1.2s infinite}
+
+.ws{display:grid;grid-template-columns:360px 1fr 220px;overflow:hidden}
+
+/* LEFT */
+.L{background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+.Ls{flex:1;overflow-y:auto;padding-bottom:80px}
+.sec{padding:14px 16px;border-bottom:1px solid var(--border)}
+.sh{font-family:var(--fd);font-size:.75rem;font-weight:500;letter-spacing:1.2px;text-transform:uppercase;color:var(--gold);margin-bottom:10px;display:flex;align-items:center;gap:6px}
+.sh svg{width:14px;height:14px;fill:var(--gold);flex-shrink:0}
+
+label{display:block;font-size:.72rem;color:var(--text-dim);margin-bottom:3px;font-weight:500;letter-spacing:.4px;text-transform:uppercase;font-family:var(--fd)}
+input[type="text"],input[type="number"],textarea,select{width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:7px 9px;border-radius:var(--radius);font-family:var(--fb);font-size:.88rem;transition:border-color .2s}
+input:focus,textarea:focus,select:focus{outline:none;border-color:var(--gold-dim)}
+textarea{resize:vertical;min-height:56px;line-height:1.4}
+.f{margin-bottom:10px}.fr{display:flex;gap:8px}.fr .f{flex:1}
+.hint{font-size:.68rem;color:var(--text-muted);margin-top:2px}
+
+input[type="range"]{-webkit-appearance:none;width:100%;height:3px;background:var(--surface3);border-radius:2px;outline:none;margin:5px 0}
+input[type="range"]::-webkit-slider-thumb{-webkit-appearance:none;width:12px;height:12px;background:var(--gold);border-radius:50%;cursor:pointer}
+.rr{display:flex;align-items:center;gap:8px}.rr input[type="range"]{flex:1}
+.rv{font-size:.8rem;color:var(--gold-light);min-width:36px;text-align:right;font-family:var(--fm)}
+
+/* SLOTS */
+.slots{display:flex;flex-direction:column;gap:8px}
+.slot{position:relative;border:2px dashed var(--border);border-radius:var(--radius);min-height:100px;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:all .25s;overflow:hidden;background:var(--surface2)}
+.slot:hover{border-color:var(--gold-dim);background:var(--gold-glow)}
+.slot.has{border-style:solid;border-color:var(--border);cursor:default}
+.slot img.pv{width:100%;max-height:160px;object-fit:contain;display:block}
+.slot .ph{display:flex;flex-direction:column;align-items:center;gap:4px;padding:14px;color:var(--text-muted);font-size:.78rem}
+.slot .ph svg{width:24px;height:24px;fill:var(--text-muted)}
+.sbar{position:absolute;top:0;left:0;right:0;display:flex;align-items:center;gap:4px;padding:4px 6px;background:linear-gradient(rgba(0,0,0,.8),transparent)}
+.slbl{font-size:.65rem;font-family:var(--fd);text-transform:uppercase;letter-spacing:1px;color:var(--gold-light);background:rgba(0,0,0,.5);padding:1px 6px;border-radius:3px}
+.sbar .sp{flex:1}
+.sb{width:22px;height:22px;border:none;border-radius:3px;background:rgba(255,255,255,.1);color:#ccc;font-size:11px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s;line-height:1}
+.sb:hover{background:rgba(255,255,255,.25);color:#fff}.sb.dng:hover{background:var(--danger)}
+
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:5px;padding:7px 14px;border:none;border-radius:var(--radius);cursor:pointer;font-family:var(--fd);font-size:.78rem;font-weight:500;letter-spacing:.8px;text-transform:uppercase;transition:all .2s}
+.bp{background:linear-gradient(135deg,var(--gold),var(--gold-dim));color:#0a0a0a}.bp:hover{background:linear-gradient(135deg,var(--gold-light),var(--gold));transform:translateY(-1px)}.bp:disabled{opacity:.35;cursor:not-allowed;transform:none}
+.bg{background:transparent;color:var(--text-dim);border:1px solid var(--border)}.bg:hover{border-color:var(--gold-dim);color:var(--gold-light)}
+#stopBtn{border-color:var(--danger);color:var(--danger)}#stopBtn:hover{background:var(--danger);color:#fff}
+.bs{padding:4px 10px;font-size:.7rem}.bf{width:100%}
+
+.gb{position:sticky;bottom:0;padding:12px 16px;background:var(--surface);border-top:1px solid var(--border);z-index:10}
+.gb .bp{width:100%;padding:12px;font-size:.95rem;letter-spacing:2px;position:relative;overflow:hidden}
+.gb .bp::after{content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;background:linear-gradient(90deg,transparent,rgba(255,255,255,.15),transparent);transition:left .5s}
+.gb .bp:hover::after{left:100%}
+.gp{height:3px;background:var(--surface3);border-radius:2px;margin-top:8px;overflow:hidden;display:none}
+.gpf{height:100%;background:linear-gradient(90deg,var(--gold-dim),var(--gold));width:0%;transition:width .3s}
+.gsl{font-size:.68rem;color:var(--text-muted);text-align:center;margin-top:4px;font-family:var(--fm);display:none}
+
+/* CENTER */
+.C{display:flex;flex-direction:column;align-items:center;justify-content:center;overflow:auto;padding:24px;background:radial-gradient(circle at 20% 80%,rgba(212,160,23,.03) 0%,transparent 50%),radial-gradient(circle at 80% 20%,rgba(100,100,140,.03) 0%,transparent 50%),var(--bg)}
+.ce{text-align:center;color:var(--text-muted);max-width:380px}.ce svg{width:56px;height:56px;fill:var(--text-muted);opacity:.2;margin-bottom:12px}
+.ce h3{font-family:var(--fd);font-size:1rem;font-weight:400;color:var(--text-dim);letter-spacing:1px;text-transform:uppercase;margin-bottom:6px}
+.ce p{font-size:.82rem;line-height:1.6}
+
+.og{display:flex;flex-wrap:wrap;gap:16px;justify-content:center;max-width:100%}
+.oc{position:relative;border-radius:var(--radius);overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.5);cursor:pointer;transition:transform .2s;max-width:100%}
+.oc:hover{transform:scale(1.01)}
+.oc img{display:block;max-height:65vh;max-width:100%;object-fit:contain;background:#0a0a0a}
+.oc .ca{position:absolute;bottom:0;left:0;right:0;display:flex;gap:4px;padding:8px;background:linear-gradient(transparent,rgba(0,0,0,.9));opacity:0;transition:opacity .2s;flex-wrap:wrap}
+.oc:hover .ca{opacity:1}
+
+.lb{position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.92);display:none;align-items:center;justify-content:center;cursor:zoom-out}
+.lb.open{display:flex}.lb img{max-width:95vw;max-height:95vh;object-fit:contain}
+
+/* RIGHT */
+.R{background:var(--surface);border-left:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+.rh{padding:10px 14px;border-bottom:1px solid var(--border);font-family:var(--fd);font-size:.75rem;font-weight:500;letter-spacing:1.2px;text-transform:uppercase;color:var(--gold)}
+.rs{flex:1;overflow-y:auto;padding:8px}
+.hi{padding:8px;border-radius:var(--radius);cursor:pointer;margin-bottom:6px;transition:background .2s;border:1px solid transparent}
+.hi:hover{background:var(--surface2);border-color:var(--border)}
+.hi .ht{font-size:.62rem;color:var(--text-muted);font-family:var(--fm)}
+.hi .hp{font-size:.75rem;color:var(--text-dim);margin:3px 0;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.hi .hth{display:flex;gap:3px;margin-top:4px}.hi .hth img{width:28px;height:28px;border-radius:3px;object-fit:cover;border:1px solid var(--border)}
+.hi .hdel{position:absolute;top:4px;right:4px;width:18px;height:18px;border:none;border-radius:3px;background:rgba(255,255,255,.05);color:var(--text-muted);font-size:11px;cursor:pointer;display:none;align-items:center;justify-content:center;line-height:1}
+.hi:hover .hdel{display:flex}.hi .hdel:hover{background:var(--danger);color:#fff}
+.hi{position:relative}
+
+.ct{cursor:pointer;user-select:none}.ct::after{content:'▾';margin-left:auto;font-size:.7rem;color:var(--text-muted);transition:transform .2s}
+.ct.cc::after{transform:rotate(-90deg)}.cb{overflow:hidden;transition:max-height .3s;max-height:800px}.cb.cc{max-height:0}
+
+.lc{display:inline-flex;align-items:center;gap:4px;background:var(--surface3);padding:3px 8px;border-radius:3px;font-size:.72rem;color:var(--text);margin:2px}
+.lc .lw{color:var(--gold-light);font-family:var(--fm)}.lc button{background:none;border:none;color:var(--danger);cursor:pointer;font-size:.8rem;padding:0 2px}
+
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(10px);background:var(--surface2);border:1px solid var(--border);border-left:3px solid var(--gold);padding:10px 20px;border-radius:var(--radius);font-size:.82rem;z-index:300;opacity:0;transition:all .3s;pointer-events:none;white-space:nowrap}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}.toast.err{border-left-color:var(--danger)}
+
+/* LASSO */
+.lasso-bar{display:flex;align-items:center;gap:8px;padding:6px 12px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);position:absolute;top:12px;left:50%;transform:translateX(-50%);z-index:20;box-shadow:0 4px 16px rgba(0,0,0,.5)}
+.lasso-bar label{margin:0;font-size:.7rem}
+.lasso-bar input[type="range"]{width:80px}
+.lasso-wrap{position:relative;display:inline-block}
+.lasso-canvas{position:absolute;top:0;left:0;cursor:crosshair;z-index:15}
+.lasso-mask-preview{position:absolute;top:0;left:0;pointer-events:none;z-index:14;opacity:.45}
+
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+@media(max-width:960px){.ws{grid-template-columns:300px 1fr 0}.R{display:none}}
+@media(max-width:640px){.ws{grid-template-columns:1fr}.L{max-height:45vh}}
+</style></head><body>
+<div class="app">
+<header>
+  <img class="logo" src="__LOGO_SRC__" alt="ML"/>
+  <div><h1>Qwen Image Edit <span class="ver">2511</span></h1><div class="tagline">Stop Compiling. <strong style="color:var(--gold)">Start Building.</strong></div></div>
+  <div class="spacer"></div>
+  <div class="pill" id="pill">READY</div>
+</header>
+<div class="ws">
+<div class="L"><div class="Ls">
+
+  <!-- IMAGES -->
+  <div class="sec">
+    <div class="sh"><svg viewBox="0 0 24 24"><path d="M21 19V5a2 2 0 00-2-2H5a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/></svg>Input Images</div>
+    <div class="slots" id="slots"></div>
+    <button class="btn bg bs" style="margin-top:8px" onclick="addSlot()">+ Add Image Slot</button>
+    <input type="file" id="fi" accept="image/*" style="display:none"/>
+    <p class="hint">Each slot = one input. Prompt can reference "image 1", "image 2". Drag files onto a slot or paste from clipboard.</p>
+  </div>
+
+  <!-- PROMPT -->
+  <div class="sec">
+    <div class="sh"><svg viewBox="0 0 24 24"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 000-1.41l-2.34-2.34a1 1 0 00-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>Prompt</div>
+    <div class="f"><textarea id="prompt" rows="3" placeholder="Describe the edit...&#10;Reference as 'image 1', 'image 2', etc."></textarea></div>
+    <div class="f"><label>Negative Prompt <span style="color:var(--text-muted);font-weight:300;text-transform:none">(required for CFG &gt; 1)</span></label>
+      <textarea id="neg" rows="2" placeholder="blurry, low quality, deformed, artifacts..."></textarea></div>
+  </div>
+
+  <!-- SETTINGS -->
+  <div class="sec">
+    <div class="sh ct" onclick="tc(this)"><svg viewBox="0 0 24 24"><path d="M19.14 12.94a7.07 7.07 0 000-1.88l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.49.49 0 00-.59-.22l-2.39.96a7.04 7.04 0 00-1.62-.94l-.36-2.54A.48.48 0 0013.93 2h-3.86a.48.48 0 00-.48.41l-.36 2.54a7.04 7.04 0 00-1.62.94l-2.39-.96a.49.49 0 00-.59.22L2.71 8.87a.48.48 0 00.12.61l2.03 1.58a7.07 7.07 0 000 1.88l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32a.49.49 0 00.59.22l2.39-.96c.5.37 1.04.69 1.62.94l.36 2.54a.48.48 0 00.48.41h3.86a.48.48 0 00.48-.41l.36-2.54a7.04 7.04 0 001.62-.94l2.39.96a.49.49 0 00.59-.22l1.92-3.32a.49.49 0 00-.12-.61l-2.03-1.58zM12 15.6A3.6 3.6 0 1115.6 12 3.6 3.6 0 0112 15.6z"/></svg>Settings</div>
+    <div class="cb">
+      <div class="f"><label>True CFG Scale</label><div class="rr"><input type="range" id="cfg" min="1" max="10" step="0.1" value="__DEFAULT_CFG__" oninput="rv('cfgV',this.value)"/><span class="rv" id="cfgV">__DEFAULT_CFG__</span></div></div>
+      <div class="f"><label>Guidance Scale <span style="color:var(--text-muted);font-weight:300;text-transform:none">(distilled only)</span></label><div class="rr"><input type="range" id="gs" min="0" max="20" step="0.5" value="1.0" oninput="rv('gsV',this.value)"/><span class="rv" id="gsV">1.0</span></div></div>
+      <div class="f"><label>Steps</label><div class="rr"><input type="range" id="steps" min="1" max="50" step="1" value="__DEFAULT_STEPS__" oninput="rv('stV',this.value)"/><span class="rv" id="stV">__DEFAULT_STEPS__</span></div></div>
+      <div class="f"><label>Batch</label><div class="rr"><input type="range" id="batch" min="1" max="4" step="1" value="1" oninput="rv('baV',this.value)"/><span class="rv" id="baV">1</span></div></div>
+      <div class="fr"><div class="f"><label>Width (0=auto)</label><input type="number" id="w" value="0" min="0" max="4096" step="64"/></div><div class="f"><label>Height (0=auto)</label><input type="number" id="h" value="0" min="0" max="4096" step="64"/></div></div>
+      <div class="fr"><div class="f"><label>Seed (-1=rand)</label><input type="number" id="seed" value="-1" min="-1"/></div><div class="f"><label>Max Seq Len</label><input type="number" id="msl" value="0" min="0" max="1024" placeholder="0=default"/></div></div>
+    </div>
+  </div>
+
+  <!-- LORA -->
+  <div class="sec">
+    <div class="sh ct cc" onclick="tc(this)"><svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>LoRA Adapters</div>
+    <div class="cb cc">
+      <div id="lcs" style="margin-bottom:8px"></div>
+      <div class="f"><label>Path</label><input type="text" id="lp" placeholder="user/my-lora"/></div>
+      <div class="fr"><div class="f"><label>Name</label><input type="text" id="ln" placeholder="auto"/></div>
+        <div class="f"><label>Weight</label><div class="rr"><input type="range" id="lw" min="0" max="2" step="0.05" value="1.0" oninput="rv('lwV',this.value)"/><span class="rv" id="lwV">1.0</span></div></div></div>
+      <button class="btn bg bs bf" onclick="addLora()">Apply LoRA</button>
+    </div>
+  </div>
+
+</div>
+<div class="gb">
+  <div style="display:flex;gap:8px">
+    <button class="btn bp" style="flex:1;padding:12px;font-size:.95rem;letter-spacing:2px;position:relative;overflow:hidden" id="genBtn" onclick="gen()">&#9889; GENERATE</button>
+    <button class="btn bg" style="padding:12px 18px;font-size:.95rem;display:none" id="stopBtn" onclick="stopGen()">&#9632; STOP</button>
+  </div>
+  <div class="gp" id="gp"><div class="gpf" id="gpf"></div></div>
+  <div class="gsl" id="gsl"></div>
+</div>
+</div>
+
+<div class="C" id="C">
+  <!-- Lasso toolbar -->
+  <div class="lasso-bar" id="lassoBar" style="display:none">
+    <button class="btn bg bs" id="lassoToggle" onclick="toggleLasso()" title="Draw mask region">&#9998; Lasso</button>
+    <label>Blur:</label>
+    <input type="range" id="maskBlur" min="0" max="50" step="1" value="10" oninput="rv('mbV',this.value)"/>
+    <span class="rv" id="mbV" style="min-width:24px">10</span>
+    <button class="btn bg bs" onclick="clearMask()">Clear</button>
+    <button class="btn bg bs" onclick="undoLasso()">Undo</button>
+  </div>
+  <div class="ce" id="ce">
+    <svg viewBox="0 0 24 24"><path d="M21 19V5a2 2 0 00-2-2H5a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/></svg>
+    <h3>Ready to Edit</h3>
+    <p>Add images to slots, write a prompt, hit Generate.<br/>Hover outputs for actions. Use the Lasso tool to mask regions.</p>
+  </div>
+  <div class="og" id="og" style="display:none"></div>
+  <!-- Lasso drawing surface — shown over Image 1 preview -->
+  <div class="lasso-wrap" id="lassoWrap" style="display:none">
+    <img id="lassoImg"/>
+    <canvas id="lassoMaskPreview" class="lasso-mask-preview"></canvas>
+    <canvas id="lassoDraw" class="lasso-canvas"></canvas>
+  </div>
+</div>
+
+<div class="R">
+  <div class="rh">History</div>
+  <div class="rs" id="hs"></div>
+</div>
+</div></div>
+
+<div class="lb" id="lb" onclick="this.classList.remove('open')"><img id="lbi"/></div>
+<div class="toast" id="toast"></div>
+
+<script>
+const $=id=>document.getElementById(id);
+const rv=(id,v)=>$(id).textContent=v;
+function tc(el){el.classList.toggle('cc');el.nextElementSibling.classList.toggle('cc')}
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+
+/* === SLOTS === */
+const S=[];let nid=0,aSid=null;
+
+function addSlot(du=null){const id=nid++;S.push({id,du});rS();return id}
+function rmSlot(id){const i=S.findIndex(s=>s.id===id);if(i>=0)S.splice(i,1);rS()}
+function setSI(id,du){const s=S.find(s=>s.id===id);if(s)s.du=du;rS()}
+function clrSlot(id){setSI(id,null)}
+function trigUp(id){aSid=id;$('fi').click()}
+function slotIdx(id){const i=S.findIndex(s=>s.id===id);return i>=0?i+1:'?'}
+
+$('fi').addEventListener('change',e=>{
+  const f=e.target.files[0];if(!f||aSid===null)return;
+  rdF(f,aSid);e.target.value='';
+});
+function rdF(file,sid){const r=new FileReader();r.onload=ev=>setSI(sid,ev.target.result);r.readAsDataURL(file)}
+
+function rS(){
+  const c=$('slots');c.innerHTML='';
+  S.forEach((s,idx)=>{
+    const d=document.createElement('div');
+    d.className='slot'+(s.du?' has':'');d.dataset.sid=s.id;
+    if(s.du){
+      d.innerHTML=`<img class="pv" src="${s.du}"/><div class="sbar"><span class="slbl">Image ${idx+1}</span><div class="sp"></div><button class="sb" title="Replace image" onclick="event.stopPropagation();trigUp(${s.id})">&#8635;</button><button class="sb" title="Clear" onclick="event.stopPropagation();clrSlot(${s.id})">&#8999;</button><button class="sb dng" title="Remove slot" onclick="event.stopPropagation();rmSlot(${s.id})">&#215;</button></div>`;
+    } else {
+      d.onclick=()=>trigUp(s.id);
+      d.innerHTML=`<div class="sbar"><span class="slbl">Image ${idx+1}</span><div class="sp"></div><button class="sb dng" title="Remove" onclick="event.stopPropagation();rmSlot(${s.id})">&#215;</button></div><div class="ph"><svg viewBox="0 0 24 24"><path d="M19 7v2.99s-1.99.01-2 0V7h-3s.01-1.99 0-2h3V2h2v3h3v2h-3zm-3 4V8h-3V5H5a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2v-8h-3zM5 19l3-4 2 3 3-4 4 5H5z"/></svg>Click to upload or drop file here</div>`;
+    }
+    d.addEventListener('dragover',e=>{e.preventDefault();d.style.borderColor='var(--gold)'});
+    d.addEventListener('dragleave',()=>d.style.borderColor='');
+    d.addEventListener('drop',e=>{e.preventDefault();d.style.borderColor='';const f=e.dataTransfer.files[0];if(f&&f.type.startsWith('image/'))rdF(f,s.id)});
+    c.appendChild(d);
+  });
+}
+addSlot();addSlot();
+
+/* === GENERATE === */
+let polling=false;
+async function gen(){
+  const filled=S.filter(s=>s.du);
+  if(!filled.length){toast('Upload at least one image',1);return}
+  const p=$('prompt').value.trim();if(!p){toast('Enter a prompt',1);return}
+  const imgs={};S.forEach((s,i)=>{if(s.du)imgs[String(i)]=s.du});
+  const imgCount=Object.keys(imgs).length;
+  console.log('Sending',imgCount,'images to /api/generate');
+  const params={images:imgs,prompt:p,negative_prompt:$('neg').value.trim(),
+    true_cfg_scale:parseFloat($('cfg').value),guidance_scale:parseFloat($('gs').value),
+    num_inference_steps:parseInt($('steps').value),num_images_per_prompt:parseInt($('batch').value),
+    width:parseInt($('w').value)||null,height:parseInt($('h').value)||null,
+    seed:parseInt($('seed').value),max_sequence_length:parseInt($('msl').value)||null,
+    mask:maskDataUrl||null,mask_blur:parseInt($('maskBlur').value)||0};
+  setG(1);
+  try{const d=await(await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(params)})).json();if(!d.ok)throw new Error(d.error);poll()}catch(e){toast(e.message,1);setG(0)}
+}
+function setG(on){
+  $('genBtn').disabled=on;$('genBtn').innerHTML=on?'&#9203; GENERATING...':'&#9889; GENERATE';
+  $('stopBtn').style.display=on?'block':'none';$('stopBtn').disabled=false;$('stopBtn').textContent='■ STOP';
+  $('gp').style.display=on?'block':'none';$('gsl').style.display=on?'block':'none';$('gpf').style.width='0%';
+  $('pill').textContent=on?'RUNNING':'READY';$('pill').className='pill'+(on?' run':'');
+}
+async function stopGen(){
+  try{
+    $('stopBtn').disabled=true;$('stopBtn').textContent='Stopping...';
+    await fetch('/api/stop',{method:'POST'});
+    toast('Stopping after current step...');
+  }catch(e){toast(e.message,1)}
+}
+function poll(){
+  if(polling)return;polling=true;
+  (async function lp(){
+    try{const d=await(await fetch('/api/status')).json();
+      $('gpf').style.width=d.progress+'%';$('gsl').textContent=d.message||'';
+      $('pill').textContent=d.running?(d.message||'RUNNING'):'READY';
+      if(d.running){setTimeout(lp,800);return}
+      polling=false;
+      if(d.error){toast(d.error,1);setG(0);return}
+      if(d.results?.length){showR(d.results);setG(0);rH();return}
+      setG(0);
+    }catch(e){setTimeout(lp,2000)}
+  })();
+}
+
+function showR(results){
+  // Exit lasso mode to show results
+  if(lassoActive){lassoActive=false;$('lassoToggle').style.background='';$('lassoToggle').style.color=''}
+  $('lassoWrap').style.display='none';
+  $('ce').style.display='none';const g=$('og');g.style.display='flex';g.innerHTML='';
+  results.forEach((b64,i)=>{
+    const c=document.createElement('div');c.className='oc';c.dataset.b64=b64;
+    // Build per-slot "Use as Image N" buttons
+    let sbtns=S.map((s,si)=>`<button class="btn bg bs" onclick="event.stopPropagation();s2s(${i},${s.id})" title="Replace the contents of Image ${si+1} with this output">Use as Image ${si+1}</button>`).join('');
+    c.innerHTML=`<img src="${b64}" onclick="$('lbi').src=this.src;$('lb').classList.add('open')"/>
+      <div class="ca">
+        <button class="btn bg bs" onclick="event.stopPropagation();dl(${i})">&#11015; Save</button>
+        <button class="btn bg bs" onclick="event.stopPropagation();s2n(${i})" title="Add this output as a new image slot">+ New Slot</button>
+        ${sbtns}
+      </div>`;
+    g.appendChild(c);
+  });
+}
+function dl(i){const c=$('og').children[i];if(!c)return;const a=document.createElement('a');a.href=c.dataset.b64;a.download='ml_output_'+i+'.png';a.click()}
+function s2s(oi,sid){const c=$('og').children[oi];if(!c)return;setSI(sid,c.dataset.b64);toast('Set as Image '+slotIdx(sid))}
+function s2n(oi){const c=$('og').children[oi];if(!c)return;const id=addSlot(c.dataset.b64);toast('Added as Image '+slotIdx(id))}
+
+/* === HISTORY === */
+async function rH(){
+  try{const d=await(await fetch('/api/history')).json();const s=$('hs');s.innerHTML='';
+  (d.history||[]).forEach(h=>{const div=document.createElement('div');div.className='hi';
+    div.onclick=e=>{if(e.target.closest('.hdel'))return;lH(h)};
+    const inTh=(h.input_thumbs||[]).map(o=>'<img src="'+o+'" style="border-color:var(--gold-dim)"/>').join('');
+    const outTh=(h.outputs||[]).slice(0,3).map(o=>'<img src="'+o+'"/>').join('');
+    div.innerHTML='<button class="hdel" onclick="event.stopPropagation();delH(\''+h.id+'\')" title="Delete">&#215;</button>'
+      +'<div class="ht">'+h.timestamp+'</div><div class="hp">'+esc(h.prompt)+'</div>'
+      +'<div class="hth">'+inTh+(inTh&&outTh?' <span style="color:var(--text-muted);font-size:.6rem;margin:0 2px">→</span> ':'')+outTh+'</div>';
+    s.appendChild(div)})}catch(e){}
+}
+async function delH(id){
+  try{await fetch('/api/history/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});rH();toast('Removed')}catch(e){}
+}
+async function lH(h){
+  $('prompt').value=h.prompt||'';$('neg').value=h.negative_prompt||'';
+  const p=h.params||{};
+  if(p.true_cfg_scale!=null){$('cfg').value=p.true_cfg_scale;rv('cfgV',p.true_cfg_scale)}
+  if(p.num_inference_steps!=null){$('steps').value=p.num_inference_steps;rv('stV',p.num_inference_steps)}
+  if(p.seed!=null)$('seed').value=p.seed;
+  if(p.guidance_scale!=null){$('gs').value=p.guidance_scale;rv('gsV',p.guidance_scale)}
+  if(p.num_images_per_prompt!=null){$('batch').value=p.num_images_per_prompt;rv('baV',p.num_images_per_prompt)}
+  // Fetch full entry to get input_images
+  try{
+    const d=await(await fetch('/api/history/entry?id='+encodeURIComponent(h.id))).json();
+    const imgs=(d.entry&&d.entry.input_images)||[];
+    if(imgs.length){
+      S.length=0;nid=0;
+      imgs.forEach(du=>addSlot(du));
+      rS();
+    }
+  }catch(e){console.warn('Could not load input images:',e)}
+  if(h.outputs?.length)showR(h.outputs);
+  toast('Loaded — inputs, prompt & settings restored');
+}
+
+/* === LORA === */
+async function addLora(){
+  const p=$('lp').value.trim();if(!p){toast('Enter path',1);return}
+  const n=$('ln').value.trim()||null,w=parseFloat($('lw').value);toast('Loading LoRA...');
+  try{const d=await(await fetch('/api/lora/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:p,name:n,weight:w})})).json();
+    if(!d.ok)throw new Error(d.error);toast(d.message);rL();$('lp').value='';$('ln').value=''}catch(e){toast(e.message,1)}
+}
+async function removeLora(n){
+  try{const d=await(await fetch('/api/lora/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})})).json();
+    if(!d.ok)throw new Error(d.error);toast(d.message);rL()}catch(e){toast(e.message,1)}
+}
+async function rL(){
+  try{const d=await(await fetch('/api/lora/list')).json();const c=$('lcs');c.innerHTML='';
+    for(const[n,w]of Object.entries(d.loras||{}))c.innerHTML+=`<span class="lc">${esc(n)} <span class="lw">${w}</span><button onclick="removeLora('${esc(n)}')">&#215;</button></span>`}catch(e){}
+}
+
+function toast(m,e){const t=$('toast');t.textContent=m;t.className='toast show'+(e?' err':'');clearTimeout(t._t);t._t=setTimeout(()=>t.className='toast',3500)}
+
+/* === LASSO MASK TOOL === */
+let lassoActive=false, lassoDrawing=false;
+let lassoPolygons=[];  // array of arrays of {x,y}
+let currentPoly=[];
+let maskDataUrl=null;
+
+function toggleLasso(){
+  // Need at least one image loaded
+  const first=S.find(s=>s.du);
+  if(!first){toast('Upload an image first',1);return}
+  lassoActive=!lassoActive;
+  $('lassoToggle').style.background=lassoActive?'var(--gold)':'';
+  $('lassoToggle').style.color=lassoActive?'#0a0a0a':'';
+  if(lassoActive){
+    showLassoCanvas(first.du);
+  } else {
+    $('lassoWrap').style.display='none';
+    // Show outputs/empty again
+    const hasOutputs=$('og').children.length>0;
+    $('og').style.display=hasOutputs?'flex':'none';
+    $('ce').style.display=hasOutputs?'none':'';
+  }
+}
+
+function showLassoCanvas(imgSrc){
+  $('ce').style.display='none';
+  $('og').style.display='none';
+  const wrap=$('lassoWrap');wrap.style.display='block';
+  const img=$('lassoImg');
+  img.onload=()=>{
+    const maxW=$('C').clientWidth-48, maxH=$('C').clientHeight-80;
+    let w=img.naturalWidth, h=img.naturalHeight;
+    const scale=Math.min(1,maxW/w,maxH/h);
+    w=Math.round(w*scale);h=Math.round(h*scale);
+    img.style.width=w+'px';img.style.height=h+'px';
+    // Size canvases
+    const dc=$('lassoDraw');dc.width=w;dc.height=h;dc.style.width=w+'px';dc.style.height=h+'px';
+    const mp=$('lassoMaskPreview');mp.width=w;mp.height=h;mp.style.width=w+'px';mp.style.height=h+'px';
+    renderMaskPreview();
+  };
+  img.src=imgSrc;
+}
+
+// Drawing handlers on the lasso canvas
+(function(){
+  const dc=$('lassoDraw');
+  dc.addEventListener('mousedown',e=>{if(!lassoActive)return;lassoDrawing=true;currentPoly=[pt(e)];drawLive()});
+  dc.addEventListener('mousemove',e=>{if(!lassoDrawing)return;currentPoly.push(pt(e));drawLive()});
+  dc.addEventListener('mouseup',()=>{if(!lassoDrawing)return;lassoDrawing=false;if(currentPoly.length>2){lassoPolygons.push([...currentPoly])}currentPoly=[];renderMaskPreview();drawLive()});
+  dc.addEventListener('mouseleave',()=>{if(!lassoDrawing)return;lassoDrawing=false;if(currentPoly.length>2){lassoPolygons.push([...currentPoly])}currentPoly=[];renderMaskPreview();drawLive()});
+  // Touch
+  dc.addEventListener('touchstart',e=>{if(!lassoActive)return;e.preventDefault();lassoDrawing=true;currentPoly=[pt(e.touches[0])];drawLive()},{passive:false});
+  dc.addEventListener('touchmove',e=>{if(!lassoDrawing)return;e.preventDefault();currentPoly.push(pt(e.touches[0]));drawLive()},{passive:false});
+  dc.addEventListener('touchend',()=>{if(!lassoDrawing)return;lassoDrawing=false;if(currentPoly.length>2){lassoPolygons.push([...currentPoly])}currentPoly=[];renderMaskPreview();drawLive()});
+
+  function pt(e){const r=dc.getBoundingClientRect();return{x:e.clientX-r.left,y:e.clientY-r.top}}
+})();
+
+function drawLive(){
+  const dc=$('lassoDraw'),ctx=dc.getContext('2d');
+  ctx.clearRect(0,0,dc.width,dc.height);
+  // Draw existing polygons as filled translucent gold
+  ctx.fillStyle='rgba(212,160,23,0.25)';ctx.strokeStyle='var(--gold)';ctx.lineWidth=2;
+  lassoPolygons.forEach(poly=>{
+    ctx.beginPath();poly.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y));ctx.closePath();ctx.fill();ctx.stroke();
+  });
+  // Draw current polygon being drawn
+  if(currentPoly.length>1){
+    ctx.beginPath();ctx.strokeStyle='#f0c840';ctx.lineWidth=2;ctx.setLineDash([4,4]);
+    currentPoly.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y));
+    ctx.stroke();ctx.setLineDash([]);
+  }
+}
+
+function renderMaskPreview(){
+  // Draw the mask preview (red/gold overlay showing selected region)
+  const mp=$('lassoMaskPreview'),ctx=mp.getContext('2d');
+  ctx.clearRect(0,0,mp.width,mp.height);
+  if(!lassoPolygons.length){maskDataUrl=null;return}
+  ctx.fillStyle='rgba(212,160,23,0.35)';
+  lassoPolygons.forEach(poly=>{
+    ctx.beginPath();poly.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y));ctx.closePath();ctx.fill();
+  });
+  // Generate the actual B&W mask at original image resolution for the backend
+  buildMaskDataUrl();
+}
+
+function buildMaskDataUrl(){
+  const first=S.find(s=>s.du);if(!first||!first.du)return;
+  // We need original image dimensions
+  const tmpImg=new Image();
+  tmpImg.onload=()=>{
+    const oc=document.createElement('canvas');oc.width=tmpImg.naturalWidth;oc.height=tmpImg.naturalHeight;
+    const octx=oc.getContext('2d');
+    // Black background (keep original)
+    octx.fillStyle='#000';octx.fillRect(0,0,oc.width,oc.height);
+    // White fill for selected regions (edit here)
+    octx.fillStyle='#fff';
+    const dc=$('lassoDraw');
+    const sx=oc.width/dc.width, sy=oc.height/dc.height;
+    lassoPolygons.forEach(poly=>{
+      octx.beginPath();
+      poly.forEach((p,i)=>i===0?octx.moveTo(p.x*sx,p.y*sy):octx.lineTo(p.x*sx,p.y*sy));
+      octx.closePath();octx.fill();
+    });
+    maskDataUrl=oc.toDataURL('image/png');
+  };
+  tmpImg.src=first.du;
+}
+
+function clearMask(){lassoPolygons=[];currentPoly=[];maskDataUrl=null;renderMaskPreview();drawLive();toast('Mask cleared')}
+function undoLasso(){if(lassoPolygons.length){lassoPolygons.pop();renderMaskPreview();drawLive();toast('Undid last stroke')}}
+
+// Show lasso bar whenever there's an image loaded
+function updateLassoBar(){
+  const hasImg=S.some(s=>s.du);
+  $('lassoBar').style.display=hasImg?'flex':'none';
+  if(!hasImg&&lassoActive){lassoActive=false;$('lassoWrap').style.display='none';$('lassoToggle').style.background='';$('lassoToggle').style.color=''}
+}
+
+// Patch rS to also update lasso bar
+const _origRS=rS;
+rS=function(){_origRS();updateLassoBar();
+  // If lasso is active and image changed, refresh
+  if(lassoActive){const first=S.find(s=>s.du);if(first)showLassoCanvas(first.du)}
+};
+
+rL();rH();
+document.addEventListener('paste',e=>{const its=e.clipboardData?.items;if(!its)return;for(const it of its){if(it.type.startsWith('image/')){const f=it.getAsFile();if(!f)continue;let tgt=S.find(s=>!s.du);if(!tgt){addSlot();tgt=S[S.length-1]}rdF(f,tgt.id);e.preventDefault();break}}});
+document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){e.preventDefault();gen()}});
+</script></body></html>"""
+
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self,*a):pass
+    def _j(self,d,s=200):
+        b=json.dumps(d).encode();self.send_response(s)
+        self.send_header("Content-Type","application/json");self.send_header("Content-Length",len(b));self.send_header("Access-Control-Allow-Origin","*");self.end_headers();self.wfile.write(b)
+    def _h(self,h):
+        b=h.encode();self.send_response(200);self.send_header("Content-Type","text/html;charset=utf-8");self.send_header("Content-Length",len(b));self.end_headers();self.wfile.write(b)
+    def _b(self):return self.rfile.read(int(self.headers.get("Content-Length",0)))
+    def do_OPTIONS(self):
+        self.send_response(204)
+        for k,v in[("Access-Control-Allow-Origin","*"),("Access-Control-Allow-Methods","GET,POST,OPTIONS"),("Access-Control-Allow-Headers","Content-Type")]:self.send_header(k,v)
+        self.end_headers()
+    def do_GET(self):
+        p=urlparse(self.path).path
+        if p=="/api/status":self._j(GENERATION_STATUS)
+        elif p=="/api/lora/list":self._j({"loras":LOADED_LORAS})
+        elif p=="/api/history":
+            # Send slim version — thumbs only, no full input_images (too large)
+            slim = []
+            for h in HISTORY[:30]:
+                entry = {k: v for k, v in h.items() if k != "input_images"}
+                slim.append(entry)
+            self._j({"history": slim})
+        elif p=="/api/history/entry":
+            # Full entry with input_images for loading into slots
+            qid = parse_qs(urlparse(self.path).query).get("id", [None])[0]
+            entry = next((h for h in HISTORY if h.get("id") == qid), None)
+            self._j({"entry": entry} if entry else {"entry": None})
+        else:
+            lb=get_logo_b64();ls=f"data:image/png;base64,{lb}" if lb else LOGO_URL
+            html=HTML_PAGE.replace("__LOGO_SRC__",ls).replace("__DEFAULT_CFG__",str(DEFAULT_TRUE_CFG)).replace("__DEFAULT_STEPS__",str(DEFAULT_STEPS))
+            self._h(html)
+    def do_POST(self):
+        p=urlparse(self.path).path
+        if p=="/api/generate":
+            if GENERATION_STATUS.get("running"):self._j({"ok":False,"error":"Already running"});return
+            try:
+                params=json.loads(self._b());threading.Thread(target=run_generation,args=(params,),daemon=True).start();self._j({"ok":True})
+            except Exception as e:self._j({"ok":False,"error":str(e)})
+        elif p=="/api/stop":
+            global INTERRUPT_FLAG
+            if GENERATION_STATUS.get("running"):
+                INTERRUPT_FLAG=True;self._j({"ok":True,"message":"Stopping after current step..."})
+            else:
+                self._j({"ok":False,"error":"Nothing running"})
+        elif p=="/api/lora/add":
+            try:
+                d=json.loads(self._b());ok,msg=apply_lora(d["path"],d.get("weight",1.0),d.get("name"));self._j({"ok":ok,"message":msg,"error":None if ok else msg})
+            except Exception as e:self._j({"ok":False,"error":str(e)})
+        elif p=="/api/lora/remove":
+            try:
+                d=json.loads(self._b());ok,msg=remove_lora(d["name"]);self._j({"ok":ok,"message":msg,"error":None if ok else msg})
+            except Exception as e:self._j({"ok":False,"error":str(e)})
+        elif p=="/api/history/delete":
+            try:
+                d=json.loads(self._b());hid=d.get("id")
+                HISTORY[:] = [h for h in HISTORY if h.get("id") != hid]
+                self._j({"ok":True})
+            except Exception as e:self._j({"ok":False,"error":str(e)})
+        else:self._j({"error":"Not found"},404)
+
+def start_server(port=7860):
+    srv=HTTPServer(("0.0.0.0",port),Handler);threading.Thread(target=srv.serve_forever,daemon=True).start()
+    print(f"\n✅ Server on port {port}");return srv
+
+def get_colab_url(port=7860):
+    try:
+        from google.colab import output;output.serve_kernel_port_as_window(port)
+        from google.colab.output import eval_js;url=eval_js(f'google.colab.kernel.proxyPort({port})')
+        if url:print(f"🔗 Open: {url}");return url
+    except:pass
+    try:from pyngrok import ngrok;t=ngrok.connect(port);print(f"🔗 Open: {t.public_url}");return t.public_url
+    except:pass
+    print(f"📡 Port {port}. Try: !npx localtunnel --port {port}");return None
+
+# ---------------------------------------------------------------------------
+# Main — EAGER load, then serve
+# ---------------------------------------------------------------------------
+if __name__=="__main__":
+    PORT=7860
+    for src in["/mnt/user-data/uploads/missing_link_logo_final_crop_small.png","missing_link_logo_final_crop_small.png"]:
+        if os.path.exists(src):
+            try:os.makedirs("/content",exist_ok=True);shutil.copy2(src,"/content/missing_link_logo_final_crop_small.png")
+            except:pass
+            break
+
+    print("🦶 Missing Link — Loading Qwen Image Edit 2511...")
+    print("="*60)
+    load_pipeline()
+    print("="*60)
+
+    srv=start_server(PORT);url=get_colab_url(PORT)
+    if not url:print(f"\nLocal: http://localhost:{PORT}")
+    print("\n🦶 Missing Link — Workbench ready! Model is loaded and warm.\n")
+    try:
+        while True:time.sleep(1)
+    except KeyboardInterrupt:print("\nBye");srv.shutdown()
