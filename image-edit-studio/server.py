@@ -369,7 +369,8 @@ async def api_logs_clear():
 # ---- Launch ----
 PORT = int(os.environ.get("PORT", "8000"))
 
-if __name__ == "__main__":
+def launch():
+    """Call this from a Colab cell: from server import launch; launch()"""
     print("=" * 60)
     print("🎨 AI Image Edit Studio — Missing Link")
     print("=" * 60)
@@ -388,42 +389,63 @@ if __name__ == "__main__":
     threading.Thread(target=_keepalive, daemon=True).start()
     print("💓 Keepalive thread started")
 
-    # Start server in background thread
+    # Start server in background thread (non-blocking)
     def _serve():
         uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
-    server_thread = threading.Thread(target=_serve, daemon=True)
-    server_thread.start()
+    threading.Thread(target=_serve, daemon=True).start()
     time.sleep(2)
+    print(f"🚀 Server running on port {PORT}")
 
-    # Get public URL via ngrok
-    from pyngrok import ngrok
-    public_url = ngrok.connect(PORT, "http").public_url
+    # Build Colab proxy URL
+    from google.colab import output as colab_output
+    from IPython.display import display, HTML as IPHTML, Javascript
 
-    print(f"🌐 Open in browser: {public_url}")
-    print(f"📡 Model loading in background — UI status bar shows progress")
+    # Use Javascript to resolve the proxy URL inside the notebook kernel
+    # then write it into the output cell
+    display(IPHTML(f'''
+    <div id="ml-launch" style="margin:8px 0">
+      <div style="font-family:monospace;font-size:13px;color:#888;margin-bottom:8px" id="ml-url-box">
+        Resolving Colab proxy URL...
+      </div>
+    </div>
+    <script>
+    (async () => {{
+      try {{
+        const url = await google.colab.kernel.proxyPort({PORT}, {{"cache": true}});
+        const box = document.getElementById('ml-url-box');
+        box.innerHTML = '🌐 <a href="' + url + '" target="_blank" style="color:#d4a017;font-weight:bold">' + url + '</a>';
+        // Insert the open button
+        const btn = document.createElement('a');
+        btn.href = url;
+        btn.target = '_blank';
+        btn.style.cssText = 'display:inline-block;padding:10px 24px;background:#d4a017;color:#000;font-family:sans-serif;font-weight:700;font-size:14px;border-radius:8px;text-decoration:none;margin:8px 0';
+        btn.textContent = '🚀 Open AI Image Edit Studio';
+        box.parentElement.insertBefore(btn, box);
+        // Insert iframe
+        const iframe = document.createElement('iframe');
+        iframe.src = url;
+        iframe.width = '100%';
+        iframe.height = '750';
+        iframe.frameBorder = '0';
+        iframe.style.cssText = 'border:1px solid #333;border-radius:8px;margin-top:8px';
+        iframe.allow = 'clipboard-read; clipboard-write';
+        box.parentElement.appendChild(iframe);
+      }} catch(e) {{
+        document.getElementById('ml-url-box').innerHTML = '⚠️ Could not resolve proxy URL: ' + e.message + '<br>Try opening: <a href="http://localhost:{PORT}" target="_blank">http://localhost:{PORT}</a>';
+      }}
+    }})();
+    </script>
+    '''))
+
+    print("📡 Model loading in background — UI status bar shows progress")
     print("=" * 60)
 
-    # If inside notebook, show iframe
-    try:
-        from IPython.display import display, HTML as IPHTML
-        display(IPHTML(f'''
-        <div style="margin:8px 0">
-          <a href="{public_url}" target="_blank" style="
-            display:inline-block;padding:10px 24px;background:#d4a017;color:#000;
-            font-family:sans-serif;font-weight:700;font-size:14px;border-radius:8px;
-            text-decoration:none;margin-bottom:8px;
-          ">🚀 Open in New Tab</a>
-        </div>
-        <iframe src="{public_url}" width="100%" height="750" frameborder="0"
-          style="border:1px solid #333;border-radius:8px;" allow="clipboard-read; clipboard-write">
-        </iframe>
-        '''))
-    except Exception:
-        pass
 
-    # Keep alive
+if __name__ == "__main__":
+    # Fallback: if run directly as a script (not from notebook), just block
+    launch()
     try:
         while True: time.sleep(1)
     except KeyboardInterrupt:
         print("\n🛑 Shutting down...")
-        ngrok.kill()
+
