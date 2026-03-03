@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>AI Image Edit Studio — Missing Link</title>
+<link rel="icon" href="https://raw.githubusercontent.com/PotentiallyARobot/MissingLink/main/missing_link_logo_final_crop_small.png" type="image/png"/>
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;600&family=Barlow:wght@300;400;500&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="/static/style.css"/>
+</head>
+<body>
+<div class="wrap">
+
+<!-- Top bar -->
+<div class="topbar">
+  <img class="topbar-logo" src="https://raw.githubusercontent.com/PotentiallyARobot/MissingLink/main/missing_link_logo_final_crop_small.png" alt="Missing Link"/>
+  <div class="topbar-divider"></div>
+  <span class="app-title">AI Image Edit Studio</span>
+  <span class="tagline">Stop Compiling. <b>Start Building.</b></span>
+  <button class="console-btn" id="consoleToggle" onclick="toggleConsole()">▸ Console</button>
+  <span class="pill loading" id="pill">LOADING</span>
+</div>
+
+<!-- Status bar -->
+<div class="sbar">
+  <div class="spinner" id="spin"></div>
+  <div class="sdot" id="dot" style="display:none"></div>
+  <span class="stxt" id="stxt">Loading model...</span>
+  <div class="pbar" id="pbar" style="display:none"><div class="pfill" id="pfill"></div></div>
+</div>
+
+<div class="main">
+
+<!-- LEFT PANEL -->
+<div class="L">
+  <div class="sec"><h3 class="open" onclick="togSec(this)">Input Images</h3><div class="body show"><div class="slots-grid" id="slots"></div><div class="slots-hint">Drop, paste (Ctrl+V), or click to add</div></div></div>
+
+  <div class="sec"><h3 class="open" onclick="togSec(this)">Prompt</h3><div class="body show"><textarea class="prompt-area" id="prompt" placeholder="Describe the edit you want..."></textarea><textarea class="neg-area" id="neg" placeholder="Negative prompt (optional)" style="margin-top:6px"></textarea></div></div>
+
+  <div class="sec"><h3 onclick="togSec(this)">LoRA</h3><div class="body">
+    <div class="lora-row">
+      <input class="lora-input" id="loraRepo" placeholder="user/repo-name" spellcheck="false"/>
+      <button class="btn bp bs" id="loraLoadBtn" onclick="loraLoad()">Load</button>
+      <button class="btn bd bs" id="loraUnloadBtn" onclick="loraUnload()" style="display:none">Unload</button>
+    </div>
+    <div class="fg" id="loraScaleRow" style="display:none">
+      <label>Scale</label>
+      <input type="range" id="loraScale" min="0" max="2" step="0.05" value="1.0" oninput="rv('loraScaleV',this.value)"/>
+      <span class="rv" id="loraScaleV">1.0</span>
+    </div>
+    <div class="lora-status" id="loraStatus">&nbsp;</div>
+  </div></div>
+
+  <div class="sec"><h3 onclick="togSec(this)">Settings</h3><div class="body">
+    <div class="fg"><label>True CFG</label><input type="range" id="cfg" min="1" max="10" step=".5" value="4" oninput="rv('cfgV',this.value)"/><span class="rv" id="cfgV">4</span></div>
+    <div class="fg"><label>Guidance</label><input type="range" id="gs" min="0" max="10" step=".5" value="1" oninput="rv('gsV',this.value)"/><span class="rv" id="gsV">1</span></div>
+    <div class="fg"><label>Steps</label><input type="range" id="steps" min="1" max="80" step="1" value="25" oninput="rv('stV',this.value)"/><span class="rv" id="stV">25</span></div>
+    <div class="fg"><label>Batch</label><input type="range" id="batch" min="1" max="4" step="1" value="1" oninput="rv('baV',this.value)"/><span class="rv" id="baV">1</span></div>
+    <div class="fg"><label>Width</label><input type="number" id="w" value="0" min="0" step="64" style="width:70px"/><span style="font-size:.65rem;color:var(--dim)">0=auto</span></div>
+    <div class="fg"><label>Height</label><input type="number" id="h" value="0" min="0" step="64" style="width:70px"/><span style="font-size:.65rem;color:var(--dim)">0=auto</span></div>
+    <div class="fg"><label>Seed</label><input type="number" id="seed" value="-1" style="width:100px"/><span style="font-size:.65rem;color:var(--dim)">-1=random</span></div>
+    <div class="fg"><label>Max Seq Len</label><input type="number" id="msl" value="0" min="0" max="1024" style="width:70px"/></div>
+  </div></div>
+
+  <div class="gbar">
+    <button class="btn bp" id="genBtn" onclick="gen()" style="min-width:120px" disabled>⚡ Generate</button>
+    <button class="btn bd" id="stopBtn" onclick="stopGen()" style="min-width:60px;display:none">■ Stop</button>
+    <div class="gp"><div class="gpf" id="gpf"></div></div>
+    <div class="gsl" id="gsl"></div>
+  </div>
+</div>
+
+<!-- CENTER PANEL -->
+<div class="C" id="C">
+  <!-- Generation progress overlay -->
+  <div class="gen-overlay" id="genOverlay">
+    <div class="gen-ring">
+      <svg viewBox="0 0 100 100"><circle class="ring-bg" cx="50" cy="50" r="45"/><circle class="ring-fg" id="genRing" cx="50" cy="50" r="45"/></svg>
+      <div class="gen-pct" id="genPct">0%</div>
+    </div>
+    <div class="gen-step" id="genStep">Preparing...</div>
+    <div class="gen-detail" id="genDetail"></div>
+    <div class="gen-eta" id="genEta"></div>
+    <button class="btn bd" onclick="stopGen()" style="margin-top:8px">■ Stop Generation</button>
+  </div>
+
+  <div class="lbar" id="lbar" style="display:none">
+    <button class="btn bg bs" id="lassoT" onclick="toggleLasso()">✎ Lasso</button>
+    <label>Blur:</label><input type="range" id="maskBlur" min="0" max="50" step="1" value="10" oninput="rv('mbV',this.value)"/>
+    <span class="rv" id="mbV" style="min-width:24px">10</span>
+    <button class="btn bg bs" onclick="clearMask()">Clear</button>
+    <button class="btn bg bs" onclick="undoLasso()">Undo</button>
+  </div>
+  <div class="ce" id="ce">
+    <img class="ce-logo" src="https://raw.githubusercontent.com/PotentiallyARobot/MissingLink/main/missing_link_logo_final_crop_small.png" alt="Missing Link"/>
+    <h3>AI Image Edit Studio</h3>
+    <p style="margin-top:6px;font-size:.85rem">Add images, write a prompt, hit Generate.<br/>Model is loading in the background...</p>
+    <p style="margin-top:8px;font-size:.65rem;color:var(--dim);letter-spacing:.3px">Powered by <b style="color:var(--gold)">Missing Link</b></p>
+  </div>
+  <div class="og" id="og" style="display:none"></div>
+  <div class="lwrap" id="lwrap" style="display:none"><img id="limg"/><canvas id="lmask" class="lmask"></canvas><canvas id="ldraw" class="lcanvas"></canvas></div>
+</div>
+
+<!-- RIGHT PANEL -->
+<div class="R">
+  <div class="rh"><svg viewBox="0 0 24 24"><path d="M13 3a9 9 0 00-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42A8.954 8.954 0 0013 21a9 9 0 000-18zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z"/></svg>History</div>
+  <div class="rs" id="hs"></div>
+</div>
+
+</div><!-- /main -->
+</div><!-- /wrap -->
+
+<!-- Console drawer -->
+<div class="console-drawer" id="consoleDrawer">
+  <div class="console-header">
+    <span>📟 Console Output</span>
+    <button class="console-clear" onclick="clearConsole()">Clear</button>
+    <button class="console-close" onclick="toggleConsole()">✕</button>
+  </div>
+  <div class="console-body" id="consoleBody"></div>
+</div>
+
+<div class="lb" id="lb" onclick="this.classList.remove('open')"><img id="lbi"/></div>
+<div class="toast" id="toast"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
