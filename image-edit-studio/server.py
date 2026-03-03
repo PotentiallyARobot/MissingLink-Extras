@@ -396,49 +396,36 @@ def launch():
     time.sleep(2)
     print(f"🚀 Server running on port {PORT}")
 
-    # Build Colab proxy URL
+    # Use Colab's native output.serve_kernel_port_as_iframe
+    # This handles auth cookies automatically — no 403
     from google.colab import output as colab_output
-    from IPython.display import display, HTML as IPHTML, Javascript
+    from IPython.display import display, HTML as IPHTML
 
-    # Use Javascript to resolve the proxy URL inside the notebook kernel
-    # then write it into the output cell
-    display(IPHTML(f'''
-    <div id="ml-launch" style="margin:8px 0">
-      <div style="font-family:monospace;font-size:13px;color:#888;margin-bottom:8px" id="ml-url-box">
-        Resolving Colab proxy URL...
-      </div>
-    </div>
-    <script>
-    (async () => {{
-      try {{
-        const url = await google.colab.kernel.proxyPort({PORT}, {{"cache": true}});
-        const box = document.getElementById('ml-url-box');
-        box.innerHTML = '🌐 <a href="' + url + '" target="_blank" style="color:#d4a017;font-weight:bold">' + url + '</a>';
-        // Insert the open button
-        const btn = document.createElement('a');
-        btn.href = url;
-        btn.target = '_blank';
-        btn.style.cssText = 'display:inline-block;padding:10px 24px;background:#d4a017;color:#000;font-family:sans-serif;font-weight:700;font-size:14px;border-radius:8px;text-decoration:none;margin:8px 0';
-        btn.textContent = '🚀 Open AI Image Edit Studio';
-        box.parentElement.insertBefore(btn, box);
-        // Insert iframe
-        const iframe = document.createElement('iframe');
-        iframe.src = url;
-        iframe.width = '100%';
-        iframe.height = '750';
-        iframe.frameBorder = '0';
-        iframe.style.cssText = 'border:1px solid #333;border-radius:8px;margin-top:8px';
-        iframe.allow = 'clipboard-read; clipboard-write';
-        box.parentElement.appendChild(iframe);
-      }} catch(e) {{
-        document.getElementById('ml-url-box').innerHTML = '⚠️ Could not resolve proxy URL: ' + e.message + '<br>Try opening: <a href="http://localhost:{PORT}" target="_blank">http://localhost:{PORT}</a>';
-      }}
-    }})();
-    </script>
-    '''))
-
+    # Show a button that opens in a new tab (uses Colab's built-in method)
     print("📡 Model loading in background — UI status bar shows progress")
     print("=" * 60)
+
+    display(IPHTML(f'''
+    <div style="margin:8px 0">
+      <button onclick="google.colab.output.setIframeHeight(0);google.colab.kernel.invokeFunction('notebook.open_port', [], {{}});"
+        style="display:inline-block;padding:10px 24px;background:#d4a017;color:#000;
+        font-family:sans-serif;font-weight:700;font-size:14px;border-radius:8px;
+        border:none;cursor:pointer;margin-bottom:8px;">
+        🚀 Open in New Tab
+      </button>
+      <span style="font-family:monospace;font-size:12px;color:#888;margin-left:12px">
+        (iframe also shown below)
+      </span>
+    </div>
+    '''))
+
+    # Register a callback so the button can open a new tab
+    def _open_port():
+        colab_output.serve_kernel_port_as_window(PORT, path='/')
+    colab_output.register_callback('notebook.open_port', _open_port)
+
+    # Show the iframe inline — this is the reliable Colab method
+    colab_output.serve_kernel_port_as_iframe(PORT, path='/', height=750)
 
 
 if __name__ == "__main__":
