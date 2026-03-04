@@ -65,6 +65,7 @@ history = []
 gpu_sem = threading.Semaphore(1)
 wait_list_lock = threading.Lock()
 wait_list = []
+_gen_progress = {}  # job_id -> latest progress event (polling fallback)
 
 # ---- LoRA state ----
 lora_lock = threading.Lock()
@@ -308,22 +309,53 @@ async def api_generate(request: Request):
         async def e(): yield f"data: {json.dumps({'type':'error','error':'Model still loading.'})}\n\n"
         return StreamingResponse(e(), media_type="text/event-stream")
     jid = str(uuid.uuid4()); eq = queue.Queue()
+
+    # Store progress in a dict so polling can access it too
+    _gen_progress[jid] = {"type": "progress", "step": 0, "total": 0, "progress": 0}
+
     threading.Thread(target=run_generation_blocking, args=(jid, body, images, eq), daemon=True).start()
+
+    # Colab's proxy buffers SSE streams aggressively. To flush data through,
+    # we pad each event with a comment block so the total chunk exceeds the
+    # proxy's ~4-8KB buffer threshold.  This is invisible to EventSource /
+    # manual SSE parsers (lines starting with ":" are SSE comments).
+    _SSE_PAD = ": " + "x" * 2048 + "\n"  # ~2KB padding comment
+
     async def stream():
         lt = time.time()
+        # Send initial padding burst to prime the proxy buffer
+        # Also send job_id so client can start polling fallback
+        yield _SSE_PAD + _SSE_PAD + f"data: {json.dumps({'type': 'init', 'job_id': jid})}\n\n"
         while True:
             try: ev = eq.get_nowait()
             except queue.Empty:
-                if time.time() - lt >= 2: yield ": keepalive\n\n"; lt = time.time()
+                if time.time() - lt >= 1.5:
+                    yield _SSE_PAD + ": keepalive\n\n"
+                    lt = time.time()
                 await asyncio.sleep(0.15); continue
-            if ev is None: break
-            lt = time.time(); yield f"data: {json.dumps(ev)}\n\n"
+            if ev is None:
+                # Store final state for polling fallback
+                _gen_progress[jid] = {"type": "done"}
+                break
+            # Update polling state
+            _gen_progress[jid] = ev
+            lt = time.time()
+            yield _SSE_PAD + f"data: {json.dumps(ev)}\n\n"
     return StreamingResponse(stream(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
+                 "X-Accel-Buffering": "no", "Content-Type": "text/event-stream"})
 
 @app.get("/api/queue")
 async def api_queue():
     ql = get_queue_length(); return {"queue_length": ql, "busy": ql > 0 or not gpu_sem._value}
+
+# ---- Polling fallback for progress (Colab proxy can buffer SSE) ----
+@app.get("/api/gen_progress/{job_id}")
+async def api_gen_progress(job_id: str):
+    p = _gen_progress.get(job_id)
+    if p is None:
+        return {"type": "unknown"}
+    return p
 
 @app.get("/api/history")
 async def api_history():
