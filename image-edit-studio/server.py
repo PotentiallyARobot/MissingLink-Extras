@@ -36,6 +36,24 @@ class LogCapture:
                     log_entries[:] = log_entries[-500:]
     def flush(self):
         self.real.flush()
+    def isatty(self):
+        return hasattr(self.real, 'isatty') and self.real.isatty()
+    def fileno(self):
+        return self.real.fileno()
+    def readable(self):
+        return False
+    def writable(self):
+        return True
+    def seekable(self):
+        return False
+    @property
+    def encoding(self):
+        return getattr(self.real, 'encoding', 'utf-8')
+    @property
+    def errors(self):
+        return getattr(self.real, 'errors', 'strict')
+    def __getattr__(self, name):
+        return getattr(self.real, name)
 
 sys.stdout = LogCapture(sys.__stdout__, "stdout")
 sys.stderr = LogCapture(sys.__stderr__, "stderr")
@@ -367,10 +385,41 @@ async def api_logs_clear():
     return {"ok": True}
 
 # ---- Launch ----
-PORT = int(os.environ.get("PORT", "8000"))
+# ══════════════════════════════════════════════════════════════
+# Robust 3-tier Colab launch (health-checked, with fallbacks)
+#
+#   Tier 1: proxyPort URL → verified new-tab link
+#   Tier 2: serve_kernel_port_as_iframe → embedded in cell
+#   Tier 3: serve_kernel_port_as_window → clickable Colab link
+#
+# Server is never advertised until localhost health-check passes.
+# ══════════════════════════════════════════════════════════════
+import socket as _socket
+
+def _find_free_port(preferred=8000):
+    """Return preferred if available, otherwise an OS-assigned free port."""
+    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("0.0.0.0", preferred))
+            return preferred
+        except OSError:
+            s.bind(("0.0.0.0", 0))
+            return s.getsockname()[1]
+
+PORT = _find_free_port(int(os.environ.get("PORT", "8000")))
+
+IN_COLAB = False
+try:
+    from google.colab.output import eval_js
+    IN_COLAB = True
+except ImportError:
+    eval_js = None
 
 def launch():
     """Call this from a Colab cell: from server import launch; launch()"""
+    import traceback as _tb
+    import requests as _requests
+
     print("=" * 60)
     print("🎨 AI Image Edit Studio — Missing Link")
     print("=" * 60)
@@ -387,52 +436,229 @@ def launch():
             try: urllib.request.urlopen(url, timeout=5)
             except: pass
     threading.Thread(target=_keepalive, daemon=True).start()
-    print("💓 Keepalive thread started")
 
     # Start server in background thread (non-blocking)
+    _server_error = [None]
+
     def _serve():
-        uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
+        try:
+            # uvicorn's log formatter can choke on the LogCapture tee
+            # that replaces sys.stdout/stderr earlier in this file.
+            # Passing log_config=None disables uvicorn's own log setup
+            # entirely, which sidesteps the "Unable to configure
+            # formatter 'default'" crash.
+            uvicorn.run(
+                app, host="0.0.0.0", port=PORT,
+                log_level="warning", log_config=None,
+            )
+        except Exception as exc:
+            _server_error[0] = exc
+            sys.__stderr__.write(f"\n❌ Server crashed: {exc}\n")
+            _tb.print_exc(file=sys.__stderr__)
+
     threading.Thread(target=_serve, daemon=True).start()
-    time.sleep(2)
-    print(f"🚀 Server running on port {PORT}")
 
-    # Use Colab's native output.serve_kernel_port_as_iframe
-    # This handles auth cookies automatically — no 403
-    from google.colab import output as colab_output
-    from IPython.display import display, HTML as IPHTML
+    # ── 1) Wait until server is actually responding on localhost ──
+    _local_ready = False
+    _last_err = None
+    for _attempt in range(80):  # ~40s total
+        if _server_error[0] is not None:
+            break
+        try:
+            _r = _requests.get(f"http://127.0.0.1:{PORT}/api/health", timeout=0.75)
+            if _r.status_code == 200:
+                _local_ready = True
+                break
+        except Exception as _e:
+            _last_err = _e
+        time.sleep(0.5)
 
-    # Show a button that opens in a new tab (uses Colab's built-in method)
+    if not _local_ready:
+        raise RuntimeError(
+            f"Server never became reachable on localhost:{PORT}.\n"
+            f"  Server error: {_server_error[0]}\n"
+            f"  Last health-check error: {_last_err}"
+        )
+
+    sys.__stdout__.write(f"✅ Server healthy on localhost:{PORT}\n")
     print("📡 Model loading in background — UI status bar shows progress")
     print("=" * 60)
 
-    display(IPHTML(f'''
-    <div style="margin:8px 0">
-      <button onclick="google.colab.output.setIframeHeight(0);google.colab.kernel.invokeFunction('notebook.open_port', [], {{}});"
-        style="display:inline-block;padding:10px 24px;background:#d4a017;color:#000;
-        font-family:sans-serif;font-weight:700;font-size:14px;border-radius:8px;
-        border:none;cursor:pointer;margin-bottom:8px;">
-        🚀 Open in New Tab
-      </button>
-      <span style="font-family:monospace;font-size:12px;color:#888;margin-left:12px">
-        (iframe also shown below)
-      </span>
-    </div>
-    '''))
+    # ── 2) Display UI (Colab vs local) ──
+    _launch_mode = None
+    public_url = None
 
-    # Register a callback so the button can open a new tab
-    def _open_port():
-        colab_output.serve_kernel_port_as_window(PORT, path='/')
-    colab_output.register_callback('notebook.open_port', _open_port)
+    if IN_COLAB:
+        from IPython.display import display, HTML as _HTML
 
-    # Show the iframe inline — this is the reliable Colab method
-    colab_output.serve_kernel_port_as_iframe(PORT, path='/', height=750)
+        # ── Shared pop-out button (resolves proxy URL client-side) ──
+        _POPOUT_BTN_JS = """
+        <script>
+        (function() {
+            var btn = document.getElementById('mle-popout-btn');
+            if (!btn) return;
+            btn.addEventListener('click', async function() {
+                btn.textContent = 'Opening...';
+                btn.style.opacity = '0.6';
+                try {
+                    var url = await google.colab.kernel.proxyPort(%d, {cache: false});
+                    if (url && !url.startsWith('http')) url = 'https://' + url;
+                    window.open(url, '_blank');
+                    btn.textContent = '↗ Open in new tab';
+                    btn.style.opacity = '1';
+                } catch(e) {
+                    btn.textContent = '⚠ Failed — try again';
+                    btn.style.opacity = '1';
+                    console.error('proxyPort error:', e);
+                }
+            });
+        })();
+        </script>
+        """ % PORT
+
+        _POPOUT_BTN_HTML = (
+            '<button id="mle-popout-btn" style="'
+            'margin-left:12px;padding:8px 18px;'
+            'background:#d4a017;color:#000;border:none;border-radius:8px;'
+            'font-family:monospace;font-size:13px;font-weight:bold;cursor:pointer;'
+            '">↗ Open in new tab</button>'
+        )
+
+        # ── Tier 1: proxyPort URL with end-to-end verification ──
+        _last_proxy_err = None
+        for _proxy_attempt in range(20):  # ~10s
+            try:
+                _candidate = eval_js(
+                    f"google.colab.kernel.proxyPort({PORT}, {{'cache': false}})"
+                )
+                if _candidate and not _candidate.startswith("http"):
+                    _candidate = "https://" + _candidate
+            except Exception as _pe:
+                _last_proxy_err = _pe
+                _candidate = None
+
+            if _candidate:
+                try:
+                    _rr = _requests.get(
+                        _candidate.rstrip("/") + "/api/health", timeout=4
+                    )
+                    if _rr.status_code == 200:
+                        public_url = _candidate
+                        _launch_mode = "proxy_url"
+                        break
+                except Exception:
+                    pass
+            time.sleep(0.5)
+
+        if _launch_mode == "proxy_url":
+            display(_HTML(f"""
+            <div style="margin:16px 0;padding:16px 24px;background:#141414;border:2px solid #d4a017;border-radius:12px;font-family:monospace;">
+                <div style="color:#8A8A8A;font-size:13px;margin-bottom:8px;">🎨 AI Image Edit Studio is live — click to open:</div>
+                <a href="{public_url}" target="_blank" style="color:#d4a017;font-size:18px;font-weight:bold;text-decoration:underline;">{public_url}</a>
+                <div style="color:#8A8A8A;font-size:12px;margin-top:10px;">
+                    Health: <a href="{public_url.rstrip('/')}/api/health" target="_blank"
+                       style="color:#8A8A8A;text-decoration:underline;">/api/health</a>
+                </div>
+            </div>
+            """))
+        else:
+            # ── Tier 2: Embed as iframe ──
+            sys.__stdout__.write(
+                f"⚠ Proxy URL not reachable (last error: {_last_proxy_err}).\n"
+                f"  Falling back to embedded iframe...\n"
+            )
+            _iframe_ok = False
+            try:
+                from google.colab import output as _colab_output
+                _colab_output.serve_kernel_port_as_iframe(PORT, height='750')
+                _launch_mode = "iframe"
+                _iframe_ok = True
+                display(_HTML(f"""
+                <div style="margin:8px 0 4px;padding:10px 16px;background:#141414;border:2px solid #d4a017;border-radius:12px;font-family:monospace;display:flex;align-items:center;flex-wrap:wrap;gap:6px;">
+                    <span style="color:#d4a017;font-weight:bold;">🎨 Image Edit Studio</span>
+                    <span style="color:#8A8A8A;font-size:13px;"> — embedded above ↑</span>
+                    {_POPOUT_BTN_HTML}
+                </div>
+                {_POPOUT_BTN_JS}
+                """))
+            except Exception as _iframe_err:
+                sys.__stdout__.write(f"  ⚠ iframe failed: {_iframe_err}\n")
+
+            # ── Tier 3: serve_kernel_port_as_window ──
+            if not _iframe_ok:
+                try:
+                    from google.colab import output as _colab_output
+                    _colab_output.serve_kernel_port_as_window(PORT, anchor_text="🎨 Click to open Image Edit Studio")
+                    _launch_mode = "window"
+                    display(_HTML(f"""
+                    <div style="margin:8px 0;padding:10px 16px;background:#141414;border:2px solid #d4a017;border-radius:12px;font-family:monospace;display:flex;align-items:center;flex-wrap:wrap;gap:6px;">
+                        <span style="color:#8A8A8A;font-size:13px;">Click the link above to open the UI, or:</span>
+                        {_POPOUT_BTN_HTML}
+                    </div>
+                    {_POPOUT_BTN_JS}
+                    """))
+                except Exception as _window_err:
+                    sys.__stdout__.write(f"  ⚠ window fallback also failed: {_window_err}\n")
+                    # ── Absolute last resort: raw JS iframe injection ──
+                    try:
+                        from IPython.display import Javascript as _JS
+                        display(_JS("""
+                        (async () => {
+                            const url = await google.colab.kernel.proxyPort(%d, {cache: false});
+                            const iframe = document.createElement('iframe');
+                            iframe.src = url;
+                            iframe.width = '100%%';
+                            iframe.height = '750';
+                            iframe.style.border = '2px solid #d4a017';
+                            iframe.style.borderRadius = '12px';
+                            document.querySelector('#output-area').appendChild(iframe);
+
+                            const btn = document.createElement('button');
+                            btn.textContent = '↗ Open in new tab';
+                            btn.style.cssText = 'margin:8px 0;padding:8px 16px;background:#d4a017;color:#000;border:none;border-radius:6px;font-family:monospace;font-size:13px;font-weight:bold;cursor:pointer;';
+                            btn.onclick = async function() {
+                                try {
+                                    const u = await google.colab.kernel.proxyPort(%d, {cache: false});
+                                    window.open(u.startsWith('http') ? u : 'https://' + u, '_blank');
+                                } catch(e) { btn.textContent = '⚠ Failed'; }
+                            };
+                            document.querySelector('#output-area').appendChild(btn);
+                        })();
+                        """ % (PORT, PORT)))
+                        _launch_mode = "js_iframe"
+                    except Exception as _js_err:
+                        raise RuntimeError(
+                            f"All Colab display methods failed for port {PORT}.\n"
+                            f"  proxyPort: {_last_proxy_err}\n"
+                            f"  iframe: {_iframe_err}\n"
+                            f"  window: {_window_err}\n"
+                            f"  JS: {_js_err}\n"
+                            f"  Server IS running on localhost:{PORT}.\n"
+                            f"  Try: Runtime → Disconnect and delete runtime, then reconnect."
+                        )
+
+        sys.__stdout__.write(f"🚀 Launch mode: {_launch_mode}\n")
+
+    else:
+        _launch_mode = "local"
+        print(f"\n🎨 Image Edit Studio running at http://localhost:{PORT}\n")
+
+    print("Server running. Interrupt cell to stop.\n")
+
+    try:
+        _start_ts = time.time()
+        while True:
+            time.sleep(30)
+            _uptime = int(time.time() - _start_ts)
+            _h, _rem = divmod(_uptime, 3600)
+            _m, _s = divmod(_rem, 60)
+            sys.__stdout__.write(
+                f"\r🎨 Uptime: {_h:02d}:{_m:02d}:{_s:02d} | Port: {PORT} | Mode: {_launch_mode}   "
+            )
+            sys.__stdout__.flush()
+    except KeyboardInterrupt:
+        print("\n\n🛑 Server stopped.")
 
 
 if __name__ == "__main__":
-    # Fallback: if run directly as a script (not from notebook), just block
     launch()
-    try:
-        while True: time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n🛑 Shutting down...")
-
