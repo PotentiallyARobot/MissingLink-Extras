@@ -207,8 +207,31 @@ async function gen() {
         mask: maskDU || null, mask_blur: parseInt($('maskBlur').value) || 0
     };
     genAC = new AbortController(); setG(1);
+    let _genJobId = null;
+    let _pollTimer = null;
     try {
         const resp = await fetch(API + '/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params), signal: genAC.signal });
+
+        // Try to extract job_id from a custom header (set by server)
+        // Also start a polling fallback that updates UI even if SSE is buffered by Colab proxy
+        const _pollProgress = async (jid) => {
+            if (!jid) return;
+            try {
+                const pr = await fetch(API + '/api/gen_progress/' + jid, { signal: AbortSignal.timeout(3000) });
+                const pd = await pr.json();
+                if (pd.type === 'progress') {
+                    $('pill').textContent = 'RUNNING'; $('pill').className = 'pill run';
+                    const pct = pd.progress || Math.round(pd.step / pd.total * 100);
+                    setProgress(pct, pd.step, pd.total, pd.per_step, pd.remaining);
+                    $('gpf').style.width = pct + '%';
+                    const eta = pd.remaining > 0 ? ' · ~' + Math.round(pd.remaining) + 's' : '';
+                    $('gsl').textContent = `Step ${pd.step}/${pd.total} (${pd.per_step || '?'}s/step${eta})`;
+                } else if (pd.type === 'queue') {
+                    $('genStep').textContent = `Queue position: ${pd.position} of ${pd.queue_length}`;
+                }
+            } catch(e) {}
+        };
+
         const reader = resp.body.getReader(); const dec = new TextDecoder(); let buf = '';
         while (true) {
             const { done, value } = await reader.read(); if (done) break;
@@ -218,6 +241,13 @@ async function gen() {
                 try {
                     const d = JSON.parse(line.slice(6));
                     if (d.type === 'error') throw new Error(d.error);
+                    else if (d.type === 'init' && d.job_id) {
+                        // Got job_id — start polling fallback for Colab proxy buffering
+                        _genJobId = d.job_id;
+                        if (!_pollTimer) {
+                            _pollTimer = setInterval(() => _pollProgress(_genJobId), 1500);
+                        }
+                    }
                     else if (d.type === 'queue') {
                         setProgress(0, 0, 0, '?', 0);
                         $('genStep').textContent = `Queue position: ${d.position} of ${d.queue_length}`;
@@ -241,7 +271,7 @@ async function gen() {
             }
         }
     } catch (e) { if (e.name === 'AbortError') toast('Stopped'); else toast(e.message, 1) }
-    finally { genAC = null; setG(0); hideProgress() }
+    finally { if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; } genAC = null; setG(0); hideProgress() }
 }
 function stopGen() { if (genAC) { genAC.abort(); genAC = null } }
 function setG(on) {
