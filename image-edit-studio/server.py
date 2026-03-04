@@ -169,14 +169,96 @@ def run_generation_blocking(job_id, body, images, event_q):
         event_q.put(None)
 
 # ---- Model loading ----
+# All model/class names are read from config.json next to this file.
+# Edit config.json (or the copy in launch.py) to change models without
+# touching server code.
+import json as _json
+
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+def _load_config():
+    """Load config.json, falling back to env vars, then defaults."""
+    defaults = {
+        "transformer_repo": "QuantFunc/Nunchaku-Qwen-Image-EDIT-2511",
+        "transformer_rank": 256,
+        "transformer_filename_pattern": "nunchaku_qwen_image_edit_2511_{variant}_{precision}.safetensors",
+        "transformer_class": "nunchaku.NunchakuQwenImageTransformer2DModel",
+        "pipeline_repo": "Qwen/Qwen-Image-Edit-2511",
+        "pipeline_class": "diffusers.QwenImageEditPlusPipeline",
+        "scheduler_class": "diffusers.FlowMatchEulerDiscreteScheduler",
+        "scheduler_config": {
+            "base_image_seq_len": 256,
+            "base_shift": "log3",
+            "invert_sigmas": False,
+            "max_image_seq_len": 8192,
+            "max_shift": "log3",
+            "num_train_timesteps": 1000,
+            "shift": 1.0,
+            "shift_terminal": None,
+            "stochastic_sampling": False,
+            "time_shift_type": "exponential",
+            "use_beta_sigmas": False,
+            "use_dynamic_shifting": True,
+            "use_exponential_sigmas": False,
+            "use_karras_sigmas": False,
+        },
+        "torch_dtype": "bfloat16",
+        "enable_cpu_offload": True,
+        "hf_cache_dir": "/root/.cache/huggingface",
+        "rank_variants": {
+            "32": "ultimate_speed",
+            "128": "balance",
+            "256": "best_quality"
+        },
+    }
+    cfg = dict(defaults)
+    # Layer 1: config.json on disk
+    if os.path.isfile(_CONFIG_PATH):
+        try:
+            with open(_CONFIG_PATH) as f:
+                file_cfg = _json.load(f)
+            cfg.update(file_cfg)
+            print(f"📄 Config loaded from {_CONFIG_PATH}")
+        except Exception as e:
+            print(f"⚠ Failed to read {_CONFIG_PATH}: {e} — using defaults")
+    # Layer 2: env var overrides (for backward compat)
+    env_map = {
+        "MLE_TRANSFORMER_REPO": "transformer_repo",
+        "MLE_TRANSFORMER_RANK": "transformer_rank",
+        "MLE_PIPELINE_REPO": "pipeline_repo",
+        "MLE_PIPELINE_CLASS": "pipeline_class",
+        "MLE_TRANSFORMER_CLASS": "transformer_class",
+        "MLE_SCHEDULER_CLASS": "scheduler_class",
+        "MLE_TORCH_DTYPE": "torch_dtype",
+        "HF_HOME": "hf_cache_dir",
+    }
+    for env_key, cfg_key in env_map.items():
+        v = os.environ.get(env_key)
+        if v is not None:
+            if cfg_key == "transformer_rank":
+                cfg[cfg_key] = int(v)
+            elif cfg_key == "enable_cpu_offload":
+                cfg[cfg_key] = v.lower() in ("1", "true", "yes")
+            else:
+                cfg[cfg_key] = v
+    return cfg
+
+MODEL_CONFIG = _load_config()
+
+def _import_class(dotted_path):
+    """Import 'package.module.ClassName' and return the class."""
+    parts = dotted_path.rsplit(".", 1)
+    if len(parts) == 2:
+        mod = __import__(parts[0], fromlist=[parts[1]])
+        return getattr(mod, parts[1])
+    raise ImportError(f"Cannot parse class path: {dotted_path}")
+
 def load_model():
     global pipeline
-    from diffusers import QwenImageEditPlusPipeline, FlowMatchEulerDiscreteScheduler
-    from nunchaku import NunchakuQwenImageTransformer2DModel
-    from nunchaku.utils import get_precision
+    cfg = MODEL_CONFIG
 
     t0 = time.time()
-    cache_dir = os.environ.get("HF_HOME", "/root/.cache/huggingface")
+    cache_dir = cfg["hf_cache_dir"]
     try:
         go = subprocess.check_output(["nvidia-smi", "--query-gpu=name,memory.total,driver_version,compute_cap", "--format=csv,noheader,nounits"], text=True).strip()
         status["gpu"] = go; print(f"🖥️  GPU: {go}")
@@ -184,34 +266,47 @@ def load_model():
     except Exception as e: print(f"⚠️  GPU info: {e}")
 
     try:
+        # ── Transformer ──
         status.update({"status": "loading", "step": 1, "detail": "Loading quantized transformer..."})
-        RANK = 256; precision = get_precision()
+        TransformerClass = _import_class(cfg["transformer_class"])
+        from nunchaku.utils import get_precision
+        precision = get_precision()
         if "int4" in precision: precision = "int4"
         elif "fp4" in precision: precision = "fp4"
-        vbr = {32: "ultimate_speed", 128: "balance", 256: "best_quality"}
-        variant = vbr.get(RANK, "balance")
-        hfp = f"QuantFunc/Nunchaku-Qwen-Image-EDIT-2511/nunchaku_qwen_image_edit_2511_{variant}_{precision}.safetensors"
+        rank = int(cfg["transformer_rank"])
+        variant = cfg["rank_variants"].get(str(rank), "balance")
+        filename = cfg["transformer_filename_pattern"].format(variant=variant, precision=precision)
+        hfp = f"{cfg['transformer_repo']}/{filename}"
         print(f"Loading transformer: {hfp}")
-        transformer = NunchakuQwenImageTransformer2DModel.from_pretrained(hfp)
+        transformer = TransformerClass.from_pretrained(hfp)
 
+        # ── Scheduler ──
         status.update({"step": 2, "detail": "Building scheduler..."})
-        scheduler = FlowMatchEulerDiscreteScheduler.from_config({
-            "base_image_seq_len": 256, "base_shift": math.log(3), "invert_sigmas": False,
-            "max_image_seq_len": 8192, "max_shift": math.log(3), "num_train_timesteps": 1000,
-            "shift": 1.0, "shift_terminal": None, "stochastic_sampling": False,
-            "time_shift_type": "exponential", "use_beta_sigmas": False, "use_dynamic_shifting": True,
-            "use_exponential_sigmas": False, "use_karras_sigmas": False,
-        })
+        SchedulerClass = _import_class(cfg["scheduler_class"])
+        sched_cfg = dict(cfg["scheduler_config"])
+        # Resolve special values
+        for k, v in sched_cfg.items():
+            if v == "log3":
+                sched_cfg[k] = math.log(3)
+        scheduler = SchedulerClass.from_config(sched_cfg)
 
+        # ── Pipeline (text encoder + VAE + tokenizer) ──
         status.update({"step": 3, "detail": "Loading text encoder + VAE..."})
-        print("Loading pipeline: Qwen/Qwen-Image-Edit-2511")
-        pipeline = QwenImageEditPlusPipeline.from_pretrained(
-            "Qwen/Qwen-Image-Edit-2511", transformer=transformer, scheduler=scheduler,
-            torch_dtype=torch.bfloat16, cache_dir=cache_dir,
+        PipelineClass = _import_class(cfg["pipeline_class"])
+        dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+        torch_dtype = dtype_map.get(cfg["torch_dtype"], torch.bfloat16)
+        print(f"Loading pipeline: {cfg['pipeline_repo']}")
+        pipeline = PipelineClass.from_pretrained(
+            cfg["pipeline_repo"], transformer=transformer, scheduler=scheduler,
+            torch_dtype=torch_dtype, cache_dir=cache_dir,
         )
 
+        # ── GPU setup ──
         status.update({"step": 4, "detail": "Enabling CPU offload..."})
-        pipeline.enable_model_cpu_offload()
+        if cfg.get("enable_cpu_offload", True):
+            pipeline.enable_model_cpu_offload()
+        else:
+            pipeline.to("cuda")
 
         status.update({"step": 5, "detail": "Finalizing..."})
         el = round(time.time() - t0, 1)
@@ -694,3 +789,4 @@ def launch():
 
 if __name__ == "__main__":
     launch()
+
