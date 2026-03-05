@@ -317,6 +317,181 @@ def load_model():
         status.update({"status": "error", "detail": f"Load failed: {str(e)}"})
 
 # ---- LoRA management ----
+
+def _is_nunchaku_transformer():
+    """Check if the pipeline transformer is a Nunchaku quantized model."""
+    if not pipeline:
+        return False
+    transformer = getattr(pipeline, "transformer", None)
+    if transformer is None:
+        return False
+    cls_name = type(transformer).__name__
+    return "Nunchaku" in cls_name
+
+def _nunchaku_load_lora(repo, scale):
+    """Load a LoRA using Nunchaku's native _lora_slots / compose_loras_v2 mechanism."""
+    from safetensors.torch import load_file
+    from huggingface_hub import hf_hub_download
+    import re
+
+    transformer = pipeline.transformer
+
+    # ── 1) Resolve repo to a local safetensors path ──
+    if os.path.isfile(repo):
+        lora_path = repo
+    elif "/" in repo and repo.endswith(".safetensors"):
+        # e.g. "user/repo/file.safetensors"
+        parts = repo.split("/")
+        if len(parts) >= 3:
+            hf_repo = "/".join(parts[:2])
+            filename = "/".join(parts[2:])
+        else:
+            hf_repo = repo
+            filename = None
+        lora_path = hf_hub_download(repo_id=hf_repo, filename=filename)
+    else:
+        # Bare HF repo — try to find a .safetensors file
+        from huggingface_hub import list_repo_files
+        files = list_repo_files(repo)
+        st_files = [f for f in files if f.endswith(".safetensors")]
+        if not st_files:
+            raise RuntimeError(f"No .safetensors file found in {repo}")
+        # Prefer files with 'lora' in the name, else take the first
+        pick = next((f for f in st_files if "lora" in f.lower()), st_files[0])
+        print(f"  → Auto-selected LoRA file: {pick}")
+        lora_path = hf_hub_download(repo_id=repo, filename=pick)
+
+    print(f"  → Loading safetensors: {lora_path}")
+    lora_sd = load_file(lora_path)
+
+    # ── 2) Try Nunchaku's built-in compose_loras_v2 (used by ComfyUI loaders) ──
+    try:
+        from nunchaku.lora.compose import compose_loras_v2, reset_lora_v2
+        print("  → Using compose_loras_v2 (nunchaku.lora.compose)")
+        reset_lora_v2(transformer)
+        compose_loras_v2(transformer, [(lora_sd, scale)])
+        return
+    except ImportError:
+        pass
+
+    # ── 3) Try alternate import paths for compose_loras_v2 ──
+    for mod_path in [
+        "nunchaku.lora.qwen.compose",
+        "nunchaku.lora.qwenimage.compose",
+    ]:
+        try:
+            mod = __import__(mod_path, fromlist=["compose_loras_v2", "reset_lora_v2"])
+            compose_fn = getattr(mod, "compose_loras_v2")
+            reset_fn = getattr(mod, "reset_lora_v2")
+            print(f"  → Using compose_loras_v2 from {mod_path}")
+            reset_fn(transformer)
+            compose_fn(transformer, [(lora_sd, scale)])
+            return
+        except (ImportError, AttributeError):
+            continue
+
+    # ── 4) Try update_lora_params if available (Flux-style, may work on newer nunchaku) ──
+    if hasattr(transformer, "update_lora_params"):
+        print("  → Using transformer.update_lora_params()")
+        transformer.update_lora_params(lora_path)
+        if hasattr(transformer, "set_lora_strength"):
+            transformer.set_lora_strength(scale)
+        return
+
+    # ── 5) Manual _lora_slots injection (last resort, mirrors ComfyUI loader logic) ──
+    has_slots = any(hasattr(m, "_lora_slots") for m in transformer.modules())
+    if has_slots:
+        print("  → Manual _lora_slots injection")
+        _manual_lora_slots_inject(transformer, lora_sd, scale)
+        return
+
+    raise RuntimeError(
+        "Could not find a compatible Nunchaku LoRA loading method. "
+        "Your nunchaku version may not yet support custom LoRA on Qwen-Image-Edit models. "
+        "Check https://github.com/mit-han-lab/nunchaku for updates, or try a non-quantized model."
+    )
+
+def _manual_lora_slots_inject(transformer, lora_sd, scale):
+    """
+    Inject LoRA weights directly into Nunchaku's pre-allocated _lora_slots.
+    This mirrors the approach used by ComfyUI-QwenImageLoraLoader.
+    """
+    import re
+    applied = 0
+    # Build a mapping from module name to module
+    module_map = {name: mod for name, mod in transformer.named_modules()}
+
+    for key, tensor in lora_sd.items():
+        # Typical keys: transformer_blocks.0.attn.to_q.lora_A.weight
+        # We need to find the parent module and check for _lora_slots
+        parts = key.split(".")
+        # Find lora_A or lora_B
+        lora_idx = None
+        for i, p in enumerate(parts):
+            if p in ("lora_A", "lora_B", "lora_down", "lora_up"):
+                lora_idx = i
+                break
+        if lora_idx is None:
+            continue
+
+        parent_path = ".".join(parts[:lora_idx])
+        parent_mod = module_map.get(parent_path)
+        if parent_mod is not None and hasattr(parent_mod, "_lora_slots"):
+            slot = parent_mod._lora_slots
+            lora_type = parts[lora_idx]
+            if "A" in lora_type or "down" in lora_type:
+                slot_key = "lora_down"
+            else:
+                slot_key = "lora_up"
+
+            if hasattr(slot, slot_key):
+                target = getattr(slot, slot_key)
+                if target.shape == tensor.shape:
+                    target.data.copy_(tensor * scale)
+                    applied += 1
+
+    if applied == 0:
+        raise RuntimeError(
+            f"Manual _lora_slots injection matched 0 layers. "
+            f"The LoRA format may be incompatible with this Nunchaku model."
+        )
+    print(f"  → Injected LoRA into {applied} slots")
+
+def _nunchaku_unload_lora():
+    """Unload LoRA from a Nunchaku transformer."""
+    transformer = pipeline.transformer
+
+    # Try reset_lora_v2
+    for mod_path in [
+        "nunchaku.lora.compose",
+        "nunchaku.lora.qwen.compose",
+        "nunchaku.lora.qwenimage.compose",
+    ]:
+        try:
+            mod = __import__(mod_path, fromlist=["reset_lora_v2"])
+            reset_fn = getattr(mod, "reset_lora_v2")
+            reset_fn(transformer)
+            print("✅ LoRA reset via reset_lora_v2")
+            return
+        except (ImportError, AttributeError):
+            continue
+
+    # Try set_lora_strength(0)
+    if hasattr(transformer, "set_lora_strength"):
+        transformer.set_lora_strength(0)
+        print("✅ LoRA strength set to 0")
+        return
+
+    # Manual slot reset
+    for mod in transformer.modules():
+        if hasattr(mod, "_lora_slots"):
+            slot = mod._lora_slots
+            for attr in ("lora_down", "lora_up"):
+                if hasattr(slot, attr):
+                    getattr(slot, attr).data.zero_()
+    print("✅ LoRA slots zeroed out")
+
+
 def _lora_load_thread(repo, scale):
     global pipeline
     with lora_lock:
@@ -330,14 +505,24 @@ def _lora_load_thread(repo, scale):
         if lora_state["loaded"]:
             print(f"🔄 Unloading existing LoRA: {lora_state['loaded']}")
             try:
-                pipeline.unload_lora_weights()
+                if _is_nunchaku_transformer():
+                    _nunchaku_unload_lora()
+                else:
+                    pipeline.unload_lora_weights()
             except Exception as ue:
                 print(f"⚠️  Unload warning: {ue}")
 
         print(f"📦 Loading LoRA: {repo} (scale={scale})")
-        pipeline.load_lora_weights(repo)
-        pipeline.fuse_lora(lora_scale=scale)
-        print(f"✅ LoRA loaded and fused: {repo}")
+
+        if _is_nunchaku_transformer():
+            # Use Nunchaku-native LoRA loading (bypasses PEFT entirely)
+            _nunchaku_load_lora(repo, scale)
+        else:
+            # Standard diffusers/PEFT path for non-quantized models
+            pipeline.load_lora_weights(repo)
+            pipeline.fuse_lora(lora_scale=scale)
+
+        print(f"✅ LoRA loaded: {repo}")
 
         with lora_lock:
             lora_state["loaded"] = repo
@@ -358,14 +543,19 @@ def _lora_unload_thread():
         if not pipeline:
             raise RuntimeError("Model not ready")
         print(f"🔄 Unfusing and unloading LoRA: {lora_state['loaded']}")
-        try:
-            pipeline.unfuse_lora()
-        except Exception:
-            pass
-        try:
-            pipeline.unload_lora_weights()
-        except Exception:
-            pass
+
+        if _is_nunchaku_transformer():
+            _nunchaku_unload_lora()
+        else:
+            try:
+                pipeline.unfuse_lora()
+            except Exception:
+                pass
+            try:
+                pipeline.unload_lora_weights()
+            except Exception:
+                pass
+
         print("✅ LoRA unloaded")
         with lora_lock:
             lora_state["loaded"] = None
