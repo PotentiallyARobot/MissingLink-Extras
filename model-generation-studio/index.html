@@ -19,9 +19,65 @@
     </div>
     <div class="app-header-right">
       <div class="header-badge" id="keepaliveBadge"><span class="dot"></span> Connected</div>
+      <button class="hw-toggle" id="hwToggle" onclick="toggleHwPanel()">
+        <div class="hw-spark" id="hwSpark">
+          <span style="height:3px"></span><span style="height:3px"></span><span style="height:3px"></span>
+          <span style="height:3px"></span><span style="height:3px"></span>
+        </div>
+        GPU
+      </button>
       <button class="console-toggle-btn" id="consoleToggle" onclick="toggleConsole()">▸ Console</button>
     </div>
   </header>
+
+  <!-- HW Monitor Panel (fixed overlay) -->
+  <div class="hw-panel" id="hwPanel">
+    <div class="hw-header">
+      <span class="hw-title">⚡ Hardware Monitor</span>
+      <span class="hw-phase" id="hwPhase">—</span>
+    </div>
+    <div class="hw-body">
+      <!-- GPU Utilization -->
+      <div class="hw-metric">
+        <div class="hw-metric-head">
+          <span class="hw-metric-label">GPU Compute</span>
+          <span class="hw-metric-value" id="hwGpuUtil">—</span>
+        </div>
+        <div class="hw-bar"><div class="hw-bar-fill gpu" id="hwGpuUtilBar" style="width:0%"></div></div>
+      </div>
+      <!-- VRAM -->
+      <div class="hw-metric">
+        <div class="hw-metric-head">
+          <span class="hw-metric-label">VRAM</span>
+          <span class="hw-metric-value" id="hwVram">—</span>
+        </div>
+        <div class="hw-bar"><div class="hw-bar-fill vram" id="hwVramBar" style="width:0%"></div></div>
+      </div>
+      <!-- CPU -->
+      <div class="hw-metric">
+        <div class="hw-metric-head">
+          <span class="hw-metric-label">CPU</span>
+          <span class="hw-metric-value" id="hwCpu">—</span>
+        </div>
+        <div class="hw-bar"><div class="hw-bar-fill cpu" id="hwCpuBar" style="width:0%"></div></div>
+      </div>
+      <!-- RAM -->
+      <div class="hw-metric">
+        <div class="hw-metric-head">
+          <span class="hw-metric-label">RAM</span>
+          <span class="hw-metric-value" id="hwRam">—</span>
+        </div>
+        <div class="hw-bar"><div class="hw-bar-fill ram" id="hwRamBar" style="width:0%"></div></div>
+      </div>
+      <div class="hw-sep"></div>
+      <!-- Detail stats -->
+      <div class="hw-stats-row" id="hwDetails">
+        <span class="hw-stat"><span class="hw-dot r"></span> <span id="hwTemp">—</span></span>
+        <span class="hw-stat"><span class="hw-dot y"></span> <span id="hwPower">—</span></span>
+        <span class="hw-stat"><span class="hw-dot g"></span> <span id="hwGpuName">—</span></span>
+      </div>
+    </div>
+  </div>
 
   <!-- ═══════════════════ SIDEBAR ═══════════════════ -->
   <aside class="sidebar">

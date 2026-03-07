@@ -17,6 +17,7 @@ const fmtTime = s => { const m = Math.floor(s / 60), sec = Math.floor(s % 60); r
 let files3d = [];
 let filesRmbg = [];
 let selectedRenderMode = 'video';
+let lastHwLogPath = null;
 
 // completedModels: array of result objects from API, enriched with UI state
 // Each: { name, glb, media?, media_type?, sprite_frames?, sprite_dir? }
@@ -128,19 +129,54 @@ setInterval(async () => {
 
 function rebuildModelTabs() {
     const bar = $('canvasTopbar');
-    // Keep spacer
     bar.innerHTML = '';
     completedModels.forEach((m, i) => {
         const btn = document.createElement('button');
         btn.className = 'model-tab' + (i === activeModelIdx ? ' active' : '');
-        btn.textContent = m.name;
         btn.title = m.name;
         btn.onclick = () => selectModel(i);
+
+        const label = document.createElement('span');
+        label.className = 'mt-label';
+        label.textContent = m.name;
+        btn.appendChild(label);
+
+        const x = document.createElement('span');
+        x.className = 'mt-close';
+        x.textContent = '×';
+        x.onclick = (e) => { e.stopPropagation(); closeModel(i); };
+        btn.appendChild(x);
+
         bar.appendChild(btn);
     });
     const spacer = document.createElement('div');
     spacer.className = 'topbar-spacer';
     bar.appendChild(spacer);
+}
+
+function closeModel(idx) {
+    completedModels.splice(idx, 1);
+    if (completedModels.length === 0) {
+        activeModelIdx = -1;
+        rebuildModelTabs();
+        // Show empty state
+        $('canvasEmpty').style.display = '';
+        $('canvasMedia').classList.remove('active');
+        $('canvasNoRender').classList.remove('active');
+        $('spriteStrip').classList.remove('active');
+        $('barName').textContent = '—';
+        $('barActions').innerHTML = '';
+    } else {
+        if (activeModelIdx >= completedModels.length) {
+            activeModelIdx = completedModels.length - 1;
+        } else if (activeModelIdx > idx) {
+            activeModelIdx--;
+        } else if (activeModelIdx === idx) {
+            activeModelIdx = Math.min(idx, completedModels.length - 1);
+        }
+        rebuildModelTabs();
+        selectModel(activeModelIdx);
+    }
 }
 
 function selectModel(idx) {
@@ -265,6 +301,17 @@ function updateBottomBar(model) {
     wrap.appendChild(dd);
     acts.appendChild(wrap);
 
+    // HW usage log download button
+    if (lastHwLogPath) {
+        const dlHw = document.createElement('a');
+        dlHw.href = '/api/file?p=' + enc(lastHwLogPath);
+        dlHw.download = 'hw_usage_log.csv';
+        dlHw.className = 'bar-btn outline';
+        dlHw.innerHTML = '📊 HW Log';
+        dlHw.title = 'Download GPU/CPU usage log (CSV)';
+        acts.appendChild(dlHw);
+    }
+
     // Close dropdown on outside click
     document.addEventListener('click', () => {
         document.querySelectorAll('.rerender-dropdown.open').forEach(d => d.classList.remove('open'));
@@ -272,26 +319,101 @@ function updateBottomBar(model) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// RE-RENDER (POST-HOC)
+// RE-RENDER (POST-HOC) — uses cached render mesh
 // ══════════════════════════════════════════════════════════════
 
 async function requestRerender(model, mode) {
-    // For now, re-renders require re-running the full generation
-    // with the same GLB's source image. We create a new job with
-    // the same settings but only the specific render mode.
-    // The backend will re-use the cached mesh if we upload the
-    // original image again. This is the simplest approach that
-    // doesn't require new backend endpoints.
+    if (!model.render_mesh) {
+        alert(
+            `Cannot re-render "${model.name}" — no cached render mesh found.\n\n` +
+            `This model was generated before mesh caching was added, ` +
+            `or the cache file was deleted. Re-generate the model to enable re-rendering.`
+        );
+        return;
+    }
 
-    // TODO: When a dedicated /api/rerender endpoint is added,
-    // this can send just the GLB path + render mode.
+    // Show progress
+    $('canvasProgress').classList.add('active');
+    $('cpPhase').textContent = `Re-rendering as ${mode}…`;
+    $('cpDetail').textContent = model.name;
+    $('cpFill').style.width = '0%';
+    $('cpPct').textContent = '0%';
+    ensureHwPolling();
 
-    alert(
-        `Re-rendering "${model.name}" as ${mode}.\n\n` +
-        `Note: This requires a dedicated /api/rerender endpoint ` +
-        `on the backend (not yet implemented). For now, re-generate ` +
-        `the model with the desired render mode selected in the sidebar.`
-    );
+    try {
+        const r = await fetch('/api/rerender', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                render_mesh: model.render_mesh,
+                name: model.name,
+                mode: mode,
+                output_dir: $('sOutDir').value,
+                fps: parseInt($('sFps').value),
+                sprite_directions: parseInt($('sSpriteDirections').value),
+                sprite_size: parseInt($('sSpriteSize').value),
+                sprite_pitch: parseFloat($('sSpritePitch').value),
+                doom_directions: parseInt($('sDoomDirections').value),
+                doom_size: parseInt($('sDoomSize').value),
+                doom_pitch: parseFloat($('sDoomPitch').value),
+            }),
+        });
+        const d = await r.json();
+        if (!d.job_id) throw new Error(d.error || 'Failed');
+
+        // Poll the rerender job
+        pollRerender(d.job_id, model);
+    } catch (e) {
+        alert('Re-render failed: ' + e.message);
+        $('canvasProgress').classList.remove('active');
+        stopHwPolling();
+    }
+}
+
+function pollRerender(jobId, originalModel) {
+    const iv = setInterval(async () => {
+        try {
+            const r = await fetch('/api/status/' + jobId);
+            const d = await r.json();
+            const p = d.progress || {};
+
+            $('cpPhase').textContent = p.phase || '';
+            $('cpFill').style.width = (p.pct || 0) + '%';
+            $('cpPct').textContent = Math.round(p.pct || 0) + '%';
+
+            if (d.log) {
+                $('consoleJob').textContent = d.log.join('\n');
+                $('consoleJob').scrollTop = $('consoleJob').scrollHeight;
+            }
+
+            if (d.status === 'done') {
+                clearInterval(iv);
+                $('canvasProgress').classList.remove('active');
+                stopHwPolling();
+
+                // Update the model in our list with new media
+                if (d.results && d.results.length > 0) {
+                    const newResult = d.results[0];
+                    const idx = completedModels.findIndex(m => m.name === originalModel.name);
+                    if (idx >= 0) {
+                        // Preserve render_mesh, update media
+                        completedModels[idx] = {
+                            ...completedModels[idx],
+                            ...newResult,
+                            render_mesh: completedModels[idx].render_mesh || newResult.render_mesh,
+                        };
+                        selectModel(idx);
+                    } else {
+                        completedModels.push(newResult);
+                        rebuildModelTabs();
+                        selectModel(completedModels.length - 1);
+                    }
+                }
+            }
+        } catch (e) {
+            console.error('rerender poll error:', e);
+        }
+    }, 800);
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -361,6 +483,12 @@ function poll(jobId, type, cfg) {
                     $('canvasProgress').classList.remove('active');
                     $('genBtn3d').disabled = false;
                     $('genBtn3d').textContent = 'Generate →';
+                    stopHwPolling();
+
+                    // Store HW log path for download
+                    if (d.hw_log) {
+                        lastHwLogPath = d.hw_log;
+                    }
 
                     // Final sync of results
                     if (d.results) {
@@ -436,6 +564,9 @@ async function startGen() {
 
         // Open console automatically
         if (!consoleOpen) toggleConsole();
+
+        // Start HW monitoring during generation
+        ensureHwPolling();
 
         localStart['generate'] = Date.now();
         poll(d.job_id, 'generate', {});
@@ -519,3 +650,120 @@ async function tryReconnect() {
 }
 
 tryReconnect();
+
+// ══════════════════════════════════════════════════════════════
+// HARDWARE MONITOR
+// ══════════════════════════════════════════════════════════════
+
+let hwPanelOpen = false;
+let hwPolling = null;
+let hwHistory = []; // last N GPU util values for sparkline
+
+function toggleHwPanel() {
+    hwPanelOpen = !hwPanelOpen;
+    $('hwPanel').classList.toggle('open', hwPanelOpen);
+    $('hwToggle').classList.toggle('active', hwPanelOpen);
+
+    if (hwPanelOpen && !hwPolling) {
+        // Start polling at 2s interval
+        fetchHw();
+        hwPolling = setInterval(fetchHw, 2000);
+    } else if (!hwPanelOpen && hwPolling) {
+        clearInterval(hwPolling);
+        hwPolling = null;
+    }
+}
+
+// Auto-poll HW during active jobs even if panel is closed (for sparkline)
+function ensureHwPolling() {
+    if (!hwPolling) {
+        hwPolling = setInterval(fetchHw, 2000);
+    }
+}
+
+function stopHwPolling() {
+    if (hwPolling && !hwPanelOpen) {
+        clearInterval(hwPolling);
+        hwPolling = null;
+    }
+}
+
+async function fetchHw() {
+    try {
+        const r = await fetch('/api/hw');
+        const hw = await r.json();
+        updateHwPanel(hw);
+        updateHwSparkline(hw);
+    } catch (e) {}
+}
+
+function updateHwPanel(hw) {
+    // GPU Compute
+    const gpuUtil = hw.gpu_util_pct ?? 0;
+    $('hwGpuUtil').textContent = gpuUtil + '%';
+    const gpuBar = $('hwGpuUtilBar');
+    gpuBar.style.width = gpuUtil + '%';
+    gpuBar.classList.toggle('hot', gpuUtil > 90);
+
+    // VRAM
+    const vramPct = hw.gpu_reserved_pct ?? hw.gpu_alloc_pct ?? 0;
+    const vramUsed = hw.gpu_reserved_mb ?? hw.gpu_alloc_mb ?? 0;
+    const vramTotal = hw.gpu_total_mb ?? 0;
+    $('hwVram').textContent = Math.round(vramUsed) + ' / ' + Math.round(vramTotal) + ' MB';
+    const vramBar = $('hwVramBar');
+    vramBar.style.width = vramPct + '%';
+    vramBar.classList.toggle('hot', vramPct > 90);
+
+    // CPU
+    const cpuPct = hw.cpu_pct ?? 0;
+    $('hwCpu').textContent = Math.round(cpuPct) + '%';
+    const cpuBar = $('hwCpuBar');
+    cpuBar.style.width = Math.min(cpuPct, 100) + '%';
+    cpuBar.classList.toggle('hot', cpuPct > 90);
+
+    // RAM
+    const ramPct = hw.ram_pct ?? 0;
+    const ramUsed = hw.ram_used_mb ?? 0;
+    const ramTotal = hw.ram_total_mb ?? 0;
+    $('hwRam').textContent = Math.round(ramUsed) + ' / ' + Math.round(ramTotal) + ' MB';
+    const ramBar = $('hwRamBar');
+    ramBar.style.width = ramPct + '%';
+    ramBar.classList.toggle('hot', ramPct > 90);
+
+    // Details
+    if (hw.gpu_temp_c !== undefined) {
+        $('hwTemp').textContent = hw.gpu_temp_c + '°C';
+    }
+    if (hw.gpu_power_w !== undefined && hw.gpu_power_limit_w !== undefined) {
+        $('hwPower').textContent = Math.round(hw.gpu_power_w) + ' / ' + Math.round(hw.gpu_power_limit_w) + 'W';
+    }
+    if (hw.gpu_name) {
+        $('hwGpuName').textContent = hw.gpu_name;
+    }
+
+    // Phase
+    if (hw.phase) {
+        $('hwPhase').textContent = hw.phase;
+        $('hwPhase').title = hw.phase;
+    } else {
+        $('hwPhase').textContent = 'Idle';
+    }
+}
+
+function updateHwSparkline(hw) {
+    const val = hw.gpu_util_pct ?? 0;
+    hwHistory.push(val);
+    if (hwHistory.length > 5) hwHistory.shift();
+
+    const bars = $('hwSpark').querySelectorAll('span');
+    for (let i = 0; i < bars.length; i++) {
+        const v = hwHistory[hwHistory.length - bars.length + i] ?? 0;
+        const h = Math.max(2, Math.round(v / 100 * 10));
+        bars[i].style.height = h + 'px';
+        // Color code: green < 50, gold < 80, red >= 80
+        if (v >= 80) bars[i].style.background = 'var(--red)';
+        else if (v >= 50) bars[i].style.background = 'var(--gold)';
+        else bars[i].style.background = 'var(--green)';
+    }
+}
+
