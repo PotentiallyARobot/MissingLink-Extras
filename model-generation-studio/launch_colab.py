@@ -256,9 +256,11 @@ try:
         _uptime = int(time.time() - _start_ts)
         _h, _rem = divmod(_uptime, 3600)
         _m, _s = divmod(_rem, 60)
-        sys.__stdout__.write(
-            f"\r🔺 Uptime: {_h:02d}:{_m:02d}:{_s:02d} | Port: {PORT} | Mode: {_launch_mode} | Jobs: {len(jobs)}   "
+        # CRITICAL: Must use print() with a real newline (\n).
+        # sys.__stdout__.write("\r...") does NOT count as cell activity
+        # and Colab will disconnect thinking the cell is idle.
+        print(
+            f"🔺 Uptime: {_h:02d}:{_m:02d}:{_s:02d} | Port: {PORT} | Mode: {_launch_mode} | Jobs: {len(jobs)}"
         )
-        sys.__stdout__.flush()
 except KeyboardInterrupt:
     print("\n\n🛑 Server stopped.")
