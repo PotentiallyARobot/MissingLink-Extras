@@ -1,54 +1,79 @@
 // ============================================================
-// 🔺 TRELLIS.2 — Client JavaScript (app.js)
-// Tab switching, dropzone, polling, render results, keepalive.
+// TRELLIS.2 Studio — Client JavaScript
+// Single-page app: sidebar controls, canvas viewport with
+// model tab navigation, console drawer, re-render support.
 // ============================================================
 
-// ── Utility helpers ──
-function $(id) { return document.getElementById(id); }
-function enc(s) { return encodeURIComponent(s); }
-function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-function show(id) { $(id).classList.add('active'); }
-function hide(id) { $(id).classList.remove('active'); }
-function fmtTime(s) {
-    const m = Math.floor(s / 60), sec = Math.floor(s % 60);
-    return m + ':' + String(sec).padStart(2, '0');
-}
-
-// ── Tab switching ──
-function switchTab(name, el) {
-    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-    el.classList.add('active');
-    $('tab-' + name).classList.add('active');
-}
-
-// ── Console toggle ──
-function toggleConsole() {
-    $('consoleHead3d').classList.toggle('open');
-    $('consoleBody3d').classList.toggle('open');
-}
+// ── Helpers ──
+const $ = id => document.getElementById(id);
+const enc = s => encodeURIComponent(s);
+const esc = s => { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; };
+const fmtTime = s => { const m = Math.floor(s / 60), sec = Math.floor(s % 60); return m + ':' + String(sec).padStart(2, '0'); };
 
 // ══════════════════════════════════════════════════════════════
-// RENDER MODE SELECTOR
+// STATE
 // ══════════════════════════════════════════════════════════════
 
+let files3d = [];
+let filesRmbg = [];
 let selectedRenderMode = 'video';
 
-function selectRender(el) {
-    document.querySelectorAll('.render-mode').forEach(m => m.classList.remove('selected'));
-    el.classList.add('selected');
-    selectedRenderMode = el.dataset.mode;
+// completedModels: array of result objects from API, enriched with UI state
+// Each: { name, glb, media?, media_type?, sprite_frames?, sprite_dir? }
+let completedModels = [];
+let activeModelIdx = -1;
 
-    // Show/hide mode-specific settings panels
-    const rts = $('rtsSettings');
-    const doom = $('doomSettings');
-    rts.classList.remove('visible');
-    doom.classList.remove('visible');
-    if (selectedRenderMode === 'rts_sprite') {
-        rts.classList.add('visible');
-    } else if (selectedRenderMode === 'doom_sprite') {
-        doom.classList.add('visible');
+// ══════════════════════════════════════════════════════════════
+// SIDEBAR TAB SWITCHING
+// ══════════════════════════════════════════════════════════════
+
+function switchSidebarTab(btn) {
+    document.querySelectorAll('.sidebar-tab').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.sidebar-panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    $(btn.dataset.panel).classList.add('active');
+}
+
+// ══════════════════════════════════════════════════════════════
+// CONSOLE DRAWER
+// ══════════════════════════════════════════════════════════════
+
+let consoleOpen = false;
+
+function toggleConsole() {
+    consoleOpen = !consoleOpen;
+    const drawer = $('consoleDrawer');
+    const btn = $('consoleToggle');
+    if (consoleOpen) {
+        document.documentElement.style.setProperty('--console-h', '200px');
+        drawer.classList.add('open');
+        btn.classList.add('active');
+        btn.textContent = '▾ Console';
+    } else {
+        document.documentElement.style.setProperty('--console-h', '0px');
+        drawer.classList.remove('open');
+        btn.classList.remove('active');
+        btn.textContent = '▸ Console';
     }
+}
+
+function switchConsoleTab(btn) {
+    document.querySelectorAll('.console-tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.console-content').forEach(c => c.style.display = 'none');
+    btn.classList.add('active');
+    $(btn.dataset.target).style.display = '';
+}
+
+// ══════════════════════════════════════════════════════════════
+// RENDER MODE
+// ══════════════════════════════════════════════════════════════
+
+function selectRender(el) {
+    document.querySelectorAll('.render-opt').forEach(m => m.classList.remove('sel'));
+    el.classList.add('sel');
+    selectedRenderMode = el.dataset.mode;
+    $('rtsSettings').classList.toggle('visible', selectedRenderMode === 'rts_sprite');
+    $('doomSettings').classList.toggle('visible', selectedRenderMode === 'doom_sprite');
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -57,42 +82,30 @@ function selectRender(el) {
 
 function initDrop(zId, iId, tId, bId, arr) {
     const z = $(zId), inp = $(iId);
-    ['dragenter', 'dragover'].forEach(e =>
-        z.addEventListener(e, ev => { ev.preventDefault(); z.classList.add('over'); })
-    );
-    ['dragleave', 'drop'].forEach(e =>
-        z.addEventListener(e, ev => { ev.preventDefault(); z.classList.remove('over'); })
-    );
-    z.addEventListener('drop', ev => addF(ev.dataTransfer.files, arr, tId, bId));
-    inp.addEventListener('change', ev => { addF(ev.target.files, arr, tId, bId); inp.value = ''; });
+    ['dragenter', 'dragover'].forEach(e => z.addEventListener(e, ev => { ev.preventDefault(); z.classList.add('over'); }));
+    ['dragleave', 'drop'].forEach(e => z.addEventListener(e, ev => { ev.preventDefault(); z.classList.remove('over'); }));
+    z.addEventListener('drop', ev => addFiles(ev.dataTransfer.files, arr, tId, bId));
+    inp.addEventListener('change', ev => { addFiles(ev.target.files, arr, tId, bId); inp.value = ''; });
 }
 
-function addF(fl, arr, tId, bId) {
-    for (const f of fl) {
-        if (f.type.startsWith('image/')) arr.push(f);
-    }
-    renderT(arr, tId, bId);
+function addFiles(fl, arr, tId, bId) {
+    for (const f of fl) if (f.type.startsWith('image/')) arr.push(f);
+    renderThumbs(arr, tId, bId);
 }
 
-function renderT(arr, tId, bId) {
+function renderThumbs(arr, tId, bId) {
     const t = $(tId);
     t.innerHTML = '';
     arr.forEach((f, i) => {
-        const d = document.createElement('div');
-        d.className = 'thumb';
-        const img = document.createElement('img');
-        img.src = URL.createObjectURL(f);
-        const x = document.createElement('button');
-        x.className = 'thumb-x';
-        x.textContent = '×';
-        x.onclick = () => { arr.splice(i, 1); renderT(arr, tId, bId); };
-        d.append(img, x);
-        t.append(d);
+        const d = document.createElement('div'); d.className = 'thumb';
+        const img = document.createElement('img'); img.src = URL.createObjectURL(f);
+        const x = document.createElement('button'); x.className = 'thumb-x'; x.textContent = '×';
+        x.onclick = () => { arr.splice(i, 1); renderThumbs(arr, tId, bId); };
+        d.append(img, x); t.append(d);
     });
     $(bId).disabled = arr.length === 0;
 }
 
-let files3d = [], filesRmbg = [];
 initDrop('dropzone3d', 'fileInput3d', 'thumbs3d', 'genBtn3d', files3d);
 initDrop('dropzoneRmbg', 'fileInputRmbg', 'thumbsRmbg', 'genBtnRmbg', filesRmbg);
 
@@ -103,73 +116,273 @@ initDrop('dropzoneRmbg', 'fileInputRmbg', 'thumbsRmbg', 'genBtnRmbg', filesRmbg)
 setInterval(async () => {
     try {
         const r = await fetch('/api/keepalive');
-        $('keepaliveBadge').style.color = r.ok ? 'var(--green)' : 'var(--red)';
+        $('keepaliveBadge').querySelector('.dot').style.background = r.ok ? 'var(--green)' : 'var(--red)';
     } catch (e) {
-        $('keepaliveBadge').style.color = 'var(--red)';
+        $('keepaliveBadge').querySelector('.dot').style.background = 'var(--red)';
     }
-    setTimeout(() => { $('keepaliveBadge').style.color = 'var(--gray)'; }, 2000);
 }, 60000);
+
+// ══════════════════════════════════════════════════════════════
+// MODEL TAB NAVIGATION
+// ══════════════════════════════════════════════════════════════
+
+function rebuildModelTabs() {
+    const bar = $('canvasTopbar');
+    // Keep spacer
+    bar.innerHTML = '';
+    completedModels.forEach((m, i) => {
+        const btn = document.createElement('button');
+        btn.className = 'model-tab' + (i === activeModelIdx ? ' active' : '');
+        btn.textContent = m.name;
+        btn.title = m.name;
+        btn.onclick = () => selectModel(i);
+        bar.appendChild(btn);
+    });
+    const spacer = document.createElement('div');
+    spacer.className = 'topbar-spacer';
+    bar.appendChild(spacer);
+}
+
+function selectModel(idx) {
+    if (idx < 0 || idx >= completedModels.length) return;
+    activeModelIdx = idx;
+    rebuildModelTabs();
+    showModelInCanvas(completedModels[idx]);
+}
+
+function showModelInCanvas(model) {
+    const empty = $('canvasEmpty');
+    const media = $('canvasMedia');
+    const noRender = $('canvasNoRender');
+    const strip = $('spriteStrip');
+
+    empty.style.display = 'none';
+    media.classList.remove('active');
+    noRender.classList.remove('active');
+    strip.classList.remove('active');
+    media.innerHTML = '';
+    strip.innerHTML = '';
+
+    // Show media
+    if (model.media && model.media_type === 'video') {
+        const vid = document.createElement('video');
+        vid.src = '/api/file?p=' + enc(model.media);
+        vid.controls = true; vid.autoplay = true; vid.muted = true; vid.loop = true; vid.playsInline = true;
+        media.appendChild(vid);
+        media.classList.add('active');
+    } else if (model.media && (model.media_type === 'image' || model.media_type === 'rts_sprite' || model.media_type === 'doom_sprite')) {
+        const img = document.createElement('img');
+        img.src = '/api/file?p=' + enc(model.media);
+        img.alt = model.name;
+        if (model.media_type === 'rts_sprite' || model.media_type === 'doom_sprite') {
+            img.className = 'sprite-preview';
+        }
+        media.appendChild(img);
+        media.classList.add('active');
+    } else {
+        noRender.classList.add('active');
+    }
+
+    // Sprite strip
+    if (model.sprite_frames && model.sprite_frames.length) {
+        model.sprite_frames.forEach(fp => {
+            const a = document.createElement('a');
+            a.href = '/api/file?p=' + enc(fp);
+            a.download = fp.split('/').pop();
+            a.className = 'sf';
+            const img = document.createElement('img');
+            img.src = '/api/file?p=' + enc(fp);
+            img.loading = 'lazy';
+            a.appendChild(img);
+            strip.appendChild(a);
+        });
+        strip.classList.add('active');
+    }
+
+    // Bottom bar
+    updateBottomBar(model);
+}
+
+function updateBottomBar(model) {
+    $('barName').textContent = model.name;
+    const acts = $('barActions');
+    acts.innerHTML = '';
+
+    // Download GLB
+    const dlGlb = document.createElement('a');
+    dlGlb.href = '/api/file?p=' + enc(model.glb);
+    dlGlb.download = model.name + '.glb';
+    dlGlb.className = 'bar-btn gold';
+    dlGlb.innerHTML = '↓ GLB';
+    acts.appendChild(dlGlb);
+
+    // Download media
+    if (model.media) {
+        const dlM = document.createElement('a');
+        dlM.href = '/api/file?p=' + enc(model.media);
+        let ext = 'png';
+        let label = 'PNG';
+        if (model.media_type === 'video') { ext = 'mp4'; label = 'MP4'; }
+        else if (model.media_type === 'rts_sprite') { label = 'Sprites'; }
+        else if (model.media_type === 'doom_sprite') { label = 'Doom'; }
+        dlM.download = model.name + '.' + ext;
+        dlM.className = 'bar-btn blue';
+        dlM.innerHTML = '↓ ' + label;
+        acts.appendChild(dlM);
+    }
+
+    // Re-render button
+    const wrap = document.createElement('div');
+    wrap.className = 'rerender-wrap';
+    const rrBtn = document.createElement('button');
+    rrBtn.className = 'bar-btn outline';
+    rrBtn.innerHTML = '🎬 Re-render';
+    rrBtn.onclick = (e) => {
+        e.stopPropagation();
+        wrap.querySelector('.rerender-dropdown').classList.toggle('open');
+    };
+    wrap.appendChild(rrBtn);
+
+    const dd = document.createElement('div');
+    dd.className = 'rerender-dropdown';
+    const modes = [
+        { mode: 'snapshot', icon: '📷', label: 'Snapshot' },
+        { mode: 'video', icon: '🎬', label: 'Video 360°' },
+        { mode: 'perspective', icon: '🔄', label: 'Turntable' },
+        { mode: 'rts_sprite', icon: '🎮', label: 'RTS Sprite' },
+        { mode: 'doom_sprite', icon: '👹', label: 'Doom Sprite' },
+    ];
+    modes.forEach(m => {
+        const item = document.createElement('button');
+        item.className = 'rd-item';
+        item.innerHTML = `<span class="rd-icon">${m.icon}</span><span class="rd-label">${m.label}</span>`;
+        item.onclick = () => {
+            dd.classList.remove('open');
+            requestRerender(model, m.mode);
+        };
+        dd.appendChild(item);
+    });
+    wrap.appendChild(dd);
+    acts.appendChild(wrap);
+
+    // Close dropdown on outside click
+    document.addEventListener('click', () => {
+        document.querySelectorAll('.rerender-dropdown.open').forEach(d => d.classList.remove('open'));
+    }, { once: false });
+}
+
+// ══════════════════════════════════════════════════════════════
+// RE-RENDER (POST-HOC)
+// ══════════════════════════════════════════════════════════════
+
+async function requestRerender(model, mode) {
+    // For now, re-renders require re-running the full generation
+    // with the same GLB's source image. We create a new job with
+    // the same settings but only the specific render mode.
+    // The backend will re-use the cached mesh if we upload the
+    // original image again. This is the simplest approach that
+    // doesn't require new backend endpoints.
+
+    // TODO: When a dedicated /api/rerender endpoint is added,
+    // this can send just the GLB path + render mode.
+
+    alert(
+        `Re-rendering "${model.name}" as ${mode}.\n\n` +
+        `Note: This requires a dedicated /api/rerender endpoint ` +
+        `on the backend (not yet implemented). For now, re-generate ` +
+        `the model with the desired render mode selected in the sidebar.`
+    );
+}
 
 // ══════════════════════════════════════════════════════════════
 // POLLING
 // ══════════════════════════════════════════════════════════════
 
-let timers = {}, localStart = {};
+let timers = {};
+let localStart = {};
+let lastResultCount = 0;
 
 function poll(jobId, type, cfg) {
     if (timers[type]) clearInterval(timers[type]);
     if (!localStart[type]) localStart[type] = Date.now();
+    lastResultCount = 0;
 
     timers[type] = setInterval(async () => {
         try {
             const r = await fetch('/api/status/' + jobId);
             const d = await r.json();
             const p = d.progress || {};
-            const elapsed = p.elapsed || ((Date.now() - localStart[type]) / 1000);
 
-            $(cfg.timer).textContent = fmtTime(elapsed);
-            const pct = p.pct || 0;
-            $(cfg.fill).style.width = pct + '%';
-            $(cfg.pct).textContent = Math.round(pct) + '%';
-            $(cfg.phase).textContent = p.phase || '';
+            // ── Update progress overlay ──
+            if (type === 'generate') {
+                const pct = p.pct || 0;
+                $('cpPhase').textContent = p.phase || '';
+                $('cpDetail').textContent = p.image_num && p.total
+                    ? `Image ${p.image_num} of ${p.total}` + (p.name ? ` — ${p.name}` : '')
+                    : '';
+                $('cpFill').style.width = pct + '%';
+                $('cpPct').textContent = Math.round(pct) + '% · ' + fmtTime(p.elapsed || (Date.now() - localStart[type]) / 1000);
 
-            if (cfg.image && p.image_num && p.total) {
-                $(cfg.image).textContent = 'Image ' + p.image_num + ' of ' + p.total +
-                    (p.name ? ' — ' + p.name : '');
+                // ── Live results: add new models as they complete ──
+                if (d.results && d.results.length > lastResultCount) {
+                    for (let i = lastResultCount; i < d.results.length; i++) {
+                        completedModels.push(d.results[i]);
+                    }
+                    lastResultCount = d.results.length;
+                    rebuildModelTabs();
+                    // Auto-select latest model
+                    selectModel(completedModels.length - 1);
+                }
             }
 
-            if (d.status === 'done') {
-                $(cfg.status).innerHTML = '<span class="done-icon">✅</span> Complete';
-            } else {
-                $(cfg.status).innerHTML = '<span class="spinner"></span> ' + cfg.statusText;
-            }
-
+            // ── Job log ──
             if (d.log) {
-                const b = $(cfg.log);
-                b.textContent = d.log.join('\n');
-                b.scrollTop = b.scrollHeight;
+                const jl = $('consoleJob');
+                jl.textContent = d.log.join('\n');
+                jl.scrollTop = jl.scrollHeight;
             }
 
-            if (cfg.console) {
+            // ── System console ──
+            try {
                 const cr = await fetch('/api/console');
                 const cd = await cr.json();
-                const cel = $(cfg.console);
-                cel.textContent = cd.lines.join('\n');
-                cel.scrollTop = cel.scrollHeight;
-            }
+                const sc = $('consoleSystem');
+                sc.textContent = cd.lines.join('\n');
+                sc.scrollTop = sc.scrollHeight;
+            } catch (e) {}
 
+            // ── Done ──
             if (d.status === 'done') {
                 clearInterval(timers[type]);
                 timers[type] = null;
                 delete localStart[type];
-                if (cfg.btn) {
-                    cfg.btn.disabled = false;
-                    cfg.btn.textContent = cfg.btnText;
+
+                if (type === 'generate') {
+                    $('canvasProgress').classList.remove('active');
+                    $('genBtn3d').disabled = false;
+                    $('genBtn3d').textContent = 'Generate →';
+
+                    // Final sync of results
+                    if (d.results) {
+                        for (let i = lastResultCount; i < d.results.length; i++) {
+                            completedModels.push(d.results[i]);
+                        }
+                        lastResultCount = d.results.length;
+                        rebuildModelTabs();
+                        if (completedModels.length > 0 && activeModelIdx < 0) {
+                            selectModel(0);
+                        }
+                    }
                 }
-                cfg.renderFn(d.results || []);
+
+                if (type === 'rmbg') {
+                    $('genBtnRmbg').disabled = false;
+                    $('genBtnRmbg').textContent = 'Remove BG →';
+                    if (d.results && d.results.length) renderRmbgResults(d.results);
+                }
             }
         } catch (e) {
-            console.error(e);
+            console.error('poll error:', e);
         }
     }, 800);
 }
@@ -182,7 +395,7 @@ async function startGen() {
     if (!files3d.length) return;
     const btn = $('genBtn3d');
     btn.disabled = true;
-    btn.textContent = 'Uploading images...';
+    btn.textContent = 'Uploading…';
 
     const autoRmbg = document.querySelector('input[name="autoRmbg"]:checked').value === 'on';
 
@@ -211,94 +424,26 @@ async function startGen() {
         const d = await r.json();
         if (!d.job_id) throw new Error(d.error || 'Failed');
 
-        btn.textContent = 'Generating...';
-        show('progressPanel3d');
-        show('logBox3d');
-        $('logBox3d').textContent = '';
-        hide('results3d');
-        $('resultsList3d').innerHTML = '';
-        $('pFill3d').style.width = '0%';
-        $('pPct3d').textContent = '0%';
-        localStart['generate'] = Date.now();
+        btn.textContent = 'Generating…';
 
-        poll(d.job_id, 'generate', {
-            timer: 'pTimer3d', fill: 'pFill3d', pct: 'pPct3d',
-            phase: 'pPhase3d', status: 'pStatus3d', statusText: 'Generating...',
-            image: 'pImage3d', log: 'logBox3d', console: 'consoleScroll3d',
-            btn: btn, btnText: 'Generate 3D models →', renderFn: render3d,
-        });
+        // Show progress overlay
+        $('canvasEmpty').style.display = 'none';
+        $('canvasProgress').classList.add('active');
+        $('cpFill').style.width = '0%';
+        $('cpPct').textContent = '0%';
+        $('cpPhase').textContent = 'Starting…';
+        $('cpDetail').textContent = '';
+
+        // Open console automatically
+        if (!consoleOpen) toggleConsole();
+
+        localStart['generate'] = Date.now();
+        poll(d.job_id, 'generate', {});
     } catch (e) {
         alert('Error: ' + e.message);
         btn.disabled = false;
-        btn.textContent = 'Generate 3D models →';
+        btn.textContent = 'Generate →';
     }
-}
-
-// ══════════════════════════════════════════════════════════════
-// RENDER 3D RESULTS
-// ══════════════════════════════════════════════════════════════
-
-function render3d(results) {
-    if (!results.length) return;
-    show('results3d');
-    const l = $('resultsList3d');
-    l.innerHTML = '';
-
-    results.forEach(r => {
-        const c = document.createElement('div');
-        c.className = 'result-card';
-        let mediaHtml = '';
-
-        if ((r.media_type === 'rts_sprite' || r.media_type === 'doom_sprite') && r.media) {
-            mediaHtml = `<img class="result-img" src="/api/file?p=${enc(r.media)}" alt="${esc(r.name)} sprite sheet" style="image-rendering:pixelated">`;
-        } else if (r.media && r.media_type === 'video') {
-            mediaHtml = `<video src="/api/file?p=${enc(r.media)}" controls playsinline autoplay muted loop></video>`;
-        } else if (r.media && r.media_type === 'image') {
-            mediaHtml = `<img class="result-img" src="/api/file?p=${enc(r.media)}" alt="${esc(r.name)}">`;
-        } else {
-            mediaHtml = '<div class="no-preview">No preview — GLB only</div>';
-        }
-
-        // Action buttons
-        let btns = `<a class="dl-btn" href="/api/file?p=${enc(r.glb)}" download="${esc(r.name)}.glb">GLB</a>`;
-        if (r.media_type === 'rts_sprite' && r.media) {
-            btns = `<a class="dl-btn blue" href="/api/file?p=${enc(r.media)}" download="${esc(r.name)}_spritesheet.png">Sprite Sheet</a>` + btns;
-        } else if (r.media_type === 'doom_sprite' && r.media) {
-            btns = `<a class="dl-btn crimson" href="/api/file?p=${enc(r.media)}" download="${esc(r.name)}_doom_sheet.png">Doom Sheet</a>` + btns;
-        } else if (r.media) {
-            const ext = r.media_type === 'video' ? 'mp4' : 'png';
-            btns = `<a class="dl-btn" href="/api/file?p=${enc(r.media)}" download="${esc(r.name)}.${ext}">${ext.toUpperCase()}</a>` + btns;
-        }
-
-        c.innerHTML = mediaHtml +
-            `<div class="result-info"><div class="result-name">${esc(r.name)}</div><div class="result-actions">${btns}</div></div>`;
-
-        // Sprite frame gallery for RTS or Doom mode
-        if (r.sprite_frames && r.sprite_frames.length) {
-            const isDoom = r.media_type === 'doom_sprite';
-            const gal = document.createElement('div');
-            gal.className = 'sprite-gallery';
-            gal.innerHTML = `<div class="sg-title">${isDoom ? '👹 Doom sprite angles' : '🎮 Individual direction frames'} (click to download)</div>`;
-
-            r.sprite_frames.forEach(fp => {
-                const fname = fp.split('/').pop();
-                const a = document.createElement('a');
-                a.href = `/api/file?p=${enc(fp)}`;
-                a.download = fname;
-                a.className = 'sprite-frame';
-                a.title = fname;
-                const img = document.createElement('img');
-                img.src = `/api/file?p=${enc(fp)}`;
-                img.alt = fname;
-                img.loading = 'lazy';
-                a.appendChild(img);
-                gal.appendChild(a);
-            });
-            c.appendChild(gal);
-        }
-
-        l.append(c);
-    });
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -309,7 +454,7 @@ async function startRmbg() {
     if (!filesRmbg.length) return;
     const btn = $('genBtnRmbg');
     btn.disabled = true;
-    btn.textContent = 'Uploading...';
+    btn.textContent = 'Uploading…';
 
     const fd = new FormData();
     filesRmbg.forEach(f => fd.append('images', f));
@@ -319,50 +464,34 @@ async function startRmbg() {
         const d = await r.json();
         if (!d.job_id) throw new Error(d.error || 'Failed');
 
-        btn.textContent = 'Processing...';
-        show('progressPanelRmbg');
-        show('logBoxRmbg');
-        $('logBoxRmbg').textContent = '';
-        hide('resultsRmbg');
-        $('resultsListRmbg').innerHTML = '';
-        $('pFillRmbg').style.width = '0%';
-        $('pPctRmbg').textContent = '0%';
+        btn.textContent = 'Processing…';
         localStart['rmbg'] = Date.now();
-
-        poll(d.job_id, 'rmbg', {
-            timer: 'pTimerRmbg', fill: 'pFillRmbg', pct: 'pPctRmbg',
-            phase: 'pPhaseRmbg', status: 'pStatusRmbg', statusText: 'Processing...',
-            image: null, log: 'logBoxRmbg', console: null,
-            btn: btn, btnText: 'Remove backgrounds →', renderFn: renderRmbg,
-        });
+        poll(d.job_id, 'rmbg', {});
     } catch (e) {
         alert('Error: ' + e.message);
         btn.disabled = false;
-        btn.textContent = 'Remove backgrounds →';
+        btn.textContent = 'Remove BG →';
     }
 }
 
-function renderRmbg(results) {
-    if (!results.length) return;
-    show('resultsRmbg');
-    const l = $('resultsListRmbg');
-    l.innerHTML = '';
-
+function renderRmbgResults(results) {
+    const section = $('rmbgResultsSection');
+    const list = $('rmbgResultsList');
+    section.style.display = '';
+    list.innerHTML = '';
     results.forEach(r => {
-        const c = document.createElement('div');
-        c.className = 'result-card';
-        c.innerHTML =
-            `<img class="result-img" src="/api/file?p=${enc(r.file)}" alt="${esc(r.name)}">` +
-            `<div class="result-info">` +
-            `<div class="result-name">${esc(r.name)}_transparent.png</div>` +
-            `<div class="result-actions"><a class="dl-btn" href="/api/file?p=${enc(r.file)}" download="${esc(r.name)}_transparent.png">Download PNG</a></div>` +
-            `</div>`;
-        l.append(c);
+        const div = document.createElement('div');
+        div.className = 'rmbg-result';
+        div.innerHTML =
+            `<img src="/api/file?p=${enc(r.file)}" alt="${esc(r.name)}">` +
+            `<span class="rr-name">${esc(r.name)}</span>` +
+            `<a class="rr-dl" href="/api/file?p=${enc(r.file)}" download="${esc(r.name)}_transparent.png">↓</a>`;
+        list.appendChild(div);
     });
 }
 
 // ══════════════════════════════════════════════════════════════
-// RECONNECT (resume polling if page reloads mid-job)
+// RECONNECT (resume if page reloads mid-job)
 // ══════════════════════════════════════════════════════════════
 
 async function tryReconnect() {
@@ -371,34 +500,22 @@ async function tryReconnect() {
         const d = await r.json();
 
         if (d.generate) {
-            show('progressPanel3d');
-            show('logBox3d');
+            $('canvasEmpty').style.display = 'none';
+            $('canvasProgress').classList.add('active');
             $('genBtn3d').disabled = true;
-            $('genBtn3d').textContent = 'Generating...';
+            $('genBtn3d').textContent = 'Generating…';
+            if (!consoleOpen) toggleConsole();
             localStart['generate'] = Date.now();
-            poll(d.generate, 'generate', {
-                timer: 'pTimer3d', fill: 'pFill3d', pct: 'pPct3d',
-                phase: 'pPhase3d', status: 'pStatus3d', statusText: 'Generating...',
-                image: 'pImage3d', log: 'logBox3d', console: 'consoleScroll3d',
-                btn: $('genBtn3d'), btnText: 'Generate 3D models →', renderFn: render3d,
-            });
+            poll(d.generate, 'generate', {});
         }
 
         if (d.rmbg) {
-            switchTab('rmbg', document.querySelector('[data-tab=rmbg]'));
-            show('progressPanelRmbg');
-            show('logBoxRmbg');
             $('genBtnRmbg').disabled = true;
-            $('genBtnRmbg').textContent = 'Processing...';
+            $('genBtnRmbg').textContent = 'Processing…';
             localStart['rmbg'] = Date.now();
-            poll(d.rmbg, 'rmbg', {
-                timer: 'pTimerRmbg', fill: 'pFillRmbg', pct: 'pPctRmbg',
-                phase: 'pPhaseRmbg', status: 'pStatusRmbg', statusText: 'Processing...',
-                image: null, log: 'logBoxRmbg', console: null,
-                btn: $('genBtnRmbg'), btnText: 'Remove backgrounds →', renderFn: renderRmbg,
-            });
+            poll(d.rmbg, 'rmbg', {});
         }
-    } catch (e) { }
+    } catch (e) {}
 }
 
 tryReconnect();

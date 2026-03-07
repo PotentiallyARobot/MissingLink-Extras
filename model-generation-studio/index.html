@@ -2,285 +2,188 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>TRELLIS.2 — 2D to 3D Generator</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>TRELLIS.2 Studio</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=JetBrains+Mono:wght@400;600&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=JetBrains+Mono:wght@400;600&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
-<div class="shell">
-  <div class="header">
-    <img src="https://raw.githubusercontent.com/PotentiallyARobot/MissingLink/main/assets/logo.png" alt="MissingLink">
-    <div class="header-text">
-      <h1>2D to 3D <span>Generator</span></h1>
-      <p>Powered by TRELLIS.2 &amp; MissingLink</p>
+<div class="app">
+
+  <!-- ═══════════════════ HEADER ═══════════════════ -->
+  <header class="app-header">
+    <div class="app-header-left">
+      <img src="https://raw.githubusercontent.com/PotentiallyARobot/MissingLink/main/assets/logo.png" alt="ML">
+      <h1>TRELLIS.2 <span>Studio</span></h1>
     </div>
-  </div>
+    <div class="app-header-right">
+      <div class="header-badge" id="keepaliveBadge"><span class="dot"></span> Connected</div>
+      <button class="console-toggle-btn" id="consoleToggle" onclick="toggleConsole()">▸ Console</button>
+    </div>
+  </header>
 
-  <div class="banner">
-    <strong>MissingLink</strong> provides <span class="hl">ultra-fast, optimized 3D generation</span> on A100, L4, and T4 GPUs.
-    Heavily optimized precompiled wheels eliminate 30+ minute build times — just pip install and run.
-    Easy-to-use Colab notebooks get you generating in under 60 seconds.
-  </div>
-
-  <div class="tabs">
-    <button class="tab-btn active" data-tab="generate" onclick="switchTab('generate',this)">🔺 Generate 3D</button>
-    <button class="tab-btn" data-tab="rmbg" onclick="switchTab('rmbg',this)">✂ Remove Background</button>
-  </div>
-
-  <!-- ══════════════════════════════════════════════════════════ -->
-  <!-- GENERATE TAB                                              -->
-  <!-- ══════════════════════════════════════════════════════════ -->
-  <div class="tab-panel active" id="tab-generate">
-    <div class="instructions">
-      <strong>Upload your images and generate 3D models.</strong><br>
-      Each image becomes a downloadable GLB model with optional preview render, saved to Google Drive.<br><br>
-      <span class="warn">⚠ Images must have transparent backgrounds (PNG with alpha).</span>
-      Auto-remove is enabled by default, or use the <strong>Remove Background</strong> tab manually.
+  <!-- ═══════════════════ SIDEBAR ═══════════════════ -->
+  <aside class="sidebar">
+    <div class="sidebar-tabs">
+      <button class="sidebar-tab active" data-panel="panelGen" onclick="switchSidebarTab(this)">🔺 Generate</button>
+      <button class="sidebar-tab" data-panel="panelRmbg" onclick="switchSidebarTab(this)">✂ RMBG</button>
     </div>
 
-    <div class="auto-rmbg-toggle" style="margin:12px 0 16px;padding:12px 16px;background:var(--off-black);border:1px solid var(--dark-border);border-radius:8px;display:flex;align-items:center;gap:12px;">
-      <span style="font-size:.85rem;color:var(--gray-light);font-weight:600;">✂ Auto Background Removal</span>
-      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.85rem;color:var(--green);font-weight:600;">
-        <input type="radio" name="autoRmbg" value="on" checked style="accent-color:var(--green);cursor:pointer;"> On
-      </label>
-      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:.85rem;color:var(--gray);">
-        <input type="radio" name="autoRmbg" value="off" style="accent-color:var(--gray);cursor:pointer;"> Off
-      </label>
-      <span style="font-size:.7rem;color:var(--gray);margin-left:auto;font-family:var(--font-mono);">Detects &amp; removes backgrounds automatically during generation</span>
-    </div>
+    <!-- ── GENERATE PANEL ── -->
+    <div class="sidebar-panel active" id="panelGen">
 
-    <div class="dropzone" id="dropzone3d">
-      <div class="dropzone-icon">📁</div>
-      <div class="dropzone-text">Drag &amp; drop images here, or <strong>click to browse</strong></div>
-      <input type="file" id="fileInput3d" multiple accept="image/*">
-    </div>
-    <div class="thumbs" id="thumbs3d"></div>
-
-    <button class="settings-toggle" onclick="this.classList.toggle('open');document.getElementById('settingsPanel').classList.toggle('open')">
-      ⚙ Generation settings <span class="arrow">▾</span>
-    </button>
-    <div class="settings-panel" id="settingsPanel">
-      <div class="field">
-        <label>Output directory</label>
-        <input type="text" id="sOutDir" value="/content/drive/MyDrive/trellis_models_out">
-        <div class="hint">Google Drive path for GLB + preview output</div>
+      <div class="sidebar-section">
+        <div class="section-label">📁 Images</div>
+        <div class="dropzone-compact" id="dropzone3d">
+          <div class="dz-text">Drop images or <strong>browse</strong></div>
+          <input type="file" id="fileInput3d" multiple accept="image/*">
+        </div>
+        <div class="thumb-strip" id="thumbs3d"></div>
       </div>
 
-      <div class="field">
-        <label>Render mode</label>
-        <div class="render-modes" id="renderModes">
-          <div class="render-mode" data-mode="none" onclick="selectRender(this)">
-            <div class="rm-icon">⚡</div>
-            <div class="rm-label">No render</div>
-            <div class="rm-desc">GLB only, fastest</div>
-          </div>
-          <div class="render-mode" data-mode="snapshot" onclick="selectRender(this)">
-            <div class="rm-icon">📷</div>
-            <div class="rm-label">Snapshot</div>
-            <div class="rm-desc">Single preview image</div>
-          </div>
-          <div class="render-mode selected" data-mode="video" onclick="selectRender(this)">
-            <div class="rm-icon">🎬</div>
-            <div class="rm-label">Video</div>
-            <div class="rm-desc">360° orbit preview</div>
-          </div>
-          <div class="render-mode" data-mode="perspective" onclick="selectRender(this)">
-            <div class="rm-icon">🔄</div>
-            <div class="rm-label">Perspective</div>
-            <div class="rm-desc">Clean 360° turntable</div>
-          </div>
-          <div class="render-mode" data-mode="rts_sprite" onclick="selectRender(this)">
-            <div class="rm-icon">🎮</div>
-            <div class="rm-label">RTS Sprite</div>
-            <div class="rm-desc">2.5D game asset sheet</div>
-          </div>
-          <div class="render-mode" data-mode="doom_sprite" onclick="selectRender(this)">
-            <div class="rm-icon">👹</div>
-            <div class="rm-label">Doom Sprite</div>
-            <div class="rm-desc">FPS billboard sheet</div>
+      <div class="sidebar-section">
+        <div class="section-label">✂ Background</div>
+        <div class="auto-rmbg-row">
+          <span class="label-text">Auto Remove</span>
+          <div class="radio-group">
+            <label class="on"><input type="radio" name="autoRmbg" value="on" checked style="accent-color:var(--green)"> On</label>
+            <label class="off"><input type="radio" name="autoRmbg" value="off"> Off</label>
           </div>
         </div>
       </div>
 
-      <!-- RTS Sprite-specific settings -->
-      <div class="rts-settings" id="rtsSettings">
-        <div class="rts-title">🎮 RTS / RPG Sprite Settings</div>
+      <div class="sidebar-section">
+        <div class="section-label">🎬 Render Mode</div>
+        <div class="render-grid" id="renderModes">
+          <div class="render-opt" data-mode="none" onclick="selectRender(this)"><div class="ro-icon">⚡</div><div class="ro-name">None</div></div>
+          <div class="render-opt" data-mode="snapshot" onclick="selectRender(this)"><div class="ro-icon">📷</div><div class="ro-name">Snap</div></div>
+          <div class="render-opt sel" data-mode="video" onclick="selectRender(this)"><div class="ro-icon">🎬</div><div class="ro-name">Video</div></div>
+          <div class="render-opt" data-mode="perspective" onclick="selectRender(this)"><div class="ro-icon">🔄</div><div class="ro-name">Turntable</div></div>
+          <div class="render-opt" data-mode="rts_sprite" onclick="selectRender(this)"><div class="ro-icon">🎮</div><div class="ro-name">RTS</div></div>
+          <div class="render-opt" data-mode="doom_sprite" onclick="selectRender(this)"><div class="ro-icon">👹</div><div class="ro-name">Doom</div></div>
+        </div>
+        <!-- RTS sub-settings -->
+        <div class="sub-settings rts" id="rtsSettings">
+          <div class="sub-title">🎮 RTS Sprite Settings</div>
+          <div class="field-row">
+            <div class="field"><label>Directions</label><select id="sSpriteDirections"><option value="8">8</option><option value="16" selected>16</option><option value="24">24</option><option value="32">32</option></select></div>
+            <div class="field"><label>Frame px</label><select id="sSpriteSize"><option value="64">64</option><option value="128">128</option><option value="256" selected>256</option><option value="512">512</option></select></div>
+          </div>
+          <div class="field"><label>Pitch</label><select id="sSpritePitch"><option value="0.35">20° RPG</option><option value="0.52" selected>30° Iso</option><option value="0.65">37° Diablo</option><option value="0.79">45° 3/4</option></select></div>
+        </div>
+        <!-- Doom sub-settings -->
+        <div class="sub-settings doom" id="doomSettings">
+          <div class="sub-title">👹 Doom Sprite Settings</div>
+          <div class="field-row">
+            <div class="field"><label>Angles</label><select id="sDoomDirections"><option value="8" selected>8</option><option value="16">16</option></select></div>
+            <div class="field"><label>Frame px</label><select id="sDoomSize"><option value="64">64</option><option value="128">128</option><option value="256" selected>256</option><option value="512">512</option></select></div>
+          </div>
+          <div class="field"><label>Camera</label><select id="sDoomPitch"><option value="0.0" selected>Eye level</option><option value="0.05">Slight down</option><option value="0.1">Low angle</option><option value="-0.05">Slight up</option></select></div>
+        </div>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="section-label">⚙ Settings</div>
+        <div class="field"><label>Output dir</label><input type="text" id="sOutDir" value="/content/drive/MyDrive/trellis_models_out"></div>
         <div class="field-row">
-          <div class="field">
-            <label>Directions</label>
-            <select id="sSpriteDirections">
-              <option value="8">8 — N/S/E/W + diagonals</option>
-              <option value="16" selected>16 — smooth rotation</option>
-              <option value="24">24 — high quality</option>
-              <option value="32">32 — ultra smooth</option>
-            </select>
-            <div class="hint">Number of rotation angles in the sprite sheet</div>
-          </div>
-          <div class="field">
-            <label>Frame size (px)</label>
-            <select id="sSpriteSize">
-              <option value="64">64×64</option>
-              <option value="128">128×128</option>
-              <option value="256" selected>256×256</option>
-              <option value="512">512×512</option>
-              <option value="1024">1024×1024</option>
-            </select>
-            <div class="hint">Size of each sprite frame in pixels</div>
-          </div>
+          <div class="field"><label>FPS</label><input type="number" id="sFps" value="15" min="5" max="60"></div>
+          <div class="field"><label>Texture</label><select id="sTexture"><option>1024</option><option>2048</option><option selected>4096</option><option>8192</option></select></div>
         </div>
-        <div class="field">
-          <label>Camera pitch</label>
-          <select id="sSpritePitch">
-            <option value="0.35">Low (20°) — top-down RPG</option>
-            <option value="0.52" selected>Classic (30°) — 2:1 isometric</option>
-            <option value="0.65">Medium (37°) — Diablo-style</option>
-            <option value="0.79">High (45°) — 3/4 view</option>
-          </select>
-          <div class="hint">Camera angle above horizon — controls the 2.5D look</div>
-        </div>
-      </div>
-
-      <!-- Doom Sprite-specific settings -->
-      <div class="doom-settings" id="doomSettings">
-        <div class="doom-title">👹 Doom / FPS Billboard Sprite Settings</div>
         <div class="field-row">
-          <div class="field">
-            <label>Rotation angles</label>
-            <select id="sDoomDirections">
-              <option value="8" selected>8 — classic Doom</option>
-              <option value="16">16 — smooth rotation</option>
-            </select>
-            <div class="hint">Doom standard is 8 (A1–A8), 16 for modern engines</div>
-          </div>
-          <div class="field">
-            <label>Frame size (px)</label>
-            <select id="sDoomSize">
-              <option value="64">64×64</option>
-              <option value="128">128×128</option>
-              <option value="256" selected>256×256</option>
-              <option value="512">512×512</option>
-              <option value="1024">1024×1024</option>
-            </select>
-            <div class="hint">Size of each sprite frame in pixels</div>
-          </div>
+          <div class="field"><label>Max faces</label><input type="number" id="sDecimate" value="1000000" min="1000"></div>
+          <div class="field"><label>Remesh band</label><input type="number" id="sRemeshBand" value="1.0" min="0.1" max="3.0" step="0.1"></div>
         </div>
-        <div class="field">
-          <label>Camera angle</label>
-          <select id="sDoomPitch">
-            <option value="0.0" selected>Eye level (0°) — classic Doom</option>
-            <option value="0.05">Slight down (3°) — Build engine</option>
-            <option value="0.1">Low angle (6°) — heroic</option>
-            <option value="-0.05">Slight up (−3°) — look up at model</option>
-          </select>
-          <div class="hint">Doom = dead-on eye level; Build engine = slight down-angle</div>
-        </div>
+        <label class="checkbox-sm"><input type="checkbox" id="sRemesh" checked> Remesh</label>
       </div>
 
-      <div class="field-row">
-        <div class="field">
-          <label>Video FPS</label>
-          <input type="number" id="sFps" value="15" min="5" max="60">
-        </div>
-        <div class="field">
-          <label>Texture size</label>
-          <select id="sTexture">
-            <option>1024</option>
-            <option>2048</option>
-            <option selected>4096</option>
-            <option>8192</option>
-          </select>
-        </div>
-      </div>
-      <div class="field-row">
-        <div class="field">
-          <label>Max faces</label>
-          <input type="number" id="sDecimate" value="1000000" min="1000">
-          <div class="hint">Target face count for exported GLB</div>
-        </div>
-        <div class="field">
-          <label>Remesh band</label>
-          <input type="number" id="sRemeshBand" value="1.0" min="0.1" max="3.0" step="0.1">
-        </div>
-      </div>
-      <label class="checkbox-row"><input type="checkbox" id="sRemesh" checked> Enable remeshing</label>
-    </div>
-
-    <button class="gen-btn" id="genBtn3d" onclick="startGen()" disabled>Generate 3D models →</button>
-
-    <div class="progress-panel" id="progressPanel3d">
-      <div class="progress-top">
-        <div class="progress-row">
-          <div class="progress-status" id="pStatus3d"><span class="spinner"></span> Generating...</div>
-          <div class="progress-timer" id="pTimer3d">0:00</div>
-        </div>
-        <div class="progress-phase" id="pPhase3d">Starting...</div>
-        <div class="progress-bar-track"><div class="progress-bar-fill" id="pFill3d"></div></div>
-        <div class="progress-pct" id="pPct3d">0%</div>
-        <div class="progress-image" id="pImage3d"></div>
-      </div>
-      <div class="console-section">
-        <div class="console-header open" id="consoleHead3d" onclick="toggleConsole()">
-          <div class="console-title"><span class="dot"></span> Console output</div>
-          <span class="console-arrow">▾</span>
-        </div>
-        <div class="console-body open" id="consoleBody3d">
-          <div class="console-scroll" id="consoleScroll3d"></div>
-        </div>
+      <div class="sidebar-section">
+        <button class="gen-btn" id="genBtn3d" onclick="startGen()" disabled>Generate →</button>
       </div>
     </div>
 
-    <div class="log-box" id="logBox3d"></div>
-
-    <div class="results" id="results3d">
-      <div class="results-header">✅ Results</div>
-      <div id="resultsList3d"></div>
-    </div>
-  </div>
-
-  <!-- ══════════════════════════════════════════════════════════ -->
-  <!-- RMBG TAB                                                  -->
-  <!-- ══════════════════════════════════════════════════════════ -->
-  <div class="tab-panel" id="tab-rmbg">
-    <div class="instructions">
-      <strong>Remove backgrounds from your images before 3D generation.</strong><br>
-      Upload images with backgrounds — processed through RMBG-1.4 into transparent PNGs. Model loads on first use.
-    </div>
-
-    <div class="dropzone" id="dropzoneRmbg">
-      <div class="dropzone-icon">✂</div>
-      <div class="dropzone-text">Drag &amp; drop images here, or <strong>click to browse</strong></div>
-      <input type="file" id="fileInputRmbg" multiple accept="image/*">
-    </div>
-    <div class="thumbs" id="thumbsRmbg"></div>
-
-    <button class="gen-btn" id="genBtnRmbg" onclick="startRmbg()" disabled>Remove backgrounds →</button>
-
-    <div class="progress-panel" id="progressPanelRmbg">
-      <div class="progress-top">
-        <div class="progress-row">
-          <div class="progress-status" id="pStatusRmbg"><span class="spinner"></span> Processing...</div>
-          <div class="progress-timer" id="pTimerRmbg">0:00</div>
+    <!-- ── RMBG PANEL ── -->
+    <div class="sidebar-panel" id="panelRmbg">
+      <div class="sidebar-section">
+        <div class="section-label">✂ Remove Background</div>
+        <div class="dropzone-compact" id="dropzoneRmbg">
+          <div class="dz-text">Drop images or <strong>browse</strong></div>
+          <input type="file" id="fileInputRmbg" multiple accept="image/*">
         </div>
-        <div class="progress-phase" id="pPhaseRmbg">Starting...</div>
-        <div class="progress-bar-track"><div class="progress-bar-fill" id="pFillRmbg"></div></div>
-        <div class="progress-pct" id="pPctRmbg">0%</div>
+        <div class="thumb-strip" id="thumbsRmbg"></div>
+      </div>
+      <div class="sidebar-section">
+        <button class="gen-btn" id="genBtnRmbg" onclick="startRmbg()" disabled>Remove BG →</button>
+      </div>
+      <div class="sidebar-section" id="rmbgResultsSection" style="display:none">
+        <div class="section-label">✅ Results</div>
+        <div class="rmbg-results" id="rmbgResultsList"></div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ═══════════════════ MAIN CANVAS ═══════════════════ -->
+  <section class="main">
+    <!-- Model navigation tabs -->
+    <div class="canvas-topbar" id="canvasTopbar">
+      <div class="topbar-spacer"></div>
+    </div>
+
+    <!-- Viewport -->
+    <div class="canvas-viewport" id="canvasViewport">
+      <!-- Empty state -->
+      <div class="canvas-empty" id="canvasEmpty">
+        <div class="ce-icon">🔺</div>
+        <div class="ce-title">No models yet</div>
+        <div class="ce-sub">Upload images in the sidebar and hit Generate to create 3D models. Results appear here.</div>
+      </div>
+
+      <!-- Media display (per-model, toggled by JS) -->
+      <div class="canvas-media" id="canvasMedia"></div>
+
+      <!-- No-render state -->
+      <div class="canvas-no-render" id="canvasNoRender">
+        <div class="cnr-icon">📦</div>
+        <div class="cnr-text">GLB exported — no render preview selected</div>
+      </div>
+
+      <!-- Progress overlay -->
+      <div class="canvas-progress" id="canvasProgress">
+        <div class="cp-ring"></div>
+        <div class="cp-phase" id="cpPhase">Starting…</div>
+        <div class="cp-detail" id="cpDetail"></div>
+        <div class="cp-bar"><div class="cp-bar-fill" id="cpFill"></div></div>
+        <div class="cp-pct" id="cpPct">0%</div>
       </div>
     </div>
 
-    <div class="log-box" id="logBoxRmbg"></div>
+    <!-- Sprite strip (shown for RTS/Doom results) -->
+    <div class="sprite-strip" id="spriteStrip"></div>
 
-    <div class="results" id="resultsRmbg">
-      <div class="results-header">✅ Backgrounds removed</div>
-      <div id="resultsListRmbg"></div>
+    <!-- Bottom action bar -->
+    <div class="canvas-bottombar" id="canvasBottombar">
+      <div class="bar-info" id="barInfo">
+        <span class="bi-name" id="barName">—</span>
+      </div>
+      <div class="bar-spacer"></div>
+      <div id="barActions"></div>
     </div>
+  </section>
+
+  <!-- ═══════════════════ CONSOLE DRAWER ═══════════════════ -->
+  <div class="console-drawer" id="consoleDrawer">
+    <div class="console-drawer-header">
+      <span class="cdh-label">Output</span>
+      <div class="console-tab-btns">
+        <button class="console-tab-btn active" data-target="consoleSystem" onclick="switchConsoleTab(this)">System</button>
+        <button class="console-tab-btn" data-target="consoleJob" onclick="switchConsoleTab(this)">Job Log</button>
+      </div>
+    </div>
+    <div class="console-content" id="consoleSystem"></div>
+    <div class="console-content job-log" id="consoleJob" style="display:none"></div>
   </div>
 
 </div>
-
-<div class="keepalive-badge" id="keepaliveBadge">●</div>
-
 <script src="/static/app.js"></script>
 </body>
 </html>
