@@ -344,6 +344,143 @@ active_jobs = {}
 _gpu_lock = threading.Lock()
 
 
+# ══════════════════════════════════════════════════════════════
+# HW USAGE LOGGER — samples GPU/CPU every second, tagged by phase
+# ══════════════════════════════════════════════════════════════
+
+class HWLogger:
+    """
+    Background sampler that records GPU/CPU/RAM stats every `interval` seconds.
+    Each sample is tagged with the current pipeline phase and model name.
+    On stop(), writes a CSV to the specified output directory.
+    """
+
+    def __init__(self, interval=1.0):
+        self.interval = interval
+        self.rows = []          # list of dicts
+        self.phase = "idle"
+        self.model_name = ""
+        self._running = False
+        self._thread = None
+        self._t0 = None
+
+    def start(self):
+        self.rows = []
+        self._running = True
+        self._t0 = time.perf_counter()
+        self._thread = threading.Thread(target=self._sample_loop, daemon=True, name="hw-logger")
+        self._thread.start()
+
+    def set_phase(self, phase, model_name=""):
+        self.phase = phase
+        if model_name:
+            self.model_name = model_name
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=3)
+            self._thread = None
+
+    def save_csv(self, out_dir):
+        """Write collected samples to CSV. Returns the file path."""
+        if not self.rows:
+            return None
+        out_path = pathlib.Path(out_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        csv_path = out_path / f"hw_usage_log_{ts}.csv"
+
+        # Write CSV manually (no pandas dependency)
+        cols = [
+            "elapsed_s", "phase", "model_name",
+            "gpu_util_pct", "gpu_mem_util_pct", "gpu_temp_c",
+            "gpu_power_w", "gpu_power_limit_w",
+            "vram_alloc_mb", "vram_reserved_mb", "vram_total_mb",
+            "cpu_pct", "ram_used_mb", "ram_total_mb", "ram_pct",
+        ]
+        with open(csv_path, "w") as f:
+            f.write(",".join(cols) + "\n")
+            for row in self.rows:
+                vals = [str(row.get(c, "")) for c in cols]
+                f.write(",".join(vals) + "\n")
+
+        size = csv_path.stat().st_size
+        print(f"  📊 HW usage log: {csv_path} ({len(self.rows)} samples, {fmt_bytes(size)})")
+        return str(csv_path)
+
+    def _sample_loop(self):
+        while self._running:
+            try:
+                elapsed = round(time.perf_counter() - self._t0, 2)
+                row = {
+                    "elapsed_s": elapsed,
+                    "phase": self.phase,
+                    "model_name": self.model_name,
+                }
+
+                # GPU via torch
+                try:
+                    row["vram_alloc_mb"] = round(torch.cuda.memory_allocated(0) / 1e6)
+                    row["vram_reserved_mb"] = round(torch.cuda.memory_reserved(0) / 1e6)
+                    row["vram_total_mb"] = round(torch.cuda.get_device_properties(0).total_memory / 1e6)
+                except Exception:
+                    pass
+
+                # GPU via nvidia-smi
+                try:
+                    _nv = subprocess.run(
+                        ["nvidia-smi",
+                         "--query-gpu=utilization.gpu,utilization.memory,temperature.gpu,power.draw,power.limit",
+                         "--format=csv,noheader,nounits"],
+                        capture_output=True, text=True, timeout=2,
+                    )
+                    if _nv.returncode == 0:
+                        parts = [p.strip() for p in _nv.stdout.strip().split(",")]
+                        if len(parts) >= 5:
+                            row["gpu_util_pct"] = int(parts[0])
+                            row["gpu_mem_util_pct"] = int(parts[1])
+                            row["gpu_temp_c"] = int(parts[2])
+                            row["gpu_power_w"] = round(float(parts[3]), 1)
+                            row["gpu_power_limit_w"] = round(float(parts[4]), 1)
+                except Exception:
+                    pass
+
+                # CPU / RAM
+                try:
+                    import psutil
+                    row["cpu_pct"] = psutil.cpu_percent(interval=0)
+                    mem = psutil.virtual_memory()
+                    row["ram_used_mb"] = round(mem.used / 1e6)
+                    row["ram_total_mb"] = round(mem.total / 1e6)
+                    row["ram_pct"] = mem.percent
+                except ImportError:
+                    try:
+                        row["cpu_pct"] = round(os.getloadavg()[0] / (os.cpu_count() or 1) * 100, 1)
+                        with open("/proc/meminfo") as f:
+                            mi = {}
+                            for line in f:
+                                p = line.split()
+                                if len(p) >= 2:
+                                    mi[p[0].rstrip(":")] = int(p[1])
+                            rt = mi.get("MemTotal", 0)
+                            ra = mi.get("MemAvailable", mi.get("MemFree", 0))
+                            row["ram_used_mb"] = round((rt - ra) / 1024)
+                            row["ram_total_mb"] = round(rt / 1024)
+                            row["ram_pct"] = round((rt - ra) / rt * 100, 1) if rt > 0 else 0
+                    except Exception:
+                        pass
+
+                self.rows.append(row)
+            except Exception:
+                pass
+
+            time.sleep(self.interval)
+
+# Global logger instance — reused across jobs
+_hw_logger = HWLogger(interval=1.0)
+
+
 def safe_stem(name):
     s = pathlib.Path(name).stem.strip()
     s = re.sub(r"\s+", "_", s)
@@ -676,6 +813,10 @@ def run_generate_job(job_id):
     done = 0
     t0_all = time.perf_counter()
 
+    # ── Start HW usage logging ──
+    _hw_logger.start()
+    _hw_logger.set_phase("job_init")
+
     with _gpu_lock:
         for idx, (orig_name, file_path) in enumerate(files):
             base = safe_stem(orig_name)
@@ -691,6 +832,8 @@ def run_generate_job(job_id):
                     "name": orig_name, "phase": label,
                     "elapsed": round(time.perf_counter() - t0_all, 1),
                 }
+                # Tag HW logger with current phase + model name
+                _hw_logger.set_phase(label, base)
 
             set_phase(0)
             job["log"].append(f"[{idx + 1}/{total}] Processing: {orig_name}")
@@ -704,6 +847,7 @@ def run_generate_job(job_id):
                     if not has_transparency(test_img):
                         job["log"].append(f"  🔍 No transparency detected — auto-removing background...")
                         job["progress"]["phase"] = "Auto-removing background..."
+                        _hw_logger.set_phase("Auto-removing background...", base)
                         file_path = auto_remove_bg(file_path)
                         job["log"].append(f"  ✅ Background removed automatically")
                     else:
@@ -760,6 +904,7 @@ def run_generate_job(job_id):
                     render_limit = min(decimate_target, RENDER_MAX_FACES)
                     n_raw = mesh.faces.shape[0]
                     if n_raw > render_limit:
+                        _hw_logger.set_phase("Simplifying mesh...", base)
                         job["log"].append(
                             f"  ▸ Simplifying: {n_raw:,} → {render_limit:,} faces"
                         )
@@ -775,6 +920,16 @@ def run_generate_job(job_id):
                     set_phase(5)
                     render_mode = s.get("render_mode", "video")
                     media_path, media_type = None, None
+
+                    # Save render-ready mesh for re-rendering later
+                    render_mesh_path = out_path / f"{base}_render_mesh.pt"
+                    try:
+                        torch.save(mesh, str(render_mesh_path))
+                        job["log"].append(f"  ✓ Render mesh cached: {fmt_bytes(render_mesh_path.stat().st_size)}")
+                    except Exception as _save_err:
+                        job["log"].append(f"  ⚠ Could not cache render mesh: {_save_err}")
+                        render_mesh_path = None
+
                     if render_mode != "none":
                         free_gb = TOTAL_VRAM - torch.cuda.memory_allocated() / 1e9
                         job["log"].append(f"  ▸ Rendering ({render_mode}) | {free_gb:.1f}GB free")
@@ -793,6 +948,7 @@ def run_generate_job(job_id):
                         torch.cuda.empty_cache()
 
                     # ── Offload models → CPU for mesh processing ──
+                    _hw_logger.set_phase("Offloading models to CPU...", base)
                     del out
                     safe_offload_models()
 
@@ -840,6 +996,8 @@ def run_generate_job(job_id):
                     # ── Done ──
                     dt = round(time.perf_counter() - t0, 2)
                     result_entry = {"name": base, "glb": str(glb_out)}
+                    if render_mesh_path and render_mesh_path.exists():
+                        result_entry["render_mesh"] = str(render_mesh_path)
                     if media_path:
                         result_entry["media"] = media_path
                         result_entry["media_type"] = media_type
@@ -913,6 +1071,18 @@ def run_generate_job(job_id):
 
         dt_total = time.perf_counter() - t0_all
         job["log"].append(f"\nDone — {done}/{total} in {dt_total:.1f}s")
+
+        # ── Stop HW logger and save CSV to output directory ──
+        _hw_logger.set_phase("complete")
+        _hw_logger.stop()
+        try:
+            hw_csv_path = _hw_logger.save_csv(str(out_path))
+            if hw_csv_path:
+                job["hw_log"] = hw_csv_path
+                job["log"].append(f"  📊 HW usage log saved: {hw_csv_path}")
+        except Exception as e:
+            job["log"].append(f"  ⚠ Failed to save HW log: {e}")
+
         job["status"] = "done"
         job["progress"] = {
             "pct": 100, "image_num": total, "total": total,
@@ -1055,18 +1225,223 @@ def api_rmbg():
     return jsonify({"job_id": job_id})
 
 
+@app.route("/api/rerender", methods=["POST"])
+def api_rerender():
+    """
+    Re-render a previously generated model with a different render mode.
+    Expects JSON: { render_mesh, name, mode, output_dir, ... render settings }
+    Loads the cached .pt mesh and runs do_render() without regenerating.
+    """
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No JSON body"}), 400
+
+    mesh_path = data.get("render_mesh", "")
+    name = data.get("name", "model")
+    mode = data.get("mode", "video")
+    out_dir = data.get("output_dir", "")
+
+    if not mesh_path or not os.path.isfile(mesh_path):
+        return jsonify({"error": f"Render mesh not found: {mesh_path}"}), 404
+    if not out_dir:
+        return jsonify({"error": "No output_dir specified"}), 400
+
+    # Validate output dir
+    SAFE_OUTPUT_BASES = ["/content/drive/MyDrive", "/content/"]
+    real_out = os.path.realpath(out_dir)
+    out_ok = any(
+        real_out == os.path.realpath(b) or real_out.startswith(os.path.realpath(b) + os.sep)
+        for b in SAFE_OUTPUT_BASES
+    )
+    if not out_ok:
+        return jsonify({"error": "Output directory not allowed"}), 400
+
+    # Create a rerender job so UI can poll progress
+    job_id = uuid.uuid4().hex[:12]
+    jobs[job_id] = {
+        "status": "running",
+        "progress": {"pct": 0, "image_num": 1, "total": 1,
+                     "name": name, "phase": "Loading mesh...", "elapsed": 0},
+        "log": [], "results": [], "files": [], "settings": {"output_dir": real_out},
+    }
+    active_jobs["generate"] = job_id
+
+    def _do_rerender():
+        job = jobs[job_id]
+        t0 = time.perf_counter()
+        try:
+            job["log"].append(f"Re-rendering {name} as {mode}...")
+            job["progress"]["phase"] = "Loading cached mesh..."
+
+            with _gpu_lock:
+                mesh = torch.load(mesh_path, map_location="cuda", weights_only=False)
+                job["log"].append(f"  ✓ Mesh loaded: {mesh.vertices.shape[0]:,} verts, {mesh.faces.shape[0]:,} faces")
+
+                job["progress"]["phase"] = f"Rendering ({mode})..."
+                job["progress"]["pct"] = 30
+
+                out_path = pathlib.Path(real_out)
+                out_path.mkdir(parents=True, exist_ok=True)
+
+                media_path, media_type = do_render(
+                    mesh, mode, out_path, name,
+                    fps=data.get("fps", 15),
+                    sprite_directions=data.get("sprite_directions", 16),
+                    sprite_size=data.get("sprite_size", 256),
+                    sprite_pitch=data.get("sprite_pitch", 0.52),
+                    doom_directions=data.get("doom_directions", 8),
+                    doom_size=data.get("doom_size", 256),
+                    doom_pitch=data.get("doom_pitch", 0.0),
+                )
+
+                del mesh
+                safe_cleanup()
+
+            dt = round(time.perf_counter() - t0, 2)
+
+            result_entry = {"name": name, "glb": ""}
+            # Find original GLB
+            glb_path = out_path / f"{name}.glb"
+            if glb_path.exists():
+                result_entry["glb"] = str(glb_path)
+            # Find render mesh
+            rm_path = out_path / f"{name}_render_mesh.pt"
+            if rm_path.exists():
+                result_entry["render_mesh"] = str(rm_path)
+            if media_path:
+                result_entry["media"] = media_path
+                result_entry["media_type"] = media_type
+            if media_type == "rts_sprite":
+                sd = out_path / f"{name}_sprites"
+                if sd.exists():
+                    result_entry["sprite_frames"] = sorted([str(f) for f in sd.glob("*.png")])
+            if media_type == "doom_sprite":
+                dd = out_path / f"{name}_doom_sprites"
+                if dd.exists():
+                    result_entry["sprite_frames"] = sorted([str(f) for f in dd.glob("*.png")])
+
+            job["results"].append(result_entry)
+            job["log"].append(f"  ✅ Re-render complete ({dt}s)")
+            if media_path:
+                job["log"].append(f"  ✓ Output: {fmt_bytes(pathlib.Path(media_path).stat().st_size)}")
+            job["status"] = "done"
+            job["progress"] = {"pct": 100, "image_num": 1, "total": 1,
+                               "name": "Complete", "phase": "All done!",
+                               "elapsed": round(dt, 1)}
+
+        except Exception as e:
+            dt = round(time.perf_counter() - t0, 2)
+            job["log"].append(f"  ❌ Re-render failed: {e}")
+            traceback.print_exc()
+            job["status"] = "done"
+            job["progress"] = {"pct": 100, "image_num": 1, "total": 1,
+                               "name": "Failed", "phase": str(e),
+                               "elapsed": round(dt, 1)}
+
+    threading.Thread(target=_do_rerender, daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
 @app.route("/api/status/<job_id>")
 def api_status(job_id):
     job = jobs.get(job_id)
     if not job:
         return jsonify({"error": "Not found"}), 404
-    return jsonify({"status": job["status"], "progress": job["progress"],
-                    "log": job["log"], "results": job["results"]})
+    resp = {"status": job["status"], "progress": job["progress"],
+            "log": job["log"], "results": job["results"]}
+    if "hw_log" in job:
+        resp["hw_log"] = job["hw_log"]
+    return jsonify(resp)
 
 
 @app.route("/api/console")
 def api_console():
     return jsonify({"lines": list(console_lines)[-200:]})
+
+
+@app.route("/api/hw")
+def api_hw():
+    """Return real-time GPU and CPU utilization stats."""
+    hw = {}
+
+    # ── GPU stats via torch.cuda ──
+    try:
+        hw["gpu_name"] = torch.cuda.get_device_name(0)
+        props = torch.cuda.get_device_properties(0)
+        hw["gpu_total_mb"] = round(props.total_memory / 1e6)
+        hw["gpu_alloc_mb"] = round(torch.cuda.memory_allocated(0) / 1e6)
+        hw["gpu_reserved_mb"] = round(torch.cuda.memory_reserved(0) / 1e6)
+        hw["gpu_free_mb"] = hw["gpu_total_mb"] - hw["gpu_reserved_mb"]
+        hw["gpu_alloc_pct"] = round(hw["gpu_alloc_mb"] / hw["gpu_total_mb"] * 100, 1) if hw["gpu_total_mb"] > 0 else 0
+        hw["gpu_reserved_pct"] = round(hw["gpu_reserved_mb"] / hw["gpu_total_mb"] * 100, 1) if hw["gpu_total_mb"] > 0 else 0
+    except Exception as e:
+        hw["gpu_error"] = str(e)
+
+    # ── GPU utilization % via nvidia-smi ──
+    try:
+        import subprocess as _sp
+        _nvsmi = _sp.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,utilization.memory,temperature.gpu,power.draw,power.limit",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if _nvsmi.returncode == 0:
+            parts = [p.strip() for p in _nvsmi.stdout.strip().split(",")]
+            if len(parts) >= 5:
+                hw["gpu_util_pct"] = int(parts[0])
+                hw["gpu_mem_util_pct"] = int(parts[1])
+                hw["gpu_temp_c"] = int(parts[2])
+                hw["gpu_power_w"] = float(parts[3])
+                hw["gpu_power_limit_w"] = float(parts[4])
+    except Exception:
+        pass
+
+    # ── CPU stats via psutil (if available) or /proc ──
+    try:
+        import psutil
+        hw["cpu_pct"] = psutil.cpu_percent(interval=0.1)
+        hw["cpu_count"] = psutil.cpu_count()
+        mem = psutil.virtual_memory()
+        hw["ram_total_mb"] = round(mem.total / 1e6)
+        hw["ram_used_mb"] = round(mem.used / 1e6)
+        hw["ram_pct"] = mem.percent
+    except ImportError:
+        # Fallback: read /proc/stat for CPU, /proc/meminfo for RAM
+        try:
+            with open("/proc/meminfo") as f:
+                meminfo = {}
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        meminfo[parts[0].rstrip(":")] = int(parts[1])
+                total = meminfo.get("MemTotal", 0)
+                avail = meminfo.get("MemAvailable", meminfo.get("MemFree", 0))
+                hw["ram_total_mb"] = round(total / 1024)
+                hw["ram_used_mb"] = round((total - avail) / 1024)
+                hw["ram_pct"] = round((total - avail) / total * 100, 1) if total > 0 else 0
+        except Exception:
+            pass
+        try:
+            hw["cpu_pct"] = round(os.getloadavg()[0] * 100 / (os.cpu_count() or 1), 1)
+            hw["cpu_count"] = os.cpu_count()
+        except Exception:
+            pass
+
+    # ── Current pipeline phase (from active generate job) ──
+    try:
+        gen_jid = active_jobs.get("generate")
+        if gen_jid and gen_jid in jobs:
+            j = jobs[gen_jid]
+            if j["status"] == "running":
+                hw["phase"] = j["progress"].get("phase", "")
+                hw["job_pct"] = j["progress"].get("pct", 0)
+                hw["job_image"] = j["progress"].get("name", "")
+                hw["job_num"] = j["progress"].get("image_num", 0)
+                hw["job_total"] = j["progress"].get("total", 0)
+    except Exception:
+        pass
+
+    return jsonify(hw)
 
 
 @app.route("/api/active")
