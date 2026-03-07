@@ -4,6 +4,11 @@
 # Simulates organic user activity via JavaScript injection
 # so Colab doesn't disconnect when you tab away.
 # ============================================================
+
+import time, sys, os, gc, threading
+import IPython
+from IPython.display import display, HTML
+
 def run_keep_alive():
     # ============================================================
     # 🔄 Colab Keep-Alive v7 — Kernel Exec + Extension-Style Click
@@ -26,11 +31,6 @@ def run_keep_alive():
     # PREREQUISITE: launch_colab.py must have run first (non-blocking).
     # TO STOP: Interrupt this cell (⬜ stop button).
     # ============================================================
-
-    import time, sys, os, gc, threading
-    import IPython
-    from IPython.display import display, HTML
-
     # ── Check server ──
     try:
         import requests as _req
@@ -157,10 +157,10 @@ def run_keep_alive():
 
     _CELL_CODE = r'''
     import time, os, gc, sys
-
+    
     _ts = time.strftime("%H:%M:%S")
     _pid = os.getpid()
-
+    
     # GPU stats
     try:
         import torch
@@ -170,7 +170,7 @@ def run_keep_alive():
         _gpu = f"VRAM:{_galloc:.1f}/{_gtotal:.1f}GB"
     except Exception:
         _gpu = "GPU:n/a"
-
+    
     try:
         import subprocess
         _nv = subprocess.run(
@@ -182,14 +182,14 @@ def run_keep_alive():
             _gpu += f" util:{_p[0]}% {_p[1]}°C {_p[2]}W"
     except Exception:
         pass
-
+    
     # Server health
     try:
         import requests
         _srv = "srv:✅" if requests.get("http://127.0.0.1:5000/api/keepalive",timeout=2).status_code==200 else "srv:❌"
     except Exception:
         _srv = "srv:—"
-
+    
     # Jobs
     try:
         _jc = len(jobs)
@@ -197,7 +197,7 @@ def run_keep_alive():
         _jstr = f"jobs:{_jc}({_ac}run)"
     except Exception:
         _jstr = ""
-
+    
     gc.collect()
     print(f"🔄 {_ts} | {_gpu} | {_srv} | {_jstr} | pid={_pid}")
     '''
