@@ -1,0 +1,296 @@
+# game_terrain_generator.promptflow
+# Version 1.2.0
+#
+# KEY DESIGN PRINCIPLE:
+#   The local 3B LLM is creative but unreliable for structured output.
+#   It is ONLY asked to write free-form descriptive text:
+#     - one short paragraph (art style)
+#     - one name per line (category list)
+#     - one sentence per tile (terrain description)
+#   All JSON building, counting, looping, and manifest construction
+#   is done entirely in `code` steps. The LLM never touches structure.
+
+meta:
+  name: "Game Terrain Generator"
+  version: "1.2.0"
+  description: "RTS terrain asset generation — local LLM for creative text only, code handles all structure"
+  author: "PromptFlow Engine"
+
+llm:
+  provider: local
+  model: Llama-3.2-3B-Instruct-uncensored
+  openai_model: gpt-4.1          # only used when provider: openai
+  temperature: 0.85
+  max_tokens: 512                 # short outputs only — LLM never writes long structured blocks
+
+  gpu_lifecycle:
+    offload_before_image_gen: true   # free ~2GB VRAM before Z-Image starts
+    reload_after_image_gen: false
+
+image_gen:
+  provider: z_image_turbo
+  server_url: "http://localhost:7860"
+  steps: 4
+  cfg_scale: 1.0
+  width: 1024
+  height: 1024
+  sample_image: true
+
+inputs:
+  game_context:
+    type: string
+    required: true
+  terrain_asset_instructions:
+    type: string
+    required: false
+    default: ""
+  terrain_assets_to_make:
+    type: integer
+    required: true
+    default: 25
+  out_dir:
+    type: string
+    required: false
+    default: "output"
+
+
+steps:
+
+  # ── STEP 1 ──────────────────────────────────────────────────────────────────
+  # Ask the LLM for a short visual style paragraph. Pure prose, no formatting.
+  # Output: raw text stored as art_style_description.
+  - id: describe_art_style
+    type: llm_call
+    name: "Describe Art Style"
+    description: "LLM writes 2-3 sentences describing the game's terrain tile visual style"
+    prompt: |
+      You are a game art director.
+
+      A developer is making this game:
+      {{inputs.game_context}}
+
+      In 2-3 sentences, describe the visual style for terrain tiles in this game.
+      Cover: perspective angle, lighting direction, color palette, realism level,
+      and what the tile platform looks like (shape, visible sides, background color).
+      Write only the description. No bullet points, no labels, no headers.
+    output_key: art_style_description
+
+
+  # ── STEP 2 ──────────────────────────────────────────────────────────────────
+  # Ask the LLM for terrain type names, one per line, nothing else.
+  # This is the simplest format a small LLM can reliably produce.
+  # Output: raw newline-separated text parsed in the next code step.
+  - id: list_terrain_categories
+    type: llm_call
+    name: "List Terrain Categories"
+    description: "LLM writes terrain type names, one per line, no other text"
+    prompt: |
+      You are a game designer.
+
+      Game description: {{inputs.game_context}}
+      Extra notes: {{inputs.terrain_asset_instructions}}
+
+      List the terrain types needed for this game's map tiles.
+      Write between 4 and 8 terrain type names.
+      Write ONLY the names, one per line, nothing else.
+      No numbers, no dashes, no descriptions, no extra words.
+
+      Example:
+      Grassland
+      Rocky Cliff
+      Volcanic Plain
+      Coastal Marsh
+    output_key: categories_raw
+
+
+  # ── STEP 3 ──────────────────────────────────────────────────────────────────
+  # Parse the raw category list and build the full work plan in Python.
+  # Distributes tile counts evenly. No LLM involved.
+  - id: build_tile_plan
+    type: code
+    name: "Build Tile Plan"
+    description: "Parses LLM category text and distributes tile counts — pure code"
+    code: |
+      import re
+
+      raw = steps["list_terrain_categories"]["categories_raw"]
+
+      # Parse: split on newlines, strip any stray bullets/numbers the LLM added
+      categories = []
+      for line in raw.strip().splitlines():
+          clean = re.sub(r"^[\s\-\*\d\.\)]+", "", line).strip()
+          # Drop lines that look like preamble ("Here are..." etc.)
+          if clean and len(clean) < 60 and not clean.lower().startswith(("here", "sure", "okay", "the following")):
+              categories.append(clean)
+
+      categories = categories[:8]
+      if len(categories) < 2:
+          categories = ["Grassland", "Rocky Terrain", "Water Feature", "Cliff Edge"]
+
+      n      = inputs["terrain_assets_to_make"]
+      n_cats = len(categories)
+      base   = n // n_cats
+      extra  = n % n_cats
+
+      tile_plan = []
+      tile_num  = 1
+      for i, cat in enumerate(categories):
+          count = base + (1 if i < extra else 0)
+          for v in range(count):
+              tile_plan.append({
+                  "id":            f"terrain_{tile_num:03d}",
+                  "category":      cat,
+                  "variant_index": v + 1,
+                  "variant_total": count,
+              })
+              tile_num += 1
+
+      art_style = steps["describe_art_style"]["art_style_description"].strip()
+
+      print(f"  {n_cats} categories: {', '.join(categories)}")
+      print(f"  Tile distribution: { {c: base + (1 if i < extra else 0) for i, c in enumerate(categories)} }")
+      print(f"  Total tiles: {len(tile_plan)}")
+
+      return {
+          "tile_plan":   tile_plan,
+          "categories":  categories,
+          "art_style":   art_style,
+      }
+
+
+  # ── STEP 4 ──────────────────────────────────────────────────────────────────
+  # For each tile, ask the LLM to write ONE sentence describing that terrain.
+  # Nothing else. No IDs, no keys, no negative prompts, no JSON.
+  # The interpreter calls the LLM once per tile and collects the raw sentences.
+  - id: write_tile_descriptions
+    type: llm_call_loop
+    name: "Write Tile Descriptions"
+    description: "LLM writes one vivid sentence per tile — no structure"
+    iterate_over: "{{steps.build_tile_plan.tile_plan}}"
+    loop_var: tile
+    prompt: |
+      You are a game artist.
+
+      Art style: {{steps.describe_art_style.art_style_description}}
+
+      Write ONE sentence describing a {{tile.category}} terrain tile for this game.
+      This is variant {{tile.variant_index}} of {{tile.variant_total}} for this terrain type
+      so make it visually distinct from other variants.
+      Describe specific things: textures, colors, what ground cover or features appear,
+      where on the tile they are positioned.
+      Write only the single sentence. Nothing else.
+    output_key: descriptions
+    max_tokens: 120
+
+
+  # ── STEP 5 ──────────────────────────────────────────────────────────────────
+  # Combine the LLM sentences with the tile plan to build the final asset list.
+  # All prompt assembly happens here in Python — LLM output is just inserted as-is.
+  - id: assemble_asset_manifest
+    type: code
+    name: "Assemble Asset Manifest"
+    description: "Combines tile plan + LLM sentences into final image-ready asset list — pure code"
+    code: |
+      import re
+
+      tile_plan    = steps["build_tile_plan"]["tile_plan"]
+      descriptions = steps["write_tile_descriptions"]["descriptions"]
+      art_style    = steps["build_tile_plan"]["art_style"]
+
+      NEGATIVE = (
+          "people, soldiers, units, buildings, vehicles, UI elements, text, watermark, "
+          "logo, border, frame, vignette, fog, haze, motion blur, low quality, "
+          "distorted, oversaturated, plastic look, cartoon, anime"
+      )
+
+      BASE_SUFFIX = "game terrain tile, isolated on pure black background"
+
+      def clean(s):
+          s = str(s).strip()
+          # Strip any label prefix a dumb model might prepend
+          s = re.sub(r"^(sentence|description|tile|variant|answer|response)[:\-\s]+", "", s, flags=re.IGNORECASE)
+          # Strip surrounding quotes
+          s = s.strip('"\'')
+          if s and s[-1] not in ".!?":
+              s += "."
+          return s
+
+      assets = []
+      for tile, raw_desc in zip(tile_plan, descriptions):
+          desc   = clean(raw_desc)
+          prompt = f"{desc} {art_style} {BASE_SUFFIX}"
+          prompt = re.sub(r" {2,}", " ", prompt).strip()
+
+          assets.append({
+              "id":              tile["id"],
+              "category":        tile["category"],
+              "name":            f"{tile['category']} {tile['variant_index']:02d}",
+              "image_prompt":    prompt,
+              "negative_prompt": NEGATIVE,
+          })
+
+      print(f"  Built {len(assets)} asset entries.")
+      for a in assets[:3]:
+          print(f"  [{a['id']}] {a['name']}: {a['image_prompt'][:90]}...")
+
+      return {"asset_manifest": assets}
+
+
+  # ── STEP 6 ──────────────────────────────────────────────────────────────────
+  # Generate all images. Interpreter offloads LLM to CPU before this step starts
+  # based on gpu_lifecycle.offload_before_image_gen set above.
+  - id: generate_images
+    type: code_loop
+    name: "Generate Terrain Images"
+    description: "GPU-lifecycle managed image generation for all terrain tiles"
+    iterate_over: "{{steps.assemble_asset_manifest.asset_manifest}}"
+    loop_var: asset
+    actions:
+      - type: image_gen
+        prompt: "{{asset.image_prompt}}"
+        negative_prompt: "{{asset.negative_prompt}}"
+        filename: "{{asset.id}}_{{asset.name | slugify}}.png"
+      - type: log
+        message: "✅ [{{loop.index}}/{{loop.total}}] {{asset.name}}"
+      - type: display_image
+        path: "{{out_dir}}/{{asset.id}}_{{asset.name | slugify}}.png"
+
+
+  # ── STEP 7 ──────────────────────────────────────────────────────────────────
+  - id: save_manifest
+    type: code
+    name: "Save Asset Manifest"
+    description: "Writes terrain_manifest.json for game engine integration"
+    code: |
+      import json, os, re
+
+      def slug(text):
+          return re.sub(r"[^a-z0-9_]", "", text.lower().replace(" ", "_"))
+
+      assets = steps["assemble_asset_manifest"]["asset_manifest"]
+      out    = inputs["out_dir"]
+      os.makedirs(out, exist_ok=True)
+
+      manifest = {
+          "game_context": inputs["game_context"],
+          "total_assets": len(assets),
+          "art_style":    steps["build_tile_plan"]["art_style"],
+          "categories":   steps["build_tile_plan"]["categories"],
+          "assets": [
+              {
+                  "id":       a["id"],
+                  "category": a["category"],
+                  "name":     a["name"],
+                  "filename": f"{a['id']}_{slug(a['name'])}.png",
+                  "prompt":   a["image_prompt"],
+              }
+              for a in assets
+          ]
+      }
+
+      path = os.path.join(out, "terrain_manifest.json")
+      with open(path, "w") as f:
+          json.dump(manifest, f, indent=2)
+
+      print(f"📋 Manifest → {path}  ({len(assets)} assets)")
+      return {"manifest_path": path, "manifest": manifest}
