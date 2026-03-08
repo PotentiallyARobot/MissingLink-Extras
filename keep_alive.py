@@ -9,7 +9,8 @@ import time, sys, os, gc, threading
 import IPython
 from IPython.display import display, HTML
 
-
+def run_keep_alive():
+  pass
 # ============================================================
 # 🔄 Colab Keep-Alive v7 — Kernel Exec + Extension-Style Click
 # ============================================================
