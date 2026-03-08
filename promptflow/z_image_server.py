@@ -5,10 +5,10 @@ Launches a local HTTP server wrapping the stable-diffusion-cpp Z-Image Turbo GGU
 Exposes /txt2img and /img2img endpoints compatible with the PromptFlow interpreter.
 
 Usage:
-    python z_image_server.py \
-        --diff_path /path/to/z-image-turbo-Q4_K_M.gguf \
-        --llm_path /path/to/Qwen3-4B-Instruct-2507-Q4_K_M.gguf \
-        --vae_path /path/to/ae.safetensors \
+    python z_image_server.py \\
+        --diff_path /path/to/z-image-turbo-Q4_K_M.gguf \\
+        --llm_path /path/to/Qwen3-4B-Instruct-2507-Q4_K_M.gguf \\
+        --vae_path /path/to/ae.safetensors \\
         --port 7860
 """
 
@@ -112,7 +112,7 @@ class ZImageHandler(BaseHTTPRequestHandler):
                     init_images = payload.get("init_images", [])
                     init_img = b64_to_pil(init_images[0]) if init_images else None
                     strength = float(payload.get("denoising_strength", 0.75))
-                    
+
                     images = sd.img_to_img(
                         image=init_img,
                         prompt=prompt,
@@ -151,11 +151,11 @@ class ZImageHandler(BaseHTTPRequestHandler):
 def run_server(host: str = "0.0.0.0", port: int = 7860,
                diff_path: str = "", llm_path: str = "", vae_path: str = "",
                offload_cpu: bool = True, flash_attn: bool = True):
-    
+
     # Load model in background thread so server starts immediately
     def _load():
         load_model(diff_path, llm_path, vae_path, offload_cpu, flash_attn)
-    
+
     t = threading.Thread(target=_load, daemon=True)
     t.start()
 
@@ -180,7 +180,7 @@ if __name__ == "__main__":
     parser.add_argument("--no_offload_cpu", action="store_true")
     parser.add_argument("--no_flash_attn", action="store_true")
     args = parser.parse_args()
-    
+
     run_server(
         host=args.host,
         port=args.port,
