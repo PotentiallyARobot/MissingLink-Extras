@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>TRELLIS.2 — World Editor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=JetBrains+Mono:wght@400;600&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/worldeditor.css">
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+
+<div class="we-app">
+
+  <!-- ═══ HEADER ═══ -->
+  <header class="we-header">
+    <div class="we-header-left">
+      <a href="/" class="we-back" title="Back to Studio">←</a>
+      <img src="https://raw.githubusercontent.com/PotentiallyARobot/MissingLink/main/assets/logo.png" alt="ML">
+      <h1>TRELLIS.2 <span>World Editor</span></h1>
+    </div>
+    <div class="we-header-center">
+      <div class="we-tool-group">
+        <button class="we-tool active" id="toolSelect" data-tool="select" title="Select (V)">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M1 1L6 13L7.5 8L13 6.5L1 1Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>
+        </button>
+        <button class="we-tool" id="toolMove" data-tool="move" title="Move (G)">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M7 1V13M1 7H13M7 1L5 3M7 1L9 3M7 13L5 11M7 13L9 11M1 7L3 5M1 7L3 9M13 7L11 5M13 7L11 9" stroke="currentColor" stroke-width="1.2"/></svg>
+        </button>
+        <button class="we-tool" id="toolRotate" data-tool="rotate" title="Rotate (R)">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M11 3A5.5 5.5 0 1 0 12 7.5" stroke="currentColor" stroke-width="1.2"/><path d="M9 1L11 3L9 5" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>
+        </button>
+        <button class="we-tool" id="toolScale" data-tool="scale" title="Scale (S)">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><rect x="1" y="1" width="5" height="5" stroke="currentColor" stroke-width="1.1"/><rect x="8" y="8" width="5" height="5" stroke="currentColor" stroke-width="1.1"/><path d="M6 6L8 8" stroke="currentColor" stroke-width="1.1"/></svg>
+        </button>
+      </div>
+      <div class="we-divider-v"></div>
+      <div class="we-tool-group">
+        <button class="we-tool" id="toolDuplicate" title="Duplicate (Shift+D)">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><rect x="1" y="3" width="8" height="8" rx="1" stroke="currentColor" stroke-width="1.1"/><path d="M5 3V2a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1h-1" stroke="currentColor" stroke-width="1.1"/></svg>
+        </button>
+        <button class="we-tool danger" id="toolDelete" title="Delete (X / Del)">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M2 4h10M5 4V3a1 1 0 011-1h2a1 1 0 011 1v1M4 4l.7 8a1 1 0 001 .9h2.6a1 1 0 001-.9L10 4" stroke="currentColor" stroke-width="1.1"/></svg>
+        </button>
+      </div>
+      <div class="we-divider-v"></div>
+      <div class="we-snap-group">
+        <button class="we-tool small active" id="btnSnapGrid" title="Snap to Grid">⊞</button>
+        <select class="we-snap-select" id="snapSize" title="Grid snap size">
+          <option value="0.25">0.25</option>
+          <option value="0.5" selected>0.5</option>
+          <option value="1">1.0</option>
+          <option value="2">2.0</option>
+        </select>
+      </div>
+    </div>
+    <div class="we-header-right">
+      <button class="we-action-btn outline" id="btnBake" title="Bake scene — render shadows and export">🔥 Bake</button>
+      <button class="we-action-btn gold" id="btnExport" title="Export scene as GLB">↓ Export</button>
+    </div>
+  </header>
+
+  <!-- ═══ LEFT PANEL — ASSET LIBRARY ═══ -->
+  <aside class="we-panel-left" id="panelLeft">
+    <div class="we-panel-header">
+      <span class="we-panel-title">📦 Assets</span>
+      <button class="we-panel-collapse" id="collapseLeft" title="Collapse">◂</button>
+    </div>
+
+    <!-- Load from generated models -->
+    <div class="we-panel-section">
+      <div class="we-section-label">Generated Models</div>
+      <div class="we-model-list" id="generatedModelList">
+        <div class="we-model-empty">No generated models found.<br>Generate models in Studio first.</div>
+      </div>
+      <button class="we-sm-btn" id="btnRefreshModels">↻ Refresh</button>
+    </div>
+
+    <!-- Load from file -->
+    <div class="we-panel-section">
+      <div class="we-section-label">Import GLB</div>
+      <div class="we-dropzone" id="weDropzone">
+        <div class="we-dz-icon">📁</div>
+        <div class="we-dz-text">Drop <strong>.glb</strong> files</div>
+        <input type="file" id="weFileInput" multiple accept=".glb,.gltf">
+      </div>
+    </div>
+
+    <!-- Primitives -->
+    <div class="we-panel-section">
+      <div class="we-section-label">Primitives</div>
+      <div class="we-prim-grid">
+        <button class="we-prim" data-prim="box" title="Box">▣</button>
+        <button class="we-prim" data-prim="sphere" title="Sphere">●</button>
+        <button class="we-prim" data-prim="cylinder" title="Cylinder">◎</button>
+        <button class="we-prim" data-prim="plane" title="Ground Plane">▬</button>
+        <button class="we-prim" data-prim="cone" title="Cone">▲</button>
+        <button class="we-prim" data-prim="torus" title="Torus">◌</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ═══ VIEWPORT ═══ -->
+  <main class="we-viewport" id="weViewport">
+    <canvas id="weCanvas"></canvas>
+
+    <!-- Gizmo axis indicator -->
+    <div class="we-axis-indicator" id="axisIndicator">
+      <canvas id="axisCanvas" width="80" height="80"></canvas>
+    </div>
+
+    <!-- HUD -->
+    <div class="we-hud" id="weHud">
+      <span class="we-hud-stat" id="hudObjs">Objects: 0</span>
+      <span class="we-hud-stat" id="hudTriCount">Tris: 0</span>
+      <span class="we-hud-stat" id="hudFps">— fps</span>
+    </div>
+
+    <!-- Selection info -->
+    <div class="we-sel-info" id="weSelInfo">
+      <span class="we-sel-name" id="selName">Nothing selected</span>
+    </div>
+
+    <!-- Empty state -->
+    <div class="we-empty-state" id="weEmptyState">
+      <div class="we-empty-icon">🌍</div>
+      <div class="we-empty-title">World Editor</div>
+      <div class="we-empty-sub">Drag models from the asset panel or drop GLB files to start building your world.<br>
+      <kbd>RMB</kbd> Pan · <kbd>MMB</kbd> Rotate · <kbd>Scroll</kbd> Zoom</div>
+    </div>
+  </main>
+
+  <!-- ═══ RIGHT PANEL — PROPERTIES + SCENE TREE ═══ -->
+  <aside class="we-panel-right" id="panelRight">
+    <div class="we-panel-header">
+      <button class="we-panel-collapse" id="collapseRight" title="Collapse">▸</button>
+      <span class="we-panel-title">⚙ Properties</span>
+    </div>
+
+    <!-- Transform -->
+    <div class="we-panel-section" id="propSection">
+      <div class="we-section-label">Transform</div>
+      <div class="we-prop-grid">
+        <div class="we-prop-row">
+          <span class="we-prop-label x">X</span>
+          <input type="number" class="we-prop-input" id="propPosX" step="0.1" value="0">
+          <span class="we-prop-label y">Y</span>
+          <input type="number" class="we-prop-input" id="propPosY" step="0.1" value="0">
+          <span class="we-prop-label z">Z</span>
+          <input type="number" class="we-prop-input" id="propPosZ" step="0.1" value="0">
+        </div>
+        <div class="we-prop-header">Position</div>
+        <div class="we-prop-row">
+          <span class="we-prop-label x">X</span>
+          <input type="number" class="we-prop-input" id="propRotX" step="5" value="0">
+          <span class="we-prop-label y">Y</span>
+          <input type="number" class="we-prop-input" id="propRotY" step="5" value="0">
+          <span class="we-prop-label z">Z</span>
+          <input type="number" class="we-prop-input" id="propRotZ" step="5" value="0">
+        </div>
+        <div class="we-prop-header">Rotation (°)</div>
+        <div class="we-prop-row">
+          <span class="we-prop-label x">X</span>
+          <input type="number" class="we-prop-input" id="propScX" step="0.1" value="1" min="0.01">
+          <span class="we-prop-label y">Y</span>
+          <input type="number" class="we-prop-input" id="propScY" step="0.1" value="1" min="0.01">
+          <span class="we-prop-label z">Z</span>
+          <input type="number" class="we-prop-input" id="propScZ" step="0.1" value="1" min="0.01">
+        </div>
+        <div class="we-prop-header">Scale</div>
+        <label class="we-prop-lock"><input type="checkbox" id="propScLock" checked> Uniform scale</label>
+      </div>
+    </div>
+
+    <!-- Scene tree -->
+    <div class="we-panel-section flex-fill">
+      <div class="we-section-label">🌳 Scene</div>
+      <div class="we-scene-tree" id="sceneTree">
+        <div class="we-tree-empty">Empty scene</div>
+      </div>
+    </div>
+
+    <!-- World settings -->
+    <div class="we-panel-section">
+      <div class="we-section-label">🌤 Environment</div>
+      <div class="we-field"><label>Ground</label><select id="envGround"><option value="grid">Grid</option><option value="solid">Solid</option><option value="none">None</option></select></div>
+      <div class="we-field"><label>Sky color</label><input type="color" id="envSkyColor" value="#1a1a2e"></div>
+      <div class="we-field"><label>Ambient</label><input type="range" id="envAmbient" min="0" max="2" step="0.1" value="0.5"></div>
+      <div class="we-field"><label>Sun angle</label><input type="range" id="envSunAngle" min="0" max="90" step="1" value="45"></div>
+    </div>
+  </aside>
+
+</div>
+
+<!-- Bake modal -->
+<div class="we-modal-overlay" id="bakeModal">
+  <div class="we-modal">
+    <div class="we-modal-header">
+      <span>🔥 Bake Scene</span>
+      <button class="we-modal-close" id="bakeClose">✕</button>
+    </div>
+    <div class="we-modal-body">
+      <p class="we-modal-desc">Render the current scene with shadows baked onto the ground plane. This captures a high-quality snapshot of your world.</p>
+      <div class="we-field"><label>Resolution</label><select id="bakeRes"><option value="1024">1024×1024</option><option value="2048" selected>2048×2048</option><option value="4096">4096×4096</option></select></div>
+      <div class="we-field"><label>Shadow quality</label><select id="bakeShadow"><option value="1024">Standard</option><option value="2048" selected>High</option><option value="4096">Ultra</option></select></div>
+      <label class="we-prop-lock"><input type="checkbox" id="bakeTransparent"> Transparent background</label>
+    </div>
+    <div class="we-modal-footer">
+      <button class="we-action-btn outline" id="bakeCancel">Cancel</button>
+      <button class="we-action-btn gold" id="bakeConfirm">🔥 Bake & Download</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="/static/worldeditor.js"></script>
+</body>
+</html>
