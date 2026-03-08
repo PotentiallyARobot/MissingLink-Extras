@@ -308,12 +308,10 @@ def generate_image(
     )
 
     if init_image is not None:
-        # img2img: use init_image + strength for denoising
         kwargs["init_image"] = init_image
         kwargs["strength"] = strength
 
     if ref_images:
-        # ref_images: style reference for Z-Image/FLUX (does not affect denoising)
         kwargs["ref_images"] = ref_images
 
     result = sd.generate_image(**kwargs)
@@ -480,7 +478,6 @@ def background_load(args):
             log.error(traceback.format_exc())
 
     try:
-        # For z-image we need all 3 components
         STATE.diff_path = args.diff_path
         load_image_gen(
             diff_path=args.diff_path,
