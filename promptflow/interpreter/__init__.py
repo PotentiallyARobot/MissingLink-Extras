@@ -1,3 +1,3 @@
-from .interpreter import PromptFlowInterpreter
+from .interpreter import PromptFlowInterpreter, start_keepalive, stop_keepalive
 
-__all__ = ["PromptFlowInterpreter"]
+__all__ = ["PromptFlowInterpreter", "start_keepalive", "stop_keepalive"]
