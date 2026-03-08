@@ -30,6 +30,7 @@ import requests
 import argparse
 import textwrap
 import traceback
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -48,6 +49,130 @@ except ImportError:
         def rule(self, *a, **kw): print("─" * 60)
         def log(self, *a, **kw): print(*a)
     console = _FallbackConsole()
+
+
+# ─────────────────────────── Colab Keep-Alive (background) ────────────────────
+# Runs as a daemon thread so it doesn't block the promptflow cell.
+# Uses three mechanisms:
+#   1. Real kernel execution via get_ipython().run_cell() every 25s
+#   2. eval_js body.click() via Colab's kernel→frontend bridge
+#   3. One-time JS injection for MutationObserver dialog dismissal
+# The thread starts automatically when the interpreter runs and stops when done.
+
+_KEEPALIVE_THREAD: Optional[threading.Thread] = None
+_KEEPALIVE_STOP = threading.Event()
+
+
+def _colab_keepalive_loop():
+    """Background thread: keeps Colab alive while long GPU work runs."""
+    # ── Check if we're actually in Colab ──
+    try:
+        ipython = get_ipython()  # type: ignore[name-defined]
+    except NameError:
+        return  # Not in a notebook at all
+
+    in_colab = False
+    eval_js_fn = None
+    try:
+        from google.colab.output import eval_js as _ejs
+        eval_js_fn = _ejs
+        in_colab = True
+    except ImportError:
+        pass
+
+    if not in_colab:
+        return  # Not in Colab — no keep-alive needed
+
+    # ── One-time JS injection for dialog dismissal ──
+    try:
+        from IPython.display import display, HTML
+        display(HTML("""<script>
+(function(){
+    function tryDismiss() {
+        var sels = ['paper-button#ok','mwc-button[slot="primaryAction"]',
+            'md-text-button[slot="primaryAction"]','md-filled-button[slot="primaryAction"]',
+            'colab-dialog paper-button','colab-dialog mwc-button'];
+        for (var i=0; i<sels.length; i++) {
+            var el = document.querySelector(sels[i]);
+            if (el && el.offsetParent !== null) { el.click(); return; }
+        }
+        var btns = document.querySelectorAll('paper-button,mwc-button,md-text-button,md-filled-button,button');
+        for (var j=0; j<btns.length; j++) {
+            var t = (btns[j].textContent||'').trim().toLowerCase();
+            if (['ok','yes','connect','reconnect','dismiss'].indexOf(t) >= 0 && btns[j].offsetParent !== null) {
+                btns[j].click(); return;
+            }
+        }
+    }
+    new MutationObserver(function(muts) {
+        for (var m=0; m<muts.length; m++)
+            for (var k=0; k<muts[m].addedNodes.length; k++) {
+                var n = muts[m].addedNodes[k];
+                if (n.nodeType===1) {
+                    var tag = (n.tagName||'').toLowerCase();
+                    if (tag.indexOf('dialog')>=0 || tag.indexOf('overlay')>=0 ||
+                        (n.querySelector && (n.querySelector('[role="dialog"]') || n.querySelector('[role="alertdialog"]')))) {
+                        setTimeout(tryDismiss, 200); setTimeout(tryDismiss, 1000);
+                    }
+                }
+            }
+    }).observe(document.body, {childList:true, subtree:true});
+    setInterval(tryDismiss, 6000);
+    try {
+        var w = new Worker(URL.createObjectURL(new Blob(
+            ['function t(){postMessage(1);setTimeout(t,20000+Math.floor(Math.random()*15000))}t();'],
+            {type:'application/javascript'})));
+        w.onmessage = function(){ tryDismiss(); document.body.click(); };
+    } catch(e) { setInterval(function(){ tryDismiss(); document.body.click(); }, 30000); }
+    document.addEventListener('visibilitychange', function(){
+        if(document.hidden) for(var i=0;i<5;i++) setTimeout(function(){ document.body.click(); }, i*400);
+        else tryDismiss();
+    });
+    console.log('[PromptFlow KA] JS dialog-dismiss active');
+})();
+</script><div style="padding:2px 6px;background:#111;border:1px solid #333;border-radius:4px;font:9px monospace;color:#4a4;display:inline-block">🔄 keep-alive active</div>"""))
+    except Exception:
+        pass
+
+    # ── Heartbeat loop ──
+    _mini_cell = "import gc; gc.collect()  # promptflow heartbeat\n"
+    cycle = 0
+    while not _KEEPALIVE_STOP.wait(timeout=25):
+        cycle += 1
+        # Mechanism 1: real kernel execution
+        try:
+            ipython.run_cell(_mini_cell, silent=True, store_history=False)
+        except Exception:
+            pass
+        # Mechanism 2: eval_js body click
+        if eval_js_fn is not None:
+            try:
+                eval_js_fn("""(function(){
+                    document.body.click();
+                    var cb = document.querySelector('colab-connect-button') || document.querySelector('#connect');
+                    if(cb) cb.click();
+                    document.dispatchEvent(new MouseEvent('mousemove',{
+                        clientX: 100+Math.floor(Math.random()*600),
+                        clientY: 100+Math.floor(Math.random()*400), bubbles:true}));
+                })();""", ignore_result=True)
+            except Exception:
+                pass
+
+
+def start_keepalive():
+    """Start the background keep-alive thread (idempotent)."""
+    global _KEEPALIVE_THREAD
+    _KEEPALIVE_STOP.clear()
+    if _KEEPALIVE_THREAD is not None and _KEEPALIVE_THREAD.is_alive():
+        return  # already running
+    _KEEPALIVE_THREAD = threading.Thread(target=_colab_keepalive_loop, daemon=True,
+                                         name="promptflow-keepalive")
+    _KEEPALIVE_THREAD.start()
+
+
+def stop_keepalive():
+    """Signal the keep-alive thread to stop."""
+    _KEEPALIVE_STOP.set()
 
 
 # ─────────────────────────── Notebook image display ───────────────────────────
@@ -166,10 +291,55 @@ class OpenAIClient:
 
 # ─────────────────────────── Image Gen Client ─────────────────────────────────
 class ImageGenClient:
-    """Calls model_server.py image endpoints (txt2img / img2img)."""
+    """Calls model_server.py image endpoints (txt2img / img2img).
+    
+    Includes:
+      - Retry with exponential backoff (3 attempts)
+      - Server health check before each attempt
+      - 600s timeout (Z-Image on T4 can be slow)
+      - Automatic wait-and-retry if server returns 503
+    """
+
+    TIMEOUT = 600          # 10 minutes — Z-Image Turbo on T4 can take 2-4 min per image
+    MAX_RETRIES = 3
+    RETRY_DELAYS = [10, 30, 60]  # seconds between retries
 
     def __init__(self, server_url: str):
         self.server_url = server_url.rstrip("/")
+        # Use a Session with connection pooling + keep-alive
+        self._session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            max_retries=0,          # we handle retries ourselves
+            pool_connections=1,
+            pool_maxsize=1,
+        )
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
+
+    def _wait_for_server(self, max_wait: int = 120) -> bool:
+        """Block until the image server responds to /health or /image/status."""
+        for attempt in range(max_wait // 5):
+            try:
+                r = self._session.get(
+                    f"{self.server_url}/image/status", timeout=5
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get("loaded") or data.get("status") == "ready":
+                        return True
+            except Exception:
+                pass
+            # Also try /health (model_server.py)
+            try:
+                r = self._session.get(f"{self.server_url}/health", timeout=5)
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get("image", {}).get("loaded"):
+                        return True
+            except Exception:
+                pass
+            time.sleep(5)
+        return False
 
     def generate(
         self,
@@ -200,17 +370,61 @@ class ImageGenClient:
         else:
             endpoint = f"{self.server_url}/image/txt2img"
 
-        resp = requests.post(endpoint, json=payload, timeout=300)
-        resp.raise_for_status()
-        data = resp.json()
+        last_error = None
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                # Health check before each attempt
+                if attempt > 0:
+                    delay = self.RETRY_DELAYS[min(attempt, len(self.RETRY_DELAYS) - 1)]
+                    print(f"    ⏳ Retry {attempt + 1}/{self.MAX_RETRIES} in {delay}s...",
+                          flush=True)
+                    time.sleep(delay)
 
-        if "error" in data:
-            raise RuntimeError(f"Image gen error: {data['error']}")
+                    print(f"    🔍 Checking server health...", flush=True)
+                    if not self._wait_for_server(max_wait=120):
+                        print(f"    ⚠️  Server not responding — retrying anyway", flush=True)
 
-        img_b64 = data["images"][0] if "images" in data else data["image"]
-        if "," in img_b64:
-            img_b64 = img_b64.split(",", 1)[1]
-        return base64.b64decode(img_b64)
+                # Force garbage collection before GPU-heavy work
+                gc.collect()
+
+                resp = self._session.post(
+                    endpoint, json=payload, timeout=self.TIMEOUT
+                )
+
+                if resp.status_code == 503:
+                    # Server busy or model not loaded — wait and retry
+                    last_error = RuntimeError(f"Server returned 503: {resp.text[:200]}")
+                    print(f"    ⚠️  Server busy (503) — will retry", flush=True)
+                    continue
+
+                resp.raise_for_status()
+                data = resp.json()
+
+                if "error" in data:
+                    last_error = RuntimeError(f"Image gen error: {data['error']}")
+                    print(f"    ⚠️  Server error: {data['error'][:100]} — will retry",
+                          flush=True)
+                    continue
+
+                img_b64 = data["images"][0] if "images" in data else data["image"]
+                if "," in img_b64:
+                    img_b64 = img_b64.split(",", 1)[1]
+                return base64.b64decode(img_b64)
+
+            except requests.exceptions.Timeout as e:
+                last_error = e
+                print(f"    ⚠️  Timeout after {self.TIMEOUT}s — will retry", flush=True)
+            except requests.exceptions.ConnectionError as e:
+                last_error = e
+                print(f"    ⚠️  Connection lost — will retry", flush=True)
+            except Exception as e:
+                last_error = e
+                print(f"    ⚠️  Error: {e} — will retry", flush=True)
+
+        raise RuntimeError(
+            f"Image generation failed after {self.MAX_RETRIES} attempts. "
+            f"Last error: {last_error}"
+        )
 
 
 # ─────────────────────────── PromptFlow Interpreter ───────────────────────────
@@ -574,6 +788,13 @@ class PromptFlowInterpreter:
                     fname       = re.sub(r"[^a-zA-Z0-9_\-.]", "_", fname_raw)
                     out_path    = os.path.join(out_dir, fname)
 
+                    # ── Resume support: skip already-generated images ──
+                    if os.path.exists(out_path) and os.path.getsize(out_path) > 1024:
+                        self._log(f"  ⏭️  Already exists → {fname} (skipping)", "success")
+                        display_image_in_notebook(out_path, caption=f"[{idx}/{total}] {item_name} (cached)")
+                        results.append({**item, "output_path": out_path, "status": "cached"})
+                        continue
+
                     self._log(f"  🎨 → {fname}")
                     if HAS_RICH:
                         console.print(f"  [dim]{textwrap.shorten(prompt_text, 110)}[/dim]")
@@ -581,6 +802,9 @@ class PromptFlowInterpreter:
                         print(f"    {prompt_text[:110]}...")
 
                     if not self.dry_run:
+                        # GC before each image to keep VRAM clean
+                        gc.collect()
+                        t_img = time.time()
                         try:
                             img_bytes = self._image_client.generate(
                                 prompt=prompt_text,
@@ -596,7 +820,8 @@ class PromptFlowInterpreter:
                             )
                             with open(out_path, "wb") as f:
                                 f.write(img_bytes)
-                            self._log(f"  ✅ Saved → {out_path}", "success")
+                            img_elapsed = time.time() - t_img
+                            self._log(f"  ✅ Saved → {out_path}  ({img_elapsed:.1f}s)", "success")
                             display_image_in_notebook(out_path, caption=f"[{idx}/{total}] {item_name}")
                             results.append({**item, "output_path": out_path, "status": "success"})
                         except Exception as e:
@@ -641,6 +866,10 @@ class PromptFlowInterpreter:
         self.load()
         self.resolve_inputs()
         self.initialize_clients()
+
+        # ── Start background keep-alive for Colab ──────────────────────────────
+        start_keepalive()
+        self._log("🔄 Background keep-alive started (Colab anti-disconnect)", "info")
 
         steps = self.config.get("steps", [])
         total = len(steps)
@@ -687,6 +916,10 @@ class PromptFlowInterpreter:
                 raise
 
         total_elapsed = time.time() - t0
+
+        # ── Stop background keep-alive ─────────────────────────────────────────
+        stop_keepalive()
+
         if HAS_RICH:
             console.print(Panel.fit(
                 f"[bold green]✅ Complete![/bold green]\n"
