@@ -288,6 +288,7 @@ def generate_image(
     seed: int = -1,
     init_image: Optional[Image.Image] = None,
     strength: float = 0.75,
+    ref_images: Optional[List[Image.Image]] = None,
 ) -> List[str]:
     """Generate image(s), return list of base64 PNG strings."""
     with STATE._lock:
@@ -295,30 +296,30 @@ def generate_image(
             raise RuntimeError("Image generation model not loaded")
         sd = STATE.sd
 
-    if init_image is not None:
-        images = sd.img_to_img(
-            image=init_image,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            width=width,
-            height=height,
-            num_inference_steps=steps,
-            guidance_scale=cfg_scale,
-            strength=strength,
-            seed=seed,
-        )
-    else:
-        images = sd.txt_to_img(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            width=width,
-            height=height,
-            num_inference_steps=steps,
-            guidance_scale=cfg_scale,
-            seed=seed,
-        )
+    kwargs = dict(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        width=width,
+        height=height,
+        sample_steps=steps,
+        cfg_scale=cfg_scale,
+        sample_method="euler",
+        seed=seed,
+    )
 
-    return [pil_to_b64(img) for img in images]
+    if init_image is not None:
+        # img2img: use init_image + strength for denoising
+        kwargs["init_image"] = init_image
+        kwargs["strength"] = strength
+
+    if ref_images:
+        # ref_images: style reference for Z-Image/FLUX (does not affect denoising)
+        kwargs["ref_images"] = ref_images
+
+    result = sd.generate_image(**kwargs)
+
+    # generate_image always returns List[PIL.Image]
+    return [pil_to_b64(img) for img in result]
 
 
 # ─────────────────────────── HTTP Request Handler ─────────────────────────────
@@ -428,12 +429,19 @@ class ModelServerHandler(BaseHTTPRequestHandler):
                 cfg    = float(payload.get("cfg_scale", 1.0))
                 seed   = int(payload.get("seed", -1))
 
-                init_img = None
-                strength = float(payload.get("denoising_strength", 0.75))
+                init_img  = None
+                ref_imgs  = None
+                strength  = float(payload.get("denoising_strength", 0.75))
+
                 if path in ("/image/img2img", "/img2img"):
                     raw_list = payload.get("init_images", [])
                     if raw_list:
                         init_img = b64_to_pil(raw_list[0])
+
+                # ref_images: optional style-reference list (Z-Image / FLUX Kontext)
+                raw_refs = payload.get("ref_images", [])
+                if raw_refs:
+                    ref_imgs = [b64_to_pil(r) for r in raw_refs]
 
                 images_b64 = generate_image(
                     prompt=prompt,
@@ -441,6 +449,7 @@ class ModelServerHandler(BaseHTTPRequestHandler):
                     width=width, height=height,
                     steps=steps, cfg_scale=cfg, seed=seed,
                     init_image=init_img, strength=strength,
+                    ref_images=ref_imgs,
                 )
                 self.send_json({"images": images_b64})
             except Exception as e:
