@@ -1,784 +1,1068 @@
 // ============================================================
-// TRELLIS.2 Studio — Client JavaScript
-// Single-page app: sidebar controls, canvas viewport with
-// model tab navigation, console drawer, re-render support.
+// RTS Lab — World Editor Engine
+//
+// Features:
+//  • RTS 2.5D camera (RMB pan, MMB orbit, scroll zoom)
+//  • GLB loading from TRELLIS output or file drop
+//  • Transform gizmos (move/rotate/scale) with grid snap
+//  • Procedural terrain generator (diamond-square heightmap)
+//  • Persistent save/load to Google Drive
+//  • Bake high-res screenshot with shadows
+//  • Export entire scene as GLB
+//  • Full scene graph + property editing
 // ============================================================
+
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+import { TransformControls } from 'three/addons/controls/TransformControls.js';
 
 // ── Helpers ──
 const $ = id => document.getElementById(id);
-const enc = s => encodeURIComponent(s);
-const esc = s => { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; };
-const fmtTime = s => { const m = Math.floor(s / 60), sec = Math.floor(s % 60); return m + ':' + String(sec).padStart(2, '0'); };
+const round3 = v => Math.round(v * 1000) / 1000;
+const fmtNum = n => n >= 1e6 ? (n/1e6).toFixed(1)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'K' : String(n);
 
 // ══════════════════════════════════════════════════════════════
 // STATE
 // ══════════════════════════════════════════════════════════════
 
-let files3d = [];
-let filesRmbg = [];
-let selectedRenderMode = 'video';
-let lastHwLogPath = null;
+let renderer, scene, camera, orbit, gizmo, gltfLoader;
+let clock, raycaster, mouse;
+let ground, grid, sunLight, ambient;
 
-// completedModels: array of result objects from API, enriched with UI state
-// Each: { name, glb, media?, media_type?, sprite_frames?, sprite_dir? }
-let completedModels = [];
-let activeModelIdx = -1;
+const objects = [];     // { id, name, mesh, type, glbPath?, glbUrl? }
+let selected = null;
+let nextId = 1;
+let activeTool = 'select';
+let snapOn = true, snapSize = 0.5;
+let worldName = 'untitled';
+
+// FPS
+let frameCnt = 0, fpsT = 0, fps = 0;
+
+// Axis mini-view
+let axScene, axCam, axRenderer;
 
 // ══════════════════════════════════════════════════════════════
-// SIDEBAR TAB SWITCHING
+// INIT
 // ══════════════════════════════════════════════════════════════
 
-function switchSidebarTab(btn) {
-    document.querySelectorAll('.sidebar-tab').forEach(b => b.classList.remove('active'));
-    document.querySelectorAll('.sidebar-panel').forEach(p => p.classList.remove('active'));
-    btn.classList.add('active');
-    $(btn.dataset.panel).classList.add('active');
+function init() {
+    const vp = $('viewport');
+    const canvas = $('canvas3d');
+
+    renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.1;
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setClearColor(0x1a1a2e, 1);
+
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1a1a2e);
+    scene.fog = new THREE.FogExp2(0x1a1a2e, 0.012);
+
+    camera = new THREE.PerspectiveCamera(35, 1, 0.1, 600);
+    camera.position.set(14, 16, 14);
+
+    // RTS controls: RMB pan, MMB orbit, scroll zoom
+    orbit = new OrbitControls(camera, canvas);
+    orbit.enableDamping = true;
+    orbit.dampingFactor = 0.1;
+    orbit.screenSpacePanning = true;
+    orbit.mouseButtons = { LEFT: null, MIDDLE: THREE.MOUSE.ROTATE, RIGHT: THREE.MOUSE.PAN };
+    orbit.touches = { ONE: THREE.TOUCH.PAN, TWO: THREE.TOUCH.DOLLY_ROTATE };
+    orbit.minPolarAngle = 0.15;
+    orbit.maxPolarAngle = Math.PI / 2.1;
+    orbit.minDistance = 3;
+    orbit.maxDistance = 120;
+    orbit.target.set(0, 0, 0);
+
+    // Transform gizmo
+    gizmo = new TransformControls(camera, canvas);
+    gizmo.setSize(0.65);
+    gizmo.addEventListener('dragging-changed', e => { orbit.enabled = !e.value; });
+    gizmo.addEventListener('objectChange', () => { updateProps(); updateTree(); });
+    scene.add(gizmo);
+
+    // Lights
+    ambient = new THREE.AmbientLight(0xffffff, 0.5);
+    scene.add(ambient);
+
+    sunLight = new THREE.DirectionalLight(0xfff5e6, 1.8);
+    setSunAngle(45);
+    sunLight.castShadow = true;
+    sunLight.shadow.mapSize.set(2048, 2048);
+    sunLight.shadow.camera.near = 0.5;
+    sunLight.shadow.camera.far = 100;
+    const sh = 35;
+    sunLight.shadow.camera.left = -sh;
+    sunLight.shadow.camera.right = sh;
+    sunLight.shadow.camera.top = sh;
+    sunLight.shadow.camera.bottom = -sh;
+    sunLight.shadow.bias = -0.0008;
+    sunLight.shadow.normalBias = 0.02;
+    scene.add(sunLight);
+    scene.add(sunLight.target);
+
+    scene.add(new THREE.HemisphereLight(0x8899bb, 0x445566, 0.25));
+
+    // Ground
+    createGround();
+
+    raycaster = new THREE.Raycaster();
+    mouse = new THREE.Vector2();
+    gltfLoader = new GLTFLoader();
+    clock = new THREE.Clock();
+
+    initAxis();
+    setupEvents();
+
+    new ResizeObserver(onResize).observe(vp);
+    onResize();
+
+    refreshModels();
+    refreshWorlds();
+    applySnap();
 }
 
 // ══════════════════════════════════════════════════════════════
-// CONSOLE DRAWER
+// GROUND
 // ══════════════════════════════════════════════════════════════
 
-let consoleOpen = false;
+function createGround() {
+    const geo = new THREE.PlaneGeometry(300, 300);
+    const mat = new THREE.ShadowMaterial({ opacity: 0.3 });
+    ground = new THREE.Mesh(geo, mat);
+    ground.rotation.x = -Math.PI / 2;
+    ground.receiveShadow = true;
+    ground.name = '__ground';
+    scene.add(ground);
 
-function toggleConsole() {
-    consoleOpen = !consoleOpen;
-    const drawer = $('consoleDrawer');
-    const btn = $('consoleToggle');
-    if (consoleOpen) {
-        document.documentElement.style.setProperty('--console-h', '200px');
-        drawer.classList.add('open');
-        btn.classList.add('active');
-        btn.textContent = '▾ Console';
-    } else {
-        document.documentElement.style.setProperty('--console-h', '0px');
-        drawer.classList.remove('open');
-        btn.classList.remove('active');
-        btn.textContent = '▸ Console';
-    }
+    grid = new THREE.GridHelper(120, 120, 0x2a3a4a, 0x1a2530);
+    grid.position.y = 0.002;
+    grid.name = '__grid';
+    scene.add(grid);
 }
 
-function switchConsoleTab(btn) {
-    document.querySelectorAll('.console-tab-btn').forEach(b => b.classList.remove('active'));
-    document.querySelectorAll('.console-content').forEach(c => c.style.display = 'none');
-    btn.classList.add('active');
-    $(btn.dataset.target).style.display = '';
+function setSunAngle(deg) {
+    const r = THREE.MathUtils.degToRad(deg);
+    const d = 30;
+    sunLight.position.set(d * Math.cos(r) * 0.7, d * Math.sin(r), d * Math.cos(r));
+    sunLight.target.position.set(0, 0, 0);
 }
 
 // ══════════════════════════════════════════════════════════════
-// RENDER MODE
+// AXIS INDICATOR
 // ══════════════════════════════════════════════════════════════
 
-function selectRender(el) {
-    document.querySelectorAll('.render-opt').forEach(m => m.classList.remove('sel'));
-    el.classList.add('sel');
-    selectedRenderMode = el.dataset.mode;
-    $('rtsSettings').classList.toggle('visible', selectedRenderMode === 'rts_sprite');
-    $('doomSettings').classList.toggle('visible', selectedRenderMode === 'doom_sprite');
+function initAxis() {
+    axScene = new THREE.Scene();
+    axCam = new THREE.PerspectiveCamera(50, 1, 0.1, 10);
+    axCam.position.set(0, 0, 2.5);
+    axRenderer = new THREE.WebGLRenderer({ canvas: $('axisCanvas'), alpha: true, antialias: true });
+    axRenderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    axRenderer.setSize(70, 70, false);
+    axScene.add(new THREE.AxesHelper(0.8));
 }
 
 // ══════════════════════════════════════════════════════════════
-// DROPZONE
+// EVENTS
 // ══════════════════════════════════════════════════════════════
 
-function initDrop(zId, iId, tId, bId, arr) {
-    const z = $(zId), inp = $(iId);
-    ['dragenter', 'dragover'].forEach(e => z.addEventListener(e, ev => { ev.preventDefault(); z.classList.add('over'); }));
-    ['dragleave', 'drop'].forEach(e => z.addEventListener(e, ev => { ev.preventDefault(); z.classList.remove('over'); }));
-    z.addEventListener('drop', ev => addFiles(ev.dataTransfer.files, arr, tId, bId));
-    inp.addEventListener('change', ev => { addFiles(ev.target.files, arr, tId, bId); inp.value = ''; });
-}
+let ptrDown = new THREE.Vector2(), ptrIsDown = false;
 
-function addFiles(fl, arr, tId, bId) {
-    for (const f of fl) if (f.type.startsWith('image/')) arr.push(f);
-    renderThumbs(arr, tId, bId);
-}
+function setupEvents() {
+    const c = $('canvas3d');
 
-function renderThumbs(arr, tId, bId) {
-    const t = $(tId);
-    t.innerHTML = '';
-    arr.forEach((f, i) => {
-        const d = document.createElement('div'); d.className = 'thumb';
-        const img = document.createElement('img'); img.src = URL.createObjectURL(f);
-        const x = document.createElement('button'); x.className = 'thumb-x'; x.textContent = '×';
-        x.onclick = () => { arr.splice(i, 1); renderThumbs(arr, tId, bId); };
-        d.append(img, x); t.append(d);
+    c.addEventListener('pointerdown', e => {
+        if (e.button !== 0) return;
+        ptrIsDown = true;
+        ptrDown.set(e.clientX, e.clientY);
     });
-    $(bId).disabled = arr.length === 0;
-}
 
-initDrop('dropzone3d', 'fileInput3d', 'thumbs3d', 'genBtn3d', files3d);
-initDrop('dropzoneRmbg', 'fileInputRmbg', 'thumbsRmbg', 'genBtnRmbg', filesRmbg);
+    c.addEventListener('pointerup', e => {
+        if (e.button !== 0 || !ptrIsDown) return;
+        ptrIsDown = false;
+        const dx = e.clientX - ptrDown.x, dy = e.clientY - ptrDown.y;
+        if (Math.sqrt(dx*dx+dy*dy) > 5 || gizmo.dragging) return;
 
-// ══════════════════════════════════════════════════════════════
-// KEEPALIVE
-// ══════════════════════════════════════════════════════════════
+        const rect = c.getBoundingClientRect();
+        mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+        raycaster.setFromCamera(mouse, camera);
 
-setInterval(async () => {
-    try {
-        const r = await fetch('/api/keepalive');
-        $('keepaliveBadge').querySelector('.dot').style.background = r.ok ? 'var(--green)' : 'var(--red)';
-    } catch (e) {
-        $('keepaliveBadge').querySelector('.dot').style.background = 'var(--red)';
-    }
-}, 60000);
+        const targets = [];
+        objects.forEach(o => o.mesh.traverse(ch => { if (ch.isMesh) targets.push(ch); }));
+        const hits = raycaster.intersectObjects(targets, false);
 
-// ══════════════════════════════════════════════════════════════
-// MODEL TAB NAVIGATION
-// ══════════════════════════════════════════════════════════════
-
-function rebuildModelTabs() {
-    const bar = $('canvasTopbar');
-    bar.innerHTML = '';
-    completedModels.forEach((m, i) => {
-        const btn = document.createElement('button');
-        btn.className = 'model-tab' + (i === activeModelIdx ? ' active' : '');
-        btn.title = m.name;
-        btn.onclick = () => selectModel(i);
-
-        const label = document.createElement('span');
-        label.className = 'mt-label';
-        label.textContent = m.name;
-        btn.appendChild(label);
-
-        const x = document.createElement('span');
-        x.className = 'mt-close';
-        x.textContent = '×';
-        x.onclick = (e) => { e.stopPropagation(); closeModel(i); };
-        btn.appendChild(x);
-
-        bar.appendChild(btn);
+        if (hits.length) {
+            const hit = hits[0].object;
+            const wo = objects.find(o => { let f = false; o.mesh.traverse(ch => { if (ch === hit) f = true; }); return f; });
+            if (wo) select(wo);
+            else deselect();
+        } else {
+            deselect();
+        }
     });
-    const spacer = document.createElement('div');
-    spacer.className = 'topbar-spacer';
-    bar.appendChild(spacer);
-}
 
-function closeModel(idx) {
-    completedModels.splice(idx, 1);
-    if (completedModels.length === 0) {
-        activeModelIdx = -1;
-        rebuildModelTabs();
-        // Show empty state
-        $('canvasEmpty').style.display = '';
-        $('canvasMedia').classList.remove('active');
-        $('canvasNoRender').classList.remove('active');
-        $('spriteStrip').classList.remove('active');
-        if (window.viewer3d) window.viewer3d.hide();
-        $('barName').textContent = '—';
-        $('barActions').innerHTML = '';
-    } else {
-        if (activeModelIdx >= completedModels.length) {
-            activeModelIdx = completedModels.length - 1;
-        } else if (activeModelIdx > idx) {
-            activeModelIdx--;
-        } else if (activeModelIdx === idx) {
-            activeModelIdx = Math.min(idx, completedModels.length - 1);
+    c.addEventListener('contextmenu', e => e.preventDefault());
+
+    // Viewport drop
+    const vp = $('viewport');
+    vp.addEventListener('dragover', e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+    vp.addEventListener('drop', e => {
+        e.preventDefault();
+        const md = e.dataTransfer.getData('application/x-rtslab-model');
+        if (md) {
+            const m = JSON.parse(md);
+            const pos = getGroundHit(e);
+            addGLB(m.glb_url, m.name, m.glb_path, pos);
+            return;
         }
-        rebuildModelTabs();
-        selectModel(activeModelIdx);
-    }
-}
+        handleFileDrop(e.dataTransfer.files);
+    });
 
-function selectModel(idx) {
-    if (idx < 0 || idx >= completedModels.length) return;
-    activeModelIdx = idx;
-    rebuildModelTabs();
-    showModelInCanvas(completedModels[idx]);
-}
+    // Keyboard
+    window.addEventListener('keydown', onKey);
 
-function showModelInCanvas(model) {
-    const empty = $('canvasEmpty');
-    const media = $('canvasMedia');
-    const noRender = $('canvasNoRender');
-    const strip = $('spriteStrip');
+    // Tool buttons
+    document.querySelectorAll('.tb[data-tool]').forEach(b => b.addEventListener('click', () => setTool(b.dataset.tool)));
+    $('btnDuplicate').addEventListener('click', duplicate);
+    $('btnDelete').addEventListener('click', deleteObj);
+    $('btnSnap').addEventListener('click', () => { snapOn = !snapOn; $('btnSnap').classList.toggle('active', snapOn); applySnap(); });
+    $('snapSize').addEventListener('change', () => { snapSize = parseFloat($('snapSize').value); applySnap(); });
 
-    empty.style.display = 'none';
-    media.classList.remove('active');
-    noRender.classList.remove('active');
-    strip.classList.remove('active');
-    media.innerHTML = '';
-    strip.innerHTML = '';
+    // Primitives
+    document.querySelectorAll('.prim').forEach(b => b.addEventListener('click', () => addPrimitive(b.dataset.prim)));
 
-    // Hide 3D viewer if open
-    if (window.viewer3d) window.viewer3d.hide();
+    // Terrain
+    $('btnGenTerrain').addEventListener('click', generateTerrain);
 
-    // Show media
-    if (model.media && model.media_type === 'video') {
-        const vid = document.createElement('video');
-        vid.src = '/api/file?p=' + enc(model.media);
-        vid.controls = true; vid.autoplay = true; vid.muted = true; vid.loop = true; vid.playsInline = true;
-        media.appendChild(vid);
-        media.classList.add('active');
-    } else if (model.media && (model.media_type === 'image' || model.media_type === 'rts_sprite' || model.media_type === 'doom_sprite')) {
-        const img = document.createElement('img');
-        img.src = '/api/file?p=' + enc(model.media);
-        img.alt = model.name;
-        if (model.media_type === 'rts_sprite' || model.media_type === 'doom_sprite') {
-            img.className = 'sprite-preview';
-        }
-        media.appendChild(img);
-        media.classList.add('active');
-    } else {
-        noRender.classList.add('active');
-    }
+    // Properties
+    ['pPosX','pPosY','pPosZ','pRotX','pRotY','pRotZ','pScX','pScY','pScZ'].forEach(id => {
+        $(id).addEventListener('input', onPropInput);
+    });
 
-    // Sprite strip
-    if (model.sprite_frames && model.sprite_frames.length) {
-        model.sprite_frames.forEach(fp => {
-            const a = document.createElement('a');
-            a.href = '/api/file?p=' + enc(fp);
-            a.download = fp.split('/').pop();
-            a.className = 'sf';
-            const img = document.createElement('img');
-            img.src = '/api/file?p=' + enc(fp);
-            img.loading = 'lazy';
-            a.appendChild(img);
-            strip.appendChild(a);
+    // Panel tabs
+    document.querySelectorAll('.ptab').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const parent = btn.closest('#panelLeft, #panelRight');
+            parent.querySelectorAll('.ptab').forEach(b => b.classList.remove('active'));
+            parent.querySelectorAll('.panel-body').forEach(p => p.classList.remove('active'));
+            btn.classList.add('active');
+            $(btn.dataset.panel).classList.add('active');
         });
-        strip.classList.add('active');
-    }
-
-    // Bottom bar
-    updateBottomBar(model);
-}
-
-function updateBottomBar(model) {
-    $('barName').textContent = model.name;
-    const acts = $('barActions');
-    acts.innerHTML = '';
-
-    // Download GLB
-    const dlGlb = document.createElement('a');
-    dlGlb.href = '/api/file?p=' + enc(model.glb);
-    dlGlb.download = model.name + '.glb';
-    dlGlb.className = 'bar-btn gold';
-    dlGlb.innerHTML = '↓ GLB';
-    acts.appendChild(dlGlb);
-
-    // View 3D button
-    const v3d = document.createElement('button');
-    v3d.className = 'bar-btn green';
-    v3d.innerHTML = '🔺 View 3D';
-    v3d.onclick = () => {
-        if (window.viewer3d && model.glb) {
-            window.viewer3d.loadFromUrl('/api/file?p=' + enc(model.glb), model.name);
-        }
-    };
-    acts.appendChild(v3d);
-
-    // Download media
-    if (model.media) {
-        const dlM = document.createElement('a');
-        dlM.href = '/api/file?p=' + enc(model.media);
-        let ext = 'png';
-        let label = 'PNG';
-        if (model.media_type === 'video') { ext = 'mp4'; label = 'MP4'; }
-        else if (model.media_type === 'rts_sprite') { label = 'Sprites'; }
-        else if (model.media_type === 'doom_sprite') { label = 'Doom'; }
-        dlM.download = model.name + '.' + ext;
-        dlM.className = 'bar-btn blue';
-        dlM.innerHTML = '↓ ' + label;
-        acts.appendChild(dlM);
-    }
-
-    // Re-render button
-    const wrap = document.createElement('div');
-    wrap.className = 'rerender-wrap';
-    const rrBtn = document.createElement('button');
-    rrBtn.className = 'bar-btn outline';
-    rrBtn.innerHTML = '🎬 Re-render';
-    rrBtn.onclick = (e) => {
-        e.stopPropagation();
-        wrap.querySelector('.rerender-dropdown').classList.toggle('open');
-    };
-    wrap.appendChild(rrBtn);
-
-    const dd = document.createElement('div');
-    dd.className = 'rerender-dropdown';
-    const modes = [
-        { mode: 'snapshot', icon: '📷', label: 'Snapshot' },
-        { mode: 'video', icon: '🎬', label: 'Video 360°' },
-        { mode: 'perspective', icon: '🔄', label: 'Turntable' },
-        { mode: 'rts_sprite', icon: '🎮', label: 'RTS Sprite' },
-        { mode: 'doom_sprite', icon: '👹', label: 'Doom Sprite' },
-    ];
-    modes.forEach(m => {
-        const item = document.createElement('button');
-        item.className = 'rd-item';
-        item.innerHTML = `<span class="rd-icon">${m.icon}</span><span class="rd-label">${m.label}</span>`;
-        item.onclick = () => {
-            dd.classList.remove('open');
-            requestRerender(model, m.mode);
-        };
-        dd.appendChild(item);
     });
-    wrap.appendChild(dd);
-    acts.appendChild(wrap);
 
-    // HW usage log download button
-    if (lastHwLogPath) {
-        const dlHw = document.createElement('a');
-        dlHw.href = '/api/file?p=' + enc(lastHwLogPath);
-        dlHw.download = 'hw_usage_log.csv';
-        dlHw.className = 'bar-btn outline';
-        dlHw.innerHTML = '📊 HW Log';
-        dlHw.title = 'Download GPU/CPU usage log (CSV)';
-        acts.appendChild(dlHw);
+    // Environment
+    $('envSky').addEventListener('input', e => { const c = new THREE.Color(e.target.value); scene.background = c; scene.fog.color = c; renderer.setClearColor(c); });
+    $('envAmbient').addEventListener('input', e => { ambient.intensity = parseFloat(e.target.value); });
+    $('envSunAngle').addEventListener('input', e => { setSunAngle(parseFloat(e.target.value)); });
+    $('envSunColor').addEventListener('input', e => { sunLight.color.set(e.target.value); });
+    $('envFog').addEventListener('input', e => { scene.fog.density = parseFloat(e.target.value); });
+    $('envGround').addEventListener('change', e => { grid.visible = e.target.value === 'grid'; ground.visible = e.target.value !== 'none'; });
+    $('envGroundColor').addEventListener('input', e => {
+        if (ground.material.type !== 'ShadowMaterial') ground.material.color.set(e.target.value);
+    });
+
+    // File input dropzone
+    const dz = $('dropzone'), fi = $('fileInput');
+    ['dragenter','dragover'].forEach(e => dz.addEventListener(e, ev => { ev.preventDefault(); dz.classList.add('over'); }));
+    ['dragleave','drop'].forEach(e => dz.addEventListener(e, ev => { ev.preventDefault(); dz.classList.remove('over'); }));
+    dz.addEventListener('drop', ev => handleFileDrop(ev.dataTransfer.files));
+    fi.addEventListener('change', ev => { handleFileDrop(ev.target.files); fi.value = ''; });
+
+    // Save / Load
+    $('btnSaveWorld').addEventListener('click', saveWorld);
+    $('btnRefreshWorlds').addEventListener('click', refreshWorlds);
+    $('btnRefreshModels').addEventListener('click', refreshModels);
+
+    // Bake
+    $('btnBake').addEventListener('click', () => $('bakeModal').classList.add('open'));
+    $('bakeModalClose').addEventListener('click', () => $('bakeModal').classList.remove('open'));
+    $('bakeCancel').addEventListener('click', () => $('bakeModal').classList.remove('open'));
+    $('bakeGo').addEventListener('click', bakeView);
+
+    // Export
+    $('btnExport').addEventListener('click', exportScene);
+}
+
+function onKey(e) {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
+    switch (e.key.toLowerCase()) {
+        case 'v': setTool('select'); break;
+        case 'g': setTool('move'); break;
+        case 'r': setTool('rotate'); break;
+        case 's': if (!e.ctrlKey && !e.metaKey) { e.preventDefault(); setTool('scale'); } break;
+        case 'x': case 'delete': case 'backspace': deleteObj(); break;
+        case 'd': if (e.shiftKey) { e.preventDefault(); duplicate(); } break;
+        case 'escape': deselect(); break;
+        case 'f': if (selected) focusObj(selected); break;
     }
+}
 
-    // Close dropdown on outside click
-    document.addEventListener('click', () => {
-        document.querySelectorAll('.rerender-dropdown.open').forEach(d => d.classList.remove('open'));
-    }, { once: false });
+function getGroundHit(e) {
+    const rect = $('canvas3d').getBoundingClientRect();
+    const mx = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    const my = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+    raycaster.setFromCamera(new THREE.Vector2(mx, my), camera);
+    const hits = raycaster.intersectObject(ground);
+    if (hits.length) return new THREE.Vector3(snap(hits[0].point.x), 0, snap(hits[0].point.z));
+    return null;
 }
 
 // ══════════════════════════════════════════════════════════════
-// RE-RENDER (POST-HOC) — uses cached render mesh
+// TOOLS
 // ══════════════════════════════════════════════════════════════
 
-async function requestRerender(model, mode) {
-    if (!model.render_mesh) {
-        alert(
-            `Cannot re-render "${model.name}" — no cached render mesh found.\n\n` +
-            `This model was generated before mesh caching was added, ` +
-            `or the cache file was deleted. Re-generate the model to enable re-rendering.`
-        );
-        return;
+function setTool(t) {
+    activeTool = t;
+    document.querySelectorAll('.tb[data-tool]').forEach(b => b.classList.toggle('active', b.dataset.tool === t));
+    if (!selected) { gizmo.detach(); return; }
+    if (t === 'select') gizmo.detach();
+    else { gizmo.attach(selected.mesh); gizmo.setMode(t === 'move' ? 'translate' : t); }
+    applySnap();
+}
+
+function applySnap() {
+    if (snapOn) {
+        gizmo.setTranslationSnap(snapSize);
+        gizmo.setRotationSnap(THREE.MathUtils.degToRad(15));
+        gizmo.setScaleSnap(0.1);
+    } else {
+        gizmo.setTranslationSnap(null);
+        gizmo.setRotationSnap(null);
+        gizmo.setScaleSnap(null);
+    }
+}
+
+function snap(v) { return snapOn ? Math.round(v / snapSize) * snapSize : v; }
+
+// ══════════════════════════════════════════════════════════════
+// SELECTION
+// ══════════════════════════════════════════════════════════════
+
+function select(wo) {
+    deselect(true);
+    selected = wo;
+    wo.mesh.traverse(ch => {
+        if (ch.isMesh && ch.material) {
+            ch._savedEmissive = ch.material.emissive?.clone();
+            ch._savedEI = ch.material.emissiveIntensity;
+            if (ch.material.emissive) { ch.material.emissive.set(0xE8A917); ch.material.emissiveIntensity = 0.07; }
+        }
+    });
+    if (activeTool !== 'select') {
+        gizmo.attach(wo.mesh);
+        gizmo.setMode(activeTool === 'move' ? 'translate' : activeTool);
+    }
+    updateProps();
+    updateTree();
+    $('selName').textContent = wo.name;
+}
+
+function deselect(silent) {
+    if (selected) {
+        selected.mesh.traverse(ch => {
+            if (ch.isMesh && ch.material && ch._savedEmissive !== undefined) {
+                ch.material.emissive.copy(ch._savedEmissive);
+                ch.material.emissiveIntensity = ch._savedEI;
+            }
+        });
+    }
+    selected = null;
+    gizmo.detach();
+    if (!silent) { updateProps(); updateTree(); $('selName').textContent = 'Nothing selected'; }
+}
+
+function focusObj(wo) {
+    const box = new THREE.Box3().setFromObject(wo.mesh);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    orbit.target.copy(center);
+    const dir = camera.position.clone().sub(center).normalize();
+    camera.position.copy(center).add(dir.multiplyScalar(Math.max(size.x, size.y, size.z) * 3));
+    orbit.update();
+}
+
+// ══════════════════════════════════════════════════════════════
+// ADD OBJECTS
+// ══════════════════════════════════════════════════════════════
+
+function addPrimitive(type) {
+    let geo, mat, name;
+    mat = new THREE.MeshStandardMaterial({ color: 0x788899, roughness: 0.7, metalness: 0.05 });
+
+    switch (type) {
+        case 'box': geo = new THREE.BoxGeometry(1,1,1); name = 'Box'; break;
+        case 'sphere': geo = new THREE.SphereGeometry(0.5,32,24); name = 'Sphere'; break;
+        case 'cylinder': geo = new THREE.CylinderGeometry(0.5,0.5,1,32); name = 'Cylinder'; break;
+        case 'plane':
+            geo = new THREE.PlaneGeometry(10,10);
+            mat = new THREE.MeshStandardMaterial({ color: 0x2a3a2a, roughness: 0.9, side: THREE.DoubleSide });
+            name = 'Ground'; break;
+        case 'cone': geo = new THREE.ConeGeometry(0.5,1,32); name = 'Cone'; break;
+        case 'rocks': return addRockCluster();
+        default: return;
     }
 
-    // Show progress
-    $('canvasProgress').classList.add('active');
-    $('cpPhase').textContent = `Re-rendering as ${mode}…`;
-    $('cpDetail').textContent = model.name;
-    $('cpFill').style.width = '0%';
-    $('cpPct').textContent = '0%';
-    ensureHwPolling();
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.castShadow = true; mesh.receiveShadow = true;
+
+    if (type === 'plane') { mesh.rotation.x = -Math.PI/2; mesh.position.y = 0.002; mesh.castShadow = false; }
+    else {
+        const t = orbit.target.clone();
+        mesh.position.set(snap(t.x), 0.5, snap(t.z));
+    }
+
+    const wo = register(mesh, name, 'primitive');
+    scene.add(mesh);
+    select(wo);
+    hideEmpty();
+}
+
+function addRockCluster() {
+    const group = new THREE.Group();
+    group.name = 'Rocks';
+
+    const rockCount = 3 + Math.floor(Math.random() * 4);
+    for (let i = 0; i < rockCount; i++) {
+        const s = 0.2 + Math.random() * 0.6;
+        const geo = new THREE.DodecahedronGeometry(s, 1);
+        // Deform vertices for organic shape
+        const pos = geo.attributes.position;
+        for (let j = 0; j < pos.count; j++) {
+            pos.setXYZ(j,
+                pos.getX(j) * (0.7 + Math.random() * 0.6),
+                pos.getY(j) * (0.5 + Math.random() * 0.5),
+                pos.getZ(j) * (0.7 + Math.random() * 0.6),
+            );
+        }
+        geo.computeVertexNormals();
+
+        const shade = 0.3 + Math.random() * 0.2;
+        const mat = new THREE.MeshStandardMaterial({ color: new THREE.Color(shade, shade * 0.95, shade * 0.85), roughness: 0.9 });
+        const rock = new THREE.Mesh(geo, mat);
+        rock.position.set((Math.random()-0.5)*2, s*0.4, (Math.random()-0.5)*2);
+        rock.rotation.set(Math.random()*0.5, Math.random()*Math.PI*2, Math.random()*0.3);
+        rock.castShadow = true; rock.receiveShadow = true;
+        group.add(rock);
+    }
+
+    const t = orbit.target.clone();
+    group.position.set(snap(t.x), 0, snap(t.z));
+    scene.add(group);
+    const wo = register(group, 'Rocks', 'primitive');
+    select(wo);
+    hideEmpty();
+}
+
+function addGLB(url, name, glbPath, position) {
+    gltfLoader.load(url, (gltf) => {
+        const root = gltf.scene || gltf.scenes?.[0];
+        if (!root) return;
+
+        const box = new THREE.Box3().setFromObject(root);
+        const size = box.getSize(new THREE.Vector3());
+        const center = box.getCenter(new THREE.Vector3());
+        const maxDim = Math.max(size.x, size.y, size.z) || 1;
+
+        const container = new THREE.Group();
+        container.name = name;
+
+        const scaleFactor = 2 / maxDim;
+        root.position.sub(center).multiplyScalar(scaleFactor);
+        root.scale.multiplyScalar(scaleFactor);
+        root.updateMatrixWorld(true);
+
+        const newBox = new THREE.Box3().setFromObject(root);
+        root.position.y += -newBox.min.y;
+
+        container.add(root);
+        container.traverse(ch => { if (ch.isMesh) { ch.castShadow = true; ch.receiveShadow = true; } });
+
+        if (position) container.position.copy(position);
+        else { const t = orbit.target.clone(); container.position.set(snap(t.x), 0, snap(t.z)); }
+
+        scene.add(container);
+        const wo = register(container, name, 'glb', glbPath, url);
+        select(wo);
+        hideEmpty();
+    }, undefined, err => console.error('GLB error:', err));
+}
+
+function register(mesh, name, type, glbPath, glbUrl) {
+    const id = nextId++;
+    const displayName = `${name}_${id}`;
+    const wo = { id, name: displayName, mesh, type, glbPath: glbPath || null, glbUrl: glbUrl || null };
+    objects.push(wo);
+    mesh.userData._woId = id;
+    updateTree();
+    updateHud();
+    return wo;
+}
+
+// ══════════════════════════════════════════════════════════════
+// DUPLICATE / DELETE
+// ══════════════════════════════════════════════════════════════
+
+function duplicate() {
+    if (!selected) return;
+    const wo = selected;
+    const cl = wo.mesh.clone();
+    cl.traverse(ch => { if (ch.isMesh && ch.material) ch.material = ch.material.clone(); });
+    cl.position.x += 1.5;
+    cl.position.z += 1.5;
+    scene.add(cl);
+    select(register(cl, wo.name.replace(/_\d+$/, ''), wo.type, wo.glbPath, wo.glbUrl));
+}
+
+function deleteObj() {
+    if (!selected) return;
+    const wo = selected;
+    deselect();
+    scene.remove(wo.mesh);
+    wo.mesh.traverse(ch => { if (ch.isMesh) { ch.geometry?.dispose(); if (Array.isArray(ch.material)) ch.material.forEach(m => m?.dispose()); else ch.material?.dispose(); } });
+    const i = objects.indexOf(wo);
+    if (i >= 0) objects.splice(i, 1);
+    updateTree(); updateHud();
+    if (objects.length === 0) showEmpty();
+}
+
+// ══════════════════════════════════════════════════════════════
+// TERRAIN GENERATOR (Diamond-Square)
+// ══════════════════════════════════════════════════════════════
+
+function generateTerrain() {
+    const mapSize = parseInt($('terrainSize').value);
+    const maxH = parseFloat($('terrainHeight').value);
+    const roughness = parseFloat($('terrainRough').value);
+    const seed = parseInt($('terrainSeed').value);
+
+    // Diamond-square heightmap
+    const n = Math.pow(2, Math.ceil(Math.log2(mapSize))) + 1;
+    const hmap = new Float32Array(n * n);
+
+    // Seeded random
+    let _s = seed;
+    const srand = () => { _s = (_s * 16807 + 0) % 2147483647; return (_s / 2147483647) - 0.5; };
+
+    // Corners
+    hmap[0] = srand() * maxH;
+    hmap[n - 1] = srand() * maxH;
+    hmap[(n-1)*n] = srand() * maxH;
+    hmap[(n-1)*n + n-1] = srand() * maxH;
+
+    let step = n - 1;
+    let scale = roughness;
+
+    while (step > 1) {
+        const half = step >> 1;
+
+        // Diamond
+        for (let y = half; y < n; y += step) {
+            for (let x = half; x < n; x += step) {
+                const a = hmap[(y-half)*n + (x-half)];
+                const b = hmap[(y-half)*n + (x+half)];
+                const c = hmap[(y+half)*n + (x-half)];
+                const d = hmap[(y+half)*n + (x+half)];
+                hmap[y*n + x] = (a+b+c+d)/4 + srand()*scale;
+            }
+        }
+
+        // Square
+        for (let y = 0; y < n; y += half) {
+            for (let x = ((y/half) % 2 === 0 ? half : 0); x < n; x += step) {
+                let sum = 0, cnt = 0;
+                if (y >= half) { sum += hmap[(y-half)*n+x]; cnt++; }
+                if (y+half < n) { sum += hmap[(y+half)*n+x]; cnt++; }
+                if (x >= half) { sum += hmap[y*n+(x-half)]; cnt++; }
+                if (x+half < n) { sum += hmap[y*n+(x+half)]; cnt++; }
+                hmap[y*n+x] = sum/cnt + srand()*scale;
+            }
+        }
+
+        step = half;
+        scale *= 0.5;
+    }
+
+    // Ensure edges are at 0 for clean borders
+    for (let i = 0; i < n; i++) {
+        hmap[i] = 0;
+        hmap[(n-1)*n+i] = 0;
+        hmap[i*n] = 0;
+        hmap[i*n+n-1] = 0;
+    }
+
+    // Clamp negatives
+    for (let i = 0; i < hmap.length; i++) hmap[i] = Math.max(hmap[i], 0);
+
+    // Build mesh
+    const geo = new THREE.PlaneGeometry(mapSize, mapSize, n-1, n-1);
+    geo.rotateX(-Math.PI / 2);
+
+    const pos = geo.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+        const col = i % n;
+        const row = Math.floor(i / n);
+        pos.setY(i, hmap[row * n + col]);
+    }
+    geo.computeVertexNormals();
+
+    // Color by height
+    const colors = new Float32Array(pos.count * 3);
+    for (let i = 0; i < pos.count; i++) {
+        const h = pos.getY(i);
+        const t = maxH > 0 ? h / maxH : 0;
+        // Gradient: dark green → green → brown → grey → white
+        let r, g, b;
+        if (t < 0.15) { r = 0.12; g = 0.18; b = 0.08; }       // valley floor
+        else if (t < 0.35) { r = 0.15; g = 0.28; b = 0.1; }    // grass
+        else if (t < 0.6) { r = 0.25; g = 0.22; b = 0.14; }    // dirt
+        else if (t < 0.8) { r = 0.35; g = 0.33; b = 0.3; }     // rock
+        else { r = 0.55; g = 0.55; b = 0.58; }                  // snow/peak
+        colors[i*3] = r; colors[i*3+1] = g; colors[i*3+2] = b;
+    }
+    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+    const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, metalness: 0, flatShading: true });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    mesh.position.y = 0;
+
+    scene.add(mesh);
+    const wo = register(mesh, 'Terrain', 'terrain');
+    select(wo);
+    hideEmpty();
+
+    // Zoom to fit
+    focusObj(wo);
+}
+
+// ══════════════════════════════════════════════════════════════
+// FILE DROP
+// ══════════════════════════════════════════════════════════════
+
+function handleFileDrop(files) {
+    for (const f of files) {
+        if (!f.name.match(/\.(glb|gltf)$/i)) continue;
+        const url = URL.createObjectURL(f);
+        addGLB(url, f.name.replace(/\.(glb|gltf)$/i, ''));
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// MODEL LIST
+// ══════════════════════════════════════════════════════════════
+
+async function refreshModels() {
+    const list = $('modelList');
+    list.innerHTML = '<div class="model-empty">Scanning…</div>';
+    try {
+        const r = await fetch('/api/models');
+        const d = await r.json();
+        if (!d.models || d.models.length === 0) {
+            list.innerHTML = '<div class="model-empty">No GLBs found in trellis output.<br>Generate models first, or import below.</div>';
+            return;
+        }
+        list.innerHTML = '';
+        d.models.forEach(m => {
+            const el = document.createElement('div');
+            el.className = 'model-item';
+            el.draggable = true;
+            el.innerHTML = `<span class="mi-icon">📦</span><span class="mi-name" title="${m.name}">${m.name}</span><span class="mi-size">${m.size_kb}KB</span><button class="mi-add" title="Add to world">+</button>`;
+            el.querySelector('.mi-add').addEventListener('click', e => { e.stopPropagation(); addGLB(m.glb_url, m.name, m.glb_path); });
+            el.addEventListener('dragstart', e => { e.dataTransfer.setData('application/x-rtslab-model', JSON.stringify(m)); e.dataTransfer.effectAllowed = 'copy'; });
+            list.appendChild(el);
+        });
+    } catch (e) {
+        list.innerHTML = '<div class="model-empty">Failed to load models.</div>';
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// WORLD SAVE / LOAD
+// ══════════════════════════════════════════════════════════════
+
+async function saveWorld() {
+    const name = $('worldNameInput').value.trim() || 'untitled';
+    worldName = name;
+    $('worldNameDisplay').textContent = name;
+
+    const worldData = {
+        camera: {
+            position: camera.position.toArray(),
+            target: orbit.target.toArray(),
+        },
+        environment: {
+            sky: '#' + scene.background.getHexString(),
+            ambient: ambient.intensity,
+            sunAngle: parseFloat($('envSunAngle').value),
+            sunColor: '#' + sunLight.color.getHexString(),
+            fogDensity: scene.fog.density,
+            groundStyle: $('envGround').value,
+        },
+        objects: objects.map(wo => ({
+            name: wo.name,
+            type: wo.type,
+            glbPath: wo.glbPath || null,
+            glbUrl: wo.glbUrl || null,
+            position: wo.mesh.position.toArray(),
+            rotation: [wo.mesh.rotation.x, wo.mesh.rotation.y, wo.mesh.rotation.z],
+            scale: wo.mesh.scale.toArray(),
+            visible: wo.mesh.visible,
+        })),
+    };
 
     try {
-        const r = await fetch('/api/rerender', {
+        const r = await fetch('/api/world/save', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                render_mesh: model.render_mesh,
-                name: model.name,
-                mode: mode,
-                output_dir: $('sOutDir').value,
-                fps: parseInt($('sFps').value),
-                sprite_directions: parseInt($('sSpriteDirections').value),
-                sprite_size: parseInt($('sSpriteSize').value),
-                sprite_pitch: parseFloat($('sSpritePitch').value),
-                doom_directions: parseInt($('sDoomDirections').value),
-                doom_size: parseInt($('sDoomSize').value),
-                doom_pitch: parseFloat($('sDoomPitch').value),
-            }),
+            body: JSON.stringify({ name, world: worldData }),
         });
         const d = await r.json();
-        if (!d.job_id) throw new Error(d.error || 'Failed');
-
-        // Poll the rerender job
-        pollRerender(d.job_id, model);
-    } catch (e) {
-        alert('Re-render failed: ' + e.message);
-        $('canvasProgress').classList.remove('active');
-        stopHwPolling();
-    }
-}
-
-function pollRerender(jobId, originalModel) {
-    const iv = setInterval(async () => {
-        try {
-            const r = await fetch('/api/status/' + jobId);
-            const d = await r.json();
-            const p = d.progress || {};
-
-            $('cpPhase').textContent = p.phase || '';
-            $('cpFill').style.width = (p.pct || 0) + '%';
-            $('cpPct').textContent = Math.round(p.pct || 0) + '%';
-
-            if (d.log) {
-                $('consoleJob').textContent = d.log.join('\n');
-                $('consoleJob').scrollTop = $('consoleJob').scrollHeight;
-            }
-
-            if (d.status === 'done') {
-                clearInterval(iv);
-                $('canvasProgress').classList.remove('active');
-                stopHwPolling();
-
-                // Update the model in our list with new media
-                if (d.results && d.results.length > 0) {
-                    const newResult = d.results[0];
-                    const idx = completedModels.findIndex(m => m.name === originalModel.name);
-                    if (idx >= 0) {
-                        // Preserve render_mesh, update media
-                        completedModels[idx] = {
-                            ...completedModels[idx],
-                            ...newResult,
-                            render_mesh: completedModels[idx].render_mesh || newResult.render_mesh,
-                        };
-                        selectModel(idx);
-                    } else {
-                        completedModels.push(newResult);
-                        rebuildModelTabs();
-                        selectModel(completedModels.length - 1);
-                    }
-                }
-            }
-        } catch (e) {
-            console.error('rerender poll error:', e);
+        if (d.ok) {
+            showToast(`💾 Saved "${name}"`);
+            refreshWorlds();
+        } else {
+            showToast('❌ Save failed: ' + (d.error || ''));
         }
-    }, 800);
+    } catch (e) {
+        showToast('❌ Save failed');
+    }
 }
 
-// ══════════════════════════════════════════════════════════════
-// POLLING
-// ══════════════════════════════════════════════════════════════
+async function loadWorld(name) {
+    try {
+        const r = await fetch(`/api/world/load?name=${encodeURIComponent(name)}`);
+        const d = await r.json();
+        if (!d.ok) { showToast('❌ Load failed'); return; }
 
-let timers = {};
-let localStart = {};
-let lastResultCount = 0;
-
-function poll(jobId, type, cfg) {
-    if (timers[type]) clearInterval(timers[type]);
-    if (!localStart[type]) localStart[type] = Date.now();
-    lastResultCount = 0;
-
-    timers[type] = setInterval(async () => {
-        try {
-            const r = await fetch('/api/status/' + jobId);
-            const d = await r.json();
-            const p = d.progress || {};
-
-            // ── Update progress overlay ──
-            if (type === 'generate') {
-                const pct = p.pct || 0;
-                $('cpPhase').textContent = p.phase || '';
-                $('cpDetail').textContent = p.image_num && p.total
-                    ? `Image ${p.image_num} of ${p.total}` + (p.name ? ` — ${p.name}` : '')
-                    : '';
-                $('cpFill').style.width = pct + '%';
-                $('cpPct').textContent = Math.round(pct) + '% · ' + fmtTime(p.elapsed || (Date.now() - localStart[type]) / 1000);
-
-                // ── Live results: add new models as they complete ──
-                if (d.results && d.results.length > lastResultCount) {
-                    for (let i = lastResultCount; i < d.results.length; i++) {
-                        completedModels.push(d.results[i]);
-                    }
-                    lastResultCount = d.results.length;
-                    rebuildModelTabs();
-                    // Auto-select latest model
-                    selectModel(completedModels.length - 1);
-                }
-            }
-
-            // ── Job log ──
-            if (d.log) {
-                const jl = $('consoleJob');
-                jl.textContent = d.log.join('\n');
-                jl.scrollTop = jl.scrollHeight;
-            }
-
-            // ── System console ──
-            try {
-                const cr = await fetch('/api/console');
-                const cd = await cr.json();
-                const sc = $('consoleSystem');
-                sc.textContent = cd.lines.join('\n');
-                sc.scrollTop = sc.scrollHeight;
-            } catch (e) {}
-
-            // ── Done ──
-            if (d.status === 'done') {
-                clearInterval(timers[type]);
-                timers[type] = null;
-                delete localStart[type];
-
-                if (type === 'generate') {
-                    $('canvasProgress').classList.remove('active');
-                    $('genBtn3d').disabled = false;
-                    $('genBtn3d').textContent = 'Generate →';
-                    stopHwPolling();
-
-                    // Store HW log path for download
-                    if (d.hw_log) {
-                        lastHwLogPath = d.hw_log;
-                    }
-
-                    // Final sync of results
-                    if (d.results) {
-                        for (let i = lastResultCount; i < d.results.length; i++) {
-                            completedModels.push(d.results[i]);
-                        }
-                        lastResultCount = d.results.length;
-                        rebuildModelTabs();
-                        if (completedModels.length > 0 && activeModelIdx < 0) {
-                            selectModel(0);
-                        }
-                    }
-                }
-
-                if (type === 'rmbg') {
-                    $('genBtnRmbg').disabled = false;
-                    $('genBtnRmbg').textContent = 'Remove BG →';
-                    if (d.results && d.results.length) renderRmbgResults(d.results);
-                }
-            }
-        } catch (e) {
-            console.error('poll error:', e);
+        // Clear current scene
+        while (objects.length) {
+            const wo = objects.pop();
+            scene.remove(wo.mesh);
         }
-    }, 800);
+        selected = null;
+        gizmo.detach();
+        nextId = 1;
+
+        const w = d.world;
+        worldName = name;
+        $('worldNameDisplay').textContent = name;
+        $('worldNameInput').value = name;
+
+        // Restore environment
+        if (w.environment) {
+            const e = w.environment;
+            if (e.sky) { const c = new THREE.Color(e.sky); scene.background = c; scene.fog.color = c; renderer.setClearColor(c); $('envSky').value = e.sky; }
+            if (e.ambient !== undefined) { ambient.intensity = e.ambient; $('envAmbient').value = e.ambient; }
+            if (e.sunAngle !== undefined) { setSunAngle(e.sunAngle); $('envSunAngle').value = e.sunAngle; }
+            if (e.sunColor) { sunLight.color.set(e.sunColor); $('envSunColor').value = e.sunColor; }
+            if (e.fogDensity !== undefined) { scene.fog.density = e.fogDensity; $('envFog').value = e.fogDensity; }
+            if (e.groundStyle) { $('envGround').value = e.groundStyle; grid.visible = e.groundStyle === 'grid'; ground.visible = e.groundStyle !== 'none'; }
+        }
+
+        // Restore camera
+        if (w.camera) {
+            camera.position.fromArray(w.camera.position);
+            orbit.target.fromArray(w.camera.target);
+            orbit.update();
+        }
+
+        // Restore objects
+        let loadPromises = [];
+        for (const obj of (w.objects || [])) {
+            if (obj.type === 'glb' && obj.glbPath) {
+                // Check if we can build URL from path
+                const url = obj.glbUrl || `/api/file?p=${encodeURIComponent(obj.glbPath)}`;
+                loadPromises.push(new Promise(resolve => {
+                    gltfLoader.load(url, (gltf) => {
+                        const root = gltf.scene || gltf.scenes?.[0];
+                        if (!root) { resolve(); return; }
+
+                        const container = new THREE.Group();
+                        container.name = obj.name;
+                        container.add(root);
+                        container.traverse(ch => { if (ch.isMesh) { ch.castShadow = true; ch.receiveShadow = true; } });
+                        container.position.fromArray(obj.position);
+                        container.rotation.set(...obj.rotation);
+                        container.scale.fromArray(obj.scale);
+                        container.visible = obj.visible !== false;
+
+                        scene.add(container);
+                        register(container, obj.name.replace(/_\d+$/, ''), 'glb', obj.glbPath, url);
+                        resolve();
+                    }, undefined, () => resolve());
+                }));
+            } else if (obj.type === 'terrain') {
+                // Terrain needs to be re-generated — we save its params eventually
+                // For now, place a placeholder
+                showToast('⚠ Terrain must be regenerated');
+            } else {
+                // Primitive recreation
+                const primType = obj.name.replace(/_\d+$/, '').toLowerCase();
+                // Simplified: recreate using the name hint
+                let geo, mat;
+                mat = new THREE.MeshStandardMaterial({ color: 0x788899, roughness: 0.7 });
+                switch (primType) {
+                    case 'box': geo = new THREE.BoxGeometry(1,1,1); break;
+                    case 'sphere': geo = new THREE.SphereGeometry(0.5,32,24); break;
+                    case 'cylinder': geo = new THREE.CylinderGeometry(0.5,0.5,1,32); break;
+                    case 'cone': geo = new THREE.ConeGeometry(0.5,1,32); break;
+                    case 'ground':
+                        geo = new THREE.PlaneGeometry(10,10);
+                        mat = new THREE.MeshStandardMaterial({ color: 0x2a3a2a, roughness: 0.9, side: THREE.DoubleSide });
+                        break;
+                    default:
+                        geo = new THREE.BoxGeometry(1,1,1); break;
+                }
+                const mesh = new THREE.Mesh(geo, mat);
+                mesh.castShadow = true; mesh.receiveShadow = true;
+                mesh.position.fromArray(obj.position);
+                mesh.rotation.set(...obj.rotation);
+                mesh.scale.fromArray(obj.scale);
+                mesh.visible = obj.visible !== false;
+                scene.add(mesh);
+                register(mesh, obj.name.replace(/_\d+$/, ''), 'primitive');
+            }
+        }
+
+        await Promise.all(loadPromises);
+        updateTree(); updateHud();
+        if (objects.length > 0) hideEmpty();
+        showToast(`✅ Loaded "${name}" (${objects.length} objects)`);
+
+    } catch (e) {
+        console.error(e);
+        showToast('❌ Load failed');
+    }
 }
 
-// ══════════════════════════════════════════════════════════════
-// GENERATE 3D
-// ══════════════════════════════════════════════════════════════
-
-async function startGen() {
-    if (!files3d.length) return;
-    const btn = $('genBtn3d');
-    btn.disabled = true;
-    btn.textContent = 'Uploading…';
-
-    const autoRmbg = document.querySelector('input[name="autoRmbg"]:checked').value === 'on';
-
-    const fd = new FormData();
-    files3d.forEach(f => fd.append('images', f));
-    fd.append('settings', JSON.stringify({
-        output_dir: $('sOutDir').value,
-        fps: parseInt($('sFps').value),
-        texture_size: parseInt($('sTexture').value),
-        decimate_target: parseInt($('sDecimate').value),
-        remesh: $('sRemesh').checked,
-        remesh_band: parseFloat($('sRemeshBand').value),
-        render_mode: selectedRenderMode,
-        video_resolution: 512,
-        sprite_directions: parseInt($('sSpriteDirections').value),
-        sprite_size: parseInt($('sSpriteSize').value),
-        sprite_pitch: parseFloat($('sSpritePitch').value),
-        doom_directions: parseInt($('sDoomDirections').value),
-        doom_size: parseInt($('sDoomSize').value),
-        doom_pitch: parseFloat($('sDoomPitch').value),
-        auto_rmbg: autoRmbg,
-    }));
-
+async function refreshWorlds() {
+    const list = $('worldList');
+    list.innerHTML = '<div class="model-empty">Loading…</div>';
     try {
-        const r = await fetch('/api/generate', { method: 'POST', body: fd });
+        const r = await fetch('/api/world/list');
         const d = await r.json();
-        if (!d.job_id) throw new Error(d.error || 'Failed');
-
-        btn.textContent = 'Generating…';
-
-        // Show progress overlay
-        $('canvasEmpty').style.display = 'none';
-        $('canvasProgress').classList.add('active');
-        $('cpFill').style.width = '0%';
-        $('cpPct').textContent = '0%';
-        $('cpPhase').textContent = 'Starting…';
-        $('cpDetail').textContent = '';
-
-        // Open console automatically
-        if (!consoleOpen) toggleConsole();
-
-        // Start HW monitoring during generation
-        ensureHwPolling();
-
-        localStart['generate'] = Date.now();
-        poll(d.job_id, 'generate', {});
+        if (!d.worlds || d.worlds.length === 0) {
+            list.innerHTML = '<div class="model-empty">No saved worlds yet.</div>';
+            return;
+        }
+        list.innerHTML = '';
+        d.worlds.forEach(w => {
+            const el = document.createElement('div');
+            el.className = 'world-item';
+            el.innerHTML = `<span class="wi-name" title="${w.name}">${w.name}</span><span class="wi-meta">${w.object_count} obj · ${w.saved_at}</span><button class="wi-del" title="Delete">✕</button>`;
+            el.addEventListener('click', e => {
+                if (e.target.closest('.wi-del')) return;
+                loadWorld(w.name);
+            });
+            el.querySelector('.wi-del').addEventListener('click', async e => {
+                e.stopPropagation();
+                if (!confirm(`Delete world "${w.name}"?`)) return;
+                await fetch('/api/world/delete', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({name: w.name}) });
+                refreshWorlds();
+            });
+            list.appendChild(el);
+        });
     } catch (e) {
-        alert('Error: ' + e.message);
-        btn.disabled = false;
-        btn.textContent = 'Generate →';
+        list.innerHTML = '<div class="model-empty">Failed to load.</div>';
     }
 }
 
 // ══════════════════════════════════════════════════════════════
-// REMOVE BACKGROUND
+// PROPERTIES PANEL
 // ══════════════════════════════════════════════════════════════
 
-async function startRmbg() {
-    if (!filesRmbg.length) return;
-    const btn = $('genBtnRmbg');
-    btn.disabled = true;
-    btn.textContent = 'Uploading…';
-
-    const fd = new FormData();
-    filesRmbg.forEach(f => fd.append('images', f));
-
-    try {
-        const r = await fetch('/api/rmbg', { method: 'POST', body: fd });
-        const d = await r.json();
-        if (!d.job_id) throw new Error(d.error || 'Failed');
-
-        btn.textContent = 'Processing…';
-        localStart['rmbg'] = Date.now();
-        poll(d.job_id, 'rmbg', {});
-    } catch (e) {
-        alert('Error: ' + e.message);
-        btn.disabled = false;
-        btn.textContent = 'Remove BG →';
+function updateProps() {
+    if (!selected) {
+        ['pPosX','pPosY','pPosZ','pRotX','pRotY','pRotZ','pScX','pScY','pScZ'].forEach(id => $(id).value = '');
+        return;
     }
+    const m = selected.mesh;
+    $('pPosX').value = round3(m.position.x); $('pPosY').value = round3(m.position.y); $('pPosZ').value = round3(m.position.z);
+    $('pRotX').value = round3(THREE.MathUtils.radToDeg(m.rotation.x));
+    $('pRotY').value = round3(THREE.MathUtils.radToDeg(m.rotation.y));
+    $('pRotZ').value = round3(THREE.MathUtils.radToDeg(m.rotation.z));
+    $('pScX').value = round3(m.scale.x); $('pScY').value = round3(m.scale.y); $('pScZ').value = round3(m.scale.z);
 }
 
-function renderRmbgResults(results) {
-    const section = $('rmbgResultsSection');
-    const list = $('rmbgResultsList');
-    section.style.display = '';
-    list.innerHTML = '';
-    results.forEach(r => {
-        const div = document.createElement('div');
-        div.className = 'rmbg-result';
-        div.innerHTML =
-            `<img src="/api/file?p=${enc(r.file)}" alt="${esc(r.name)}">` +
-            `<span class="rr-name">${esc(r.name)}</span>` +
-            `<a class="rr-dl" href="/api/file?p=${enc(r.file)}" download="${esc(r.name)}_transparent.png">↓</a>`;
-        list.appendChild(div);
+function onPropInput(e) {
+    if (!selected) return;
+    const m = selected.mesh, id = e.target.id, v = parseFloat(e.target.value) || 0;
+    if (id === 'pPosX') m.position.x = v;
+    else if (id === 'pPosY') m.position.y = v;
+    else if (id === 'pPosZ') m.position.z = v;
+    else if (id === 'pRotX') m.rotation.x = THREE.MathUtils.degToRad(v);
+    else if (id === 'pRotY') m.rotation.y = THREE.MathUtils.degToRad(v);
+    else if (id === 'pRotZ') m.rotation.z = THREE.MathUtils.degToRad(v);
+    else if (id === 'pScX') { m.scale.x = v; if ($('pScLock').checked) { m.scale.y = v; m.scale.z = v; $('pScY').value = round3(v); $('pScZ').value = round3(v); } }
+    else if (id === 'pScY') { m.scale.y = v; if ($('pScLock').checked) { m.scale.x = v; m.scale.z = v; $('pScX').value = round3(v); $('pScZ').value = round3(v); } }
+    else if (id === 'pScZ') { m.scale.z = v; if ($('pScLock').checked) { m.scale.x = v; m.scale.y = v; $('pScX').value = round3(v); $('pScY').value = round3(v); } }
+}
+
+// ══════════════════════════════════════════════════════════════
+// SCENE TREE
+// ══════════════════════════════════════════════════════════════
+
+function updateTree() {
+    const tree = $('sceneTree');
+    if (!objects.length) { tree.innerHTML = '<div class="tree-empty">Empty world</div>'; return; }
+    tree.innerHTML = '';
+    objects.forEach(wo => {
+        const el = document.createElement('div');
+        el.className = 'tree-item' + (selected === wo ? ' sel' : '');
+        const icon = wo.type === 'glb' ? '📦' : wo.type === 'terrain' ? '🏔' : '◆';
+        el.innerHTML = `<span class="ti-icon">${icon}</span><span class="ti-name">${wo.name}</span><button class="ti-vis ${wo.mesh.visible?'':'off'}" title="Toggle">👁</button>`;
+        el.addEventListener('click', e => { if (!e.target.closest('.ti-vis')) select(wo); });
+        el.querySelector('.ti-vis').addEventListener('click', () => { wo.mesh.visible = !wo.mesh.visible; updateTree(); });
+        tree.appendChild(el);
     });
 }
 
-// ══════════════════════════════════════════════════════════════
-// RECONNECT (resume if page reloads mid-job)
-// ══════════════════════════════════════════════════════════════
-
-async function tryReconnect() {
-    try {
-        const r = await fetch('/api/active');
-        const d = await r.json();
-
-        if (d.generate) {
-            $('canvasEmpty').style.display = 'none';
-            $('canvasProgress').classList.add('active');
-            $('genBtn3d').disabled = true;
-            $('genBtn3d').textContent = 'Generating…';
-            if (!consoleOpen) toggleConsole();
-            localStart['generate'] = Date.now();
-            poll(d.generate, 'generate', {});
+function updateHud() {
+    $('hudObjs').textContent = `${objects.length} objects`;
+    let tris = 0;
+    objects.forEach(wo => wo.mesh.traverse(ch => {
+        if (ch.isMesh && ch.geometry) {
+            const idx = ch.geometry.index;
+            const pos = ch.geometry.attributes?.position;
+            tris += idx ? idx.count / 3 : (pos?.count || 0) / 3;
         }
-
-        if (d.rmbg) {
-            $('genBtnRmbg').disabled = true;
-            $('genBtnRmbg').textContent = 'Processing…';
-            localStart['rmbg'] = Date.now();
-            poll(d.rmbg, 'rmbg', {});
-        }
-    } catch (e) {}
+    }));
+    $('hudTris').textContent = fmtNum(Math.round(tris)) + ' tris';
 }
-
-tryReconnect();
 
 // ══════════════════════════════════════════════════════════════
-// HARDWARE MONITOR
+// BAKE VIEW
 // ══════════════════════════════════════════════════════════════
 
-let hwPanelOpen = false;
-let hwPolling = null;
-let hwHistory = []; // last N GPU util values for sparkline
+function bakeView() {
+    const res = parseInt($('bakeRes').value);
+    const shadowRes = parseInt($('bakeShadowRes').value);
+    const transparent = $('bakeTransparent').checked;
 
-function toggleHwPanel() {
-    hwPanelOpen = !hwPanelOpen;
-    $('hwPanel').classList.toggle('open', hwPanelOpen);
-    $('hwToggle').classList.toggle('active', hwPanelOpen);
+    const br = new THREE.WebGLRenderer({ antialias: true, alpha: transparent, preserveDrawingBuffer: true });
+    br.outputColorSpace = THREE.SRGBColorSpace;
+    br.toneMapping = THREE.ACESFilmicToneMapping;
+    br.toneMappingExposure = 1.1;
+    br.shadowMap.enabled = true;
+    br.shadowMap.type = THREE.PCFSoftShadowMap;
+    br.setSize(res, res);
+    br.setPixelRatio(1);
+    br.setClearColor(transparent ? 0x000000 : scene.background, transparent ? 0 : 1);
 
-    if (hwPanelOpen && !hwPolling) {
-        // Start polling at 2s interval
-        fetchHw();
-        hwPolling = setInterval(fetchHw, 2000);
-    } else if (!hwPanelOpen && hwPolling) {
-        clearInterval(hwPolling);
-        hwPolling = null;
+    const origShadow = sunLight.shadow.mapSize.clone();
+    sunLight.shadow.mapSize.set(shadowRes, shadowRes);
+    sunLight.shadow.map?.dispose(); sunLight.shadow.map = null;
+
+    const gv = grid.visible, tv = gizmo.visible;
+    grid.visible = false; gizmo.visible = false;
+    ground.material.opacity = 0.45;
+
+    const bc = camera.clone();
+    bc.aspect = 1; bc.updateProjectionMatrix();
+
+    br.render(scene, bc);
+
+    const url = br.domElement.toDataURL('image/png');
+    const a = document.createElement('a');
+    a.href = url; a.download = `${worldName}_bake.png`; a.click();
+
+    grid.visible = gv; gizmo.visible = tv;
+    ground.material.opacity = 0.3;
+    sunLight.shadow.mapSize.copy(origShadow);
+    sunLight.shadow.map?.dispose(); sunLight.shadow.map = null;
+    br.dispose();
+
+    $('bakeModal').classList.remove('open');
+    showToast('🔥 Baked!');
+}
+
+// ══════════════════════════════════════════════════════════════
+// EXPORT GLB
+// ══════════════════════════════════════════════════════════════
+
+function exportScene() {
+    if (!objects.length) { showToast('Nothing to export'); return; }
+    const group = new THREE.Group();
+    objects.forEach(wo => { if (wo.mesh.visible) group.add(wo.mesh.clone()); });
+
+    const exporter = new GLTFExporter();
+    exporter.parse(group, result => {
+        const blob = new Blob([result], { type: 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = `${worldName}.glb`; a.click();
+        URL.revokeObjectURL(url);
+        showToast('↓ Exported GLB');
+    }, err => showToast('Export failed'), { binary: true });
+}
+
+// ══════════════════════════════════════════════════════════════
+// TOAST
+// ══════════════════════════════════════════════════════════════
+
+function showToast(msg) {
+    let toast = document.querySelector('.toast');
+    if (!toast) {
+        toast = document.createElement('div');
+        toast.className = 'toast';
+        toast.style.cssText = 'position:fixed;bottom:16px;left:50%;transform:translateX(-50%);padding:8px 18px;background:#18181B;border:1px solid #E8A917;border-radius:6px;font-family:var(--fn-mono);font-size:11px;color:#E8A917;z-index:600;pointer-events:none;opacity:0;transition:opacity .2s';
+        document.body.appendChild(toast);
+    }
+    toast.textContent = msg;
+    toast.style.opacity = '1';
+    clearTimeout(toast._t);
+    toast._t = setTimeout(() => { toast.style.opacity = '0'; }, 2500);
+}
+
+// ══════════════════════════════════════════════════════════════
+// EMPTY STATE
+// ══════════════════════════════════════════════════════════════
+
+function hideEmpty() { $('emptyState').classList.add('hidden'); }
+function showEmpty() { $('emptyState').classList.remove('hidden'); }
+
+// ══════════════════════════════════════════════════════════════
+// RENDER LOOP
+// ══════════════════════════════════════════════════════════════
+
+function animate() {
+    requestAnimationFrame(animate);
+    orbit.update();
+    renderer.render(scene, camera);
+
+    // Axis
+    if (axCam) { axCam.quaternion.copy(camera.quaternion); axRenderer.render(axScene, axCam); }
+
+    // FPS
+    frameCnt++;
+    const t = clock.getElapsedTime();
+    if (t - fpsT >= 0.5) {
+        fps = Math.round(frameCnt / (t - fpsT));
+        $('hudFps').textContent = fps + ' fps';
+        frameCnt = 0; fpsT = t;
     }
 }
 
-// Auto-poll HW during active jobs even if panel is closed (for sparkline)
-function ensureHwPolling() {
-    if (!hwPolling) {
-        hwPolling = setInterval(fetchHw, 2000);
-    }
+function onResize() {
+    const vp = $('viewport');
+    const w = vp.clientWidth || 1, h = vp.clientHeight || 1;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
 }
 
-function stopHwPolling() {
-    if (hwPolling && !hwPanelOpen) {
-        clearInterval(hwPolling);
-        hwPolling = null;
-    }
-}
+// ══════════════════════════════════════════════════════════════
+// BOOT
+// ══════════════════════════════════════════════════════════════
 
-async function fetchHw() {
-    try {
-        const r = await fetch('/api/hw');
-        const hw = await r.json();
-        updateHwPanel(hw);
-        updateHwSparkline(hw);
-    } catch (e) {}
-}
-
-function updateHwPanel(hw) {
-    // GPU Compute
-    const gpuUtil = hw.gpu_util_pct ?? 0;
-    $('hwGpuUtil').textContent = gpuUtil + '%';
-    const gpuBar = $('hwGpuUtilBar');
-    gpuBar.style.width = gpuUtil + '%';
-    gpuBar.classList.toggle('hot', gpuUtil > 90);
-
-    // VRAM
-    const vramPct = hw.gpu_reserved_pct ?? hw.gpu_alloc_pct ?? 0;
-    const vramUsed = hw.gpu_reserved_mb ?? hw.gpu_alloc_mb ?? 0;
-    const vramTotal = hw.gpu_total_mb ?? 0;
-    $('hwVram').textContent = Math.round(vramUsed) + ' / ' + Math.round(vramTotal) + ' MB';
-    const vramBar = $('hwVramBar');
-    vramBar.style.width = vramPct + '%';
-    vramBar.classList.toggle('hot', vramPct > 90);
-
-    // CPU
-    const cpuPct = hw.cpu_pct ?? 0;
-    $('hwCpu').textContent = Math.round(cpuPct) + '%';
-    const cpuBar = $('hwCpuBar');
-    cpuBar.style.width = Math.min(cpuPct, 100) + '%';
-    cpuBar.classList.toggle('hot', cpuPct > 90);
-
-    // RAM
-    const ramPct = hw.ram_pct ?? 0;
-    const ramUsed = hw.ram_used_mb ?? 0;
-    const ramTotal = hw.ram_total_mb ?? 0;
-    $('hwRam').textContent = Math.round(ramUsed) + ' / ' + Math.round(ramTotal) + ' MB';
-    const ramBar = $('hwRamBar');
-    ramBar.style.width = ramPct + '%';
-    ramBar.classList.toggle('hot', ramPct > 90);
-
-    // Details
-    if (hw.gpu_temp_c !== undefined) {
-        $('hwTemp').textContent = hw.gpu_temp_c + '°C';
-    }
-    if (hw.gpu_power_w !== undefined && hw.gpu_power_limit_w !== undefined) {
-        $('hwPower').textContent = Math.round(hw.gpu_power_w) + ' / ' + Math.round(hw.gpu_power_limit_w) + 'W';
-    }
-    if (hw.gpu_name) {
-        $('hwGpuName').textContent = hw.gpu_name;
-    }
-
-    // Phase
-    if (hw.phase) {
-        $('hwPhase').textContent = hw.phase;
-        $('hwPhase').title = hw.phase;
-    } else {
-        $('hwPhase').textContent = 'Idle';
-    }
-}
-
-function updateHwSparkline(hw) {
-    const val = hw.gpu_util_pct ?? 0;
-    hwHistory.push(val);
-    if (hwHistory.length > 5) hwHistory.shift();
-
-    const bars = $('hwSpark').querySelectorAll('span');
-    for (let i = 0; i < bars.length; i++) {
-        const v = hwHistory[hwHistory.length - bars.length + i] ?? 0;
-        const h = Math.max(2, Math.round(v / 100 * 10));
-        bars[i].style.height = h + 'px';
-        // Color code: green < 50, gold < 80, red >= 80
-        if (v >= 80) bars[i].style.background = 'var(--red)';
-        else if (v >= 50) bars[i].style.background = 'var(--gold)';
-        else bars[i].style.background = 'var(--green)';
-    }
-}
-
+init();
+animate();
