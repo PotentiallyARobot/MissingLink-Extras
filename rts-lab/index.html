@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>TRELLIS.2 Studio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=JetBrains+Mono:wght@400;600&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<div class="app">
+
+  <!-- ═══════════════════ HEADER ═══════════════════ -->
+  <header class="app-header">
+    <div class="app-header-left">
+      <img src="https://raw.githubusercontent.com/PotentiallyARobot/MissingLink/main/assets/logo.png" alt="ML">
+      <h1>TRELLIS.2 <span>Studio</span></h1>
+    </div>
+    <div class="app-header-right">
+      <a href="/worldeditor" class="console-toggle-btn" style="text-decoration:none" title="Open World Editor">🌍 World Editor</a>
+      <div class="header-badge" id="keepaliveBadge"><span class="dot"></span> Connected</div>
+      <button class="hw-toggle" id="hwToggle" onclick="toggleHwPanel()">
+        <div class="hw-spark" id="hwSpark">
+          <span style="height:3px"></span><span style="height:3px"></span><span style="height:3px"></span>
+          <span style="height:3px"></span><span style="height:3px"></span>
+        </div>
+        GPU
+      </button>
+      <button class="console-toggle-btn" id="consoleToggle" onclick="toggleConsole()">▸ Console</button>
+    </div>
+  </header>
+
+  <!-- HW Monitor Panel (fixed overlay) -->
+  <div class="hw-panel" id="hwPanel">
+    <div class="hw-header">
+      <span class="hw-title">⚡ Hardware Monitor</span>
+      <span class="hw-phase" id="hwPhase">—</span>
+    </div>
+    <div class="hw-body">
+      <!-- GPU Utilization -->
+      <div class="hw-metric">
+        <div class="hw-metric-head">
+          <span class="hw-metric-label">GPU Compute</span>
+          <span class="hw-metric-value" id="hwGpuUtil">—</span>
+        </div>
+        <div class="hw-bar"><div class="hw-bar-fill gpu" id="hwGpuUtilBar" style="width:0%"></div></div>
+      </div>
+      <!-- VRAM -->
+      <div class="hw-metric">
+        <div class="hw-metric-head">
+          <span class="hw-metric-label">VRAM</span>
+          <span class="hw-metric-value" id="hwVram">—</span>
+        </div>
+        <div class="hw-bar"><div class="hw-bar-fill vram" id="hwVramBar" style="width:0%"></div></div>
+      </div>
+      <!-- CPU -->
+      <div class="hw-metric">
+        <div class="hw-metric-head">
+          <span class="hw-metric-label">CPU</span>
+          <span class="hw-metric-value" id="hwCpu">—</span>
+        </div>
+        <div class="hw-bar"><div class="hw-bar-fill cpu" id="hwCpuBar" style="width:0%"></div></div>
+      </div>
+      <!-- RAM -->
+      <div class="hw-metric">
+        <div class="hw-metric-head">
+          <span class="hw-metric-label">RAM</span>
+          <span class="hw-metric-value" id="hwRam">—</span>
+        </div>
+        <div class="hw-bar"><div class="hw-bar-fill ram" id="hwRamBar" style="width:0%"></div></div>
+      </div>
+      <div class="hw-sep"></div>
+      <!-- Detail stats -->
+      <div class="hw-stats-row" id="hwDetails">
+        <span class="hw-stat"><span class="hw-dot r"></span> <span id="hwTemp">—</span></span>
+        <span class="hw-stat"><span class="hw-dot y"></span> <span id="hwPower">—</span></span>
+        <span class="hw-stat"><span class="hw-dot g"></span> <span id="hwGpuName">—</span></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════ SIDEBAR ═══════════════════ -->
+  <aside class="sidebar">
+    <div class="sidebar-tabs">
+      <button class="sidebar-tab active" data-panel="panelGen" onclick="switchSidebarTab(this)">🔺 Generate</button>
+      <button class="sidebar-tab" data-panel="panelRmbg" onclick="switchSidebarTab(this)">✂ RMBG</button>
+    </div>
+
+    <!-- ── GENERATE PANEL ── -->
+    <div class="sidebar-panel active" id="panelGen">
+
+      <div class="sidebar-section">
+        <div class="section-label">📁 Images</div>
+        <div class="dropzone-compact" id="dropzone3d">
+          <div class="dz-text">Drop images or <strong>browse</strong></div>
+          <input type="file" id="fileInput3d" multiple accept="image/*">
+        </div>
+        <div class="thumb-strip" id="thumbs3d"></div>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="section-label">✂ Background</div>
+        <div class="auto-rmbg-row">
+          <span class="label-text">Auto Remove</span>
+          <div class="radio-group">
+            <label class="on"><input type="radio" name="autoRmbg" value="on" checked style="accent-color:var(--green)"> On</label>
+            <label class="off"><input type="radio" name="autoRmbg" value="off"> Off</label>
+          </div>
+        </div>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="section-label">🎬 Render Mode</div>
+        <div class="render-grid" id="renderModes">
+          <div class="render-opt" data-mode="none" onclick="selectRender(this)"><div class="ro-icon">⚡</div><div class="ro-name">None</div></div>
+          <div class="render-opt" data-mode="snapshot" onclick="selectRender(this)"><div class="ro-icon">📷</div><div class="ro-name">Snap</div></div>
+          <div class="render-opt sel" data-mode="video" onclick="selectRender(this)"><div class="ro-icon">🎬</div><div class="ro-name">Video</div></div>
+          <div class="render-opt" data-mode="perspective" onclick="selectRender(this)"><div class="ro-icon">🔄</div><div class="ro-name">Turntable</div></div>
+          <div class="render-opt" data-mode="rts_sprite" onclick="selectRender(this)"><div class="ro-icon">🎮</div><div class="ro-name">RTS</div></div>
+          <div class="render-opt" data-mode="doom_sprite" onclick="selectRender(this)"><div class="ro-icon">👹</div><div class="ro-name">Doom</div></div>
+        </div>
+        <!-- RTS sub-settings -->
+        <div class="sub-settings rts" id="rtsSettings">
+          <div class="sub-title">🎮 RTS Sprite Settings</div>
+          <div class="field-row">
+            <div class="field"><label>Directions</label><select id="sSpriteDirections"><option value="8">8</option><option value="16" selected>16</option><option value="24">24</option><option value="32">32</option></select></div>
+            <div class="field"><label>Frame px</label><select id="sSpriteSize"><option value="64">64</option><option value="128">128</option><option value="256" selected>256</option><option value="512">512</option></select></div>
+          </div>
+          <div class="field"><label>Pitch</label><select id="sSpritePitch"><option value="0.35">20° RPG</option><option value="0.52" selected>30° Iso</option><option value="0.65">37° Diablo</option><option value="0.79">45° 3/4</option></select></div>
+        </div>
+        <!-- Doom sub-settings -->
+        <div class="sub-settings doom" id="doomSettings">
+          <div class="sub-title">👹 Doom Sprite Settings</div>
+          <div class="field-row">
+            <div class="field"><label>Angles</label><select id="sDoomDirections"><option value="8" selected>8</option><option value="16">16</option></select></div>
+            <div class="field"><label>Frame px</label><select id="sDoomSize"><option value="64">64</option><option value="128">128</option><option value="256" selected>256</option><option value="512">512</option></select></div>
+          </div>
+          <div class="field"><label>Camera</label><select id="sDoomPitch"><option value="0.0" selected>Eye level</option><option value="0.05">Slight down</option><option value="0.1">Low angle</option><option value="-0.05">Slight up</option></select></div>
+        </div>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="section-label">⚙ Settings</div>
+        <div class="field"><label>Output dir</label><input type="text" id="sOutDir" value="/content/drive/MyDrive/trellis_models_out"></div>
+        <div class="field-row">
+          <div class="field"><label>FPS</label><input type="number" id="sFps" value="15" min="5" max="60"></div>
+          <div class="field"><label>Texture</label><select id="sTexture"><option>1024</option><option>2048</option><option selected>4096</option><option>8192</option></select></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Max faces</label><input type="number" id="sDecimate" value="1000000" min="1000"></div>
+          <div class="field"><label>Remesh band</label><input type="number" id="sRemeshBand" value="1.0" min="0.1" max="3.0" step="0.1"></div>
+        </div>
+        <label class="checkbox-sm"><input type="checkbox" id="sRemesh" checked> Remesh</label>
+      </div>
+
+      <div class="sidebar-section">
+        <button class="gen-btn" id="genBtn3d" onclick="startGen()" disabled>Generate →</button>
+      </div>
+    </div>
+
+    <!-- ── RMBG PANEL ── -->
+    <div class="sidebar-panel" id="panelRmbg">
+      <div class="sidebar-section">
+        <div class="section-label">✂ Remove Background</div>
+        <div class="dropzone-compact" id="dropzoneRmbg">
+          <div class="dz-text">Drop images or <strong>browse</strong></div>
+          <input type="file" id="fileInputRmbg" multiple accept="image/*">
+        </div>
+        <div class="thumb-strip" id="thumbsRmbg"></div>
+      </div>
+      <div class="sidebar-section">
+        <button class="gen-btn" id="genBtnRmbg" onclick="startRmbg()" disabled>Remove BG →</button>
+      </div>
+      <div class="sidebar-section" id="rmbgResultsSection" style="display:none">
+        <div class="section-label">✅ Results</div>
+        <div class="rmbg-results" id="rmbgResultsList"></div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ═══════════════════ MAIN CANVAS ═══════════════════ -->
+  <section class="main">
+    <!-- Model navigation tabs -->
+    <div class="canvas-topbar" id="canvasTopbar">
+      <div class="topbar-spacer"></div>
+    </div>
+
+    <!-- Viewport -->
+    <div class="canvas-viewport" id="canvasViewport">
+      <!-- Empty state -->
+      <div class="canvas-empty" id="canvasEmpty">
+        <div class="ce-icon">🔺</div>
+        <div class="ce-title">No models yet</div>
+        <div class="ce-sub">Upload images in the sidebar and hit Generate to create 3D models. Results appear here.</div>
+      </div>
+
+      <!-- Media display (per-model, toggled by JS) -->
+      <div class="canvas-media" id="canvasMedia"></div>
+
+      <!-- No-render state -->
+      <div class="canvas-no-render" id="canvasNoRender">
+        <div class="cnr-icon">📦</div>
+        <div class="cnr-text">GLB exported — no render preview selected</div>
+      </div>
+
+      <!-- Progress overlay -->
+      <div class="canvas-progress" id="canvasProgress">
+        <div class="cp-ring"></div>
+        <div class="cp-phase" id="cpPhase">Starting…</div>
+        <div class="cp-detail" id="cpDetail"></div>
+        <div class="cp-bar"><div class="cp-bar-fill" id="cpFill"></div></div>
+        <div class="cp-pct" id="cpPct">0%</div>
+      </div>
+    </div>
+
+    <!-- Sprite strip (shown for RTS/Doom results) -->
+    <div class="sprite-strip" id="spriteStrip"></div>
+
+    <!-- Bottom action bar -->
+    <div class="canvas-bottombar" id="canvasBottombar">
+      <div class="bar-info" id="barInfo">
+        <span class="bi-name" id="barName">—</span>
+      </div>
+      <div class="bar-spacer"></div>
+      <div id="barActions"></div>
+    </div>
+  </section>
+
+  <!-- ═══════════════════ CONSOLE DRAWER ═══════════════════ -->
+  <div class="console-drawer" id="consoleDrawer">
+    <div class="console-drawer-header">
+      <span class="cdh-label">Output</span>
+      <div class="console-tab-btns">
+        <button class="console-tab-btn active" data-target="consoleSystem" onclick="switchConsoleTab(this)">System</button>
+        <button class="console-tab-btn" data-target="consoleJob" onclick="switchConsoleTab(this)">Job Log</button>
+      </div>
+    </div>
+    <div class="console-content" id="consoleSystem"></div>
+    <div class="console-content job-log" id="consoleJob" style="display:none"></div>
+  </div>
+
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>
