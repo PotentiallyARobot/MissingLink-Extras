@@ -7,6 +7,15 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=JetBrains+Mono:wght@400;600&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/styles.css">
+<script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
 </head>
 <body>
 <div class="app">
@@ -203,6 +212,43 @@
         <div class="cnr-text">GLB exported — no render preview selected</div>
       </div>
 
+      <!-- 3D GLB Viewer (Three.js) -->
+      <div class="canvas-3dviewer" id="canvas3dViewer">
+        <canvas id="glbCanvas"></canvas>
+        <div class="viewer-hud" id="viewerHud">
+          <span class="hud-stat" id="hudTris">—</span>
+          <span class="hud-stat" id="hudVerts">—</span>
+          <span class="hud-stat" id="hudFps">—</span>
+          <span class="hud-mode" id="hudMode">SHADED</span>
+        </div>
+        <div class="viewer-toolbar" id="viewerToolbar">
+          <button class="vtb-btn" id="btnResetCam" title="Reset Camera">⟲</button>
+          <button class="vtb-btn" id="btnWireframe" title="Toggle Wireframe">◇</button>
+          <button class="vtb-btn gold" id="btnTexMap" title="View Texture Map">🗺 Texture</button>
+        </div>
+      </div>
+
+      <!-- Texture Map Modal -->
+      <div class="tex-modal-overlay" id="texModalOverlay">
+        <div class="tex-modal">
+          <div class="tex-modal-header">
+            <span class="tex-modal-title">🗺 UV Texture Map</span>
+            <div class="tex-modal-actions">
+              <a class="tex-dl-btn" id="texDownloadBtn" download="texture_map.png">↓ Download</a>
+              <button class="tex-close-btn" id="texCloseBtn">✕</button>
+            </div>
+          </div>
+          <div class="tex-modal-body" id="texModalBody">
+            <div class="tex-checker-bg">
+              <canvas id="texPreviewCanvas"></canvas>
+            </div>
+          </div>
+          <div class="tex-modal-footer">
+            <span class="tex-info" id="texInfo">—</span>
+          </div>
+        </div>
+      </div>
+
       <!-- Progress overlay -->
       <div class="canvas-progress" id="canvasProgress">
         <div class="cp-ring"></div>
@@ -241,5 +287,6 @@
 
 </div>
 <script src="/static/app.js"></script>
+<script type="module" src="/static/viewer3d.js"></script>
 </body>
 </html>

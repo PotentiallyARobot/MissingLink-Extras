@@ -164,6 +164,7 @@ function closeModel(idx) {
         $('canvasMedia').classList.remove('active');
         $('canvasNoRender').classList.remove('active');
         $('spriteStrip').classList.remove('active');
+        if (window.viewer3d) window.viewer3d.hide();
         $('barName').textContent = '—';
         $('barActions').innerHTML = '';
     } else {
@@ -198,6 +199,9 @@ function showModelInCanvas(model) {
     strip.classList.remove('active');
     media.innerHTML = '';
     strip.innerHTML = '';
+
+    // Hide 3D viewer if open
+    if (window.viewer3d) window.viewer3d.hide();
 
     // Show media
     if (model.media && model.media_type === 'video') {
@@ -251,6 +255,17 @@ function updateBottomBar(model) {
     dlGlb.className = 'bar-btn gold';
     dlGlb.innerHTML = '↓ GLB';
     acts.appendChild(dlGlb);
+
+    // View 3D button
+    const v3d = document.createElement('button');
+    v3d.className = 'bar-btn green';
+    v3d.innerHTML = '🔺 View 3D';
+    v3d.onclick = () => {
+        if (window.viewer3d && model.glb) {
+            window.viewer3d.loadFromUrl('/api/file?p=' + enc(model.glb), model.name);
+        }
+    };
+    acts.appendChild(v3d);
 
     // Download media
     if (model.media) {
