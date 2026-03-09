@@ -876,11 +876,17 @@ def run_generate_job(job_id):
                         safe_reload_models()
 
                     set_phase(1)
+
+                    # Always cache stages for editor re-use
+                    stage_cache_dir = out_path / f"{base}_stages"
+                    stage_cache_dir.mkdir(parents=True, exist_ok=True)
+
                     out = trellis_pipe.run(
                         [image], image_weights=[1.0],
                         sparse_structure_sampler_params={"steps": 12},
                         shape_slat_sampler_params={"steps": 12},
                         tex_slat_sampler_params={"steps": 12},
+                        cache_stages=str(stage_cache_dir),
                     )
                     if not out:
                         raise RuntimeError("Empty pipeline result")
@@ -998,6 +1004,8 @@ def run_generate_job(job_id):
                     result_entry = {"name": base, "glb": str(glb_out)}
                     if render_mesh_path and render_mesh_path.exists():
                         result_entry["render_mesh"] = str(render_mesh_path)
+                    # Stage cache for editor
+                    result_entry["stage_cache"] = str(stage_cache_dir)
                     if media_path:
                         result_entry["media"] = media_path
                         result_entry["media_type"] = media_type
@@ -1339,6 +1347,305 @@ def api_rerender():
                                "elapsed": round(dt, 1)}
 
     threading.Thread(target=_do_rerender, daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+# ══════════════════════════════════════════════════════════════
+# EDITOR: STAGE INSPECTION + RETEXTURE
+# ══════════════════════════════════════════════════════════════
+
+@app.route("/api/stages")
+def api_stages():
+    """
+    Inspect what cached stages exist for a model.
+    Query param: dir = path to {model}_stages directory.
+    Returns which stages are available and their sizes.
+    """
+    stage_dir = request.args.get("dir", "")
+    if not stage_dir or not os.path.isdir(stage_dir):
+        return jsonify({"error": "Stage directory not found"}), 404
+
+    STAGE_NAMES = [
+        "image_cond_512", "image_cond_1024",
+        "tex_cond_512", "tex_cond_1024",
+        "sparse_structure", "shape_slat", "tex_slat",
+        "decoded_mesh",
+    ]
+
+    stages = {}
+    for name in STAGE_NAMES:
+        pt_path = os.path.join(stage_dir, f"{name}.pt")
+        pkl_path = os.path.join(stage_dir, f"{name}.pkl")
+        if os.path.isfile(pt_path):
+            stages[name] = {
+                "path": pt_path,
+                "size_mb": round(os.path.getsize(pt_path) / 1048576, 1),
+            }
+        elif os.path.isfile(pkl_path):
+            stages[name] = {
+                "path": pkl_path,
+                "size_mb": round(os.path.getsize(pkl_path) / 1048576, 1),
+            }
+
+    # Determine editing capabilities
+    has_sparse = "sparse_structure" in stages
+    has_shape = "shape_slat" in stages
+    has_tex = "tex_slat" in stages
+    has_cond = "image_cond_512" in stages or "image_cond_1024" in stages
+
+    capabilities = []
+    if has_sparse and has_shape and has_tex:
+        capabilities = ["lock_structure", "lock_geometry", "retexture", "full_regen"]
+    elif has_shape:
+        capabilities = ["lock_geometry", "retexture"]
+    elif has_sparse:
+        capabilities = ["lock_structure", "retexture"]
+
+    return jsonify({
+        "stages": stages,
+        "capabilities": capabilities,
+        "has_sparse": has_sparse,
+        "has_shape": has_shape,
+        "has_tex": has_tex,
+        "has_cond": has_cond,
+    })
+
+
+@app.route("/api/retexture", methods=["POST"])
+def api_retexture():
+    """
+    Retexture a model: lock structure + geometry, regenerate texture only
+    using a new reference image. Uses cached stage artifacts.
+
+    Form data:
+      - image: new reference image file
+      - stage_cache: path to the model's _stages directory
+      - output_dir: where to save results
+      - name: base name for output files
+      - lock_mode: 'lock_geometry' (reuse sparse_structure + shape_slat)
+                   or 'lock_structure' (reuse sparse_structure only)
+      - settings: JSON with texture_size, decimate_target, remesh, etc.
+    """
+    image_file = request.files.get("image")
+    if not image_file:
+        return jsonify({"error": "No reference image provided"}), 400
+
+    stage_cache_dir = request.form.get("stage_cache", "")
+    if not stage_cache_dir or not os.path.isdir(stage_cache_dir):
+        return jsonify({"error": "Stage cache directory not found"}), 404
+
+    lock_mode = request.form.get("lock_mode", "lock_geometry")
+    name = request.form.get("name", "retextured")
+    settings = json.loads(request.form.get("settings", "{}"))
+
+    out_dir = settings.get("output_dir", "/content/drive/MyDrive/trellis_models_out")
+    SAFE_OUTPUT_BASES = ["/content/drive/MyDrive", "/content/"]
+    real_out = os.path.realpath(out_dir)
+    out_ok = any(
+        real_out == os.path.realpath(b) or real_out.startswith(os.path.realpath(b) + os.sep)
+        for b in SAFE_OUTPUT_BASES
+    )
+    if not out_ok:
+        return jsonify({"error": "Output directory not allowed"}), 400
+
+    # Save uploaded reference image
+    job_id = uuid.uuid4().hex[:12]
+    job_dir = UPLOAD_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = secure_filename(image_file.filename) or f"ref_{uuid.uuid4().hex[:8]}.png"
+    ref_path = str(job_dir / safe_name)
+    image_file.save(ref_path)
+
+    jobs[job_id] = {
+        "status": "running",
+        "progress": {"pct": 0, "image_num": 1, "total": 1,
+                     "name": name, "phase": "Starting retexture...", "elapsed": 0},
+        "log": [], "results": [], "files": [(safe_name, ref_path)],
+        "settings": {"output_dir": real_out},
+    }
+    active_jobs["generate"] = job_id
+
+    def _do_retexture():
+        job = jobs[job_id]
+        t0 = time.perf_counter()
+        try:
+            out_path = pathlib.Path(real_out)
+            out_path.mkdir(parents=True, exist_ok=True)
+
+            # Build load_stages dict based on lock mode
+            load_stages = {}
+
+            sparse_pt = os.path.join(stage_cache_dir, "sparse_structure.pt")
+            shape_pt = os.path.join(stage_cache_dir, "shape_slat.pt")
+            cond_512_pt = os.path.join(stage_cache_dir, "image_cond_512.pt")
+            cond_1024_pt = os.path.join(stage_cache_dir, "image_cond_1024.pt")
+
+            if lock_mode == "lock_geometry":
+                # Reuse structure + shape, regenerate texture only
+                if os.path.isfile(sparse_pt):
+                    load_stages["sparse_structure"] = sparse_pt
+                if os.path.isfile(shape_pt):
+                    load_stages["shape_slat"] = shape_pt
+                job["log"].append("🔒 Lock mode: GEOMETRY (reusing structure + shape)")
+            elif lock_mode == "lock_structure":
+                # Reuse structure only, regenerate shape + texture
+                if os.path.isfile(sparse_pt):
+                    load_stages["sparse_structure"] = sparse_pt
+                job["log"].append("🔒 Lock mode: STRUCTURE (reusing sparse structure)")
+
+            job["log"].append(f"  ▸ Locked stages: {list(load_stages.keys())}")
+            job["log"].append(f"  ▸ Reference image: {safe_name}")
+
+            # Auto-remove background from new reference image
+            auto_rmbg = settings.get("auto_rmbg", True)
+            actual_ref_path = ref_path
+            if auto_rmbg:
+                try:
+                    test_img = Image.open(ref_path)
+                    if not has_transparency(test_img):
+                        job["log"].append("  🔍 Auto-removing background from reference...")
+                        job["progress"]["phase"] = "Removing background..."
+                        actual_ref_path = auto_remove_bg(ref_path)
+                        job["log"].append("  ✅ Background removed")
+                    del test_img
+                except Exception as e:
+                    job["log"].append(f"  ⚠ BG removal failed: {e}")
+
+            with _gpu_lock:
+                image = Image.open(actual_ref_path).convert("RGBA")
+
+                job["progress"]["phase"] = "Running retexture pipeline..."
+                job["progress"]["pct"] = 10
+
+                # New stage cache for this retexture version
+                retex_cache = out_path / f"{name}_stages"
+                retex_cache.mkdir(parents=True, exist_ok=True)
+
+                out_meshes = trellis_pipe.run(
+                    [image], image_weights=[1.0],
+                    sparse_structure_sampler_params={"steps": 12},
+                    shape_slat_sampler_params={"steps": 12},
+                    tex_slat_sampler_params={"steps": 12},
+                    load_stages=load_stages,
+                    cache_stages=str(retex_cache),
+                )
+
+                if not out_meshes:
+                    raise RuntimeError("Empty pipeline result")
+
+                mesh = out_meshes[0]
+                mesh.vertices = mesh.vertices.clone()
+                mesh.faces = mesh.faces.clone()
+                if hasattr(mesh, 'attrs') and mesh.attrs is not None:
+                    mesh.attrs = mesh.attrs.clone()
+                if hasattr(mesh, 'coords') and mesh.coords is not None:
+                    mesh.coords = mesh.coords.clone()
+
+                job["log"].append(
+                    f"  ✓ Mesh: {mesh.vertices.shape[0]:,} verts, {mesh.faces.shape[0]:,} faces"
+                )
+                job["progress"]["phase"] = "Rendering preview..."
+                job["progress"]["pct"] = 50
+
+                # Simplify if needed
+                decimate_target = settings.get("decimate_target", 1000000)
+                render_limit = min(decimate_target, RENDER_MAX_FACES)
+                n_raw = mesh.faces.shape[0]
+                if n_raw > render_limit:
+                    mesh.simplify(render_limit)
+                    mesh.vertices = mesh.vertices.clone()
+                    mesh.faces = mesh.faces.clone()
+
+                # Save render mesh
+                render_mesh_path = out_path / f"{name}_render_mesh.pt"
+                try:
+                    torch.save(mesh, str(render_mesh_path))
+                except Exception:
+                    render_mesh_path = None
+
+                # Render preview
+                render_mode = settings.get("render_mode", "video")
+                media_path, media_type = None, None
+                if render_mode != "none":
+                    media_path, media_type = do_render(
+                        mesh, render_mode, out_path, name,
+                        fps=settings.get("fps", 15),
+                    )
+                    torch.cuda.empty_cache()
+
+                # Offload and do mesh processing
+                del out_meshes
+                safe_offload_models()
+
+                job["progress"]["phase"] = "Processing mesh..."
+                job["progress"]["pct"] = 65
+
+                t_prep = time.perf_counter()
+                prepared = pp.prepare_mesh(
+                    vertices=mesh.vertices,
+                    faces=mesh.faces,
+                    attr_volume=mesh.attrs,
+                    coords=mesh.coords,
+                    attr_layout=mesh.layout,
+                    aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                    voxel_size=mesh.voxel_size,
+                    decimation_target=decimate_target,
+                    texture_size=settings.get("texture_size", 4096),
+                    remesh=settings.get("remesh", True),
+                    remesh_band=settings.get("remesh_band", 1.0),
+                    verbose=True,
+                    name=name,
+                )
+                del mesh
+                safe_cleanup()
+
+                # UV unwrap
+                job["progress"]["phase"] = "UV unwrapping..."
+                job["progress"]["pct"] = 78
+                unwrapped = pp.uv_unwrap(prepared, verbose=True)
+                del prepared
+
+                # Bake + export GLB
+                glb_out = out_path / f"{name}.glb"
+                job["progress"]["phase"] = "Baking textures..."
+                job["progress"]["pct"] = 88
+                pp.bake_and_export(unwrapped, str(glb_out), verbose=True)
+                del unwrapped
+                safe_cleanup()
+
+            dt = round(time.perf_counter() - t0, 2)
+            glb_size = glb_out.stat().st_size
+
+            result_entry = {"name": name, "glb": str(glb_out)}
+            if render_mesh_path and render_mesh_path.exists():
+                result_entry["render_mesh"] = str(render_mesh_path)
+            result_entry["stage_cache"] = str(retex_cache)
+            if media_path:
+                result_entry["media"] = media_path
+                result_entry["media_type"] = media_type
+
+            job["results"].append(result_entry)
+            job["log"].append(f"  ✅ Retexture complete: {name} — {fmt_bytes(glb_size)} ({dt}s)")
+            job["status"] = "done"
+            job["progress"] = {
+                "pct": 100, "image_num": 1, "total": 1,
+                "name": "Complete", "phase": "Retexture done!",
+                "elapsed": round(dt, 1),
+            }
+
+        except Exception as e:
+            dt = round(time.perf_counter() - t0, 2)
+            job["log"].append(f"  ❌ Retexture failed: {e}")
+            traceback.print_exc()
+            safe_offload_models()
+            job["status"] = "done"
+            job["progress"] = {
+                "pct": 100, "image_num": 1, "total": 1,
+                "name": "Failed", "phase": str(e),
+                "elapsed": round(dt, 1),
+            }
+
+    threading.Thread(target=_do_retexture, daemon=True).start()
     return jsonify({"job_id": job_id})
 
 
