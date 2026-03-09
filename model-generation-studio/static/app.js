@@ -651,19 +651,152 @@ function renderRmbgResults(results) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// EDITOR: STAGE INSPECTION + RETEXTURE
+// EDITOR: STAGE INSPECTION + RETEXTURE + MASK PAINTING
 // ══════════════════════════════════════════════════════════════
 
 let editRefFile = null;
 let selectedLockMode = 'lock_geometry';
-let currentStagesData = null;  // cached /api/stages response
-let editHistory = [];  // track retexture lineage
+let currentStagesData = null;
+let editHistory = [];
 
 function selectLock(el) {
     document.querySelectorAll('.lock-opt').forEach(o => o.classList.remove('sel'));
     el.classList.add('sel');
     selectedLockMode = el.dataset.lock;
     updateRetexButton();
+    updateRetexSummary();
+}
+
+// ── Paint mode UI wiring ──
+
+function onTogglePaint() {
+    if (!window.viewer3d) return;
+    // Load GLB in viewer first if not active
+    const model = completedModels[activeModelIdx];
+    if (model && model.glb && !window.viewer3d.isPaintMode) {
+        window.viewer3d.loadFromUrl('/api/file?p=' + enc(model.glb), model.name);
+        // Small delay to let model load before entering paint mode
+        setTimeout(() => {
+            const active = window.viewer3d.togglePaintMode();
+            updatePaintUI(active);
+        }, 800);
+    } else {
+        const active = window.viewer3d.togglePaintMode();
+        updatePaintUI(active);
+    }
+}
+
+function onExitPaint() {
+    if (!window.viewer3d) return;
+    if (window.viewer3d.isPaintMode) {
+        window.viewer3d.exitPaintMode();
+    }
+    updatePaintUI(false);
+}
+
+function updatePaintUI(active) {
+    const btn = $('maskPaintBtn');
+    const toolbar = $('paintToolbar');
+    if (active) {
+        btn.classList.add('active');
+        btn.innerHTML = '<span class="mb-icon">✓</span> Painting...';
+        toolbar.classList.add('active');
+    } else {
+        btn.classList.remove('active');
+        btn.innerHTML = '<span class="mb-icon">🖌</span> Paint Mask';
+        toolbar.classList.remove('active');
+    }
+}
+
+function setPaintTool(tool) {
+    if (!window.viewer3d) return;
+    if (tool === 'eraser') {
+        window.viewer3d.setBrushErasing(true);
+        $('ptBrush').classList.remove('active');
+        $('ptEraser').classList.add('active');
+    } else {
+        window.viewer3d.setBrushErasing(false);
+        $('ptBrush').classList.add('active');
+        $('ptEraser').classList.remove('active');
+    }
+}
+
+function onBrushSizeChange(val) {
+    $('ptSizeVal').textContent = val;
+    if (window.viewer3d) window.viewer3d.setBrushSize(parseInt(val));
+}
+
+function onClearMask() {
+    if (window.viewer3d) window.viewer3d.clearMask();
+    updateMaskPreview(false);
+}
+
+function onDownloadMask() {
+    if (!window.viewer3d) return;
+    const url = window.viewer3d.getMaskDataURL();
+    if (!url) return;
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'mask_uv.png';
+    a.click();
+}
+
+function onMaskFileUpload(input) {
+    const file = input.files?.[0];
+    if (!file) return;
+    const img = new Image();
+    img.onload = () => {
+        if (window.viewer3d) {
+            window.viewer3d.loadMaskFromImage(img);
+            updateMaskPreview(true);
+            // Enter viewer if not already
+            const model = completedModels[activeModelIdx];
+            if (model && model.glb) {
+                window.viewer3d.loadFromUrl('/api/file?p=' + enc(model.glb), model.name);
+            }
+        }
+    };
+    img.src = URL.createObjectURL(file);
+    input.value = '';
+}
+
+function updateMaskPreview(hasContent) {
+    const row = $('maskPreviewRow');
+    const status = $('maskStatus');
+    if (hasContent) {
+        row.style.display = '';
+        status.textContent = 'Mask active — only masked regions will be affected';
+        // Draw mask preview thumbnail
+        const thumb = $('maskPreviewThumb');
+        const ctx = thumb.getContext('2d');
+        ctx.clearRect(0, 0, 64, 64);
+        const url = window.viewer3d?.getMaskDataURL?.();
+        if (url) {
+            const img = new Image();
+            img.onload = () => ctx.drawImage(img, 0, 0, 64, 64);
+            img.src = url;
+        }
+    } else {
+        row.style.display = 'none';
+        status.textContent = 'No mask — full model will be affected';
+    }
+    updateRetexSummary();
+}
+
+// Listen for mask changes from viewer
+window.addEventListener('maskChanged', (e) => {
+    updateMaskPreview(e.detail?.hasContent || false);
+});
+
+function updateRetexSummary() {
+    const el = $('retexSummary');
+    if (!el) return;
+    const hasMask = window.viewer3d?.hasMaskContent?.() || false;
+    const weight = $('infWeight')?.value || 100;
+    const steps = $('infSteps')?.value || 12;
+    const lock = selectedLockMode === 'lock_geometry' ? 'geometry locked' : 'structure locked';
+    const maskLabel = hasMask ? 'masked region only' : 'full model';
+    el.textContent = `${lock} · ${maskLabel} · ${weight}% blend · ${steps} steps`;
 }
 
 // Init dropzone for edit panel reference image
@@ -698,7 +831,7 @@ function updateRetexButton() {
     btn.disabled = !editRefFile || !currentStagesData;
 }
 
-// Called whenever activeModelIdx changes — refresh edit panel
+// Called whenever activeModelIdx changes
 async function refreshEditPanel() {
     const noModel = $('editNoModel');
     const modelInfo = $('editModelInfo');
@@ -706,6 +839,8 @@ async function refreshEditPanel() {
     const refSection = $('editRefSection');
     const actionSection = $('editActionSection');
     const historySection = $('editHistorySection');
+    const maskSection = $('editMaskSection');
+    const influenceSection = $('editInfluenceSection');
 
     if (activeModelIdx < 0 || !completedModels[activeModelIdx]) {
         noModel.style.display = '';
@@ -714,6 +849,8 @@ async function refreshEditPanel() {
         refSection.style.display = 'none';
         actionSection.style.display = 'none';
         historySection.style.display = 'none';
+        maskSection.style.display = 'none';
+        influenceSection.style.display = 'none';
         currentStagesData = null;
         return;
     }
@@ -723,12 +860,13 @@ async function refreshEditPanel() {
     modelInfo.style.display = '';
     $('editModelName').textContent = model.name;
 
-    // Fetch stages if stage_cache exists
     if (!model.stage_cache) {
         $('stageList').innerHTML = '<div class="enm-text">No stage cache for this model.<br>Re-generate to enable editing.</div>';
         locksSection.style.display = 'none';
         refSection.style.display = 'none';
         actionSection.style.display = 'none';
+        maskSection.style.display = 'none';
+        influenceSection.style.display = 'none';
         currentStagesData = null;
         return;
     }
@@ -738,15 +876,16 @@ async function refreshEditPanel() {
         const data = await r.json();
         currentStagesData = data;
         renderStageList(data);
-        renderCapabilities(data);
         renderLockControls(data);
 
         locksSection.style.display = '';
         refSection.style.display = '';
         actionSection.style.display = '';
+        maskSection.style.display = '';
+        influenceSection.style.display = '';
         updateRetexButton();
+        updateRetexSummary();
 
-        // Build edit history from completedModels lineage
         refreshEditHistory(model);
     } catch (e) {
         console.error('Failed to fetch stages:', e);
@@ -781,7 +920,6 @@ function renderStageList(data) {
         list.appendChild(el);
     }
 
-    // Capability badges
     if (data.capabilities && data.capabilities.length > 0) {
         const badges = document.createElement('div');
         badges.className = 'cap-badges';
@@ -801,10 +939,6 @@ function renderStageList(data) {
     }
 }
 
-function renderCapabilities(data) {
-    // (capabilities are now rendered inside renderStageList)
-}
-
 function renderLockControls(data) {
     const caps = data.capabilities || [];
     document.querySelectorAll('.lock-opt').forEach(el => {
@@ -816,7 +950,6 @@ function renderLockControls(data) {
             el.classList.remove('sel');
         }
     });
-    // Auto-select best available lock
     if (caps.includes('lock_geometry')) {
         selectedLockMode = 'lock_geometry';
         document.querySelectorAll('.lock-opt').forEach(o => o.classList.remove('sel'));
@@ -832,7 +965,6 @@ function refreshEditHistory(activeModel) {
     const section = $('editHistorySection');
     const list = $('editHistoryList');
 
-    // Find models that share the same base lineage (by original name or stage_cache parent)
     const related = completedModels.filter(m =>
         m.name === activeModel.name ||
         m.name.startsWith(activeModel.name + '_retex') ||
@@ -846,7 +978,7 @@ function refreshEditHistory(activeModel) {
 
     section.style.display = '';
     list.innerHTML = '';
-    related.forEach((m, i) => {
+    related.forEach((m) => {
         const isRetex = m.name.includes('_retex');
         const isActive = m === activeModel;
         const el = document.createElement('div');
@@ -875,17 +1007,34 @@ async function startRetexture() {
     btn.disabled = true;
     btn.innerHTML = '<span class="retex-icon">⏳</span> Retexturing…';
 
-    // Generate a retex name
+    // Exit paint mode if active
+    if (window.viewer3d?.isPaintMode) {
+        window.viewer3d.exitPaintMode();
+        updatePaintUI(false);
+    }
+
     const timestamp = Date.now().toString(36).slice(-4);
     const retexName = model.name + '_retex_' + timestamp;
 
     const autoRmbg = document.querySelector('input[name="autoRmbg"]:checked')?.value === 'on';
+    const blendWeight = parseInt($('infWeight')?.value || 100) / 100;
+    const samplingSteps = parseInt($('infSteps')?.value || 12);
 
     const fd = new FormData();
     fd.append('image', editRefFile);
     fd.append('stage_cache', model.stage_cache);
     fd.append('lock_mode', selectedLockMode);
     fd.append('name', retexName);
+
+    // Add mask if painted
+    const hasMask = window.viewer3d?.hasMaskContent?.() || false;
+    if (hasMask) {
+        const maskBlob = await window.viewer3d.getMaskBlob();
+        if (maskBlob) {
+            fd.append('mask', maskBlob, 'mask.png');
+        }
+    }
+
     fd.append('settings', JSON.stringify({
         output_dir: $('sOutDir').value,
         fps: parseInt($('sFps').value),
@@ -895,6 +1044,9 @@ async function startRetexture() {
         remesh_band: parseFloat($('sRemeshBand').value),
         render_mode: selectedRenderMode,
         auto_rmbg: autoRmbg,
+        blend_weight: blendWeight,
+        sampling_steps: samplingSteps,
+        has_mask: hasMask,
     }));
 
     try {
@@ -902,7 +1054,6 @@ async function startRetexture() {
         const d = await r.json();
         if (!d.job_id) throw new Error(d.error || 'Failed');
 
-        // Show progress
         $('canvasEmpty').style.display = 'none';
         $('canvasProgress').classList.add('active');
         $('cpFill').style.width = '0%';

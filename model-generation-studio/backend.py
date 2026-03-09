@@ -1414,17 +1414,15 @@ def api_stages():
 @app.route("/api/retexture", methods=["POST"])
 def api_retexture():
     """
-    Retexture a model: lock structure + geometry, regenerate texture only
-    using a new reference image. Uses cached stage artifacts.
+    Retexture a model with masked latent blending.
 
     Form data:
       - image: new reference image file
+      - mask: (optional) UV-space mask PNG from the 3D paint tool
       - stage_cache: path to the model's _stages directory
-      - output_dir: where to save results
       - name: base name for output files
-      - lock_mode: 'lock_geometry' (reuse sparse_structure + shape_slat)
-                   or 'lock_structure' (reuse sparse_structure only)
-      - settings: JSON with texture_size, decimate_target, remesh, etc.
+      - lock_mode: 'lock_geometry' or 'lock_structure'
+      - settings: JSON with blend_weight, sampling_steps, texture_size, etc.
     """
     image_file = request.files.get("image")
     if not image_file:
@@ -1456,6 +1454,17 @@ def api_retexture():
     ref_path = str(job_dir / safe_name)
     image_file.save(ref_path)
 
+    # Save mask if provided
+    mask_path = None
+    mask_file = request.files.get("mask")
+    if mask_file:
+        mask_path = str(job_dir / "mask.png")
+        mask_file.save(mask_path)
+
+    blend_weight = settings.get("blend_weight", 1.0)
+    sampling_steps = settings.get("sampling_steps", 12)
+    has_mask = settings.get("has_mask", False)
+
     jobs[job_id] = {
         "status": "running",
         "progress": {"pct": 0, "image_num": 1, "total": 1,
@@ -1472,31 +1481,28 @@ def api_retexture():
             out_path = pathlib.Path(real_out)
             out_path.mkdir(parents=True, exist_ok=True)
 
-            # Build load_stages dict based on lock mode
             load_stages = {}
-
             sparse_pt = os.path.join(stage_cache_dir, "sparse_structure.pt")
             shape_pt = os.path.join(stage_cache_dir, "shape_slat.pt")
-            cond_512_pt = os.path.join(stage_cache_dir, "image_cond_512.pt")
-            cond_1024_pt = os.path.join(stage_cache_dir, "image_cond_1024.pt")
+            orig_tex_pt = os.path.join(stage_cache_dir, "tex_slat.pt")
 
             if lock_mode == "lock_geometry":
-                # Reuse structure + shape, regenerate texture only
                 if os.path.isfile(sparse_pt):
                     load_stages["sparse_structure"] = sparse_pt
                 if os.path.isfile(shape_pt):
                     load_stages["shape_slat"] = shape_pt
                 job["log"].append("🔒 Lock mode: GEOMETRY (reusing structure + shape)")
             elif lock_mode == "lock_structure":
-                # Reuse structure only, regenerate shape + texture
                 if os.path.isfile(sparse_pt):
                     load_stages["sparse_structure"] = sparse_pt
                 job["log"].append("🔒 Lock mode: STRUCTURE (reusing sparse structure)")
 
             job["log"].append(f"  ▸ Locked stages: {list(load_stages.keys())}")
             job["log"].append(f"  ▸ Reference image: {safe_name}")
+            job["log"].append(f"  ▸ Blend weight: {blend_weight:.0%} | Steps: {sampling_steps}")
+            if has_mask and mask_path:
+                job["log"].append(f"  ▸ Mask: UV mask provided (masked latent blend)")
 
-            # Auto-remove background from new reference image
             auto_rmbg = settings.get("auto_rmbg", True)
             actual_ref_path = ref_path
             if auto_rmbg:
@@ -1517,18 +1523,72 @@ def api_retexture():
                 job["progress"]["phase"] = "Running retexture pipeline..."
                 job["progress"]["pct"] = 10
 
-                # New stage cache for this retexture version
                 retex_cache = out_path / f"{name}_stages"
                 retex_cache.mkdir(parents=True, exist_ok=True)
 
                 out_meshes = trellis_pipe.run(
                     [image], image_weights=[1.0],
-                    sparse_structure_sampler_params={"steps": 12},
-                    shape_slat_sampler_params={"steps": 12},
-                    tex_slat_sampler_params={"steps": 12},
+                    sparse_structure_sampler_params={"steps": sampling_steps},
+                    shape_slat_sampler_params={"steps": sampling_steps},
+                    tex_slat_sampler_params={"steps": sampling_steps},
                     load_stages=load_stages,
                     cache_stages=str(retex_cache),
                 )
+
+                # ── Masked / weighted latent blending ──
+                needs_blend = (
+                    (has_mask and mask_path and os.path.isfile(orig_tex_pt))
+                    or (blend_weight < 1.0 and os.path.isfile(orig_tex_pt))
+                )
+                if needs_blend:
+                    try:
+                        from trellis2.pipelines.trellis2_image_to_3d import StageCache
+
+                        new_tex_pt = os.path.join(str(retex_cache), "tex_slat.pt")
+                        if os.path.isfile(new_tex_pt):
+                            orig_tex = StageCache.load(orig_tex_pt, as_sparse=True)
+                            new_tex = StageCache.load(new_tex_pt, as_sparse=True)
+
+                            if orig_tex.feats.shape == new_tex.feats.shape:
+                                # Compute effective weight
+                                w = blend_weight
+                                if has_mask and mask_path:
+                                    mask_img = Image.open(mask_path).convert("L")
+                                    mask_np = np.array(mask_img).astype(np.float32) / 255.0
+                                    mask_coverage = float(mask_np.mean())
+                                    w = blend_weight * mask_coverage
+                                    job["log"].append(f"  🎨 Masked blend: {w:.0%} effective (coverage {mask_coverage:.0%} × weight {blend_weight:.0%})")
+                                else:
+                                    job["log"].append(f"  🎨 Global blend at {w:.0%}")
+
+                                wt = torch.tensor(w, dtype=orig_tex.feats.dtype,
+                                                   device=orig_tex.feats.device)
+                                blended_feats = (1 - wt) * orig_tex.feats + wt * new_tex.feats
+                                new_tex = new_tex.replace(feats=blended_feats)
+
+                                StageCache(str(retex_cache)).save("tex_slat", new_tex)
+
+                                # Re-decode with blended latents
+                                slat_path = load_stages.get("shape_slat",
+                                    os.path.join(str(retex_cache), "shape_slat.pt"))
+                                shape_loaded = StageCache.load(slat_path, as_sparse=True)
+                                if isinstance(shape_loaded, tuple):
+                                    shape_for_decode, res = shape_loaded
+                                else:
+                                    shape_for_decode = shape_loaded
+                                    res = 1024
+
+                                out_meshes = trellis_pipe.decode_latent(
+                                    shape_for_decode, new_tex, res)
+                                StageCache(str(retex_cache)).save("decoded_mesh", out_meshes)
+                                job["log"].append(f"    ✓ Blend + re-decode complete")
+                            else:
+                                job["log"].append(f"    ⚠ Shape mismatch, skipping blend")
+
+                            del orig_tex, new_tex
+                    except Exception as blend_err:
+                        job["log"].append(f"  ⚠ Latent blend failed: {blend_err}")
+                        traceback.print_exc()
 
                 if not out_meshes:
                     raise RuntimeError("Empty pipeline result")

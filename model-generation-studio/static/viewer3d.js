@@ -1,9 +1,10 @@
 // ============================================================
 // TRELLIS.2 Studio — 3D GLB Viewer (viewer3d.js)
-// GPU-accelerated viewer with interaction-aware quality:
-//   • While orbiting/zooming: fast unlit MeshBasicMaterial
-//   • When idle: full PBR shaded with lights
-// Also extracts UV texture maps for 2D preview.
+// GPU-accelerated viewer with:
+//   • Interaction-aware quality (fast unlit while orbiting)
+//   • 3D paint mask system for region selection
+//   • UV texture map extraction
+//   • Zoom +/- controls for laptop users
 // ============================================================
 
 import * as THREE from 'three';
@@ -23,7 +24,22 @@ let frameCount = 0, fpsTime = 0, currentFps = 0;
 let animFrameId = null;
 let isActive = false;
 
-const IDLE_DELAY = 180; // ms after interaction stops → switch to shaded
+// ── Paint mask state ──
+let paintMode = false;          // is paint mode active
+let isPainting = false;         // mouse is down and painting
+let paintErasing = false;       // eraser mode
+let brushSize = 24;             // brush radius in pixels
+let maskCanvas = null;          // offscreen canvas for UV mask
+let maskCtx = null;
+const MASK_RESOLUTION = 1024;   // mask texture resolution
+let maskTexture = null;         // THREE.CanvasTexture for overlay
+let maskOverlayMaterials = new Map(); // mesh → mask overlay material
+let raycaster = new THREE.Raycaster();
+let paintPointer = new THREE.Vector2();
+let brushCursor = null;         // screen-space brush cursor div
+let lastPaintUV = null;         // for interpolating strokes
+
+const IDLE_DELAY = 180;
 
 // ── DOM refs ──
 const container = document.getElementById('canvas3dViewer');
@@ -47,7 +63,6 @@ const texModalBody = document.getElementById('texModalBody');
 // ══════════════════════════════════════════════════════════════
 
 function init() {
-    // Renderer
     renderer = new THREE.WebGLRenderer({
         canvas: canvas,
         antialias: true,
@@ -60,15 +75,12 @@ function init() {
     renderer.shadowMap.enabled = false;
     renderer.setClearColor(0x09090B, 1);
 
-    // Scene
     scene = new THREE.Scene();
     scene.background = new THREE.Color(0x09090B);
 
-    // Camera
     camera = new THREE.PerspectiveCamera(45, 1, 0.01, 2000);
     camera.position.set(2, 1.5, 3);
 
-    // Controls
     controls = new OrbitControls(camera, canvas);
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
@@ -77,17 +89,12 @@ function init() {
     controls.zoomSpeed = 1.2;
     controls.screenSpacePanning = true;
 
-    // Track interaction for LOD switching
     controls.addEventListener('start', onInteractionStart);
     controls.addEventListener('end', onInteractionEnd);
 
-    // Lights (used in shaded mode)
     setupLights();
-
-    // Clock for FPS
     clock = new THREE.Clock();
 
-    // Resize observer
     const ro = new ResizeObserver(onResize);
     ro.observe(container);
 
@@ -99,6 +106,21 @@ function init() {
     texOverlay.addEventListener('click', (e) => {
         if (e.target === texOverlay) closeTextureModal();
     });
+
+    // Paint events on the canvas
+    canvas.addEventListener('pointerdown', onPaintDown);
+    canvas.addEventListener('pointermove', onPaintMove);
+    canvas.addEventListener('pointerup', onPaintUp);
+    canvas.addEventListener('pointerleave', onPaintUp);
+
+    // Create brush cursor
+    brushCursor = document.createElement('div');
+    brushCursor.className = 'brush-cursor';
+    brushCursor.style.display = 'none';
+    container.appendChild(brushCursor);
+
+    // Init mask canvas
+    initMaskCanvas();
 }
 
 function setupLights() {
@@ -123,39 +145,342 @@ function setupLights() {
 }
 
 // ══════════════════════════════════════════════════════════════
+// MASK CANVAS (offscreen UV-space mask)
+// ══════════════════════════════════════════════════════════════
+
+function initMaskCanvas() {
+    maskCanvas = document.createElement('canvas');
+    maskCanvas.width = MASK_RESOLUTION;
+    maskCanvas.height = MASK_RESOLUTION;
+    maskCtx = maskCanvas.getContext('2d');
+    clearMask();
+}
+
+function clearMask() {
+    if (!maskCtx) return;
+    maskCtx.clearRect(0, 0, MASK_RESOLUTION, MASK_RESOLUTION);
+    if (maskTexture) {
+        maskTexture.needsUpdate = true;
+    }
+    lastPaintUV = null;
+    // Dispatch event so UI can update
+    window.dispatchEvent(new CustomEvent('maskChanged', { detail: { hasContent: false } }));
+}
+
+function getMaskDataURL() {
+    return maskCanvas ? maskCanvas.toDataURL('image/png') : null;
+}
+
+function getMaskBlob() {
+    return new Promise((resolve) => {
+        if (!maskCanvas) { resolve(null); return; }
+        maskCanvas.toBlob(resolve, 'image/png');
+    });
+}
+
+function loadMaskFromImage(img) {
+    if (!maskCtx) return;
+    maskCtx.clearRect(0, 0, MASK_RESOLUTION, MASK_RESOLUTION);
+    maskCtx.drawImage(img, 0, 0, MASK_RESOLUTION, MASK_RESOLUTION);
+    if (maskTexture) maskTexture.needsUpdate = true;
+    window.dispatchEvent(new CustomEvent('maskChanged', { detail: { hasContent: true } }));
+}
+
+function hasMaskContent() {
+    if (!maskCtx) return false;
+    const data = maskCtx.getImageData(0, 0, MASK_RESOLUTION, MASK_RESOLUTION).data;
+    for (let i = 3; i < data.length; i += 4) {
+        if (data[i] > 10) return true;
+    }
+    return false;
+}
+
+// ══════════════════════════════════════════════════════════════
+// PAINT MODE
+// ══════════════════════════════════════════════════════════════
+
+function enterPaintMode() {
+    if (!currentModel) return;
+    paintMode = true;
+    controls.enabled = false;
+
+    // Force shaded mode for responsiveness during paint
+    switchToFastMode();
+
+    // Create mask texture if needed
+    if (!maskTexture) {
+        maskTexture = new THREE.CanvasTexture(maskCanvas);
+        maskTexture.colorSpace = THREE.SRGBColorSpace;
+        maskTexture.wrapS = THREE.ClampToEdgeWrapping;
+        maskTexture.wrapT = THREE.ClampToEdgeWrapping;
+    }
+
+    // Apply mask overlay to all meshes
+    currentModel.traverse((obj) => {
+        if (!obj.isMesh || !obj.geometry.attributes.uv) return;
+        const orig = originalMaterials.get(obj);
+        if (!orig) return;
+
+        // Create overlay material: base texture + mask tint
+        const baseMat = Array.isArray(orig) ? orig[0] : orig;
+        const overlayMat = new THREE.MeshBasicMaterial({
+            map: baseMat?.map ?? null,
+            color: baseMat?.color?.clone?.() ?? new THREE.Color(0xcccccc),
+            transparent: true,
+            side: baseMat?.side ?? THREE.FrontSide,
+        });
+
+        // Custom shader chunk to tint masked areas
+        overlayMat.onBeforeCompile = (shader) => {
+            shader.uniforms.maskTex = { value: maskTexture };
+            shader.fragmentShader = shader.fragmentShader.replace(
+                '#include <map_fragment>',
+                `#include <map_fragment>
+                 // Mask overlay
+                 vec4 maskSample = texture2D(maskTex, vMapUv);
+                 float maskAlpha = maskSample.a * 0.55;
+                 diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.91, 0.42, 0.09), maskAlpha);
+                `
+            );
+            shader.fragmentShader = 'uniform sampler2D maskTex;\n' + shader.fragmentShader;
+        };
+
+        maskOverlayMaterials.set(obj, overlayMat);
+        obj.material = overlayMat;
+    });
+
+    // Show brush cursor
+    brushCursor.style.display = 'block';
+    updateBrushCursor();
+    canvas.style.cursor = 'none';
+
+    hudMode.textContent = 'PAINT';
+    hudMode.classList.remove('shaded', 'fast', 'wire');
+    hudMode.classList.add('paint');
+}
+
+function exitPaintMode() {
+    paintMode = false;
+    isPainting = false;
+    controls.enabled = true;
+
+    // Restore original materials
+    currentModel?.traverse((obj) => {
+        if (!obj.isMesh) return;
+        const orig = originalMaterials.get(obj);
+        if (orig) obj.material = orig;
+    });
+
+    // Clean up overlay materials
+    for (const mat of maskOverlayMaterials.values()) {
+        mat?.dispose?.();
+    }
+    maskOverlayMaterials.clear();
+
+    brushCursor.style.display = 'none';
+    canvas.style.cursor = '';
+
+    if (forcedWireframe) {
+        // Restore wireframe state
+    } else {
+        switchToShadedMode();
+    }
+}
+
+function togglePaintMode() {
+    if (paintMode) exitPaintMode();
+    else enterPaintMode();
+    return paintMode;
+}
+
+function setBrushSize(size) {
+    brushSize = Math.max(4, Math.min(120, size));
+    updateBrushCursor();
+}
+
+function setBrushErasing(erasing) {
+    paintErasing = erasing;
+    updateBrushCursor();
+}
+
+function updateBrushCursor() {
+    if (!brushCursor) return;
+    const d = brushSize * 2;
+    brushCursor.style.width = d + 'px';
+    brushCursor.style.height = d + 'px';
+    brushCursor.style.borderColor = paintErasing
+        ? 'rgba(239, 68, 68, 0.8)'
+        : 'rgba(232, 169, 23, 0.9)';
+    brushCursor.style.background = paintErasing
+        ? 'rgba(239, 68, 68, 0.06)'
+        : 'rgba(232, 169, 23, 0.06)';
+}
+
+// ── Paint Events ──
+
+function onPaintDown(e) {
+    if (!paintMode) return;
+    isPainting = true;
+    lastPaintUV = null;
+    paintAtScreen(e.clientX, e.clientY);
+}
+
+function onPaintMove(e) {
+    if (!paintMode) return;
+
+    // Update cursor position
+    const rect = canvas.getBoundingClientRect();
+    const cx = e.clientX - rect.left;
+    const cy = e.clientY - rect.top;
+    brushCursor.style.left = (cx - brushSize) + 'px';
+    brushCursor.style.top = (cy - brushSize) + 'px';
+
+    if (isPainting) {
+        paintAtScreen(e.clientX, e.clientY);
+    }
+}
+
+function onPaintUp(e) {
+    if (!paintMode) return;
+    isPainting = false;
+    lastPaintUV = null;
+
+    // Check if mask has content and notify
+    const has = hasMaskContent();
+    window.dispatchEvent(new CustomEvent('maskChanged', { detail: { hasContent: has } }));
+}
+
+function paintAtScreen(clientX, clientY) {
+    if (!currentModel || !maskCtx) return;
+
+    const rect = canvas.getBoundingClientRect();
+    paintPointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+    paintPointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+
+    raycaster.setFromCamera(paintPointer, camera);
+
+    // Collect meshes
+    const meshes = [];
+    currentModel.traverse((obj) => {
+        if (obj.isMesh && obj.geometry.attributes.uv) meshes.push(obj);
+    });
+
+    const hits = raycaster.intersectObjects(meshes, false);
+    if (hits.length === 0) return;
+
+    const hit = hits[0];
+    const uv = hit.uv;
+    if (!uv) return;
+
+    // Convert UV to mask canvas coords
+    const mx = uv.x * MASK_RESOLUTION;
+    const my = (1 - uv.y) * MASK_RESOLUTION; // flip Y for canvas
+
+    // Brush radius in UV space — approximate from screen brush size
+    // Use distance to estimate UV-space brush radius
+    const uvRadius = (brushSize / Math.min(rect.width, rect.height)) * 1.8;
+    const maskRadius = uvRadius * MASK_RESOLUTION;
+    const r = Math.max(2, maskRadius);
+
+    // Interpolate between last paint point for smooth strokes
+    const points = [];
+    if (lastPaintUV) {
+        const dx = mx - lastPaintUV.x;
+        const dy = my - lastPaintUV.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        const step = Math.max(1, r * 0.3);
+        const steps = Math.ceil(dist / step);
+        for (let i = 0; i <= steps; i++) {
+            const t = steps > 0 ? i / steps : 1;
+            points.push({ x: lastPaintUV.x + dx * t, y: lastPaintUV.y + dy * t });
+        }
+    } else {
+        points.push({ x: mx, y: my });
+    }
+    lastPaintUV = { x: mx, y: my };
+
+    // Paint or erase
+    for (const pt of points) {
+        if (paintErasing) {
+            maskCtx.globalCompositeOperation = 'destination-out';
+            maskCtx.beginPath();
+            maskCtx.arc(pt.x, pt.y, r, 0, Math.PI * 2);
+            maskCtx.fill();
+            maskCtx.globalCompositeOperation = 'source-over';
+        } else {
+            const grad = maskCtx.createRadialGradient(pt.x, pt.y, 0, pt.x, pt.y, r);
+            grad.addColorStop(0, 'rgba(255, 140, 0, 0.85)');
+            grad.addColorStop(0.6, 'rgba(255, 140, 0, 0.5)');
+            grad.addColorStop(1, 'rgba(255, 140, 0, 0)');
+            maskCtx.fillStyle = grad;
+            maskCtx.beginPath();
+            maskCtx.arc(pt.x, pt.y, r, 0, Math.PI * 2);
+            maskCtx.fill();
+        }
+    }
+
+    // Update texture
+    if (maskTexture) maskTexture.needsUpdate = true;
+}
+
+// ══════════════════════════════════════════════════════════════
+// ZOOM CONTROLS (for laptop users)
+// ══════════════════════════════════════════════════════════════
+
+function zoomIn() {
+    if (!controls || !camera) return;
+    const dir = new THREE.Vector3();
+    camera.getWorldDirection(dir);
+    camera.position.addScaledVector(dir, controls.minDistance * 2 || 0.3);
+    controls.update();
+}
+
+function zoomOut() {
+    if (!controls || !camera) return;
+    const dir = new THREE.Vector3();
+    camera.getWorldDirection(dir);
+    camera.position.addScaledVector(dir, -(controls.minDistance * 2 || 0.3));
+    controls.update();
+}
+
+// ══════════════════════════════════════════════════════════════
 // INTERACTION-AWARE QUALITY SWITCHING
 // ══════════════════════════════════════════════════════════════
 
 function onInteractionStart() {
+    if (paintMode) return; // don't switch materials during paint
     if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
     if (!isInteracting) {
         isInteracting = true;
-        if (!forcedWireframe) switchToFastMode();
+        if (!forcedWireframe && !paintMode) switchToFastMode();
     }
 }
 
 function onInteractionEnd() {
+    if (paintMode) return;
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
         isInteracting = false;
-        if (!forcedWireframe) switchToShadedMode();
+        if (!forcedWireframe && !paintMode) switchToShadedMode();
     }, IDLE_DELAY);
 }
 
 function switchToFastMode() {
-    if (!currentModel) return;
+    if (!currentModel || paintMode) return;
     currentModel.traverse((obj) => {
         if (!obj.isMesh) return;
         const unlit = unlitMaterials.get(obj);
         if (unlit) obj.material = unlit;
     });
-    hudMode.textContent = 'FAST';
-    hudMode.classList.add('fast');
-    hudMode.classList.remove('shaded', 'wire');
+    if (!paintMode) {
+        hudMode.textContent = 'FAST';
+        hudMode.classList.add('fast');
+        hudMode.classList.remove('shaded', 'wire', 'paint');
+    }
 }
 
 function switchToShadedMode() {
-    if (!currentModel) return;
+    if (!currentModel || paintMode) return;
     currentModel.traverse((obj) => {
         if (!obj.isMesh) return;
         const orig = originalMaterials.get(obj);
@@ -167,7 +492,7 @@ function switchToShadedMode() {
     });
     hudMode.textContent = 'SHADED';
     hudMode.classList.add('shaded');
-    hudMode.classList.remove('fast', 'wire');
+    hudMode.classList.remove('fast', 'wire', 'paint');
 }
 
 function toggleWireframe() {
@@ -176,6 +501,7 @@ function toggleWireframe() {
     if (!currentModel) return;
 
     if (forcedWireframe) {
+        if (paintMode) exitPaintMode();
         currentModel.traverse((obj) => {
             if (!obj.isMesh) return;
             const orig = originalMaterials.get(obj);
@@ -187,7 +513,7 @@ function toggleWireframe() {
         });
         hudMode.textContent = 'WIREFRAME';
         hudMode.classList.add('wire');
-        hudMode.classList.remove('fast', 'shaded');
+        hudMode.classList.remove('fast', 'shaded', 'paint');
     } else {
         if (isInteracting) switchToFastMode();
         else switchToShadedMode();
@@ -199,8 +525,10 @@ function toggleWireframe() {
 // ══════════════════════════════════════════════════════════════
 
 function loadFromUrl(url, name) {
-    // Show the viewer
     show();
+
+    // Exit paint mode if active
+    if (paintMode) exitPaintMode();
 
     // Clear previous
     if (currentModel) {
@@ -210,7 +538,11 @@ function loadFromUrl(url, name) {
     }
     originalMaterials.clear();
     unlitMaterials.clear();
+    maskOverlayMaterials.clear();
     extractedTextures = [];
+
+    // Clear mask for new model
+    clearMask();
 
     hudTris.textContent = 'Loading…';
     hudVerts.textContent = '';
@@ -229,7 +561,6 @@ function loadFromUrl(url, name) {
             if (!obj.isMesh) return;
             meshCount++;
 
-            // Disable auto-update for perf
             obj.frustumCulled = true;
             obj.castShadow = false;
             obj.receiveShadow = false;
@@ -330,13 +661,14 @@ function disposeModel(root) {
     root?.traverse((obj) => {
         if (obj.isMesh) {
             obj.geometry?.dispose?.();
-            // Don't dispose original materials, just unlit clones
         }
     });
-    // Dispose unlit materials
     for (const mat of unlitMaterials.values()) {
         if (Array.isArray(mat)) mat.forEach(m => m?.dispose?.());
         else mat?.dispose?.();
+    }
+    for (const mat of maskOverlayMaterials.values()) {
+        mat?.dispose?.();
     }
 }
 
@@ -346,12 +678,9 @@ function disposeModel(root) {
 
 function openTextureModal() {
     if (extractedTextures.length === 0) return;
-
     texOverlay.classList.add('open');
 
-    // Build selector if multiple textures
     const body = texModalBody;
-    // Remove old selector if any
     const oldSel = body.querySelector('.tex-selector');
     if (oldSel) oldSel.remove();
 
@@ -387,7 +716,6 @@ function renderTexturePreview(idx) {
     texPreviewCanvas.height = h;
     const ctx = texPreviewCanvas.getContext('2d');
 
-    // Draw checkerboard background
     const checkSize = Math.max(8, Math.round(w / 64));
     for (let y = 0; y < h; y += checkSize) {
         for (let x = 0; x < w; x += checkSize) {
@@ -396,12 +724,10 @@ function renderTexturePreview(idx) {
         }
     }
 
-    // Draw the texture
     ctx.drawImage(img, 0, 0, w, h);
 
     texInfo.textContent = `${tex.name || 'Texture'} — ${w}×${h}px`;
 
-    // Update download link
     texDownloadBtn.href = texPreviewCanvas.toDataURL('image/png');
     texDownloadBtn.download = `${tex.name || 'texture_map'}.png`;
 }
@@ -421,7 +747,6 @@ function animate() {
     controls.update();
     renderer.render(scene, camera);
 
-    // FPS counter
     frameCount++;
     const elapsed = clock.getElapsedTime();
     if (elapsed - fpsTime >= 0.5) {
@@ -440,23 +765,21 @@ function show() {
     isActive = true;
     container.classList.add('active');
 
-    // Hide other canvas states
     const empty = document.getElementById('canvasEmpty');
     const media = document.getElementById('canvasMedia');
     const noRender = document.getElementById('canvasNoRender');
-    const progress = document.getElementById('canvasProgress');
     if (empty) empty.style.display = 'none';
     if (media) media.classList.remove('active');
     if (noRender) noRender.classList.remove('active');
 
     onResize();
-
     if (!animFrameId) animate();
 }
 
 function hide() {
     isActive = false;
     container.classList.remove('active');
+    if (paintMode) exitPaintMode();
 }
 
 function onResize() {
@@ -482,4 +805,20 @@ window.viewer3d = {
     show,
     hide,
     resetCamera,
+    // Paint mask API
+    togglePaintMode,
+    enterPaintMode,
+    exitPaintMode,
+    setBrushSize,
+    setBrushErasing,
+    clearMask,
+    getMaskDataURL,
+    getMaskBlob,
+    hasMaskContent,
+    loadMaskFromImage,
+    get isPaintMode() { return paintMode; },
+    get brushSize() { return brushSize; },
+    // Zoom
+    zoomIn,
+    zoomOut,
 };

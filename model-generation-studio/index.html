@@ -183,6 +183,30 @@
         </div>
       </div>
 
+      <!-- Mask Painting -->
+      <div class="sidebar-section" id="editMaskSection" style="display:none">
+        <div class="section-label">🖌 Region Mask</div>
+        <div class="mask-actions">
+          <button class="mask-btn" id="maskPaintBtn" onclick="onTogglePaint()">
+            <span class="mb-icon">🖌</span> Paint Mask
+          </button>
+          <button class="mask-btn secondary" id="maskUploadBtn" onclick="document.getElementById('maskFileInput').click()">
+            <span class="mb-icon">📤</span> Upload Mask
+          </button>
+          <input type="file" id="maskFileInput" accept="image/*" style="display:none"
+                 onchange="onMaskFileUpload(this)">
+        </div>
+        <div class="mask-status" id="maskStatus">No mask — full model will be affected</div>
+        <div class="mask-preview-row" id="maskPreviewRow" style="display:none">
+          <canvas id="maskPreviewThumb" width="64" height="64" class="mask-thumb"></canvas>
+          <div class="mask-preview-info">
+            <span class="mpi-label">UV Mask Active</span>
+            <button class="mask-btn-sm" onclick="onDownloadMask()">↓ Save</button>
+            <button class="mask-btn-sm danger" onclick="onClearMask()">✕ Clear</button>
+          </div>
+        </div>
+      </div>
+
       <!-- Lock Controls -->
       <div class="sidebar-section" id="editLocksSection" style="display:none">
         <div class="section-label">🔒 Stage Locks</div>
@@ -204,6 +228,26 @@
         </div>
       </div>
 
+      <!-- Influence Weight -->
+      <div class="sidebar-section" id="editInfluenceSection" style="display:none">
+        <div class="section-label">⚖ Influence</div>
+        <div class="influence-row">
+          <label class="inf-label">Blend Weight</label>
+          <input type="range" id="infWeight" min="0" max="100" value="100" class="inf-slider"
+                 oninput="document.getElementById('infWeightVal').textContent = this.value + '%'">
+          <span class="inf-value" id="infWeightVal">100%</span>
+        </div>
+        <div class="inf-hint">How strongly the new reference replaces the original in masked regions. 100% = full replace, 50% = blend half-and-half.</div>
+
+        <div class="influence-row" style="margin-top:10px">
+          <label class="inf-label">Sampling Steps</label>
+          <input type="range" id="infSteps" min="4" max="24" value="12" class="inf-slider"
+                 oninput="document.getElementById('infStepsVal').textContent = this.value">
+          <span class="inf-value" id="infStepsVal">12</span>
+        </div>
+        <div class="inf-hint">More steps = higher quality, slower. 8–12 is fast, 16–24 for final quality.</div>
+      </div>
+
       <!-- Reference Image for Retexture -->
       <div class="sidebar-section" id="editRefSection" style="display:none">
         <div class="section-label">🖼 New Reference Image</div>
@@ -212,7 +256,6 @@
           <input type="file" id="fileInputEdit" accept="image/*">
         </div>
         <div class="thumb-strip" id="thumbsEdit"></div>
-        <div class="edit-ref-hint">This image will drive the new texture/appearance while keeping the locked stages from the original model.</div>
       </div>
 
       <!-- Retexture Action -->
@@ -220,6 +263,7 @@
         <button class="gen-btn retex-btn" id="retexBtn" onclick="startRetexture()" disabled>
           <span class="retex-icon">🔄</span> Retexture →
         </button>
+        <div class="retex-summary" id="retexSummary"></div>
       </div>
 
       <!-- Edit History -->
@@ -288,6 +332,27 @@
           <button class="vtb-btn" id="btnResetCam" title="Reset Camera">⟲</button>
           <button class="vtb-btn" id="btnWireframe" title="Toggle Wireframe">◇</button>
           <button class="vtb-btn gold" id="btnTexMap" title="View Texture Map">🗺 Texture</button>
+          <div class="vtb-sep"></div>
+          <button class="vtb-btn" id="btnZoomIn" title="Zoom In" onclick="window.viewer3d?.zoomIn()">+</button>
+          <button class="vtb-btn" id="btnZoomOut" title="Zoom Out" onclick="window.viewer3d?.zoomOut()">−</button>
+        </div>
+
+        <!-- Paint toolbar (shown when paint mode is active) -->
+        <div class="paint-toolbar" id="paintToolbar">
+          <div class="pt-group">
+            <button class="pt-btn active" id="ptBrush" onclick="setPaintTool('brush')" title="Paint Brush">🖌</button>
+            <button class="pt-btn" id="ptEraser" onclick="setPaintTool('eraser')" title="Eraser">◻</button>
+          </div>
+          <div class="pt-sep"></div>
+          <div class="pt-group pt-size-group">
+            <label class="pt-label">Size</label>
+            <input type="range" id="ptSizeSlider" min="4" max="100" value="24" class="pt-slider"
+                   oninput="onBrushSizeChange(this.value)">
+            <span class="pt-value" id="ptSizeVal">24</span>
+          </div>
+          <div class="pt-sep"></div>
+          <button class="pt-btn" id="ptClear" onclick="onClearMask()" title="Clear Mask">🗑</button>
+          <button class="pt-btn" id="ptDone" onclick="onExitPaint()" title="Done Painting">✓</button>
         </div>
       </div>
 
