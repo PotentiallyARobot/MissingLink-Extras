@@ -335,6 +335,11 @@
           <div class="vtb-sep"></div>
           <button class="vtb-btn" id="btnZoomIn" title="Zoom In" onclick="window.viewer3d?.zoomIn()">+</button>
           <button class="vtb-btn" id="btnZoomOut" title="Zoom Out" onclick="window.viewer3d?.zoomOut()">−</button>
+          <div class="vtb-sep"></div>
+          <button class="vtb-btn vtb-sm" title="Pan Left (A)" onclick="window.viewer3d?.panCamera(-1,0)">◂</button>
+          <button class="vtb-btn vtb-sm" title="Pan Right (D)" onclick="window.viewer3d?.panCamera(1,0)">▸</button>
+          <button class="vtb-btn vtb-sm" title="Pan Up (W)" onclick="window.viewer3d?.panCamera(0,1)">▴</button>
+          <button class="vtb-btn vtb-sm" title="Pan Down (S)" onclick="window.viewer3d?.panCamera(0,-1)">▾</button>
         </div>
 
         <!-- Paint toolbar (shown when paint mode is active) -->
@@ -350,6 +355,8 @@
                    oninput="onBrushSizeChange(this.value)">
             <span class="pt-value" id="ptSizeVal">24</span>
           </div>
+          <div class="pt-sep"></div>
+          <button class="pt-btn active" id="ptCamLock" onclick="onToggleCamLock()" title="Lock/Unlock Camera — Hold Space to orbit">🔒</button>
           <div class="pt-sep"></div>
           <button class="pt-btn" id="ptClear" onclick="onClearMask()" title="Clear Mask">🗑</button>
           <button class="pt-btn" id="ptDone" onclick="onExitPaint()" title="Done Painting">✓</button>

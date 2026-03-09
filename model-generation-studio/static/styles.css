@@ -473,6 +473,7 @@ body{background:var(--black);color:var(--text);font-family:var(--font-body);font
 
 /* Viewer toolbar separator */
 .vtb-sep{width:1px;height:16px;background:var(--border);margin:0 2px}
+.vtb-btn.vtb-sm{padding:5px 6px;font-size:11px;min-width:24px}
 
 /* ═══ MASK CONTROLS ═══ */
 .mask-actions{display:flex;gap:6px;margin-bottom:8px}

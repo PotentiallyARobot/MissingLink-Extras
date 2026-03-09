@@ -671,11 +671,9 @@ function selectLock(el) {
 
 function onTogglePaint() {
     if (!window.viewer3d) return;
-    // Load GLB in viewer first if not active
     const model = completedModels[activeModelIdx];
     if (model && model.glb && !window.viewer3d.isPaintMode) {
         window.viewer3d.loadFromUrl('/api/file?p=' + enc(model.glb), model.name);
-        // Small delay to let model load before entering paint mode
         setTimeout(() => {
             const active = window.viewer3d.togglePaintMode();
             updatePaintUI(active);
@@ -688,11 +686,39 @@ function onTogglePaint() {
 
 function onExitPaint() {
     if (!window.viewer3d) return;
-    if (window.viewer3d.isPaintMode) {
-        window.viewer3d.exitPaintMode();
-    }
+    if (window.viewer3d.isPaintMode) window.viewer3d.exitPaintMode();
     updatePaintUI(false);
 }
+
+function onToggleCamLock() {
+    if (!window.viewer3d || !window.viewer3d.isPaintMode) return;
+    const locked = window.viewer3d.togglePaintCameraLock();
+    $('ptCamLock').classList.toggle('active', locked);
+    $('ptCamLock').textContent = locked ? '🔒' : '🔓';
+}
+
+// Space bar: hold to temporarily unlock camera for orbiting while in paint mode
+document.addEventListener('keydown', (e) => {
+    if (e.code === 'Space' && window.viewer3d?.isPaintMode && window.viewer3d?.isPaintCameraLocked) {
+        e.preventDefault();
+        window.viewer3d.togglePaintCameraLock();
+        $('ptCamLock').classList.remove('active');
+        $('ptCamLock').textContent = '🔓';
+    }
+});
+document.addEventListener('keyup', (e) => {
+    if (e.code === 'Space' && window.viewer3d?.isPaintMode && !window.viewer3d?.isPaintCameraLocked) {
+        e.preventDefault();
+        window.viewer3d.togglePaintCameraLock();
+        $('ptCamLock').classList.add('active');
+        $('ptCamLock').textContent = '🔒';
+    }
+});
+
+// Listen for paint mode state changes from viewer
+window.addEventListener('paintModeChanged', (e) => {
+    updatePaintUI(e.detail?.active || false);
+});
 
 function updatePaintUI(active) {
     const btn = $('maskPaintBtn');
