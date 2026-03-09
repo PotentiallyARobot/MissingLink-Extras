@@ -226,6 +226,7 @@ class LocalLLMClient:
     """
     Routes LLM calls to model_server.py POST /llm/chat.
     Uses the local uncensored Llama-3.2-3B-Instruct model.
+    HTTP mode — used when running CLI against a remote server.
     """
     def __init__(self, server_url: str):
         self.server_url = server_url.rstrip("/")
@@ -265,6 +266,59 @@ class LocalLLMClient:
         return r.json()
 
 
+class DirectLLMClient:
+    """
+    Wraps a llama_cpp.Llama instance directly in-process.
+    No HTTP, no sockets, no serialization. Used in notebook mode.
+    """
+    def __init__(self, llm_obj):
+        self._llm = llm_obj  # llama_cpp.Llama instance
+
+    def chat(self, prompt: str, temperature: float = 0.85, max_tokens: int = 4096) -> str:
+        result = self._llm.create_chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return result["choices"][0]["message"]["content"]
+
+    def status(self) -> Dict:
+        return {"loaded": self._llm is not None, "on_gpu": True, "model": "direct"}
+
+    def offload(self) -> Dict:
+        """In direct mode, offload by moving to CPU layers=0. 
+        We delete and rebuild with n_gpu_layers=0."""
+        if self._llm is None:
+            return {"status": "not_loaded"}
+        try:
+            from llama_cpp import Llama
+            path = self._llm.model_path
+            ctx  = self._llm.n_ctx()
+            del self._llm
+            gc.collect()
+            self._llm = Llama(model_path=path, n_gpu_layers=0, n_ctx=ctx,
+                              verbose=False, chat_format="llama-3")
+            return {"status": "offloaded", "gpu_free_mb": -1}
+        except Exception as e:
+            return {"status": f"error: {e}"}
+
+    def reload(self) -> Dict:
+        """Reload onto GPU — rebuild with n_gpu_layers=99."""
+        if self._llm is None:
+            return {"status": "not_loaded"}
+        try:
+            from llama_cpp import Llama
+            path = self._llm.model_path
+            ctx  = self._llm.n_ctx()
+            del self._llm
+            gc.collect()
+            self._llm = Llama(model_path=path, n_gpu_layers=99, n_ctx=ctx,
+                              verbose=False, chat_format="llama-3")
+            return {"status": "reloaded_to_gpu"}
+        except Exception as e:
+            return {"status": f"error: {e}"}
+
+
 class OpenAIClient:
     def __init__(self, api_key: str, model: str = "gpt-4.1"):
         self.api_key = api_key
@@ -291,55 +345,11 @@ class OpenAIClient:
 
 # ─────────────────────────── Image Gen Client ─────────────────────────────────
 class ImageGenClient:
-    """Calls model_server.py image endpoints (txt2img / img2img).
-    
-    Includes:
-      - Retry with exponential backoff (3 attempts)
-      - Server health check before each attempt
-      - 600s timeout (Z-Image on T4 can be slow)
-      - Automatic wait-and-retry if server returns 503
-    """
-
-    TIMEOUT = 600          # 10 minutes — Z-Image Turbo on T4 can take 2-4 min per image
-    MAX_RETRIES = 3
-    RETRY_DELAYS = [10, 30, 60]  # seconds between retries
+    """Calls model_server.py image endpoints (txt2img / img2img) over HTTP.
+    Used when running CLI against a remote/separate server process."""
 
     def __init__(self, server_url: str):
         self.server_url = server_url.rstrip("/")
-        # Use a Session with connection pooling + keep-alive
-        self._session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(
-            max_retries=0,          # we handle retries ourselves
-            pool_connections=1,
-            pool_maxsize=1,
-        )
-        self._session.mount("http://", adapter)
-        self._session.mount("https://", adapter)
-
-    def _wait_for_server(self, max_wait: int = 120) -> bool:
-        """Block until the image server responds to /health or /image/status."""
-        for attempt in range(max_wait // 5):
-            try:
-                r = self._session.get(
-                    f"{self.server_url}/image/status", timeout=5
-                )
-                if r.status_code == 200:
-                    data = r.json()
-                    if data.get("loaded") or data.get("status") == "ready":
-                        return True
-            except Exception:
-                pass
-            # Also try /health (model_server.py)
-            try:
-                r = self._session.get(f"{self.server_url}/health", timeout=5)
-                if r.status_code == 200:
-                    data = r.json()
-                    if data.get("image", {}).get("loaded"):
-                        return True
-            except Exception:
-                pass
-            time.sleep(5)
-        return False
 
     def generate(
         self,
@@ -370,61 +380,110 @@ class ImageGenClient:
         else:
             endpoint = f"{self.server_url}/image/txt2img"
 
-        last_error = None
-        for attempt in range(self.MAX_RETRIES):
-            try:
-                # Health check before each attempt
-                if attempt > 0:
-                    delay = self.RETRY_DELAYS[min(attempt, len(self.RETRY_DELAYS) - 1)]
-                    print(f"    ⏳ Retry {attempt + 1}/{self.MAX_RETRIES} in {delay}s...",
-                          flush=True)
-                    time.sleep(delay)
+        resp = requests.post(endpoint, json=payload, timeout=600)
+        resp.raise_for_status()
+        data = resp.json()
 
-                    print(f"    🔍 Checking server health...", flush=True)
-                    if not self._wait_for_server(max_wait=120):
-                        print(f"    ⚠️  Server not responding — retrying anyway", flush=True)
+        if "error" in data:
+            raise RuntimeError(f"Image gen error: {data['error']}")
 
-                # Force garbage collection before GPU-heavy work
-                gc.collect()
+        img_b64 = data["images"][0] if "images" in data else data["image"]
+        if "," in img_b64:
+            img_b64 = img_b64.split(",", 1)[1]
+        return base64.b64decode(img_b64)
 
-                resp = self._session.post(
-                    endpoint, json=payload, timeout=self.TIMEOUT
-                )
 
-                if resp.status_code == 503:
-                    # Server busy or model not loaded — wait and retry
-                    last_error = RuntimeError(f"Server returned 503: {resp.text[:200]}")
-                    print(f"    ⚠️  Server busy (503) — will retry", flush=True)
-                    continue
+class DirectImageGenClient:
+    """
+    Wraps a StableDiffusion instance directly in-process.
+    No HTTP, no sockets, no serialization, no timeouts.
+    
+    This is the reliable path: the sd.generate_image() call runs in the
+    same Python process as the interpreter. The only thing that can fail
+    is the GPU itself (OOM).
+    
+    Key reliability features:
+      - gc.collect() + torch.cuda.empty_cache() between every generation
+      - PIL images explicitly closed after base64 conversion
+      - All intermediate buffers released immediately
+    """
 
-                resp.raise_for_status()
-                data = resp.json()
+    def __init__(self, sd_obj):
+        self._sd = sd_obj  # StableDiffusion instance from stable_diffusion_cpp
 
-                if "error" in data:
-                    last_error = RuntimeError(f"Image gen error: {data['error']}")
-                    print(f"    ⚠️  Server error: {data['error'][:100]} — will retry",
-                          flush=True)
-                    continue
+    def generate(
+        self,
+        prompt: str,
+        negative_prompt: str = "",
+        width: int = 1024,
+        height: int = 1024,
+        steps: int = 4,
+        cfg_scale: float = 1.0,
+        seed: int = -1,
+        sample_image_b64: Optional[str] = None,
+        strength: float = 0.75,
+    ) -> bytes:
+        import io as _io
+        from PIL import Image as _Image
 
-                img_b64 = data["images"][0] if "images" in data else data["image"]
-                if "," in img_b64:
-                    img_b64 = img_b64.split(",", 1)[1]
-                return base64.b64decode(img_b64)
+        # ── Clean up GPU memory BEFORE each generation ──
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+        except ImportError:
+            pass
 
-            except requests.exceptions.Timeout as e:
-                last_error = e
-                print(f"    ⚠️  Timeout after {self.TIMEOUT}s — will retry", flush=True)
-            except requests.exceptions.ConnectionError as e:
-                last_error = e
-                print(f"    ⚠️  Connection lost — will retry", flush=True)
-            except Exception as e:
-                last_error = e
-                print(f"    ⚠️  Error: {e} — will retry", flush=True)
-
-        raise RuntimeError(
-            f"Image generation failed after {self.MAX_RETRIES} attempts. "
-            f"Last error: {last_error}"
+        # ── Build kwargs ──
+        kwargs = dict(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            width=width,
+            height=height,
+            sample_steps=steps,
+            cfg_scale=cfg_scale,
+            sample_method="euler",
+            seed=seed,
         )
+
+        # ── Handle sample image (img2img) ──
+        init_img = None
+        if sample_image_b64:
+            raw_b64 = sample_image_b64
+            if "," in raw_b64:
+                raw_b64 = raw_b64.split(",", 1)[1]
+            init_img = _Image.open(_io.BytesIO(base64.b64decode(raw_b64)))
+            kwargs["init_image"] = init_img
+            kwargs["strength"] = strength
+
+        # ── Generate ──
+        result_images = self._sd.generate_image(**kwargs)
+
+        # ── Convert first result to PNG bytes ──
+        buf = _io.BytesIO()
+        result_images[0].save(buf, format="PNG")
+        png_bytes = buf.getvalue()
+        buf.close()
+
+        # ── Explicitly release all PIL images and buffers ──
+        for img in result_images:
+            img.close()
+        if init_img is not None:
+            init_img.close()
+        del result_images, init_img
+
+        # ── Clean up GPU memory AFTER each generation ──
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+
+        return png_bytes
 
 
 # ─────────────────────────── PromptFlow Interpreter ───────────────────────────
@@ -437,6 +496,10 @@ class PromptFlowInterpreter:
         model_server_url: str = "http://localhost:7860",
         sample_image_path: Optional[str] = None,
         dry_run: bool = False,
+        # ── Direct in-process model objects (preferred for notebooks) ──
+        # Pass these to bypass HTTP entirely. No sockets, no timeouts.
+        sd_instance=None,       # StableDiffusion object from stable_diffusion_cpp
+        llm_instance=None,      # llama_cpp.Llama object (or None to use OpenAI)
     ):
         self.promptflow_path = promptflow_path
         self.cli_inputs = cli_inputs
@@ -445,6 +508,10 @@ class PromptFlowInterpreter:
         self.sample_image_path = sample_image_path
         self.dry_run = dry_run
 
+        # Direct model references
+        self._sd_instance = sd_instance
+        self._llm_instance = llm_instance
+
         self.config: Dict = {}
         self.inputs: Dict = {}
         self.steps_output: Dict = {}
@@ -452,9 +519,9 @@ class PromptFlowInterpreter:
 
         # Clients (set after config load)
         self._llm_provider: str = "local"
-        self._local_llm: Optional[LocalLLMClient] = None
+        self._local_llm = None   # LocalLLMClient or DirectLLMClient
         self._openai_llm: Optional[OpenAIClient] = None
-        self._image_client: Optional[ImageGenClient] = None
+        self._image_client = None  # ImageGenClient or DirectImageGenClient
 
         # GPU lifecycle state
         self._llm_offloaded: bool = False
@@ -549,16 +616,22 @@ class PromptFlowInterpreter:
 
         self._llm_provider = llm_cfg.get("provider", "local")
 
+        # ── LLM client ────────────────────────────────────────────────────────
         if self._llm_provider == "local":
-            self._local_llm = LocalLLMClient(server_url=self.model_server_url)
-            # Check LLM is available
-            status = self._local_llm.status()
-            if status.get("loaded"):
-                on_gpu = status.get("on_gpu", False)
-                model  = status.get("model", "unknown")
-                self._log(f"✅ Local LLM ready: {model}  (GPU={on_gpu})", "success")
+            if self._llm_instance is not None:
+                # DIRECT MODE: no HTTP, call llama_cpp in-process
+                self._local_llm = DirectLLMClient(self._llm_instance)
+                self._log("✅ Local LLM: DIRECT in-process (no HTTP)", "success")
             else:
-                self._log("⚠️  Local LLM not yet loaded — will wait or fallback", "warn")
+                # HTTP MODE: talk to model_server.py
+                self._local_llm = LocalLLMClient(server_url=self.model_server_url)
+                status = self._local_llm.status()
+                if status.get("loaded"):
+                    on_gpu = status.get("on_gpu", False)
+                    model  = status.get("model", "unknown")
+                    self._log(f"✅ Local LLM ready: {model}  (GPU={on_gpu})", "success")
+                else:
+                    self._log("⚠️  Local LLM not yet loaded — will wait or fallback", "warn")
         else:
             if not self.openai_api_key:
                 raise ValueError("openai_api_key required when llm.provider='openai'")
@@ -566,9 +639,16 @@ class PromptFlowInterpreter:
             self._openai_llm = OpenAIClient(api_key=self.openai_api_key, model=openai_model)
             self._log(f"✅ OpenAI client: {openai_model}", "success")
 
-        server_url = img_cfg.get("server_url", self.model_server_url)
-        self._image_client = ImageGenClient(server_url=server_url)
-        self._log(f"✅ Image gen client → {server_url}", "success")
+        # ── Image gen client ──────────────────────────────────────────────────
+        if self._sd_instance is not None:
+            # DIRECT MODE: no HTTP, call stable_diffusion_cpp in-process
+            self._image_client = DirectImageGenClient(self._sd_instance)
+            self._log("✅ Image gen: DIRECT in-process (no HTTP, no timeouts)", "success")
+        else:
+            # HTTP MODE: talk to model_server.py or z_image_server.py
+            server_url = img_cfg.get("server_url", self.model_server_url)
+            self._image_client = ImageGenClient(server_url=server_url)
+            self._log(f"✅ Image gen client → {server_url} (HTTP mode)", "success")
 
     # ── GPU lifecycle: offload before image gen ────────────────────────────────
     def _maybe_offload_llm(self):
@@ -642,6 +722,9 @@ class PromptFlowInterpreter:
             )
 
     def _wait_for_local_llm(self):
+        # Direct mode — always ready
+        if isinstance(self._local_llm, DirectLLMClient):
+            return
         for attempt in range(30):
             if self._local_llm.status().get("loaded"):
                 return
