@@ -92,6 +92,7 @@
   <aside class="sidebar">
     <div class="sidebar-tabs">
       <button class="sidebar-tab active" data-panel="panelGen" onclick="switchSidebarTab(this)">🔺 Generate</button>
+      <button class="sidebar-tab" data-panel="panelEdit" onclick="switchSidebarTab(this)">🔧 Edit</button>
       <button class="sidebar-tab" data-panel="panelRmbg" onclick="switchSidebarTab(this)">✂ RMBG</button>
     </div>
 
@@ -165,6 +166,68 @@
       <div class="sidebar-section">
         <button class="gen-btn" id="genBtn3d" onclick="startGen()" disabled>Generate →</button>
       </div>
+    </div>
+
+    <!-- ── EDIT PANEL ── -->
+    <div class="sidebar-panel" id="panelEdit">
+
+      <!-- Stage Inspector -->
+      <div class="sidebar-section">
+        <div class="section-label">📊 Stage Inspector</div>
+        <div class="edit-no-model" id="editNoModel">
+          <div class="enm-text">Select a model tab above to inspect its stages and enable editing.</div>
+        </div>
+        <div class="edit-model-info" id="editModelInfo" style="display:none">
+          <div class="emi-name" id="editModelName">—</div>
+          <div class="stage-list" id="stageList"></div>
+        </div>
+      </div>
+
+      <!-- Lock Controls -->
+      <div class="sidebar-section" id="editLocksSection" style="display:none">
+        <div class="section-label">🔒 Stage Locks</div>
+        <div class="lock-grid" id="lockGrid">
+          <button class="lock-opt" data-lock="lock_structure" onclick="selectLock(this)">
+            <div class="lock-icon">🏗</div>
+            <div class="lock-info">
+              <div class="lock-name">Lock Structure</div>
+              <div class="lock-desc">Keep silhouette, regen shape + texture</div>
+            </div>
+          </button>
+          <button class="lock-opt sel" data-lock="lock_geometry" onclick="selectLock(this)">
+            <div class="lock-icon">🔒</div>
+            <div class="lock-info">
+              <div class="lock-name">Lock Geometry</div>
+              <div class="lock-desc">Keep exact shape, retexture only</div>
+            </div>
+          </button>
+        </div>
+      </div>
+
+      <!-- Reference Image for Retexture -->
+      <div class="sidebar-section" id="editRefSection" style="display:none">
+        <div class="section-label">🖼 New Reference Image</div>
+        <div class="dropzone-compact" id="dropzoneEdit">
+          <div class="dz-text">Drop reference image or <strong>browse</strong></div>
+          <input type="file" id="fileInputEdit" accept="image/*">
+        </div>
+        <div class="thumb-strip" id="thumbsEdit"></div>
+        <div class="edit-ref-hint">This image will drive the new texture/appearance while keeping the locked stages from the original model.</div>
+      </div>
+
+      <!-- Retexture Action -->
+      <div class="sidebar-section" id="editActionSection" style="display:none">
+        <button class="gen-btn retex-btn" id="retexBtn" onclick="startRetexture()" disabled>
+          <span class="retex-icon">🔄</span> Retexture →
+        </button>
+      </div>
+
+      <!-- Edit History -->
+      <div class="sidebar-section" id="editHistorySection" style="display:none">
+        <div class="section-label">📜 Edit History</div>
+        <div class="edit-history-list" id="editHistoryList"></div>
+      </div>
+
     </div>
 
     <!-- ── RMBG PANEL ── -->

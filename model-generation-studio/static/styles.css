@@ -342,3 +342,96 @@ body{background:var(--black);color:var(--text);font-family:var(--font-body);font
 /* Green bar button */
 .bar-btn.green{background:rgba(34,197,94,.1);border-color:rgba(34,197,94,.2);color:var(--green)}
 .bar-btn.green:hover{background:rgba(34,197,94,.2)}
+
+/* ═══ EDITOR PANEL ═══ */
+
+/* No model selected state */
+.edit-no-model{padding:16px 12px;text-align:center}
+.enm-text{font-size:11px;color:var(--text-muted);line-height:1.6}
+
+/* Model info */
+.edit-model-info .emi-name{
+    font-family:var(--font-mono);font-size:11px;font-weight:700;color:var(--gold);
+    padding:6px 10px;background:var(--gold-dim);border:1px solid rgba(232,169,23,.15);
+    border-radius:5px;margin-bottom:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+
+/* Stage list */
+.stage-list{display:flex;flex-direction:column;gap:4px}
+.stage-item{
+    display:flex;align-items:center;gap:8px;padding:6px 10px;
+    background:var(--surface-3);border:1px solid var(--border);border-radius:5px;
+    font-size:10px;transition:all .15s;
+}
+.stage-item.available{border-color:rgba(34,197,94,.2)}
+.stage-item.available .si-dot{background:var(--green)}
+.stage-item.missing .si-dot{background:var(--text-muted);opacity:.3}
+.stage-item .si-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.stage-item .si-name{
+    font-family:var(--font-mono);font-weight:600;color:var(--text-dim);flex:1;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.stage-item.missing .si-name{color:var(--text-muted);opacity:.5}
+.stage-item .si-size{font-family:var(--font-mono);font-size:9px;color:var(--text-muted)}
+
+/* Lock controls */
+.lock-grid{display:flex;flex-direction:column;gap:6px}
+.lock-opt{
+    display:flex;align-items:flex-start;gap:10px;padding:10px 12px;
+    background:var(--surface-3);border:1px solid var(--border);border-radius:6px;
+    cursor:pointer;transition:all .15s;text-align:left;width:100%;
+}
+.lock-opt:hover{border-color:var(--text-muted)}
+.lock-opt.sel{border-color:var(--gold);background:var(--gold-dim)}
+.lock-opt.disabled{opacity:.35;pointer-events:none}
+.lock-opt .lock-icon{font-size:18px;flex-shrink:0;margin-top:1px}
+.lock-opt .lock-info{flex:1;min-width:0}
+.lock-opt .lock-name{
+    font-family:var(--font-mono);font-size:10px;font-weight:700;
+    color:var(--text-dim);letter-spacing:.3px;
+}
+.lock-opt.sel .lock-name{color:var(--gold)}
+.lock-opt .lock-desc{font-size:9px;color:var(--text-muted);margin-top:2px;line-height:1.4}
+
+/* Reference image hint */
+.edit-ref-hint{
+    font-size:9px;color:var(--text-muted);line-height:1.5;margin-top:8px;
+    padding:8px 10px;background:var(--surface-3);border:1px solid var(--border);
+    border-radius:5px;
+}
+
+/* Retexture button */
+.retex-btn{background:linear-gradient(135deg,var(--gold-dark),var(--gold));position:relative;overflow:hidden}
+.retex-btn:hover:not(:disabled){background:linear-gradient(135deg,var(--gold),var(--gold-light))}
+.retex-btn .retex-icon{font-size:12px}
+
+/* Edit history list */
+.edit-history-list{display:flex;flex-direction:column;gap:4px}
+.edit-history-item{
+    display:flex;align-items:center;gap:8px;padding:7px 10px;
+    background:var(--surface-3);border:1px solid var(--border);border-radius:5px;
+    cursor:pointer;transition:all .12s;
+}
+.edit-history-item:hover{border-color:var(--text-muted)}
+.edit-history-item.active{border-color:var(--gold);background:var(--gold-dim)}
+.edit-history-item .ehi-icon{font-size:12px;flex-shrink:0}
+.edit-history-item .ehi-info{flex:1;min-width:0}
+.edit-history-item .ehi-name{
+    font-family:var(--font-mono);font-size:10px;font-weight:600;color:var(--text-dim);
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.edit-history-item .ehi-detail{font-size:9px;color:var(--text-muted)}
+.edit-history-item .ehi-badge{
+    font-family:var(--font-mono);font-size:8px;font-weight:700;
+    padding:2px 6px;border-radius:3px;letter-spacing:.5px;text-transform:uppercase;flex-shrink:0;
+}
+.edit-history-item .ehi-badge.original{background:rgba(59,130,246,.12);color:var(--blue);border:1px solid rgba(59,130,246,.2)}
+.edit-history-item .ehi-badge.retex{background:rgba(232,169,23,.1);color:var(--gold);border:1px solid rgba(232,169,23,.2)}
+
+/* Capability badges shown on Edit tab */
+.cap-badges{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}
+.cap-badge{
+    font-family:var(--font-mono);font-size:8px;font-weight:700;
+    padding:3px 7px;border-radius:3px;letter-spacing:.5px;text-transform:uppercase;
+    background:rgba(34,197,94,.08);color:var(--green);border:1px solid rgba(34,197,94,.15);
+}

@@ -267,6 +267,20 @@ function updateBottomBar(model) {
     };
     acts.appendChild(v3d);
 
+    // Edit button — opens edit tab
+    if (model.stage_cache) {
+        const editBtn = document.createElement('button');
+        editBtn.className = 'bar-btn outline';
+        editBtn.innerHTML = '🔧 Edit';
+        editBtn.onclick = () => {
+            // Switch to Edit tab
+            const editTab = document.querySelector('.sidebar-tab[data-panel="panelEdit"]');
+            if (editTab) switchSidebarTab(editTab);
+            refreshEditPanel();
+        };
+        acts.appendChild(editBtn);
+    }
+
     // Download media
     if (model.media) {
         const dlM = document.createElement('a');
@@ -635,6 +649,285 @@ function renderRmbgResults(results) {
         list.appendChild(div);
     });
 }
+
+// ══════════════════════════════════════════════════════════════
+// EDITOR: STAGE INSPECTION + RETEXTURE
+// ══════════════════════════════════════════════════════════════
+
+let editRefFile = null;
+let selectedLockMode = 'lock_geometry';
+let currentStagesData = null;  // cached /api/stages response
+let editHistory = [];  // track retexture lineage
+
+function selectLock(el) {
+    document.querySelectorAll('.lock-opt').forEach(o => o.classList.remove('sel'));
+    el.classList.add('sel');
+    selectedLockMode = el.dataset.lock;
+    updateRetexButton();
+}
+
+// Init dropzone for edit panel reference image
+(function initEditDropzone() {
+    const z = $('dropzoneEdit'), inp = $('fileInputEdit');
+    ['dragenter', 'dragover'].forEach(e => z.addEventListener(e, ev => { ev.preventDefault(); z.classList.add('over'); }));
+    ['dragleave', 'drop'].forEach(e => z.addEventListener(e, ev => { ev.preventDefault(); z.classList.remove('over'); }));
+    z.addEventListener('drop', ev => {
+        const f = ev.dataTransfer.files[0];
+        if (f && f.type.startsWith('image/')) setEditRef(f);
+    });
+    inp.addEventListener('change', ev => {
+        if (ev.target.files[0]) setEditRef(ev.target.files[0]);
+        inp.value = '';
+    });
+})();
+
+function setEditRef(file) {
+    editRefFile = file;
+    const t = $('thumbsEdit');
+    t.innerHTML = '';
+    const d = document.createElement('div'); d.className = 'thumb';
+    const img = document.createElement('img'); img.src = URL.createObjectURL(file);
+    const x = document.createElement('button'); x.className = 'thumb-x'; x.textContent = '×';
+    x.onclick = () => { editRefFile = null; t.innerHTML = ''; updateRetexButton(); };
+    d.append(img, x); t.append(d);
+    updateRetexButton();
+}
+
+function updateRetexButton() {
+    const btn = $('retexBtn');
+    btn.disabled = !editRefFile || !currentStagesData;
+}
+
+// Called whenever activeModelIdx changes — refresh edit panel
+async function refreshEditPanel() {
+    const noModel = $('editNoModel');
+    const modelInfo = $('editModelInfo');
+    const locksSection = $('editLocksSection');
+    const refSection = $('editRefSection');
+    const actionSection = $('editActionSection');
+    const historySection = $('editHistorySection');
+
+    if (activeModelIdx < 0 || !completedModels[activeModelIdx]) {
+        noModel.style.display = '';
+        modelInfo.style.display = 'none';
+        locksSection.style.display = 'none';
+        refSection.style.display = 'none';
+        actionSection.style.display = 'none';
+        historySection.style.display = 'none';
+        currentStagesData = null;
+        return;
+    }
+
+    const model = completedModels[activeModelIdx];
+    noModel.style.display = 'none';
+    modelInfo.style.display = '';
+    $('editModelName').textContent = model.name;
+
+    // Fetch stages if stage_cache exists
+    if (!model.stage_cache) {
+        $('stageList').innerHTML = '<div class="enm-text">No stage cache for this model.<br>Re-generate to enable editing.</div>';
+        locksSection.style.display = 'none';
+        refSection.style.display = 'none';
+        actionSection.style.display = 'none';
+        currentStagesData = null;
+        return;
+    }
+
+    try {
+        const r = await fetch('/api/stages?dir=' + enc(model.stage_cache));
+        const data = await r.json();
+        currentStagesData = data;
+        renderStageList(data);
+        renderCapabilities(data);
+        renderLockControls(data);
+
+        locksSection.style.display = '';
+        refSection.style.display = '';
+        actionSection.style.display = '';
+        updateRetexButton();
+
+        // Build edit history from completedModels lineage
+        refreshEditHistory(model);
+    } catch (e) {
+        console.error('Failed to fetch stages:', e);
+        $('stageList').innerHTML = '<div class="enm-text">Error loading stages.</div>';
+        currentStagesData = null;
+    }
+}
+
+function renderStageList(data) {
+    const list = $('stageList');
+    list.innerHTML = '';
+
+    const STAGE_LABELS = {
+        'sparse_structure': '🏗 Sparse Structure',
+        'shape_slat': '🔷 Shape Latent',
+        'tex_slat': '🎨 Texture Latent',
+        'image_cond_512': '🖼 Conditioning 512',
+        'image_cond_1024': '🖼 Conditioning 1024',
+        'decoded_mesh': '📦 Decoded Mesh',
+    };
+    const DISPLAY_ORDER = ['sparse_structure', 'shape_slat', 'tex_slat', 'image_cond_512', 'image_cond_1024', 'decoded_mesh'];
+
+    for (const name of DISPLAY_ORDER) {
+        const stage = data.stages[name];
+        const el = document.createElement('div');
+        el.className = 'stage-item ' + (stage ? 'available' : 'missing');
+        el.innerHTML = `
+            <div class="si-dot"></div>
+            <div class="si-name">${STAGE_LABELS[name] || name}</div>
+            ${stage ? `<div class="si-size">${stage.size_mb} MB</div>` : ''}
+        `;
+        list.appendChild(el);
+    }
+
+    // Capability badges
+    if (data.capabilities && data.capabilities.length > 0) {
+        const badges = document.createElement('div');
+        badges.className = 'cap-badges';
+        const CAP_LABELS = {
+            'lock_structure': 'Lock Structure',
+            'lock_geometry': 'Lock Geometry',
+            'retexture': 'Retexture',
+            'full_regen': 'Full Regen',
+        };
+        data.capabilities.forEach(c => {
+            const b = document.createElement('span');
+            b.className = 'cap-badge';
+            b.textContent = CAP_LABELS[c] || c;
+            badges.appendChild(b);
+        });
+        list.appendChild(badges);
+    }
+}
+
+function renderCapabilities(data) {
+    // (capabilities are now rendered inside renderStageList)
+}
+
+function renderLockControls(data) {
+    const caps = data.capabilities || [];
+    document.querySelectorAll('.lock-opt').forEach(el => {
+        const lock = el.dataset.lock;
+        if (caps.includes(lock)) {
+            el.classList.remove('disabled');
+        } else {
+            el.classList.add('disabled');
+            el.classList.remove('sel');
+        }
+    });
+    // Auto-select best available lock
+    if (caps.includes('lock_geometry')) {
+        selectedLockMode = 'lock_geometry';
+        document.querySelectorAll('.lock-opt').forEach(o => o.classList.remove('sel'));
+        document.querySelector('.lock-opt[data-lock="lock_geometry"]')?.classList.add('sel');
+    } else if (caps.includes('lock_structure')) {
+        selectedLockMode = 'lock_structure';
+        document.querySelectorAll('.lock-opt').forEach(o => o.classList.remove('sel'));
+        document.querySelector('.lock-opt[data-lock="lock_structure"]')?.classList.add('sel');
+    }
+}
+
+function refreshEditHistory(activeModel) {
+    const section = $('editHistorySection');
+    const list = $('editHistoryList');
+
+    // Find models that share the same base lineage (by original name or stage_cache parent)
+    const related = completedModels.filter(m =>
+        m.name === activeModel.name ||
+        m.name.startsWith(activeModel.name + '_retex') ||
+        activeModel.name.startsWith(m.name + '_retex')
+    );
+
+    if (related.length <= 1) {
+        section.style.display = 'none';
+        return;
+    }
+
+    section.style.display = '';
+    list.innerHTML = '';
+    related.forEach((m, i) => {
+        const isRetex = m.name.includes('_retex');
+        const isActive = m === activeModel;
+        const el = document.createElement('div');
+        el.className = 'edit-history-item' + (isActive ? ' active' : '');
+        el.innerHTML = `
+            <span class="ehi-icon">${isRetex ? '🔄' : '🔺'}</span>
+            <div class="ehi-info">
+                <div class="ehi-name">${esc(m.name)}</div>
+            </div>
+            <span class="ehi-badge ${isRetex ? 'retex' : 'original'}">${isRetex ? 'retex' : 'original'}</span>
+        `;
+        el.onclick = () => {
+            const idx = completedModels.indexOf(m);
+            if (idx >= 0) selectModel(idx);
+        };
+        list.appendChild(el);
+    });
+}
+
+async function startRetexture() {
+    if (!editRefFile || activeModelIdx < 0) return;
+    const model = completedModels[activeModelIdx];
+    if (!model || !model.stage_cache) return;
+
+    const btn = $('retexBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="retex-icon">⏳</span> Retexturing…';
+
+    // Generate a retex name
+    const timestamp = Date.now().toString(36).slice(-4);
+    const retexName = model.name + '_retex_' + timestamp;
+
+    const autoRmbg = document.querySelector('input[name="autoRmbg"]:checked')?.value === 'on';
+
+    const fd = new FormData();
+    fd.append('image', editRefFile);
+    fd.append('stage_cache', model.stage_cache);
+    fd.append('lock_mode', selectedLockMode);
+    fd.append('name', retexName);
+    fd.append('settings', JSON.stringify({
+        output_dir: $('sOutDir').value,
+        fps: parseInt($('sFps').value),
+        texture_size: parseInt($('sTexture').value),
+        decimate_target: parseInt($('sDecimate').value),
+        remesh: $('sRemesh').checked,
+        remesh_band: parseFloat($('sRemeshBand').value),
+        render_mode: selectedRenderMode,
+        auto_rmbg: autoRmbg,
+    }));
+
+    try {
+        const r = await fetch('/api/retexture', { method: 'POST', body: fd });
+        const d = await r.json();
+        if (!d.job_id) throw new Error(d.error || 'Failed');
+
+        // Show progress
+        $('canvasEmpty').style.display = 'none';
+        $('canvasProgress').classList.add('active');
+        $('cpFill').style.width = '0%';
+        $('cpPct').textContent = '0%';
+        $('cpPhase').textContent = 'Retexturing…';
+        $('cpDetail').textContent = retexName;
+        if (!consoleOpen) toggleConsole();
+        ensureHwPolling();
+
+        localStart['generate'] = Date.now();
+        poll(d.job_id, 'generate', {});
+    } catch (e) {
+        alert('Retexture failed: ' + e.message);
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<span class="retex-icon">🔄</span> Retexture →';
+    }
+}
+
+// Hook into selectModel to refresh edit panel
+const _origSelectModel = selectModel;
+selectModel = function(idx) {
+    _origSelectModel(idx);
+    refreshEditPanel();
+};
 
 // ══════════════════════════════════════════════════════════════
 // RECONNECT (resume if page reloads mid-job)
