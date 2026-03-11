@@ -156,7 +156,7 @@ def load_z_image_turbo(lora_dir=None):
         diffusion_model_path=diff_path,
         llm_path=llm_path,
         vae_path=vae_path,
-        lora_dir=ldir,
+        lora_model_dir=ldir,
         offload_params_to_cpu=True,
         diffusion_flash_attn=True,
     )
@@ -189,7 +189,7 @@ def load_wan_22(lora_dir=None):
         high_noise_diffusion_model_path=high_path,
         t5xxl_path=t5_path,
         vae_path=vae_path,
-        lora_dir=ldir,
+        lora_model_dir=ldir,
         flow_shift=3.0,
         keep_clip_on_cpu=True,
         diffusion_flash_attn=True,
