@@ -55,6 +55,50 @@ LORA_DIRS = {
 for d in LORA_DIRS.values():
     d.mkdir(parents=True, exist_ok=True)
 
+
+# ══════════════════════════════════════════════════════════════
+# CONSOLE CAPTURE — captures print output for UI display
+# ══════════════════════════════════════════════════════════════
+
+import collections
+
+class TeeWriter:
+    def __init__(self, original, buf):
+        self._original = original
+        self._buf = buf
+    def write(self, s):
+        self._original.write(s)
+        if s.strip():
+            self._buf.append(s.rstrip('\n'))
+        return len(s)
+    def flush(self):
+        self._original.flush()
+    def fileno(self):
+        return self._original.fileno()
+    def __getattr__(self, name):
+        return getattr(self._original, name)
+
+console_lines = collections.deque(maxlen=500)
+sys.stdout = TeeWriter(sys.__stdout__, console_lines)
+sys.stderr = TeeWriter(sys.__stderr__, console_lines)
+
+
+# ══════════════════════════════════════════════════════════════
+# PRE-DOWNLOAD Z-IMAGE TURBO WEIGHTS
+# ══════════════════════════════════════════════════════════════
+
+print("⬇ Pre-downloading Z-Image Turbo model weights...")
+try:
+    _zit_diff = hf_hub_download(repo_id="unsloth/Z-Image-Turbo-GGUF", filename="z-image-turbo-Q4_K_M.gguf")
+    print(f"  ✓ Diffusion: {_zit_diff}")
+    _zit_llm = hf_hub_download(repo_id="unsloth/Qwen3-4B-Instruct-2507-GGUF", filename="Qwen3-4B-Instruct-2507-Q4_K_M.gguf")
+    print(f"  ✓ LLM: {_zit_llm}")
+    _zit_vae = hf_hub_download(repo_id="black-forest-labs/FLUX.1-schnell", filename="ae.safetensors")
+    print(f"  ✓ VAE: {_zit_vae}")
+    print("✅ Z-Image Turbo weights ready")
+except Exception as _e:
+    print(f"⚠ Pre-download failed (will retry on first generate): {_e}")
+
 # ══════════════════════════════════════════════════════════════
 # PIPELINE STATE
 # ══════════════════════════════════════════════════════════════
@@ -222,26 +266,47 @@ jobs = {}
 
 
 def run_z_image_job(job_id):
-    """Generate an image with Z-Image Turbo."""
+    """Generate an image with Z-Image Turbo. Supports txt2img and img2img."""
     job = jobs[job_id]
     try:
         s = job["settings"]
         lora_dir = LORA_DIRS["z-image-turbo"]
 
         job["progress"] = {"pct": 10, "phase": "Loading model..."}
+        print(f"🎨 Starting Z-Image generation: {s.get('width',512)}x{s.get('height',512)}, {s.get('steps',25)} steps")
         sd = ensure_pipeline("z-image-turbo", lora_dir)
 
-        job["progress"] = {"pct": 30, "phase": "Generating image..."}
-        images = sd.txt_to_img(
-            prompt=s.get("prompt", ""),
-            negative_prompt=s.get("negative_prompt", ""),
-            width=s.get("width", 832),
-            height=s.get("height", 480),
-            cfg_scale=s.get("cfg_scale", 1.0),
-            sample_steps=s.get("steps", 4),
-            sample_method=s.get("sampler", "euler"),
-            seed=s.get("seed", -1),
-        )
+        input_path = s.get("input_image_path")
+        has_input = input_path and os.path.exists(input_path)
+
+        if has_input:
+            job["progress"] = {"pct": 30, "phase": "Generating (img2img)..."}
+            print(f"  Using input image: {input_path} (strength={s.get('strength', 0.75)})")
+            images = sd.img_to_img(
+                image=input_path,
+                prompt=s.get("prompt", ""),
+                negative_prompt=s.get("negative_prompt", ""),
+                width=s.get("width", 512),
+                height=s.get("height", 512),
+                cfg_scale=s.get("cfg_scale", 4.0),
+                sample_steps=s.get("steps", 25),
+                sample_method=s.get("sampler", "euler"),
+                seed=s.get("seed", -1),
+                strength=s.get("strength", 0.75),
+            )
+        else:
+            job["progress"] = {"pct": 30, "phase": "Generating (txt2img)..."}
+            print(f"  txt2img: prompt='{s.get('prompt','')[:60]}...'")
+            images = sd.txt_to_img(
+                prompt=s.get("prompt", ""),
+                negative_prompt=s.get("negative_prompt", ""),
+                width=s.get("width", 512),
+                height=s.get("height", 512),
+                cfg_scale=s.get("cfg_scale", 4.0),
+                sample_steps=s.get("steps", 25),
+                sample_method=s.get("sampler", "euler"),
+                seed=s.get("seed", -1),
+            )
 
         if not images:
             raise RuntimeError("No images returned")
@@ -541,3 +606,10 @@ def api_hw():
     hw["pipeline"] = current_pipeline["name"]
     hw["lora_dir"] = current_pipeline["lora_dir"]
     return jsonify(hw)
+
+
+@app.route("/api/console")
+def api_console():
+    """Return last N lines of console output."""
+    n = int(request.args.get("n", 80))
+    return jsonify({"lines": list(console_lines)[-n:]})
