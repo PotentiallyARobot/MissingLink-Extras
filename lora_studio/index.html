@@ -253,15 +253,15 @@ textarea.gen-input{min-height:60px;font-family:var(--font)}
 // CONFIG
 // ═══════════════════════════════════════════════════════════
 const MODELS={
-  'wan-2.2':{label:'Wan 2.2 I2V',color:'#7b68ee',q:'wan 2.2',baseMatch:['wan'],type:'video',
-    defaults:{steps:20,cfg:6.0,w:832,h:480,frames:49,strength:0.75}},
   'z-image-turbo':{label:'Z-Image Turbo',color:'#ff6b35',q:'z-image-turbo',baseMatch:['z-image','zimage','z image'],type:'image',
     defaults:{steps:4,cfg:1.0,w:832,h:480}},
+  'wan-2.2':{label:'Wan 2.2 I2V',color:'#7b68ee',q:'wan 2.2',baseMatch:['wan'],type:'video',
+    defaults:{steps:20,cfg:6.0,w:832,h:480,frames:49,strength:0.75}},
 };
 const CIVITAI='https://civitai.com/api/v1';
 
 // ═══ STATE ═══
-let S={model:'wan-2.2',query:'',sort:'Most Downloaded',period:'',tag:'',nsfw:false,
+let S={model:'z-image-turbo',query:'',sort:'Most Downloaded',period:'',tag:'',nsfw:false,
         results:[],nextUrl:null,total:0,hasMore:true,loading:false,mode:'browse'};
 let abortCtrl=null,debounce=null;
 const cache=new Map();
