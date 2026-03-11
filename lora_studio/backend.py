@@ -282,8 +282,8 @@ def run_z_image_job(job_id):
         if has_input:
             job["progress"] = {"pct": 30, "phase": "Generating (img2img)..."}
             print(f"  Using input image: {input_path} (strength={s.get('strength', 0.75)})")
-            images = sd.img_to_img(
-                image=input_path,
+            images = sd.generate_image(
+                init_image=input_path,
                 prompt=s.get("prompt", ""),
                 negative_prompt=s.get("negative_prompt", ""),
                 width=s.get("width", 512),
