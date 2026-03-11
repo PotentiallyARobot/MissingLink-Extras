@@ -1,26 +1,23 @@
 # ============================================================
 # LoRA Studio — Colab Launch Script (launch_colab.py)
 #
-# Usage (single Colab cell):
-#   %cd /content/lora_studio
+# NON-BLOCKING: Starts the Flask server in a daemon thread,
+# verifies health, sets up the Colab proxy URL, then RETURNS.
+#
+# Usage (Colab cell):
+#   !pip install -q flask Pillow huggingface_hub numpy tqdm requests ffmpeg-python stable-diffusion-cpp-python
+#   import os
+#   os.chdir("/content/lora_studio")
+#   from backend import *
 #   exec(open("launch_colab.py").read())
 # ============================================================
 
-import time, threading, traceback, sys, subprocess
+import time, threading, traceback, sys
 import socket as _socket
 import requests as _requests
 
-# ── Install deps ──
-print("📦 Installing dependencies...")
-subprocess.check_call([
-    sys.executable, "-m", "pip", "install", "-q",
-    "flask", "Pillow", "huggingface_hub", "numpy", "tqdm",
-    "requests", "ffmpeg-python",
-    "stable-diffusion-cpp-python",
-], stdout=sys.stdout, stderr=sys.stderr)
-
-# ── Import backend ──
-from backend import app, IN_COLAB, eval_js
+# ── These come from backend.py (already imported via `from backend import *`) ──
+# app, IN_COLAB, eval_js
 
 def _find_free_port(preferred=5000):
     with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:

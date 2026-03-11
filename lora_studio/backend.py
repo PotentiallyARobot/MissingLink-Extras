@@ -11,7 +11,8 @@ from io import BytesIO
 def _ensure(pkg, pip_name=None):
     try: __import__(pkg)
     except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pip_name or pkg])
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", pip_name or pkg],
+                       capture_output=True, check=True)
 
 _ensure("flask")
 _ensure("PIL", "Pillow")
