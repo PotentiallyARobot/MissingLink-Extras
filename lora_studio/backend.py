@@ -1,11 +1,14 @@
 # ============================================================
-# LoRA Studio — Backend (backend.py)
+# Missing Link — AI Image Studio Backend (backend.py)
 # Flask server for LoRA browsing + generation with
 # Z-Image Turbo (GGUF) and Wan 2.2 I2V (GGUF)
+# Google Drive history persistence
+# https://www.missinglink.build/
 # ============================================================
 
 import os, sys, pathlib, subprocess, time, threading, traceback, json, uuid, gc, math, shutil, glob
 from io import BytesIO
+from datetime import datetime
 
 # ── Ensure deps ──
 def _ensure(pkg, pip_name=None):
@@ -55,9 +58,92 @@ LORA_DIRS = {
 for d in LORA_DIRS.values():
     d.mkdir(parents=True, exist_ok=True)
 
+# ══════════════════════════════════════════════════════════════
+# GOOGLE DRIVE HISTORY
+# ══════════════════════════════════════════════════════════════
+
+GDRIVE_SAVE_PATH = os.environ.get("GDRIVE_SAVE_PATH", "/content/drive/MyDrive/MissingLink_Studio")
+_gdrive_lock = threading.Lock()
+
+def _ensure_gdrive_mounted():
+    """Try to mount Google Drive if in Colab and not already mounted."""
+    if not IN_COLAB:
+        return False
+    if os.path.exists("/content/drive/MyDrive"):
+        return True
+    try:
+        from google.colab import drive
+        drive.mount("/content/drive", force_remount=False)
+        return os.path.exists("/content/drive/MyDrive")
+    except Exception as e:
+        print(f"⚠ Google Drive mount failed: {e}")
+        return False
+
+def _get_save_dir():
+    """Return the current save directory path, creating it if needed."""
+    p = pathlib.Path(GDRIVE_SAVE_PATH)
+    p.mkdir(parents=True, exist_ok=True)
+    (p / "images").mkdir(exist_ok=True)
+    return p
+
+def _history_file():
+    return _get_save_dir() / "history.json"
+
+def load_history():
+    with _gdrive_lock:
+        hf = _history_file()
+        if hf.exists():
+            try:
+                with open(hf, "r") as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"⚠ Failed to load history: {e}")
+        return []
+
+def save_history(history):
+    with _gdrive_lock:
+        hf = _history_file()
+        try:
+            with open(hf, "w") as f:
+                json.dump(history, f, indent=2)
+        except Exception as e:
+            print(f"⚠ Failed to save history: {e}")
+
+def add_history_entry(entry):
+    history = load_history()
+    history.insert(0, entry)
+    if len(history) > 500:
+        history = history[:500]
+    save_history(history)
+    return history
+
+def copy_image_to_gdrive(src_path, filename=None):
+    try:
+        save_dir = _get_save_dir() / "images"
+        if not filename:
+            filename = os.path.basename(src_path)
+        dst = save_dir / filename
+        shutil.copy2(str(src_path), str(dst))
+        return str(dst)
+    except Exception as e:
+        print(f"⚠ Failed to copy image to Drive: {e}")
+        return str(src_path)
+
+def copy_input_image_to_gdrive(src_path):
+    try:
+        save_dir = _get_save_dir() / "images" / "inputs"
+        save_dir.mkdir(exist_ok=True)
+        filename = f"input_{uuid.uuid4().hex[:8]}_{os.path.basename(src_path)}"
+        dst = save_dir / filename
+        shutil.copy2(str(src_path), str(dst))
+        return str(dst)
+    except Exception as e:
+        print(f"⚠ Failed to copy input image to Drive: {e}")
+        return str(src_path)
+
 
 # ══════════════════════════════════════════════════════════════
-# CONSOLE CAPTURE — captures print output for UI display
+# CONSOLE CAPTURE
 # ══════════════════════════════════════════════════════════════
 
 import collections
@@ -99,29 +185,29 @@ try:
 except Exception as _e:
     print(f"⚠ Pre-download failed (will retry on first generate): {_e}")
 
+if IN_COLAB:
+    _ensure_gdrive_mounted()
+    print(f"📂 History save path: {GDRIVE_SAVE_PATH}")
+
 # ══════════════════════════════════════════════════════════════
 # PIPELINE STATE
 # ══════════════════════════════════════════════════════════════
 
 pipeline_lock = threading.Lock()
 current_pipeline = {
-    "name": None,       # "z-image-turbo" or "wan-2.2"
-    "sd": None,         # StableDiffusion instance
-    "lora_dir": None,   # which lora_dir it was loaded with
+    "name": None,
+    "sd": None,
+    "lora_dir": None,
 }
 
-
 def gpu_cleanup():
-    """Aggressively free GPU memory."""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
     gc.collect()
 
-
 def unload_pipeline():
-    """Unload the current pipeline and free all GPU memory."""
     if current_pipeline["sd"] is not None:
         print("📤 Unloading current pipeline...")
         del current_pipeline["sd"]
@@ -133,41 +219,29 @@ def unload_pipeline():
             vram_free = (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()) / 1e9
             print(f"   VRAM free after unload: {vram_free:.1f} GB")
 
-
 def load_z_image_turbo(lora_dir=None):
-    """Load Z-Image Turbo GGUF pipeline."""
     from stable_diffusion_cpp import StableDiffusion
-
     DIFF_REPO = "unsloth/Z-Image-Turbo-GGUF"
     DIFF_FILE = "z-image-turbo-Q4_K_M.gguf"
     LLM_REPO  = "unsloth/Qwen3-4B-Instruct-2507-GGUF"
     LLM_FILE  = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
     VAE_REPO  = "black-forest-labs/FLUX.1-schnell"
     VAE_FILE  = "ae.safetensors"
-
     print("⬇ Downloading Z-Image Turbo components...")
     diff_path = hf_hub_download(repo_id=DIFF_REPO, filename=DIFF_FILE)
     llm_path  = hf_hub_download(repo_id=LLM_REPO,  filename=LLM_FILE)
     vae_path  = hf_hub_download(repo_id=VAE_REPO,  filename=VAE_FILE)
-
     ldir = str(lora_dir) if lora_dir else None
     print(f"🔧 Loading Z-Image Turbo (lora_dir={ldir})...")
     sd = StableDiffusion(
-        diffusion_model_path=diff_path,
-        llm_path=llm_path,
-        vae_path=vae_path,
-        lora_model_dir=ldir,
-        offload_params_to_cpu=True,
-        diffusion_flash_attn=True,
+        diffusion_model_path=diff_path, llm_path=llm_path, vae_path=vae_path,
+        lora_model_dir=ldir, offload_params_to_cpu=True, diffusion_flash_attn=True,
     )
     print("✅ Z-Image Turbo loaded")
     return sd
 
-
 def load_wan_22(lora_dir=None):
-    """Load Wan 2.2 I2V GGUF pipeline."""
     from stable_diffusion_cpp import StableDiffusion
-
     I2V_REPO = "QuantStack/Wan2.2-I2V-A14B-GGUF"
     QUANT = "Q4_K_S"
     LOW_NOISE_FILE  = f"LowNoise/Wan2.2-I2V-A14B-LowNoise-{QUANT}.gguf"
@@ -175,31 +249,22 @@ def load_wan_22(lora_dir=None):
     VAE_FILE        = "VAE/Wan2.1_VAE.safetensors"
     T5_REPO = "city96/umt5-xxl-encoder-gguf"
     T5_FILE = "umt5-xxl-encoder-Q8_0.gguf"
-
     print("⬇ Downloading Wan 2.2 I2V components...")
     low_path  = hf_hub_download(repo_id=I2V_REPO, filename=LOW_NOISE_FILE)
     high_path = hf_hub_download(repo_id=I2V_REPO, filename=HIGH_NOISE_FILE)
     vae_path  = hf_hub_download(repo_id=I2V_REPO, filename=VAE_FILE)
     t5_path   = hf_hub_download(repo_id=T5_REPO,  filename=T5_FILE)
-
     ldir = str(lora_dir) if lora_dir else None
     print(f"🔧 Loading Wan 2.2 I2V (lora_dir={ldir})...")
     sd = StableDiffusion(
-        diffusion_model_path=low_path,
-        high_noise_diffusion_model_path=high_path,
-        t5xxl_path=t5_path,
-        vae_path=vae_path,
-        lora_model_dir=ldir,
-        flow_shift=3.0,
-        keep_clip_on_cpu=True,
-        diffusion_flash_attn=True,
+        diffusion_model_path=low_path, high_noise_diffusion_model_path=high_path,
+        t5xxl_path=t5_path, vae_path=vae_path, lora_model_dir=ldir,
+        flow_shift=3.0, keep_clip_on_cpu=True, diffusion_flash_attn=True,
     )
     print("✅ Wan 2.2 I2V loaded")
     return sd
 
-
 def ensure_pipeline(model_name, lora_dir=None):
-    """Load or reload the correct pipeline. Returns the sd object."""
     with pipeline_lock:
         need_reload = (
             current_pipeline["name"] != model_name or
@@ -208,16 +273,13 @@ def ensure_pipeline(model_name, lora_dir=None):
         )
         if not need_reload:
             return current_pipeline["sd"]
-
         unload_pipeline()
-
         if model_name == "z-image-turbo":
             sd = load_z_image_turbo(lora_dir)
         elif model_name == "wan-2.2":
             sd = load_wan_22(lora_dir)
         else:
             raise ValueError(f"Unknown model: {model_name}")
-
         current_pipeline["name"] = model_name
         current_pipeline["sd"] = sd
         current_pipeline["lora_dir"] = str(lora_dir) if lora_dir else None
@@ -229,7 +291,6 @@ def ensure_pipeline(model_name, lora_dir=None):
 # ══════════════════════════════════════════════════════════════
 
 def civitai_download(url, out_path, token=None, chunk_size=1024*1024):
-    """Download a file from CivitAI to a local path."""
     token = token or os.environ.get("CIVITAI_API_KEY", "")
     if token:
         parts = urlparse(url)
@@ -237,16 +298,13 @@ def civitai_download(url, out_path, token=None, chunk_size=1024*1024):
         query["token"] = token
         url = urlunparse((parts.scheme, parts.netloc, parts.path,
                           parts.params, urlencode(query), parts.fragment))
-
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://civitai.com/", "Accept": "*/*"}
     with http_requests.get(url, headers=headers, stream=True, allow_redirects=True) as r:
         r.raise_for_status()
-        # Try to get filename from Content-Disposition
         cd = r.headers.get("content-disposition", "")
         if "filename=" in cd and out_path.endswith("/"):
             fname = cd.split("filename=")[-1].strip().strip('"')
             out_path = out_path + fname
-
         total = int(r.headers.get("content-length", 0))
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         with open(out_path, "wb") as f:
@@ -264,50 +322,36 @@ def civitai_download(url, out_path, token=None, chunk_size=1024*1024):
 
 jobs = {}
 
-
 def run_z_image_job(job_id):
-    """Generate an image with Z-Image Turbo. Supports txt2img and img2img."""
     job = jobs[job_id]
     try:
         s = job["settings"]
         lora_dir = LORA_DIRS["z-image-turbo"]
-
         job["progress"] = {"pct": 10, "phase": "Loading model..."}
         print(f"🎨 Starting Z-Image generation: {s.get('width',512)}x{s.get('height',512)}, {s.get('steps',25)} steps")
         sd = ensure_pipeline("z-image-turbo", lora_dir)
-
         input_path = s.get("input_image_path")
         has_input = input_path and os.path.exists(input_path)
-
         if has_input:
             job["progress"] = {"pct": 30, "phase": "Generating (img2img)..."}
             print(f"  Using input image: {input_path} (strength={s.get('strength', 0.75)})")
             images = sd.generate_image(
-                init_image=input_path,
-                prompt=s.get("prompt", ""),
+                init_image=input_path, prompt=s.get("prompt", ""),
                 negative_prompt=s.get("negative_prompt", ""),
-                width=s.get("width", 512),
-                height=s.get("height", 512),
-                cfg_scale=s.get("cfg_scale", 4.0),
-                sample_steps=s.get("steps", 25),
-                sample_method=s.get("sampler", "euler"),
-                seed=s.get("seed", -1),
+                width=s.get("width", 512), height=s.get("height", 512),
+                cfg_scale=s.get("cfg_scale", 4.0), sample_steps=s.get("steps", 25),
+                sample_method=s.get("sampler", "euler"), seed=s.get("seed", -1),
                 strength=s.get("strength", 0.75),
             )
         else:
             job["progress"] = {"pct": 30, "phase": "Generating (txt2img)..."}
             print(f"  txt2img: prompt='{s.get('prompt','')[:60]}...'")
             images = sd.txt_to_img(
-                prompt=s.get("prompt", ""),
-                negative_prompt=s.get("negative_prompt", ""),
-                width=s.get("width", 512),
-                height=s.get("height", 512),
-                cfg_scale=s.get("cfg_scale", 4.0),
-                sample_steps=s.get("steps", 25),
-                sample_method=s.get("sampler", "euler"),
-                seed=s.get("seed", -1),
+                prompt=s.get("prompt", ""), negative_prompt=s.get("negative_prompt", ""),
+                width=s.get("width", 512), height=s.get("height", 512),
+                cfg_scale=s.get("cfg_scale", 4.0), sample_steps=s.get("steps", 25),
+                sample_method=s.get("sampler", "euler"), seed=s.get("seed", -1),
             )
-
         if not images:
             raise RuntimeError("No images returned")
 
@@ -315,33 +359,47 @@ def run_z_image_job(job_id):
         out_path = OUTPUTS / f"{job_id}.png"
         images[0].save(str(out_path))
 
-        job["result"] = {"path": str(out_path), "type": "image"}
+        # Save to Google Drive + history
+        gdrive_path = copy_image_to_gdrive(str(out_path), f"{job_id}.png")
+        input_gdrive_path = None
+        if has_input:
+            input_gdrive_path = copy_input_image_to_gdrive(input_path)
+
+        history_entry = {
+            "id": job_id,
+            "timestamp": datetime.now().isoformat(),
+            "model": "z-image-turbo",
+            "type": "image",
+            "prompt": s.get("prompt", ""),
+            "negative_prompt": s.get("negative_prompt", ""),
+            "width": s.get("width", 512), "height": s.get("height", 512),
+            "steps": s.get("steps", 25), "cfg_scale": s.get("cfg_scale", 4.0),
+            "seed": s.get("seed", -1), "strength": s.get("strength", 0.75),
+            "output_path": gdrive_path, "local_output_path": str(out_path),
+            "input_image_path": input_gdrive_path,
+            "local_input_path": input_path if has_input else None,
+        }
+        add_history_entry(history_entry)
+
+        job["result"] = {"path": str(out_path), "type": "image", "history_entry": history_entry}
         job["status"] = "done"
         job["progress"] = {"pct": 100, "phase": "Complete!"}
         print(f"✅ Z-Image generation done: {out_path}")
-
     except Exception as e:
         traceback.print_exc()
         job["status"] = "error"
         job["error"] = str(e)
         job["progress"] = {"pct": 100, "phase": f"Error: {e}"}
 
-
 def run_wan_job(job_id):
-    """Generate a video with Wan 2.2 I2V."""
     job = jobs[job_id]
     try:
         s = job["settings"]
         lora_dir = LORA_DIRS["wan-2.2"]
-
-        # Save uploaded image
         input_path = s.get("input_image_path")
         if not input_path or not os.path.exists(input_path):
             raise ValueError("Input image required for Wan 2.2 I2V")
-
         job["progress"] = {"pct": 5, "phase": "Preparing image..."}
-
-        # Resize to target area while preserving aspect ratio
         img = Image.open(input_path).convert("RGB")
         target_area = s.get("width", 832) * s.get("height", 480)
         aspect = img.width / img.height
@@ -352,23 +410,14 @@ def run_wan_job(job_id):
         img = img.resize((W, H), Image.Resampling.LANCZOS)
         resized_path = str(UPLOADS / f"{job_id}_resized.png")
         img.save(resized_path)
-
         job["progress"] = {"pct": 10, "phase": "Loading model..."}
         sd = ensure_pipeline("wan-2.2", lora_dir)
-
         job["progress"] = {"pct": 30, "phase": "Generating video..."}
-
         common = dict(
-            prompt=s.get("prompt", ""),
-            negative_prompt=s.get("negative_prompt", ""),
-            width=W,
-            height=H,
-            cfg_scale=s.get("cfg_scale", 6.0),
-            sample_method=s.get("sampler", "euler"),
-            video_frames=s.get("video_frames", 49),
+            prompt=s.get("prompt", ""), negative_prompt=s.get("negative_prompt", ""),
+            width=W, height=H, cfg_scale=s.get("cfg_scale", 6.0),
+            sample_method=s.get("sampler", "euler"), video_frames=s.get("video_frames", 49),
         )
-
-        # Try multiple call signatures for compatibility
         frames = None
         for extra in [
             {"init_image": resized_path, "strength": s.get("strength", 0.75)},
@@ -382,30 +431,37 @@ def run_wan_job(job_id):
                 break
             except TypeError:
                 continue
-
         if not frames:
             raise RuntimeError("No frames returned from Wan 2.2 I2V")
-
         job["progress"] = {"pct": 85, "phase": "Encoding video..."}
-
-        # Save as mp4 using ffmpeg
         out_path = OUTPUTS / f"{job_id}.mp4"
         _save_video_ffmpeg(frames, s.get("fps", 16), str(out_path))
 
-        job["result"] = {"path": str(out_path), "type": "video"}
+        gdrive_path = copy_image_to_gdrive(str(out_path), f"{job_id}.mp4")
+        input_gdrive_path = copy_input_image_to_gdrive(input_path)
+        history_entry = {
+            "id": job_id, "timestamp": datetime.now().isoformat(),
+            "model": "wan-2.2", "type": "video",
+            "prompt": s.get("prompt", ""), "negative_prompt": s.get("negative_prompt", ""),
+            "width": W, "height": H, "steps": s.get("steps", 20),
+            "cfg_scale": s.get("cfg_scale", 6.0), "seed": s.get("seed", -1),
+            "strength": s.get("strength", 0.75), "video_frames": s.get("video_frames", 49),
+            "output_path": gdrive_path, "local_output_path": str(out_path),
+            "input_image_path": input_gdrive_path, "local_input_path": input_path,
+        }
+        add_history_entry(history_entry)
+
+        job["result"] = {"path": str(out_path), "type": "video", "history_entry": history_entry}
         job["status"] = "done"
         job["progress"] = {"pct": 100, "phase": "Complete!"}
         print(f"✅ Wan 2.2 I2V generation done: {out_path}")
-
     except Exception as e:
         traceback.print_exc()
         job["status"] = "error"
         job["error"] = str(e)
         job["progress"] = {"pct": 100, "phase": f"Error: {e}"}
 
-
 def _save_video_ffmpeg(frames, fps, out_path):
-    """Save PIL frames to mp4 using ffmpeg subprocess."""
     import ffmpeg as ffmpeg_lib
     if not frames:
         raise ValueError("No frames")
@@ -428,11 +484,9 @@ app = Flask(__name__)
 import logging
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
-
 @app.route("/api/keepalive")
 def api_keepalive():
     return jsonify({"ok": True})
-
 
 @app.route("/")
 def index():
@@ -441,12 +495,9 @@ def index():
         return send_file(str(html_path), mimetype="text/html")
     return Response("<h1>index.html not found</h1>", mimetype="text/html", status=404)
 
-
 # ── LoRA Management ──
-
 @app.route("/api/loras")
 def api_list_loras():
-    """List downloaded LoRAs for each model."""
     result = {}
     for model_key, ldir in LORA_DIRS.items():
         files = []
@@ -457,25 +508,19 @@ def api_list_loras():
         result[model_key] = files
     return jsonify(result)
 
-
 @app.route("/api/lora/download", methods=["POST"])
 def api_download_lora():
-    """Download a LoRA from CivitAI to the correct folder."""
     data = request.json
     url = data.get("url")
-    model_key = data.get("model")       # "z-image-turbo" or "wan-2.2"
+    model_key = data.get("model")
     filename = data.get("filename", "")
     token = data.get("token", os.environ.get("CIVITAI_API_KEY", ""))
-
     if not url or not model_key:
         return jsonify({"error": "url and model required"}), 400
-
     ldir = LORA_DIRS.get(model_key)
     if not ldir:
         return jsonify({"error": f"Unknown model: {model_key}"}), 400
-
     out_path = str(ldir / filename) if filename else str(ldir) + "/"
-
     try:
         saved = civitai_download(url, out_path, token=token)
         return jsonify({"ok": True, "path": saved, "filename": os.path.basename(saved)})
@@ -483,47 +528,34 @@ def api_download_lora():
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-
 @app.route("/api/lora/delete", methods=["POST"])
 def api_delete_lora():
-    """Delete a LoRA file."""
     data = request.json
     path = data.get("path", "")
     if not path:
         return jsonify({"error": "path required"}), 400
-
-    # Safety: only allow deleting from lora dirs
     real = os.path.realpath(path)
     allowed = any(real.startswith(os.path.realpath(str(d))) for d in LORA_DIRS.values())
     if not allowed or not os.path.isfile(real):
         return jsonify({"error": "Not allowed"}), 403
-
     os.remove(real)
     return jsonify({"ok": True})
 
-
 @app.route("/api/lora/clear", methods=["POST"])
 def api_clear_loras():
-    """Clear all LoRAs for a model and unload pipeline."""
     model_key = request.json.get("model")
     ldir = LORA_DIRS.get(model_key)
     if not ldir:
         return jsonify({"error": "Unknown model"}), 400
-
     for f in ldir.glob("*"):
         if f.is_file():
             f.unlink()
-
-    # Force pipeline reload on next generate
     with pipeline_lock:
         if current_pipeline["name"] == model_key:
             unload_pipeline()
-
     return jsonify({"ok": True})
 
-
-# ── Upload (for Wan I2V input image) ──
-
+# ── Upload ──
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
     f = request.files.get("file")
@@ -534,37 +566,26 @@ def api_upload():
     f.save(str(path))
     return jsonify({"path": str(path), "filename": fname})
 
-
 # ── Generation ──
-
 @app.route("/api/generate", methods=["POST"])
 def api_generate():
     data = request.json
     model_key = data.get("model")
     settings = data.get("settings", {})
-
     if model_key not in LORA_DIRS:
         return jsonify({"error": f"Unknown model: {model_key}"}), 400
-
     job_id = uuid.uuid4().hex[:12]
     job = {
-        "id": job_id,
-        "model": model_key,
-        "settings": settings,
-        "status": "running",
-        "progress": {"pct": 0, "phase": "Starting..."},
-        "result": None,
-        "error": None,
+        "id": job_id, "model": model_key, "settings": settings,
+        "status": "running", "progress": {"pct": 0, "phase": "Starting..."},
+        "result": None, "error": None,
     }
     jobs[job_id] = job
-
     if model_key == "z-image-turbo":
         threading.Thread(target=run_z_image_job, args=(job_id,), daemon=True).start()
     elif model_key == "wan-2.2":
         threading.Thread(target=run_wan_job, args=(job_id,), daemon=True).start()
-
     return jsonify({"job_id": job_id})
-
 
 @app.route("/api/status/<job_id>")
 def api_status(job_id):
@@ -572,25 +593,20 @@ def api_status(job_id):
     if not job:
         return jsonify({"error": "Not found"}), 404
     return jsonify({
-        "status": job["status"],
-        "progress": job["progress"],
-        "result": job["result"],
-        "error": job["error"],
+        "status": job["status"], "progress": job["progress"],
+        "result": job["result"], "error": job["error"],
     })
-
 
 @app.route("/api/file")
 def api_file():
     p = request.args.get("p", "")
     if not p or not os.path.isfile(p):
         return "Not found", 404
-    # Only serve from our output/upload dirs
     real = os.path.realpath(p)
-    allowed_roots = [str(OUTPUTS), str(UPLOADS)]
+    allowed_roots = [str(OUTPUTS), str(UPLOADS), os.path.realpath(GDRIVE_SAVE_PATH)]
     if not any(real.startswith(r) for r in allowed_roots):
         return "Forbidden", 403
     return send_file(real)
-
 
 @app.route("/api/hw")
 def api_hw():
@@ -607,9 +623,47 @@ def api_hw():
     hw["lora_dir"] = current_pipeline["lora_dir"]
     return jsonify(hw)
 
-
 @app.route("/api/console")
 def api_console():
-    """Return last N lines of console output."""
     n = int(request.args.get("n", 80))
     return jsonify({"lines": list(console_lines)[-n:]})
+
+# ── History API ──
+@app.route("/api/history")
+def api_history():
+    limit = int(request.args.get("limit", 100))
+    history = load_history()
+    return jsonify({"history": history[:limit], "total": len(history)})
+
+@app.route("/api/history/delete", methods=["POST"])
+def api_history_delete():
+    entry_id = request.json.get("id")
+    if not entry_id:
+        return jsonify({"error": "id required"}), 400
+    history = load_history()
+    history = [h for h in history if h.get("id") != entry_id]
+    save_history(history)
+    return jsonify({"ok": True})
+
+@app.route("/api/history/clear", methods=["POST"])
+def api_history_clear():
+    save_history([])
+    return jsonify({"ok": True})
+
+# ── Save Path API ──
+@app.route("/api/save-path")
+def api_get_save_path():
+    return jsonify({"path": GDRIVE_SAVE_PATH, "gdrive_mounted": os.path.exists("/content/drive/MyDrive")})
+
+@app.route("/api/save-path", methods=["POST"])
+def api_set_save_path():
+    global GDRIVE_SAVE_PATH
+    new_path = request.json.get("path", "").strip()
+    if not new_path:
+        return jsonify({"error": "path required"}), 400
+    GDRIVE_SAVE_PATH = new_path
+    try:
+        _get_save_dir()
+        return jsonify({"ok": True, "path": GDRIVE_SAVE_PATH})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500

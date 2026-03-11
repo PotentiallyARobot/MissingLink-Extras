@@ -3,37 +3,51 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LoRA Studio</title>
+<title>Missing Link — AI Studio</title>
+<link rel="icon" href="https://www.missinglink.build/logo.png" type="image/png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Sora:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&display=swap" rel="stylesheet">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-:root{--bg:#07070c;--card:#0e0e16;--elev:#131320;--glass:rgba(14,14,22,0.85);--b1:rgba(255,255,255,0.055);--b2:rgba(255,255,255,0.12);--t1:#e4e4ee;--t2:#78788a;--t3:#4a4a5a;--orange:#ff6b35;--purple:#7b68ee;--cyan:#36d6c3;--red:#ff4466;--green:#4ade80;--font:'Sora',system-ui,sans-serif;--mono:'JetBrains Mono',monospace}
-body{background:var(--bg);color:var(--t1);font-family:var(--font);min-height:100vh}
+:root{
+  --bg:#060609;--card:#0c0c14;--elev:#111119;--glass:rgba(12,12,20,0.92);
+  --b1:rgba(255,255,255,0.06);--b2:rgba(255,255,255,0.13);
+  --t1:#e8e8f0;--t2:#7a7a8e;--t3:#46465a;
+  --accent:#c8ff3e;--accent2:#3effb8;--purple:#8b6cff;--red:#ff4466;--green:#4ade80;
+  --font:'DM Sans',system-ui,sans-serif;--mono:'JetBrains Mono',monospace;
+}
+html,body{height:100%;overflow:hidden}
+body{background:var(--bg);color:var(--t1);font-family:var(--font)}
 
 /* ── NAV ── */
-.nav{display:flex;align-items:center;gap:12px;padding:10px 20px;border-bottom:1px solid var(--b1);background:var(--glass);backdrop-filter:blur(20px);position:sticky;top:0;z-index:100}
-.logo{display:flex;align-items:center;gap:8px;font-weight:700;font-size:15px;flex-shrink:0}
-.logo-i{width:28px;height:28px;border-radius:7px;background:linear-gradient(135deg,var(--orange),var(--purple));display:flex;align-items:center;justify-content:center;font-size:14px}
-.nav-tabs{display:flex;gap:4px;margin-left:auto}
-.nav-tab{padding:6px 16px;border-radius:7px;border:1px solid var(--b1);background:0;color:var(--t2);font:500 12px var(--font);cursor:pointer;transition:all .15s}
+.nav{display:flex;align-items:center;gap:12px;padding:0 16px;height:48px;border-bottom:1px solid var(--b1);background:var(--glass);backdrop-filter:blur(24px);position:relative;z-index:100}
+.logo{display:flex;align-items:center;gap:8px;font-weight:700;font-size:14px;flex-shrink:0;letter-spacing:-0.02em}
+.logo img{height:22px;width:auto;border-radius:4px}
+.logo-sep{color:var(--t3);font-weight:400;margin:0 2px}
+.logo-sub{color:var(--t2);font-weight:500;font-size:12px}
+.nav-tabs{display:flex;gap:3px;margin-left:auto}
+.nav-tab{padding:5px 14px;border-radius:6px;border:1px solid var(--b1);background:0;color:var(--t2);font:500 11px var(--font);cursor:pointer;transition:all .15s;letter-spacing:-0.01em}
 .nav-tab:hover{background:rgba(255,255,255,0.04);color:var(--t1)}
-.nav-tab.on{border-color:transparent;color:#fff}
-.mode-tabs{display:flex;gap:3px;margin-left:16px}
-.mode-tab{padding:5px 12px;border-radius:6px;border:1px solid var(--b1);background:0;color:var(--t3);font:500 11px var(--font);cursor:pointer;transition:all .15s}
+.nav-tab.on{border-color:transparent;color:#000;font-weight:600}
+.mode-tabs{display:flex;gap:2px;margin-left:12px;background:rgba(255,255,255,0.04);border-radius:7px;padding:2px}
+.mode-tab{padding:4px 14px;border-radius:5px;border:0;background:0;color:var(--t3);font:500 11px var(--font);cursor:pointer;transition:all .15s}
 .mode-tab:hover{color:var(--t1)}
-.mode-tab.on{background:var(--purple);color:#fff;border-color:transparent}
+.mode-tab.on{background:var(--accent);color:#000;font-weight:600}
+.nav-settings{margin-left:8px;padding:5px 10px;border-radius:6px;border:1px solid var(--b1);background:0;color:var(--t2);font:11px var(--font);cursor:pointer;transition:all .15s;display:flex;align-items:center;gap:4px}
+.nav-settings:hover{color:var(--t1);border-color:var(--b2)}
 
 /* ── PAGES ── */
-.page{display:none;max-width:1480px;margin:0 auto;padding:16px 20px 48px}
-.page.show{display:block}
+.page{display:none;height:calc(100vh - 48px);overflow:hidden}
+.page.show{display:flex;flex-direction:column}
 
-/* ── BROWSE FILTERS ── */
+/* ── BROWSE PAGE ── */
+#pageBrowse.show{display:block;overflow-y:auto}
+#pageBrowse{padding:16px 20px 48px;max-width:1480px;margin:0 auto}
 .filters{display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap;align-items:center}
 .search-w{flex:1;min-width:200px;position:relative}
 .search-w svg{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--t3);pointer-events:none}
 .search-w input{width:100%;padding:8px 12px 8px 36px;border-radius:8px;border:1px solid var(--b1);background:rgba(255,255,255,0.03);color:var(--t1);font:13px var(--font);outline:0;transition:all .15s}
-.search-w input:focus{border-color:var(--b2);box-shadow:0 0 0 3px rgba(123,104,238,0.08)}
+.search-w input:focus{border-color:var(--b2);box-shadow:0 0 0 3px rgba(200,255,62,0.06)}
 .search-w input::placeholder{color:var(--t3)}
 .fctl{padding:7px 10px;border-radius:8px;border:1px solid var(--b1);background:rgba(255,255,255,0.03);color:var(--t1);font:12px var(--font);cursor:pointer;outline:0}
 .fctl option{background:#16162a}
@@ -43,8 +57,6 @@ body{background:var(--bg);color:var(--t1);font-family:var(--font);min-height:100
 .nsfw-dot{width:7px;height:7px;border-radius:50%;background:var(--t3);transition:all .12s}
 .nsfw-tog.on .nsfw-dot{background:var(--red);box-shadow:0 0 6px var(--red)}
 .result-info{font-size:11px;color:var(--t3);margin-bottom:10px}
-
-/* ── GRID ── */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:11px}
 .card{border-radius:12px;background:var(--card);border:1px solid var(--b1);overflow:hidden;transition:transform .2s,box-shadow .2s;contain:layout style paint}
 .card:hover{border-color:var(--b2);transform:translateY(-2px);box-shadow:0 6px 24px rgba(0,0,0,0.4)}
@@ -54,10 +66,10 @@ body{background:var(--bg);color:var(--t1);font-family:var(--font);min-height:100
 .no-img{width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#222}
 .badge{position:absolute;top:6px;padding:2px 6px;border-radius:4px;color:#fff;font:600 8.5px/1.4 var(--font);text-transform:uppercase;letter-spacing:.3px}
 .badge-nsfw{left:6px;background:rgba(255,50,50,0.85)}
-.badge-bm{right:6px;background:rgba(54,214,195,0.85);color:#000}
+.badge-bm{right:6px;background:rgba(200,255,62,0.85);color:#000}
 .card-ov{position:absolute;inset:0;background:linear-gradient(to top,rgba(0,0,0,.9) 0%,rgba(0,0,0,.3) 50%,transparent 100%);display:none;flex-direction:column;justify-content:flex-end;padding:11px;gap:5px}
 .card:hover .card-ov{display:flex}
-.btn-dl{display:flex;align-items:center;justify-content:center;gap:5px;padding:8px;border-radius:7px;border:0;color:#fff;font:600 11.5px var(--font);cursor:pointer;transition:all .12s}
+.btn-dl{display:flex;align-items:center;justify-content:center;gap:5px;padding:8px;border-radius:7px;border:0;color:#000;font:600 11.5px var(--font);cursor:pointer;transition:all .12s}
 .btn-dl:hover{filter:brightness(1.12)}
 .btn-civ{text-align:center;padding:5px;border-radius:5px;background:rgba(255,255,255,0.08);color:#bbb;font-size:10.5px;text-decoration:none;transition:all .12s}
 .btn-civ:hover{color:#fff}
@@ -67,55 +79,157 @@ body{background:var(--bg);color:var(--t1);font-family:var(--font);min-height:100
 .card-stats{display:flex;gap:10px;font-size:9.5px;color:var(--t3)}
 .card-stats span{display:flex;align-items:center;gap:2px}
 .sts{text-align:center;padding:40px 20px;color:var(--t3);font-size:13px}
-.spin{display:inline-block;width:18px;height:18px;border:2px solid rgba(255,255,255,0.08);border-top-color:var(--purple);border-radius:50%;animation:sp .7s linear infinite;margin-bottom:6px}
+.spin{display:inline-block;width:18px;height:18px;border:2px solid rgba(255,255,255,0.08);border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite}
 @keyframes sp{to{transform:rotate(360deg)}}
 .err{background:rgba(255,50,50,0.07);border:1px solid rgba(255,50,50,0.18);border-radius:8px;padding:12px;margin:10px auto;max-width:500px;text-align:center;color:#ff6b6b;font-size:11.5px}
 #sentinel{height:1px}
 
-/* ── GENERATE PAGE ── */
-.gen-layout{display:grid;grid-template-columns:320px 1fr;gap:16px;min-height:70vh}
-@media(max-width:800px){.gen-layout{grid-template-columns:1fr}}
-.gen-sidebar{background:var(--card);border:1px solid var(--b1);border-radius:12px;padding:16px;overflow-y:auto;max-height:calc(100vh - 80px)}
-.gen-main{display:flex;flex-direction:column;gap:12px}
+/* ══════════════════════════════════════════════════════════════
+   GENERATE PAGE — 3-column: console | controls | output+history
+   ══════════════════════════════════════════════════════════════ */
+.gen-layout{
+  display:grid;
+  grid-template-columns:280px 320px 1fr;
+  height:100%;
+  overflow:hidden;
+}
+@media(max-width:1000px){.gen-layout{grid-template-columns:1fr;grid-template-rows:auto 1fr auto}}
 
-.gen-section{margin-bottom:14px}
-.gen-label{font-size:11px;color:var(--t2);margin-bottom:5px;display:flex;justify-content:space-between;align-items:center}
+/* Column: Console (left) */
+.gen-console{
+  background:#08080e;border-right:1px solid var(--b1);
+  display:flex;flex-direction:column;overflow:hidden;
+}
+.gen-console-header{
+  display:flex;justify-content:space-between;align-items:center;
+  padding:10px 14px;border-bottom:1px solid var(--b1);background:rgba(255,255,255,0.015);
+  flex-shrink:0;
+}
+.gen-console-header span{font:600 10px var(--mono);color:var(--t3);text-transform:uppercase;letter-spacing:0.08em}
+.gen-console-header button{background:0;border:0;color:var(--t3);font:10px var(--mono);cursor:pointer;padding:2px 6px;border-radius:3px}
+.gen-console-header button:hover{color:var(--t1);background:rgba(255,255,255,0.05)}
+.gen-console pre{
+  flex:1;overflow-y:auto;padding:10px 14px;
+  font:10px/1.5 var(--mono);color:#5a5a70;margin:0;
+  white-space:pre-wrap;word-break:break-all;
+}
+
+/* Column: Controls (middle) */
+.gen-sidebar{
+  background:var(--card);border-right:1px solid var(--b1);
+  overflow-y:auto;padding:16px;
+  display:flex;flex-direction:column;
+}
+.gen-section{margin-bottom:12px}
+.gen-label{font-size:10.5px;color:var(--t2);margin-bottom:4px;display:flex;justify-content:space-between;align-items:center;letter-spacing:0.01em}
 .gen-label span{color:var(--t3);font-family:var(--mono);font-size:10px}
-.gen-input{width:100%;padding:7px 10px;border-radius:7px;border:1px solid var(--b1);background:rgba(255,255,255,0.03);color:var(--t1);font:12px var(--font);outline:0;resize:vertical}
-.gen-input:focus{border-color:var(--b2)}
-textarea.gen-input{min-height:60px;font-family:var(--font)}
+.gen-input{width:100%;padding:7px 10px;border-radius:7px;border:1px solid var(--b1);background:rgba(255,255,255,0.03);color:var(--t1);font:12px var(--font);outline:0;resize:vertical;transition:border .15s}
+.gen-input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(200,255,62,0.08)}
+textarea.gen-input{min-height:54px;font-family:var(--font)}
 .gen-row{display:flex;gap:8px}
 .gen-row>*{flex:1}
-.gen-slider{width:100%;accent-color:var(--purple);margin-top:2px}
-.gen-btn{padding:10px 20px;border-radius:8px;border:0;font:600 13px var(--font);cursor:pointer;transition:all .15s;display:flex;align-items:center;justify-content:center;gap:6px;width:100%}
+.gen-slider{width:100%;accent-color:var(--accent);margin-top:2px;height:4px}
+.gen-btn{padding:10px 20px;border-radius:8px;border:0;font:600 12px var(--font);cursor:pointer;transition:all .15s;display:flex;align-items:center;justify-content:center;gap:6px;width:100%;letter-spacing:-0.01em}
 .gen-btn:hover{filter:brightness(1.1)}
-.gen-btn:disabled{opacity:0.5;cursor:not-allowed}
-.gen-btn-primary{background:var(--purple);color:#fff}
-.gen-btn-danger{background:rgba(255,68,102,0.15);color:var(--red);border:1px solid rgba(255,68,102,0.2)}
+.gen-btn:disabled{opacity:0.4;cursor:not-allowed}
+.gen-btn-primary{background:var(--accent);color:#000}
+.gen-btn-secondary{background:rgba(255,255,255,0.06);color:var(--t1);border:1px solid var(--b1)}
+.gen-btn-secondary:hover{border-color:var(--b2)}
+.gen-btn-danger{background:rgba(255,68,102,0.1);color:var(--red);border:1px solid rgba(255,68,102,0.15)}
+.gen-btn-use{background:rgba(139,108,255,0.15);color:var(--purple);border:1px solid rgba(139,108,255,0.2)}
+.gen-btn-use:hover{background:rgba(139,108,255,0.25)}
 
-/* Lora pills */
-.lora-pills{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
-.lora-pill{display:flex;align-items:center;gap:4px;padding:3px 8px;border-radius:5px;background:rgba(123,104,238,0.12);color:#9d8df0;font:10.5px var(--mono);max-width:200px}
+.lora-pills{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+.lora-pill{display:flex;align-items:center;gap:4px;padding:3px 8px;border-radius:5px;background:rgba(200,255,62,0.08);color:var(--accent);font:10px var(--mono);max-width:200px}
 .lora-pill span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.lora-pill button{background:0;border:0;color:#9d8df0;cursor:pointer;font-size:12px;line-height:1;padding:0 2px}
+.lora-pill button{background:0;border:0;color:var(--accent);cursor:pointer;font-size:12px;line-height:1;padding:0 2px}
 
-/* Image upload area */
-.upload-zone{border:2px dashed var(--b1);border-radius:8px;padding:20px;text-align:center;color:var(--t3);font-size:12px;cursor:pointer;transition:all .15s}
-.upload-zone:hover{border-color:var(--b2);color:var(--t2)}
-.upload-zone.has-img{padding:4px;border-style:solid}
+.upload-zone{border:1px dashed var(--b2);border-radius:8px;padding:16px;text-align:center;color:var(--t3);font-size:11px;cursor:pointer;transition:all .15s}
+.upload-zone:hover{border-color:var(--accent);color:var(--t2)}
+.upload-zone.has-img{padding:4px;border-style:solid;border-color:var(--b1)}
 .upload-zone img{max-width:100%;border-radius:6px}
 
-/* Output area */
-.gen-output{flex:1;display:flex;align-items:center;justify-content:center;background:var(--card);border:1px solid var(--b1);border-radius:12px;min-height:400px;position:relative;overflow:hidden}
-.gen-output img,.gen-output video{max-width:100%;max-height:100%;object-fit:contain;border-radius:8px}
-.gen-progress{position:absolute;bottom:16px;left:16px;right:16px;background:rgba(0,0,0,0.8);backdrop-filter:blur(8px);border-radius:10px;padding:12px 16px}
-.gen-pbar{height:4px;background:rgba(255,255,255,0.08);border-radius:2px;margin-top:6px;overflow:hidden}
-.gen-pbar-fill{height:100%;background:var(--purple);border-radius:2px;transition:width .3s}
-.gen-phase{font-size:11px;color:var(--t2)}
+.sidebar-spacer{flex:1}
 
-/* Downloading indicator */
+/* Column: Output + History (right) */
+.gen-main{display:flex;flex-direction:column;overflow:hidden}
+
+.gen-output{
+  flex:1;display:flex;align-items:center;justify-content:center;
+  background:var(--bg);position:relative;overflow:hidden;min-height:0;
+}
+.gen-output img,.gen-output video{max-width:100%;max-height:100%;object-fit:contain}
+.gen-progress{position:absolute;bottom:16px;left:16px;right:16px;background:rgba(0,0,0,0.85);backdrop-filter:blur(12px);border-radius:10px;padding:12px 16px;border:1px solid var(--b1)}
+.gen-pbar{height:3px;background:rgba(255,255,255,0.06);border-radius:2px;margin-top:6px;overflow:hidden}
+.gen-pbar-fill{height:100%;background:var(--accent);border-radius:2px;transition:width .3s}
+.gen-phase{font-size:10.5px;color:var(--t2)}
+
+/* Use as Edit button — floats over output */
+.use-as-edit-btn{
+  position:absolute;top:12px;right:12px;z-index:10;
+  padding:6px 14px;border-radius:6px;border:1px solid rgba(139,108,255,0.3);
+  background:rgba(12,12,20,0.9);backdrop-filter:blur(8px);
+  color:var(--purple);font:600 11px var(--font);cursor:pointer;
+  display:none;align-items:center;gap:5px;transition:all .15s;
+}
+.use-as-edit-btn:hover{background:rgba(139,108,255,0.2);border-color:var(--purple)}
+.use-as-edit-btn.show{display:flex}
+
+/* History strip */
+.gen-history{
+  height:110px;min-height:110px;flex-shrink:0;
+  border-top:1px solid var(--b1);background:var(--card);
+  display:flex;flex-direction:column;overflow:hidden;
+}
+.gen-history-header{
+  display:flex;justify-content:space-between;align-items:center;
+  padding:6px 14px;border-bottom:1px solid var(--b1);flex-shrink:0;
+}
+.gen-history-header span{font:600 10px var(--mono);color:var(--t3);text-transform:uppercase;letter-spacing:0.08em}
+.gen-history-header button{background:0;border:0;color:var(--t3);font:10px var(--font);cursor:pointer;padding:2px 6px;border-radius:3px}
+.gen-history-header button:hover{color:var(--red)}
+.history-strip{
+  flex:1;display:flex;gap:6px;padding:6px 14px;
+  overflow-x:auto;overflow-y:hidden;align-items:center;
+}
+.history-strip::-webkit-scrollbar{height:4px}
+.history-strip::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.06);border-radius:2px}
+.history-item{
+  flex-shrink:0;width:64px;height:64px;border-radius:6px;
+  overflow:hidden;border:2px solid transparent;cursor:pointer;
+  position:relative;transition:all .15s;background:#0a0a12;
+}
+.history-item:hover{border-color:var(--b2);transform:scale(1.05)}
+.history-item.active{border-color:var(--accent)}
+.history-item img{width:100%;height:100%;object-fit:cover}
+.history-item .hi-badge{
+  position:absolute;bottom:0;left:0;right:0;
+  background:rgba(0,0,0,0.8);padding:1px 3px;
+  font:600 7px var(--mono);color:var(--t2);text-align:center;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.history-item .hi-input-dot{
+  position:absolute;top:3px;right:3px;width:6px;height:6px;
+  border-radius:50%;background:var(--purple);border:1px solid rgba(0,0,0,0.5);
+}
+.history-empty{color:var(--t3);font-size:11px;display:flex;align-items:center;justify-content:center;flex:1}
+
+/* Toast */
 .dl-toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--elev);border:1px solid var(--b1);border-radius:10px;padding:10px 20px;display:none;align-items:center;gap:8px;font-size:12px;color:var(--t1);z-index:200;box-shadow:0 4px 20px rgba(0,0,0,0.5)}
 .dl-toast.show{display:flex}
+
+/* Settings Modal */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:300;display:none;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
+.modal-overlay.show{display:flex}
+.modal{background:var(--card);border:1px solid var(--b1);border-radius:14px;padding:24px;width:440px;max-width:90vw}
+.modal h3{font-size:14px;margin-bottom:16px;font-weight:600}
+.modal label{font-size:11px;color:var(--t2);display:block;margin-bottom:4px}
+.modal input[type=text]{width:100%;padding:8px 10px;border-radius:7px;border:1px solid var(--b1);background:rgba(255,255,255,0.03);color:var(--t1);font:12px var(--font);outline:0;margin-bottom:12px}
+.modal input[type=text]:focus{border-color:var(--accent)}
+.modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+.modal-actions button{padding:7px 18px;border-radius:7px;border:0;font:500 12px var(--font);cursor:pointer;transition:all .12s}
+.modal .btn-save{background:var(--accent);color:#000}
+.modal .btn-cancel{background:rgba(255,255,255,0.06);color:var(--t1)}
 
 /* Scrollbar */
 ::-webkit-scrollbar{width:5px;height:5px}
@@ -123,9 +237,10 @@ textarea.gen-input{min-height:60px;font-family:var(--font)}
 ::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.06);border-radius:3px}
 
 @media(max-width:640px){
-  .nav{flex-wrap:wrap}
+  .nav{flex-wrap:wrap;height:auto;padding:8px 12px}
   .filters{flex-direction:column}
   .grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
+  .gen-layout{grid-template-columns:1fr}
 }
 </style>
 </head>
@@ -133,12 +248,18 @@ textarea.gen-input{min-height:60px;font-family:var(--font)}
 
 <!-- NAV -->
 <div class="nav">
-  <div class="logo"><div class="logo-i">⚡</div>LoRA Studio</div>
+  <div class="logo">
+    <img src="https://www.missinglink.build/logo.png" alt="Missing Link" onerror="this.style.display='none'">
+    <span>Missing Link</span>
+    <span class="logo-sep">/</span>
+    <span class="logo-sub">AI Studio</span>
+  </div>
   <div class="nav-tabs" id="modelTabs"></div>
   <div class="mode-tabs">
     <button class="mode-tab on" onclick="setMode('browse')">Browse</button>
     <button class="mode-tab" onclick="setMode('generate')">Generate</button>
   </div>
+  <button class="nav-settings" onclick="openSettings()">⚙ Settings</button>
 </div>
 
 <!-- BROWSE PAGE -->
@@ -163,6 +284,17 @@ textarea.gen-input{min-height:60px;font-family:var(--font)}
 <!-- GENERATE PAGE -->
 <div class="page" id="pageGenerate">
   <div class="gen-layout">
+
+    <!-- Left: Console -->
+    <div class="gen-console">
+      <div class="gen-console-header">
+        <span>Console</span>
+        <button onclick="$('consolePre').textContent=''">Clear</button>
+      </div>
+      <pre id="consolePre"></pre>
+    </div>
+
+    <!-- Middle: Controls -->
     <div class="gen-sidebar">
       <div class="gen-section">
         <div class="gen-label">Prompt</div>
@@ -170,12 +302,11 @@ textarea.gen-input{min-height:60px;font-family:var(--font)}
       </div>
       <div class="gen-section">
         <div class="gen-label">Negative Prompt</div>
-        <textarea class="gen-input" id="genNeg" rows="2" placeholder="What to avoid..." style="min-height:40px">blurry, low quality, watermark, text</textarea>
+        <textarea class="gen-input" id="genNeg" rows="2" placeholder="What to avoid..." style="min-height:36px">blurry, low quality, watermark, text</textarea>
       </div>
 
-      <!-- Input image: img2img for Z-Image, I2V for Wan -->
       <div class="gen-section" id="inputImageSection">
-        <div class="gen-label" id="uploadLabel">Input Image (optional — enables img2img)</div>
+        <div class="gen-label" id="uploadLabel">Input Image (optional — img2img)</div>
         <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
           Click to upload image
         </div>
@@ -230,30 +361,56 @@ textarea.gen-input{min-height:60px;font-family:var(--font)}
 
       <div class="gen-section">
         <div class="gen-label">Active LoRAs <span id="loraCount">0</span></div>
-        <div class="lora-pills" id="loraPills"><span style="color:var(--t3);font-size:11px">None — download from Browse tab</span></div>
+        <div class="lora-pills" id="loraPills"><span style="color:var(--t3);font-size:10px">None — download from Browse</span></div>
       </div>
 
-      <div class="gen-section">
+      <div class="sidebar-spacer"></div>
+
+      <div class="gen-section" style="margin-bottom:6px">
         <button class="gen-btn gen-btn-primary" id="genBtn" onclick="startGeneration()">
           ⚡ Generate
         </button>
       </div>
-      <div class="gen-section">
-        <button class="gen-btn gen-btn-danger" onclick="clearLoras()">Clear LoRAs & Reload</button>
+      <div class="gen-section" style="margin-bottom:0">
+        <button class="gen-btn gen-btn-danger" onclick="clearLoras()" style="font-size:10px;padding:7px">Clear LoRAs &amp; Reload</button>
       </div>
     </div>
 
+    <!-- Right: Output + History -->
     <div class="gen-main">
       <div class="gen-output" id="genOutput">
         <span style="color:var(--t3);font-size:13px">Output will appear here</span>
+        <button class="use-as-edit-btn" id="useAsEditBtn" onclick="useOutputAsInput()" title="Use this generated image as input for img2img">
+          ↗ Use as Input
+        </button>
       </div>
-      <div id="consolePanel" style="background:#0a0a10;border:1px solid var(--b1);border-radius:10px;overflow:hidden;max-height:200px;display:flex;flex-direction:column">
-        <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 12px;border-bottom:1px solid var(--b1);background:rgba(255,255,255,0.02)">
-          <span style="font-size:10.5px;color:var(--t3)">Console Output</span>
-          <button onclick="$('consolePre').textContent=''" style="background:0;border:0;color:var(--t3);font-size:10px;cursor:pointer">Clear</button>
+      <div class="gen-history">
+        <div class="gen-history-header">
+          <span>History</span>
+          <button onclick="clearHistory()">Clear All</button>
         </div>
-        <pre id="consolePre" style="flex:1;overflow-y:auto;padding:8px 12px;font:10.5px/1.45 var(--mono);color:#7a7a90;margin:0;white-space:pre-wrap;word-break:break-all"></pre>
+        <div class="history-strip" id="historyStrip">
+          <div class="history-empty">No generations yet</div>
+        </div>
       </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- Settings Modal -->
+<div class="modal-overlay" id="settingsModal">
+  <div class="modal">
+    <h3>⚙ Studio Settings</h3>
+    <label>Google Drive Save Path</label>
+    <input type="text" id="settingsSavePath" placeholder="/content/drive/MyDrive/MissingLink_Studio">
+    <div style="font-size:10px;color:var(--t3);margin-top:-8px;margin-bottom:12px">
+      History and generated images are saved here. Requires Google Drive mounted in Colab.
+    </div>
+    <div id="settingsDriveStatus" style="font-size:11px;margin-bottom:8px"></div>
+    <div class="modal-actions">
+      <button class="btn-cancel" onclick="closeSettings()">Cancel</button>
+      <button class="btn-save" onclick="saveSettings()">Save</button>
     </div>
   </div>
 </div>
@@ -266,9 +423,9 @@ textarea.gen-input{min-height:60px;font-family:var(--font)}
 // CONFIG
 // ═══════════════════════════════════════════════════════════
 const MODELS={
-  'z-image-turbo':{label:'Z-Image Turbo',color:'#ff6b35',q:'z-image-turbo',baseMatch:['z-image','zimage','z image'],type:'image',
+  'z-image-turbo':{label:'Z-Image Turbo',color:'#c8ff3e',q:'z-image-turbo',baseMatch:['z-image','zimage','z image'],type:'image',
     defaults:{steps:25,cfg:4.0,w:512,h:512}},
-  'wan-2.2':{label:'Wan 2.2 I2V',color:'#7b68ee',q:'wan 2.2',baseMatch:['wan'],type:'video',
+  'wan-2.2':{label:'Wan 2.2 I2V',color:'#8b6cff',q:'wan 2.2',baseMatch:['wan'],type:'video',
     defaults:{steps:20,cfg:6.0,w:832,h:480,frames:49,strength:0.75}},
 };
 const CIVITAI='https://civitai.com/api/v1';
@@ -278,7 +435,9 @@ let S={model:'z-image-turbo',query:'',sort:'Most Downloaded',period:'',tag:'',ns
         results:[],nextUrl:null,total:0,hasMore:true,loading:false,mode:'browse'};
 let abortCtrl=null,debounce=null;
 const cache=new Map();
-let uploadedImagePath=null; // for Wan I2V
+let uploadedImagePath=null;
+let currentOutputPath=null; // track last generated output for "use as input"
+let historyData=[];
 
 const $=id=>document.getElementById(id);
 const esc=s=>s?s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'):'';
@@ -294,13 +453,13 @@ function setMode(m){
   document.querySelectorAll('.mode-tab').forEach((t,i)=>t.classList.toggle('on',i===(m==='browse'?0:1)));
   $('pageBrowse').classList.toggle('show',m==='browse');
   $('pageGenerate').classList.toggle('show',m==='generate');
-  if(m==='generate'){refreshGenUI();startConsolePoll()}else{stopConsolePoll()}
+  if(m==='generate'){refreshGenUI();startConsolePoll();loadHistory()}else{stopConsolePoll()}
 }
 
 // ═══ MODEL TABS ═══
 function renderTabs(){
   $('modelTabs').innerHTML=Object.entries(MODELS).map(([k,c])=>
-    `<button class="nav-tab${S.model===k?' on':''}" style="${S.model===k?'background:'+c.color+';box-shadow:0 2px 8px '+c.color+'44':''}" onclick="switchModel('${k}')">${c.label}</button>`
+    `<button class="nav-tab${S.model===k?' on':''}" style="${S.model===k?'background:'+c.color+';color:#000;box-shadow:0 2px 8px '+c.color+'33':''}" onclick="switchModel('${k}')">${c.label}</button>`
   ).join('');
 }
 function switchModel(k){S.model=k;S.query='';$('searchInput').value='';S.results=[];S.nextUrl=null;cache.clear();renderTabs();updatePH();doFetch();if(S.mode==='generate')refreshGenUI()}
@@ -363,16 +522,13 @@ async function downloadLora(idx){
   const m=S.results[idx];if(!m)return;
   const ver=m.modelVersions?.[0];const f=ver?.files?.[0];
   if(!f||!f.downloadUrl){alert('No download URL found');return}
-
   const toast=$('dlToast'),txt=$('dlToastText');
   toast.classList.add('show');
   txt.textContent=`Downloading ${m.name}...`;
-
   try{
     const token=prompt('CivitAI API token (or leave empty):','') || '';
     const res=await fetch('/api/lora/download',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
+      method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({url:f.downloadUrl,model:S.model,filename:f.name||m.name.replace(/[^a-zA-Z0-9_.-]/g,'_')+'.safetensors',token}),
     });
     const data=await res.json();
@@ -390,11 +546,8 @@ async function downloadLora(idx){
 function refreshGenUI(){
   const cfg=MODELS[S.model];
   const isVideo=cfg.type==='video';
-  // Video-only controls
   $('videoCtrlSection').style.display=isVideo?'block':'none';
-  // Update upload label
-  $('uploadLabel').textContent=isVideo?'Input Image (required for I2V)':'Input Image (optional — enables img2img)';
-  // Set defaults
+  $('uploadLabel').textContent=isVideo?'Input Image (required for I2V)':'Input Image (optional — img2img)';
   const d=cfg.defaults;
   $('genSteps').value=d.steps;$('stepsVal').textContent=d.steps;
   $('genCfg').value=d.cfg;$('cfgVal').textContent=d.cfg;
@@ -413,7 +566,7 @@ async function refreshLoras(){
     const files=data[S.model]||[];
     $('loraCount').textContent=files.length;
     if(files.length===0){
-      $('loraPills').innerHTML='<span style="color:var(--t3);font-size:11px">None — download from Browse tab</span>';
+      $('loraPills').innerHTML='<span style="color:var(--t3);font-size:10px">None — download from Browse</span>';
     }else{
       $('loraPills').innerHTML=files.map((f,i)=>
         `<div class="lora-pill"><span title="${esc(f.name)}">${esc(f.name)}</span><button onclick="deleteLora('${esc(f.path)}')">×</button></div>`
@@ -445,6 +598,15 @@ $('fileInput').addEventListener('change',async e=>{
   }catch(err){alert('Upload failed: '+err)}
 });
 
+// ── Use output as input image ──
+async function useOutputAsInput(){
+  if(!currentOutputPath)return;
+  uploadedImagePath=currentOutputPath;
+  const zone=$('uploadZone');
+  zone.classList.add('has-img');
+  zone.innerHTML=`<img src="/api/file?p=${encodeURIComponent(currentOutputPath)}">`;
+}
+
 // ── Generation ──
 let pollTimer=null;
 
@@ -461,10 +623,7 @@ async function startGeneration(){
     sampler:'euler',
     strength:parseFloat($('genImgStr').value),
   };
-
-  // Attach input image if uploaded (works for both img2img and I2V)
   if(uploadedImagePath) settings.input_image_path=uploadedImagePath;
-
   if(cfg.type==='video'){
     settings.video_frames=parseInt($('genFrames').value);
     settings.fps=16;
@@ -472,7 +631,9 @@ async function startGeneration(){
   }
 
   $('genBtn').disabled=true;
-  $('genOutput').innerHTML=`<div class="gen-progress"><div class="gen-phase" id="genPhase">Starting...</div><div class="gen-pbar"><div class="gen-pbar-fill" id="genPbar" style="width:0%"></div></div></div>`;
+  $('useAsEditBtn').classList.remove('show');
+  currentOutputPath=null;
+  $('genOutput').innerHTML=`<div class="gen-progress"><div class="gen-phase" id="genPhase">Starting...</div><div class="gen-pbar"><div class="gen-pbar-fill" id="genPbar" style="width:0%"></div></div></div><button class="use-as-edit-btn" id="useAsEditBtn" onclick="useOutputAsInput()">↗ Use as Input</button>`;
 
   try{
     const res=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:S.model,settings})});
@@ -480,7 +641,7 @@ async function startGeneration(){
     if(d.error){throw new Error(d.error)}
     pollJob(d.job_id);
   }catch(e){
-    $('genOutput').innerHTML=`<div class="err">${esc(e.message)}</div>`;
+    $('genOutput').innerHTML=`<div class="err">${esc(e.message)}</div><button class="use-as-edit-btn" id="useAsEditBtn" onclick="useOutputAsInput()">↗ Use as Input</button>`;
     $('genBtn').disabled=false;
   }
 }
@@ -491,10 +652,10 @@ function pollJob(jobId){
     try{
       const res=await fetch(`/api/status/${jobId}`);
       const d=await res.json();
-      if($('genPhase'))$('genPhase').textContent=d.progress?.phase||'...';
-      if($('genPbar'))$('genPbar').style.width=(d.progress?.pct||0)+'%';
-
-      // Fetch console logs
+      const phase=document.getElementById('genPhase');
+      const pbar=document.getElementById('genPbar');
+      if(phase)phase.textContent=d.progress?.phase||'...';
+      if(pbar)pbar.style.width=(d.progress?.pct||0)+'%';
       fetchConsole();
 
       if(d.status==='done'||d.status==='error'){
@@ -502,19 +663,23 @@ function pollJob(jobId){
         $('genBtn').disabled=false;
         if(d.result){
           const url=`/api/file?p=${encodeURIComponent(d.result.path)}`;
+          currentOutputPath=d.result.path;
           if(d.result.type==='video'){
-            $('genOutput').innerHTML=`<video src="${url}" controls autoplay loop style="max-width:100%;max-height:100%"></video>`;
+            $('genOutput').innerHTML=`<video src="${url}" controls autoplay loop></video><button class="use-as-edit-btn show" id="useAsEditBtn" onclick="useOutputAsInput()">↗ Use as Input</button>`;
           }else{
-            $('genOutput').innerHTML=`<img src="${url}" style="max-width:100%;max-height:100%">`;
+            $('genOutput').innerHTML=`<img src="${url}"><button class="use-as-edit-btn show" id="useAsEditBtn" onclick="useOutputAsInput()">↗ Use as Input</button>`;
           }
+          // Reload history
+          loadHistory();
         }else if(d.error){
-          $('genOutput').innerHTML=`<div class="err">${esc(d.error)}</div>`;
+          $('genOutput').innerHTML=`<div class="err">${esc(d.error)}</div><button class="use-as-edit-btn" id="useAsEditBtn" onclick="useOutputAsInput()">↗ Use as Input</button>`;
         }
       }
     }catch(e){console.error(e)}
   },1000);
 }
 
+// ── Console ──
 async function fetchConsole(){
   try{
     const res=await fetch('/api/console?n=60');
@@ -527,6 +692,119 @@ async function fetchConsole(){
   }catch(e){}
 }
 
+// ── History ──
+async function loadHistory(){
+  try{
+    const res=await fetch('/api/history?limit=100');
+    const d=await res.json();
+    historyData=d.history||[];
+    renderHistory();
+  }catch(e){console.error('History load failed:',e)}
+}
+
+function renderHistory(){
+  const strip=$('historyStrip');
+  if(!historyData.length){
+    strip.innerHTML='<div class="history-empty">No generations yet</div>';
+    return;
+  }
+  strip.innerHTML=historyData.map((h,i)=>{
+    // Determine image URL: use local path first (faster), then drive path
+    const imgPath=h.local_output_path||h.output_path;
+    const imgUrl=`/api/file?p=${encodeURIComponent(imgPath)}`;
+    const hasInput=!!h.input_image_path||!!h.local_input_path;
+    const timeStr=new Date(h.timestamp).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+    return `<div class="history-item" onclick="loadHistoryEntry(${i})" title="${esc(h.prompt?.substring(0,80)||'No prompt')}">
+      ${h.type==='video'?`<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;background:#0a0a14;font-size:18px">🎬</div>`:`<img src="${imgUrl}" loading="lazy">`}
+      ${hasInput?'<div class="hi-input-dot"></div>':''}
+      <div class="hi-badge">${timeStr}</div>
+    </div>`;
+  }).join('');
+}
+
+function loadHistoryEntry(idx){
+  const h=historyData[idx];
+  if(!h)return;
+
+  // Load prompt and settings into UI
+  $('genPrompt').value=h.prompt||'';
+  $('genNeg').value=h.negative_prompt||'';
+
+  if(h.width){$('genW').value=h.width;$('wVal').textContent=h.width}
+  if(h.height){$('genH').value=h.height;$('hVal').textContent=h.height}
+  if(h.steps){$('genSteps').value=h.steps;$('stepsVal').textContent=h.steps}
+  if(h.cfg_scale){$('genCfg').value=h.cfg_scale;$('cfgVal').textContent=h.cfg_scale}
+  if(h.seed!==undefined){$('genSeed').value=h.seed}
+  if(h.strength){$('genImgStr').value=h.strength;$('imgStrVal').textContent=h.strength}
+
+  // Load input image if it was used
+  const inputPath=h.local_input_path||h.input_image_path;
+  if(inputPath){
+    uploadedImagePath=inputPath;
+    const zone=$('uploadZone');
+    zone.classList.add('has-img');
+    zone.innerHTML=`<img src="/api/file?p=${encodeURIComponent(inputPath)}">`;
+  }
+
+  // Show the output image
+  const outPath=h.local_output_path||h.output_path;
+  if(outPath){
+    currentOutputPath=outPath;
+    const url=`/api/file?p=${encodeURIComponent(outPath)}`;
+    if(h.type==='video'){
+      $('genOutput').innerHTML=`<video src="${url}" controls autoplay loop></video><button class="use-as-edit-btn show" id="useAsEditBtn" onclick="useOutputAsInput()">↗ Use as Input</button>`;
+    }else{
+      $('genOutput').innerHTML=`<img src="${url}"><button class="use-as-edit-btn show" id="useAsEditBtn" onclick="useOutputAsInput()">↗ Use as Input</button>`;
+    }
+  }
+
+  // Highlight active history item
+  document.querySelectorAll('.history-item').forEach((el,i)=>el.classList.toggle('active',i===idx));
+}
+
+async function clearHistory(){
+  if(!confirm('Clear all generation history?'))return;
+  try{
+    await fetch('/api/history/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+    historyData=[];
+    renderHistory();
+  }catch(e){alert('Failed: '+e)}
+}
+
+// ── Settings Modal ──
+async function openSettings(){
+  $('settingsModal').classList.add('show');
+  try{
+    const res=await fetch('/api/save-path');
+    const d=await res.json();
+    $('settingsSavePath').value=d.path||'';
+    $('settingsDriveStatus').innerHTML=d.gdrive_mounted
+      ?'<span style="color:var(--green)">✓ Google Drive mounted</span>'
+      :'<span style="color:var(--red)">✗ Google Drive not mounted</span>';
+  }catch(e){
+    $('settingsDriveStatus').innerHTML='<span style="color:var(--t3)">Could not fetch settings</span>';
+  }
+}
+
+function closeSettings(){$('settingsModal').classList.remove('show')}
+
+async function saveSettings(){
+  const path=$('settingsSavePath').value.trim();
+  if(!path){alert('Path cannot be empty');return}
+  try{
+    const res=await fetch('/api/save-path',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({path}),
+    });
+    const d=await res.json();
+    if(d.error)throw new Error(d.error);
+    closeSettings();
+  }catch(e){alert('Failed: '+e.message)}
+}
+
+// Close modal on backdrop click
+$('settingsModal').addEventListener('click',e=>{if(e.target===$('settingsModal'))closeSettings()});
+
 // ═══ EVENTS ═══
 function resetAndFetch(){S.results=[];S.nextUrl=null;cache.clear();doFetch()}
 $('searchInput').addEventListener('input',e=>{clearTimeout(debounce);debounce=setTimeout(()=>{S.query=e.target.value.trim();resetAndFetch()},300)});
@@ -534,11 +812,9 @@ $('sortSel').onchange=e=>{S.sort=e.target.value;resetAndFetch()};
 $('periodSel').onchange=e=>{S.period=e.target.value;resetAndFetch()};
 let tagDb;$('tagInput').addEventListener('input',e=>{clearTimeout(tagDb);tagDb=setTimeout(()=>{S.tag=e.target.value.trim();resetAndFetch()},400)});
 $('nsfwTog').onclick=()=>{S.nsfw=!S.nsfw;$('nsfwTog').classList.toggle('on',S.nsfw);resetAndFetch()};
-document.addEventListener('keydown',e=>{if(e.key==='Escape'&&S.mode==='browse'){}});
 
 // ═══ INIT ═══
 renderTabs();updatePH();doFetch();
-// Start console polling when on generate tab
 let consolePollTimer=null;
 function startConsolePoll(){if(!consolePollTimer)consolePollTimer=setInterval(fetchConsole,2000)}
 function stopConsolePoll(){if(consolePollTimer){clearInterval(consolePollTimer);consolePollTimer=null}}
