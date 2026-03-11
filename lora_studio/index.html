@@ -173,34 +173,40 @@ textarea.gen-input{min-height:60px;font-family:var(--font)}
         <textarea class="gen-input" id="genNeg" rows="2" placeholder="What to avoid..." style="min-height:40px">blurry, low quality, watermark, text</textarea>
       </div>
 
-      <!-- Wan I2V: input image -->
-      <div class="gen-section" id="inputImageSection" style="display:none">
-        <div class="gen-label">Input Image (I2V)</div>
+      <!-- Input image: img2img for Z-Image, I2V for Wan -->
+      <div class="gen-section" id="inputImageSection">
+        <div class="gen-label" id="uploadLabel">Input Image (optional — enables img2img)</div>
         <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
-          Click or drag image here
+          Click to upload image
         </div>
         <input type="file" id="fileInput" accept="image/*" style="display:none">
-      </div>
-
-      <div class="gen-row">
-        <div class="gen-section">
-          <div class="gen-label">Width <span id="wVal">832</span></div>
-          <input type="range" class="gen-slider" id="genW" min="256" max="1536" step="32" value="832" oninput="$('wVal').textContent=this.value">
-        </div>
-        <div class="gen-section">
-          <div class="gen-label">Height <span id="hVal">480</span></div>
-          <input type="range" class="gen-slider" id="genH" min="256" max="1536" step="32" value="480" oninput="$('hVal').textContent=this.value">
+        <div class="gen-row" style="margin-top:6px">
+          <div class="gen-section" style="margin-bottom:0" id="imgStrSection">
+            <div class="gen-label">Img Strength <span id="imgStrVal">0.75</span></div>
+            <input type="range" class="gen-slider" id="genImgStr" min="0.05" max="1.0" step="0.05" value="0.75" oninput="$('imgStrVal').textContent=this.value">
+          </div>
         </div>
       </div>
 
       <div class="gen-row">
         <div class="gen-section">
-          <div class="gen-label">Steps <span id="stepsVal">4</span></div>
-          <input type="range" class="gen-slider" id="genSteps" min="1" max="50" value="4" oninput="$('stepsVal').textContent=this.value">
+          <div class="gen-label">Width <span id="wVal">512</span></div>
+          <input type="range" class="gen-slider" id="genW" min="256" max="1536" step="32" value="512" oninput="$('wVal').textContent=this.value">
         </div>
         <div class="gen-section">
-          <div class="gen-label">CFG <span id="cfgVal">1.0</span></div>
-          <input type="range" class="gen-slider" id="genCfg" min="0.5" max="20" step="0.5" value="1.0" oninput="$('cfgVal').textContent=this.value">
+          <div class="gen-label">Height <span id="hVal">512</span></div>
+          <input type="range" class="gen-slider" id="genH" min="256" max="1536" step="32" value="512" oninput="$('hVal').textContent=this.value">
+        </div>
+      </div>
+
+      <div class="gen-row">
+        <div class="gen-section">
+          <div class="gen-label">Steps <span id="stepsVal">25</span></div>
+          <input type="range" class="gen-slider" id="genSteps" min="1" max="50" value="25" oninput="$('stepsVal').textContent=this.value">
+        </div>
+        <div class="gen-section">
+          <div class="gen-label">CFG <span id="cfgVal">4.0</span></div>
+          <input type="range" class="gen-slider" id="genCfg" min="0.5" max="20" step="0.5" value="4.0" oninput="$('cfgVal').textContent=this.value">
         </div>
       </div>
 
@@ -241,6 +247,13 @@ textarea.gen-input{min-height:60px;font-family:var(--font)}
       <div class="gen-output" id="genOutput">
         <span style="color:var(--t3);font-size:13px">Output will appear here</span>
       </div>
+      <div id="consolePanel" style="background:#0a0a10;border:1px solid var(--b1);border-radius:10px;overflow:hidden;max-height:200px;display:flex;flex-direction:column">
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 12px;border-bottom:1px solid var(--b1);background:rgba(255,255,255,0.02)">
+          <span style="font-size:10.5px;color:var(--t3)">Console Output</span>
+          <button onclick="$('consolePre').textContent=''" style="background:0;border:0;color:var(--t3);font-size:10px;cursor:pointer">Clear</button>
+        </div>
+        <pre id="consolePre" style="flex:1;overflow-y:auto;padding:8px 12px;font:10.5px/1.45 var(--mono);color:#7a7a90;margin:0;white-space:pre-wrap;word-break:break-all"></pre>
+      </div>
     </div>
   </div>
 </div>
@@ -254,7 +267,7 @@ textarea.gen-input{min-height:60px;font-family:var(--font)}
 // ═══════════════════════════════════════════════════════════
 const MODELS={
   'z-image-turbo':{label:'Z-Image Turbo',color:'#ff6b35',q:'z-image-turbo',baseMatch:['z-image','zimage','z image'],type:'image',
-    defaults:{steps:4,cfg:1.0,w:832,h:480}},
+    defaults:{steps:25,cfg:4.0,w:512,h:512}},
   'wan-2.2':{label:'Wan 2.2 I2V',color:'#7b68ee',q:'wan 2.2',baseMatch:['wan'],type:'video',
     defaults:{steps:20,cfg:6.0,w:832,h:480,frames:49,strength:0.75}},
 };
@@ -281,7 +294,7 @@ function setMode(m){
   document.querySelectorAll('.mode-tab').forEach((t,i)=>t.classList.toggle('on',i===(m==='browse'?0:1)));
   $('pageBrowse').classList.toggle('show',m==='browse');
   $('pageGenerate').classList.toggle('show',m==='generate');
-  if(m==='generate')refreshGenUI();
+  if(m==='generate'){refreshGenUI();startConsolePoll()}else{stopConsolePoll()}
 }
 
 // ═══ MODEL TABS ═══
@@ -377,8 +390,10 @@ async function downloadLora(idx){
 function refreshGenUI(){
   const cfg=MODELS[S.model];
   const isVideo=cfg.type==='video';
-  $('inputImageSection').style.display=isVideo?'block':'none';
+  // Video-only controls
   $('videoCtrlSection').style.display=isVideo?'block':'none';
+  // Update upload label
+  $('uploadLabel').textContent=isVideo?'Input Image (required for I2V)':'Input Image (optional — enables img2img)';
   // Set defaults
   const d=cfg.defaults;
   $('genSteps').value=d.steps;$('stepsVal').textContent=d.steps;
@@ -388,6 +403,7 @@ function refreshGenUI(){
   if(d.frames){$('genFrames').value=d.frames;$('framesVal').textContent=d.frames}
   if(d.strength){$('genStr').value=d.strength;$('strVal').textContent=d.strength}
   refreshLoras();
+  fetchConsole();
 }
 
 async function refreshLoras(){
@@ -443,13 +459,15 @@ async function startGeneration(){
     cfg_scale:parseFloat($('genCfg').value),
     seed:parseInt($('genSeed').value),
     sampler:'euler',
+    strength:parseFloat($('genImgStr').value),
   };
+
+  // Attach input image if uploaded (works for both img2img and I2V)
+  if(uploadedImagePath) settings.input_image_path=uploadedImagePath;
 
   if(cfg.type==='video'){
     settings.video_frames=parseInt($('genFrames').value);
-    settings.strength=parseFloat($('genStr').value);
     settings.fps=16;
-    settings.input_image_path=uploadedImagePath;
     if(!uploadedImagePath){alert('Upload an input image for I2V');return}
   }
 
@@ -473,8 +491,11 @@ function pollJob(jobId){
     try{
       const res=await fetch(`/api/status/${jobId}`);
       const d=await res.json();
-      $('genPhase').textContent=d.progress?.phase||'...';
-      $('genPbar').style.width=(d.progress?.pct||0)+'%';
+      if($('genPhase'))$('genPhase').textContent=d.progress?.phase||'...';
+      if($('genPbar'))$('genPbar').style.width=(d.progress?.pct||0)+'%';
+
+      // Fetch console logs
+      fetchConsole();
 
       if(d.status==='done'||d.status==='error'){
         clearInterval(pollTimer);pollTimer=null;
@@ -494,6 +515,18 @@ function pollJob(jobId){
   },1000);
 }
 
+async function fetchConsole(){
+  try{
+    const res=await fetch('/api/console?n=60');
+    const d=await res.json();
+    const pre=$('consolePre');
+    if(pre&&d.lines){
+      pre.textContent=d.lines.join('\n');
+      pre.scrollTop=pre.scrollHeight;
+    }
+  }catch(e){}
+}
+
 // ═══ EVENTS ═══
 function resetAndFetch(){S.results=[];S.nextUrl=null;cache.clear();doFetch()}
 $('searchInput').addEventListener('input',e=>{clearTimeout(debounce);debounce=setTimeout(()=>{S.query=e.target.value.trim();resetAndFetch()},300)});
@@ -505,10 +538,10 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&S.mode==='browse'){
 
 // ═══ INIT ═══
 renderTabs();updatePH();doFetch();
-// Auto-prompt for token on first load
-if(!localStorage.getItem('civitai_token_prompted')){
-  localStorage.setItem('civitai_token_prompted','1');
-}
+// Start console polling when on generate tab
+let consolePollTimer=null;
+function startConsolePoll(){if(!consolePollTimer)consolePollTimer=setInterval(fetchConsole,2000)}
+function stopConsolePoll(){if(consolePollTimer){clearInterval(consolePollTimer);consolePollTimer=null}}
 </script>
 </body>
 </html>
