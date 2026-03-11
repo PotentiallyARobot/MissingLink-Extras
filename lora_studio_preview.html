@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LoRA Studio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Sora:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#07070c;--card:#0e0e16;--elev:#131320;--glass:rgba(14,14,22,0.85);--b1:rgba(255,255,255,0.055);--b2:rgba(255,255,255,0.12);--t1:#e4e4ee;--t2:#78788a;--t3:#4a4a5a;--orange:#ff6b35;--purple:#7b68ee;--cyan:#36d6c3;--red:#ff4466;--green:#4ade80;--font:'Sora',system-ui,sans-serif;--mono:'JetBrains Mono',monospace}
+body{background:var(--bg);color:var(--t1);font-family:var(--font);min-height:100vh}
+
+/* ── NAV ── */
+.nav{display:flex;align-items:center;gap:12px;padding:10px 20px;border-bottom:1px solid var(--b1);background:var(--glass);backdrop-filter:blur(20px);position:sticky;top:0;z-index:100}
+.logo{display:flex;align-items:center;gap:8px;font-weight:700;font-size:15px;flex-shrink:0}
+.logo-i{width:28px;height:28px;border-radius:7px;background:linear-gradient(135deg,var(--orange),var(--purple));display:flex;align-items:center;justify-content:center;font-size:14px}
+.nav-tabs{display:flex;gap:4px;margin-left:auto}
+.nav-tab{padding:6px 16px;border-radius:7px;border:1px solid var(--b1);background:0;color:var(--t2);font:500 12px var(--font);cursor:pointer;transition:all .15s}
+.nav-tab:hover{background:rgba(255,255,255,0.04);color:var(--t1)}
+.nav-tab.on{border-color:transparent;color:#fff}
+.mode-tabs{display:flex;gap:3px;margin-left:16px}
+.mode-tab{padding:5px 12px;border-radius:6px;border:1px solid var(--b1);background:0;color:var(--t3);font:500 11px var(--font);cursor:pointer;transition:all .15s}
+.mode-tab:hover{color:var(--t1)}
+.mode-tab.on{background:var(--purple);color:#fff;border-color:transparent}
+
+/* ── PAGES ── */
+.page{display:none;max-width:1480px;margin:0 auto;padding:16px 20px 48px}
+.page.show{display:block}
+
+/* ── BROWSE FILTERS ── */
+.filters{display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap;align-items:center}
+.search-w{flex:1;min-width:200px;position:relative}
+.search-w svg{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--t3);pointer-events:none}
+.search-w input{width:100%;padding:8px 12px 8px 36px;border-radius:8px;border:1px solid var(--b1);background:rgba(255,255,255,0.03);color:var(--t1);font:13px var(--font);outline:0;transition:all .15s}
+.search-w input:focus{border-color:var(--b2);box-shadow:0 0 0 3px rgba(123,104,238,0.08)}
+.search-w input::placeholder{color:var(--t3)}
+.fctl{padding:7px 10px;border-radius:8px;border:1px solid var(--b1);background:rgba(255,255,255,0.03);color:var(--t1);font:12px var(--font);cursor:pointer;outline:0}
+.fctl option{background:#16162a}
+.tag-in{width:100px}
+.nsfw-tog{display:flex;align-items:center;gap:5px;cursor:pointer;user-select:none;font-size:11px;color:var(--t3);padding:5px 10px;border-radius:8px;border:1px solid var(--b1);background:rgba(255,255,255,0.03);transition:all .15s;white-space:nowrap}
+.nsfw-tog.on{border-color:var(--red);color:var(--red);background:rgba(255,68,102,0.08)}
+.nsfw-dot{width:7px;height:7px;border-radius:50%;background:var(--t3);transition:all .12s}
+.nsfw-tog.on .nsfw-dot{background:var(--red);box-shadow:0 0 6px var(--red)}
+.result-info{font-size:11px;color:var(--t3);margin-bottom:10px}
+
+/* ── GRID ── */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:11px}
+.card{border-radius:12px;background:var(--card);border:1px solid var(--b1);overflow:hidden;transition:transform .2s,box-shadow .2s;contain:layout style paint}
+.card:hover{border-color:var(--b2);transform:translateY(-2px);box-shadow:0 6px 24px rgba(0,0,0,0.4)}
+.card-img{position:relative;aspect-ratio:3/4;overflow:hidden;background:#0a0a12}
+.card-img img{width:100%;height:100%;object-fit:cover;transition:transform .4s}
+.card:hover .card-img img{transform:scale(1.03)}
+.no-img{width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#222}
+.badge{position:absolute;top:6px;padding:2px 6px;border-radius:4px;color:#fff;font:600 8.5px/1.4 var(--font);text-transform:uppercase;letter-spacing:.3px}
+.badge-nsfw{left:6px;background:rgba(255,50,50,0.85)}
+.badge-bm{right:6px;background:rgba(54,214,195,0.85);color:#000}
+.card-ov{position:absolute;inset:0;background:linear-gradient(to top,rgba(0,0,0,.9) 0%,rgba(0,0,0,.3) 50%,transparent 100%);display:none;flex-direction:column;justify-content:flex-end;padding:11px;gap:5px}
+.card:hover .card-ov{display:flex}
+.btn-dl{display:flex;align-items:center;justify-content:center;gap:5px;padding:8px;border-radius:7px;border:0;color:#fff;font:600 11.5px var(--font);cursor:pointer;transition:all .12s}
+.btn-dl:hover{filter:brightness(1.12)}
+.btn-civ{text-align:center;padding:5px;border-radius:5px;background:rgba(255,255,255,0.08);color:#bbb;font-size:10.5px;text-decoration:none;transition:all .12s}
+.btn-civ:hover{color:#fff}
+.card-body{padding:9px 11px 11px}
+.card-name{font:600 12.5px/1.3 var(--font);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:2px}
+.card-meta{font-size:10px;color:var(--t2);margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.card-stats{display:flex;gap:10px;font-size:9.5px;color:var(--t3)}
+.card-stats span{display:flex;align-items:center;gap:2px}
+.sts{text-align:center;padding:40px 20px;color:var(--t3);font-size:13px}
+.spin{display:inline-block;width:18px;height:18px;border:2px solid rgba(255,255,255,0.08);border-top-color:var(--purple);border-radius:50%;animation:sp .7s linear infinite;margin-bottom:6px}
+@keyframes sp{to{transform:rotate(360deg)}}
+.err{background:rgba(255,50,50,0.07);border:1px solid rgba(255,50,50,0.18);border-radius:8px;padding:12px;margin:10px auto;max-width:500px;text-align:center;color:#ff6b6b;font-size:11.5px}
+#sentinel{height:1px}
+
+/* ── GENERATE PAGE ── */
+.gen-layout{display:grid;grid-template-columns:320px 1fr;gap:16px;min-height:70vh}
+@media(max-width:800px){.gen-layout{grid-template-columns:1fr}}
+.gen-sidebar{background:var(--card);border:1px solid var(--b1);border-radius:12px;padding:16px;overflow-y:auto;max-height:calc(100vh - 80px)}
+.gen-main{display:flex;flex-direction:column;gap:12px}
+
+.gen-section{margin-bottom:14px}
+.gen-label{font-size:11px;color:var(--t2);margin-bottom:5px;display:flex;justify-content:space-between;align-items:center}
+.gen-label span{color:var(--t3);font-family:var(--mono);font-size:10px}
+.gen-input{width:100%;padding:7px 10px;border-radius:7px;border:1px solid var(--b1);background:rgba(255,255,255,0.03);color:var(--t1);font:12px var(--font);outline:0;resize:vertical}
+.gen-input:focus{border-color:var(--b2)}
+textarea.gen-input{min-height:60px;font-family:var(--font)}
+.gen-row{display:flex;gap:8px}
+.gen-row>*{flex:1}
+.gen-slider{width:100%;accent-color:var(--purple);margin-top:2px}
+.gen-btn{padding:10px 20px;border-radius:8px;border:0;font:600 13px var(--font);cursor:pointer;transition:all .15s;display:flex;align-items:center;justify-content:center;gap:6px;width:100%}
+.gen-btn:hover{filter:brightness(1.1)}
+.gen-btn:disabled{opacity:0.5;cursor:not-allowed}
+.gen-btn-primary{background:var(--purple);color:#fff}
+.gen-btn-danger{background:rgba(255,68,102,0.15);color:var(--red);border:1px solid rgba(255,68,102,0.2)}
+
+/* Lora pills */
+.lora-pills{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
+.lora-pill{display:flex;align-items:center;gap:4px;padding:3px 8px;border-radius:5px;background:rgba(123,104,238,0.12);color:#9d8df0;font:10.5px var(--mono);max-width:200px}
+.lora-pill span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lora-pill button{background:0;border:0;color:#9d8df0;cursor:pointer;font-size:12px;line-height:1;padding:0 2px}
+
+/* Image upload area */
+.upload-zone{border:2px dashed var(--b1);border-radius:8px;padding:20px;text-align:center;color:var(--t3);font-size:12px;cursor:pointer;transition:all .15s}
+.upload-zone:hover{border-color:var(--b2);color:var(--t2)}
+.upload-zone.has-img{padding:4px;border-style:solid}
+.upload-zone img{max-width:100%;border-radius:6px}
+
+/* Output area */
+.gen-output{flex:1;display:flex;align-items:center;justify-content:center;background:var(--card);border:1px solid var(--b1);border-radius:12px;min-height:400px;position:relative;overflow:hidden}
+.gen-output img,.gen-output video{max-width:100%;max-height:100%;object-fit:contain;border-radius:8px}
+.gen-progress{position:absolute;bottom:16px;left:16px;right:16px;background:rgba(0,0,0,0.8);backdrop-filter:blur(8px);border-radius:10px;padding:12px 16px}
+.gen-pbar{height:4px;background:rgba(255,255,255,0.08);border-radius:2px;margin-top:6px;overflow:hidden}
+.gen-pbar-fill{height:100%;background:var(--purple);border-radius:2px;transition:width .3s}
+.gen-phase{font-size:11px;color:var(--t2)}
+
+/* Downloading indicator */
+.dl-toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--elev);border:1px solid var(--b1);border-radius:10px;padding:10px 20px;display:none;align-items:center;gap:8px;font-size:12px;color:var(--t1);z-index:200;box-shadow:0 4px 20px rgba(0,0,0,0.5)}
+.dl-toast.show{display:flex}
+
+/* Scrollbar */
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:0}
+::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.06);border-radius:3px}
+
+@media(max-width:640px){
+  .nav{flex-wrap:wrap}
+  .filters{flex-direction:column}
+  .grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
+}
+</style>
+</head>
+<body>
+
+<!-- NAV -->
+<div class="nav">
+  <div class="logo"><div class="logo-i">⚡</div>LoRA Studio</div>
+  <div class="nav-tabs" id="modelTabs"></div>
+  <div class="mode-tabs">
+    <button class="mode-tab on" onclick="setMode('browse')">Browse</button>
+    <button class="mode-tab" onclick="setMode('generate')">Generate</button>
+  </div>
+</div>
+
+<!-- BROWSE PAGE -->
+<div class="page show" id="pageBrowse">
+  <div class="filters">
+    <div class="search-w">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+      <input type="text" id="searchInput" placeholder="Search LoRAs...">
+    </div>
+    <select class="fctl" id="sortSel"><option value="Most Downloaded">Most Downloaded</option><option value="Highest Rated">Highest Rated</option><option value="Newest">Newest</option></select>
+    <select class="fctl" id="periodSel"><option value="">All Time</option><option value="Year">Year</option><option value="Month">Month</option><option value="Week">Week</option></select>
+    <input type="text" class="fctl tag-in" id="tagInput" placeholder="Tag...">
+    <div class="nsfw-tog" id="nsfwTog"><div class="nsfw-dot"></div><span>NSFW</span></div>
+  </div>
+  <div class="result-info" id="resultInfo"></div>
+  <div id="errorBox"></div>
+  <div class="grid" id="grid"></div>
+  <div id="statusArea"></div>
+  <div id="sentinel"></div>
+</div>
+
+<!-- GENERATE PAGE -->
+<div class="page" id="pageGenerate">
+  <div class="gen-layout">
+    <div class="gen-sidebar">
+      <div class="gen-section">
+        <div class="gen-label">Prompt</div>
+        <textarea class="gen-input" id="genPrompt" rows="3" placeholder="Describe what to generate..."></textarea>
+      </div>
+      <div class="gen-section">
+        <div class="gen-label">Negative Prompt</div>
+        <textarea class="gen-input" id="genNeg" rows="2" placeholder="What to avoid..." style="min-height:40px">blurry, low quality, watermark, text</textarea>
+      </div>
+
+      <!-- Wan I2V: input image -->
+      <div class="gen-section" id="inputImageSection" style="display:none">
+        <div class="gen-label">Input Image (I2V)</div>
+        <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()">
+          Click or drag image here
+        </div>
+        <input type="file" id="fileInput" accept="image/*" style="display:none">
+      </div>
+
+      <div class="gen-row">
+        <div class="gen-section">
+          <div class="gen-label">Width <span id="wVal">832</span></div>
+          <input type="range" class="gen-slider" id="genW" min="256" max="1536" step="32" value="832" oninput="$('wVal').textContent=this.value">
+        </div>
+        <div class="gen-section">
+          <div class="gen-label">Height <span id="hVal">480</span></div>
+          <input type="range" class="gen-slider" id="genH" min="256" max="1536" step="32" value="480" oninput="$('hVal').textContent=this.value">
+        </div>
+      </div>
+
+      <div class="gen-row">
+        <div class="gen-section">
+          <div class="gen-label">Steps <span id="stepsVal">4</span></div>
+          <input type="range" class="gen-slider" id="genSteps" min="1" max="50" value="4" oninput="$('stepsVal').textContent=this.value">
+        </div>
+        <div class="gen-section">
+          <div class="gen-label">CFG <span id="cfgVal">1.0</span></div>
+          <input type="range" class="gen-slider" id="genCfg" min="0.5" max="20" step="0.5" value="1.0" oninput="$('cfgVal').textContent=this.value">
+        </div>
+      </div>
+
+      <div class="gen-section" id="videoCtrlSection" style="display:none">
+        <div class="gen-row">
+          <div>
+            <div class="gen-label">Frames <span id="framesVal">49</span></div>
+            <input type="range" class="gen-slider" id="genFrames" min="17" max="97" step="8" value="49" oninput="$('framesVal').textContent=this.value">
+          </div>
+          <div>
+            <div class="gen-label">Strength <span id="strVal">0.75</span></div>
+            <input type="range" class="gen-slider" id="genStr" min="0.1" max="1.0" step="0.05" value="0.75" oninput="$('strVal').textContent=this.value">
+          </div>
+        </div>
+      </div>
+
+      <div class="gen-section">
+        <div class="gen-label">Seed</div>
+        <input type="number" class="gen-input" id="genSeed" value="-1" style="min-height:auto">
+      </div>
+
+      <div class="gen-section">
+        <div class="gen-label">Active LoRAs <span id="loraCount">0</span></div>
+        <div class="lora-pills" id="loraPills"><span style="color:var(--t3);font-size:11px">None — download from Browse tab</span></div>
+      </div>
+
+      <div class="gen-section">
+        <button class="gen-btn gen-btn-primary" id="genBtn" onclick="startGeneration()">
+          ⚡ Generate
+        </button>
+      </div>
+      <div class="gen-section">
+        <button class="gen-btn gen-btn-danger" onclick="clearLoras()">Clear LoRAs & Reload</button>
+      </div>
+    </div>
+
+    <div class="gen-main">
+      <div class="gen-output" id="genOutput">
+        <span style="color:var(--t3);font-size:13px">Output will appear here</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Download toast -->
+<div class="dl-toast" id="dlToast"><div class="spin"></div><span id="dlToastText">Downloading LoRA...</span></div>
+
+<script>
+// ═══════════════════════════════════════════════════════════
+// CONFIG
+// ═══════════════════════════════════════════════════════════
+const MODELS={
+  'wan-2.2':{label:'Wan 2.2 I2V',color:'#7b68ee',q:'wan 2.2',baseMatch:['wan'],type:'video',
+    defaults:{steps:20,cfg:6.0,w:832,h:480,frames:49,strength:0.75}},
+  'z-image-turbo':{label:'Z-Image Turbo',color:'#ff6b35',q:'z-image-turbo',baseMatch:['z-image','zimage','z image'],type:'image',
+    defaults:{steps:4,cfg:1.0,w:832,h:480}},
+};
+const CIVITAI='https://civitai.com/api/v1';
+
+// ═══ STATE ═══
+let S={model:'wan-2.2',query:'',sort:'Most Downloaded',period:'',tag:'',nsfw:false,
+        results:[],nextUrl:null,total:0,hasMore:true,loading:false,mode:'browse'};
+let abortCtrl=null,debounce=null;
+const cache=new Map();
+let uploadedImagePath=null; // for Wan I2V
+
+const $=id=>document.getElementById(id);
+const esc=s=>s?s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'):'';
+function fmtSz(b){if(!b)return'?';if(b>1e9)return(b/1e9).toFixed(1)+' GB';if(b>1e6)return(b/1e6).toFixed(0)+' MB';return(b/1e3).toFixed(0)+' KB'}
+function fmtN(n){if(!n)return'0';return n>1000?(n/1000).toFixed(1)+'k':String(n)}
+function matchBM(model,cfg){const vs=model.modelVersions||[];return vs.some(v=>(v.baseModel||'').toLowerCase().match(new RegExp(cfg.baseMatch.join('|'))))}
+function getBM(model,cfg){for(const v of model.modelVersions||[])if((v.baseModel||'').toLowerCase().match(new RegExp(cfg.baseMatch.join('|'))))return v.baseModel;return model.modelVersions?.[0]?.baseModel||'?'}
+function verImgs(ver){if(!ver||!ver.images)return[];return ver.images.filter(i=>S.nsfw||(!i.nsfw&&(!i.nsfwLevel||i.nsfwLevel<=2))).slice(0,6)}
+
+// ═══ MODE SWITCH ═══
+function setMode(m){
+  S.mode=m;
+  document.querySelectorAll('.mode-tab').forEach((t,i)=>t.classList.toggle('on',i===(m==='browse'?0:1)));
+  $('pageBrowse').classList.toggle('show',m==='browse');
+  $('pageGenerate').classList.toggle('show',m==='generate');
+  if(m==='generate')refreshGenUI();
+}
+
+// ═══ MODEL TABS ═══
+function renderTabs(){
+  $('modelTabs').innerHTML=Object.entries(MODELS).map(([k,c])=>
+    `<button class="nav-tab${S.model===k?' on':''}" style="${S.model===k?'background:'+c.color+';box-shadow:0 2px 8px '+c.color+'44':''}" onclick="switchModel('${k}')">${c.label}</button>`
+  ).join('');
+}
+function switchModel(k){S.model=k;S.query='';$('searchInput').value='';S.results=[];S.nextUrl=null;cache.clear();renderTabs();updatePH();doFetch();if(S.mode==='generate')refreshGenUI()}
+function updatePH(){$('searchInput').placeholder=`Search ${MODELS[S.model].label} LoRAs...`}
+
+// ═══ FETCH ═══
+async function doFetch(append){
+  if(abortCtrl)abortCtrl.abort();abortCtrl=new AbortController();
+  S.loading=true;if(!append)renderGrid();renderStatus();
+  const cfg=MODELS[S.model];
+  try{
+    let url;
+    if(append&&S.nextUrl)url=S.nextUrl;
+    else{const q=S.query||cfg.q;const p=['types=LORA','sort='+encodeURIComponent(S.sort),'limit=100'];if(q)p.push('query='+encodeURIComponent(q));if(S.period)p.push('period='+encodeURIComponent(S.period));if(S.tag)p.push('tag='+encodeURIComponent(S.tag));if(S.nsfw)p.push('nsfw=true');url=CIVITAI+'/models?'+p.join('&')}
+    let filtered=[],pages=0;
+    while(url&&pages<3){
+      let data;if(cache.has(url))data=cache.get(url);
+      else{const r=await fetch(url,{signal:abortCtrl.signal});if(!r.ok)throw new Error(`API ${r.status}`);data=await r.json();cache.set(url,data);if(cache.size>60)cache.delete(cache.keys().next().value)}
+      filtered=filtered.concat((data.items||[]).filter(m=>matchBM(m,cfg)));
+      S.nextUrl=data.metadata?.nextPage||null;S.total=data.metadata?.totalItems||0;pages++;
+      if(filtered.length>=12||!S.nextUrl)break;url=S.nextUrl;
+    }
+    if(append)S.results=S.results.concat(filtered);else S.results=filtered;
+    S.hasMore=!!S.nextUrl;$('errorBox').innerHTML='';
+  }catch(e){if(e.name!=='AbortError')$('errorBox').innerHTML=`<div class="err">${esc(e.message)}</div>`}
+  finally{S.loading=false;renderGrid();renderStatus();renderInfo();$('sentinel').style.display=S.hasMore?'block':'none'}
+}
+
+// ═══ GRID ═══
+function renderGrid(){
+  const g=$('grid');if(S.loading&&!S.results.length){g.innerHTML='';return}
+  const cfg=MODELS[S.model];
+  g.innerHTML=S.results.map((m,i)=>{
+    const ver=m.modelVersions?.[0],imgs=verImgs(ver),img0=imgs[0],st=m.stats||{},f=ver?.files?.[0],sz=f?.sizeKB?f.sizeKB*1024:null,bm=getBM(m,cfg);
+    return`<div class="card"><div class="card-img">
+      ${img0?`<img data-src="${esc(img0.url)}" alt="" loading="lazy">`:'<div class="no-img">No preview</div>'}
+      ${m.nsfw?'<span class="badge badge-nsfw">NSFW</span>':''}
+      <span class="badge badge-bm">${esc(bm)}</span>
+      <div class="card-ov">
+        <button class="btn-dl" style="background:${cfg.color}" onclick="event.stopPropagation();downloadLora(${i})">⬇ Download to Colab</button>
+        <a class="btn-civ" href="https://civitai.com/models/${m.id}" target="_blank" rel="noopener" onclick="event.stopPropagation()">View on CivitAI →</a>
+      </div>
+    </div><div class="card-body">
+      <div class="card-name" title="${esc(m.name)}">${esc(m.name)}</div>
+      <div class="card-meta">by ${esc(m.creator?.username||'?')} · ${fmtSz(sz)}</div>
+      <div class="card-stats"><span>⬇${fmtN(st.downloadCount)}</span><span>★${st.rating?.toFixed(1)||'—'}</span><span>♥${fmtN(st.favoriteCount)}</span></div>
+    </div></div>`
+  }).join('');
+  requestAnimationFrame(lazyObs);
+}
+let imgObs;function lazyObs(){if(!imgObs)imgObs=new IntersectionObserver(es=>{es.forEach(e=>{if(e.isIntersecting){const i=e.target;if(i.dataset.src){i.src=i.dataset.src;delete i.dataset.src}imgObs.unobserve(i)}})},{rootMargin:'300px'});document.querySelectorAll('.card-img img[data-src]').forEach(i=>imgObs.observe(i))}
+
+function renderStatus(){const el=$('statusArea');if(S.loading)el.innerHTML='<div class="sts"><div class="spin"></div><div>Searching...</div></div>';else if(!S.results.length)el.innerHTML='<div class="sts">No LoRAs found for this model.</div>';else el.innerHTML=''}
+function renderInfo(){$('resultInfo').textContent=S.results.length&&!S.loading?`${S.results.length} LoRAs for ${MODELS[S.model].label}`:''}
+
+new IntersectionObserver(es=>{if(es[0].isIntersecting&&S.hasMore&&!S.loading&&S.results.length)doFetch(true)},{rootMargin:'600px'}).observe($('sentinel'));
+
+// ═══ DOWNLOAD LORA ═══
+async function downloadLora(idx){
+  const m=S.results[idx];if(!m)return;
+  const ver=m.modelVersions?.[0];const f=ver?.files?.[0];
+  if(!f||!f.downloadUrl){alert('No download URL found');return}
+
+  const toast=$('dlToast'),txt=$('dlToastText');
+  toast.classList.add('show');
+  txt.textContent=`Downloading ${m.name}...`;
+
+  try{
+    const token=prompt('CivitAI API token (or leave empty):','') || '';
+    const res=await fetch('/api/lora/download',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({url:f.downloadUrl,model:S.model,filename:f.name||m.name.replace(/[^a-zA-Z0-9_.-]/g,'_')+'.safetensors',token}),
+    });
+    const data=await res.json();
+    if(data.error)throw new Error(data.error);
+    txt.textContent=`✅ ${data.filename} downloaded!`;
+    setTimeout(()=>toast.classList.remove('show'),2500);
+    refreshLoras();
+  }catch(e){
+    txt.textContent=`❌ ${e.message}`;
+    setTimeout(()=>toast.classList.remove('show'),4000);
+  }
+}
+
+// ═══ GENERATE PAGE ═══
+function refreshGenUI(){
+  const cfg=MODELS[S.model];
+  const isVideo=cfg.type==='video';
+  $('inputImageSection').style.display=isVideo?'block':'none';
+  $('videoCtrlSection').style.display=isVideo?'block':'none';
+  // Set defaults
+  const d=cfg.defaults;
+  $('genSteps').value=d.steps;$('stepsVal').textContent=d.steps;
+  $('genCfg').value=d.cfg;$('cfgVal').textContent=d.cfg;
+  $('genW').value=d.w;$('wVal').textContent=d.w;
+  $('genH').value=d.h;$('hVal').textContent=d.h;
+  if(d.frames){$('genFrames').value=d.frames;$('framesVal').textContent=d.frames}
+  if(d.strength){$('genStr').value=d.strength;$('strVal').textContent=d.strength}
+  refreshLoras();
+}
+
+async function refreshLoras(){
+  try{
+    const res=await fetch('/api/loras');
+    const data=await res.json();
+    const files=data[S.model]||[];
+    $('loraCount').textContent=files.length;
+    if(files.length===0){
+      $('loraPills').innerHTML='<span style="color:var(--t3);font-size:11px">None — download from Browse tab</span>';
+    }else{
+      $('loraPills').innerHTML=files.map((f,i)=>
+        `<div class="lora-pill"><span title="${esc(f.name)}">${esc(f.name)}</span><button onclick="deleteLora('${esc(f.path)}')">×</button></div>`
+      ).join('');
+    }
+  }catch(e){console.error(e)}
+}
+
+async function deleteLora(path){
+  try{await fetch('/api/lora/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})});refreshLoras()}catch(e){alert(e)}
+}
+
+async function clearLoras(){
+  if(!confirm(`Clear all ${MODELS[S.model].label} LoRAs?`))return;
+  try{await fetch('/api/lora/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:S.model})});refreshLoras()}catch(e){alert(e)}
+}
+
+// ── Image upload ──
+$('fileInput').addEventListener('change',async e=>{
+  const file=e.target.files[0];if(!file)return;
+  const fd=new FormData();fd.append('file',file);
+  try{
+    const res=await fetch('/api/upload',{method:'POST',body:fd});
+    const data=await res.json();
+    uploadedImagePath=data.path;
+    const zone=$('uploadZone');
+    zone.classList.add('has-img');
+    zone.innerHTML=`<img src="/api/file?p=${encodeURIComponent(data.path)}">`;
+  }catch(err){alert('Upload failed: '+err)}
+});
+
+// ── Generation ──
+let pollTimer=null;
+
+async function startGeneration(){
+  const cfg=MODELS[S.model];
+  const settings={
+    prompt:$('genPrompt').value,
+    negative_prompt:$('genNeg').value,
+    width:parseInt($('genW').value),
+    height:parseInt($('genH').value),
+    steps:parseInt($('genSteps').value),
+    cfg_scale:parseFloat($('genCfg').value),
+    seed:parseInt($('genSeed').value),
+    sampler:'euler',
+  };
+
+  if(cfg.type==='video'){
+    settings.video_frames=parseInt($('genFrames').value);
+    settings.strength=parseFloat($('genStr').value);
+    settings.fps=16;
+    settings.input_image_path=uploadedImagePath;
+    if(!uploadedImagePath){alert('Upload an input image for I2V');return}
+  }
+
+  $('genBtn').disabled=true;
+  $('genOutput').innerHTML=`<div class="gen-progress"><div class="gen-phase" id="genPhase">Starting...</div><div class="gen-pbar"><div class="gen-pbar-fill" id="genPbar" style="width:0%"></div></div></div>`;
+
+  try{
+    const res=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:S.model,settings})});
+    const d=await res.json();
+    if(d.error){throw new Error(d.error)}
+    pollJob(d.job_id);
+  }catch(e){
+    $('genOutput').innerHTML=`<div class="err">${esc(e.message)}</div>`;
+    $('genBtn').disabled=false;
+  }
+}
+
+function pollJob(jobId){
+  if(pollTimer)clearInterval(pollTimer);
+  pollTimer=setInterval(async()=>{
+    try{
+      const res=await fetch(`/api/status/${jobId}`);
+      const d=await res.json();
+      $('genPhase').textContent=d.progress?.phase||'...';
+      $('genPbar').style.width=(d.progress?.pct||0)+'%';
+
+      if(d.status==='done'||d.status==='error'){
+        clearInterval(pollTimer);pollTimer=null;
+        $('genBtn').disabled=false;
+        if(d.result){
+          const url=`/api/file?p=${encodeURIComponent(d.result.path)}`;
+          if(d.result.type==='video'){
+            $('genOutput').innerHTML=`<video src="${url}" controls autoplay loop style="max-width:100%;max-height:100%"></video>`;
+          }else{
+            $('genOutput').innerHTML=`<img src="${url}" style="max-width:100%;max-height:100%">`;
+          }
+        }else if(d.error){
+          $('genOutput').innerHTML=`<div class="err">${esc(d.error)}</div>`;
+        }
+      }
+    }catch(e){console.error(e)}
+  },1000);
+}
+
+// ═══ EVENTS ═══
+function resetAndFetch(){S.results=[];S.nextUrl=null;cache.clear();doFetch()}
+$('searchInput').addEventListener('input',e=>{clearTimeout(debounce);debounce=setTimeout(()=>{S.query=e.target.value.trim();resetAndFetch()},300)});
+$('sortSel').onchange=e=>{S.sort=e.target.value;resetAndFetch()};
+$('periodSel').onchange=e=>{S.period=e.target.value;resetAndFetch()};
+let tagDb;$('tagInput').addEventListener('input',e=>{clearTimeout(tagDb);tagDb=setTimeout(()=>{S.tag=e.target.value.trim();resetAndFetch()},400)});
+$('nsfwTog').onclick=()=>{S.nsfw=!S.nsfw;$('nsfwTog').classList.toggle('on',S.nsfw);resetAndFetch()};
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&S.mode==='browse'){}});
+
+// ═══ INIT ═══
+renderTabs();updatePH();doFetch();
+// Auto-prompt for token on first load
+if(!localStorage.getItem('civitai_token_prompted')){
+  localStorage.setItem('civitai_token_prompted','1');
+}
+</script>
+</body>
+</html>
