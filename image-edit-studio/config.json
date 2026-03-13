@@ -5,7 +5,7 @@
     "backend": "gguf",
 
     "diffusion_model": {
-        "repo_id": "unsloth/Qwen-Image-Edit-2511-GGUF",
+        "repo_id": "Frederic75/Qwen-Image-Edit-2511-GGUF",
         "filename": "qwen-image-edit-2511-Q4_K_M.gguf"
     },
 
