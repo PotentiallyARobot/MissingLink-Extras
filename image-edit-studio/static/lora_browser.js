@@ -1,16 +1,19 @@
 /* ══════════════════════════════════════════════════════════════
    LoRA Browser — CivitAI search & pick for AI Image Edit Studio
-   Standalone JS module. Depends on lora_browser.html being in DOM.
+   Standalone JS module.
 
    PUBLIC API:
      loraBrowser.open()   — show the browser modal
      loraBrowser.close()  — hide it
-     loraBrowser.onPick   — callback(repo) when user selects a LoRA
+     loraBrowser.onPick   — callback(info) when user selects a LoRA
    ══════════════════════════════════════════════════════════════ */
 
 const loraBrowser = (() => {
     const CIVITAI = 'https://civitai.com/api/v1';
+    // Base model strings CivitAI uses for Qwen Image Edit variants
     const BASE_MATCH = ['qwen', 'qwen-image', 'qwen image'];
+    // Thumbnail width for card images (CivitAI CDN supports /width=N)
+    const THUMB_W = 280;
 
     // ── State ──
     const st = {
@@ -29,24 +32,24 @@ const loraBrowser = (() => {
     const cache = new Map();
     let toastTimer = null;
 
-    // ── DOM refs (lazily resolved after DOM is ready) ──
+    // ── DOM refs (lazy) ──
     let _dom = null;
     function dom() {
         if (!_dom) {
             _dom = {
-                overlay:    document.getElementById('loraBrowserOverlay'),
-                close:      document.getElementById('loraBrowserClose'),
-                search:     document.getElementById('lbSearch'),
-                sort:       document.getElementById('lbSort'),
-                period:     document.getElementById('lbPeriod'),
-                nsfw:       document.getElementById('lbNsfwTog'),
-                info:       document.getElementById('lbResultInfo'),
-                scroll:     document.getElementById('lbScroll'),
-                grid:       document.getElementById('lbGrid'),
-                error:      document.getElementById('lbError'),
-                status:     document.getElementById('lbStatus'),
-                sentinel:   document.getElementById('lbSentinel'),
-                toast:      document.getElementById('lbToast'),
+                overlay:  document.getElementById('loraBrowserOverlay'),
+                close:    document.getElementById('loraBrowserClose'),
+                search:   document.getElementById('lbSearch'),
+                sort:     document.getElementById('lbSort'),
+                period:   document.getElementById('lbPeriod'),
+                nsfw:     document.getElementById('lbNsfwTog'),
+                info:     document.getElementById('lbResultInfo'),
+                scroll:   document.getElementById('lbScroll'),
+                grid:     document.getElementById('lbGrid'),
+                error:    document.getElementById('lbError'),
+                status:   document.getElementById('lbStatus'),
+                sentinel: document.getElementById('lbSentinel'),
+                toast:    document.getElementById('lbToast'),
             };
         }
         return _dom;
@@ -56,6 +59,33 @@ const loraBrowser = (() => {
     const esc = s => s ? s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;') : '';
     function fmtSz(b) { if (!b) return '?'; if (b > 1e9) return (b / 1e9).toFixed(1) + ' GB'; if (b > 1e6) return (b / 1e6).toFixed(0) + ' MB'; return (b / 1e3).toFixed(0) + ' KB'; }
     function fmtN(n) { if (!n) return '0'; return n > 1000 ? (n / 1000).toFixed(1) + 'k' : String(n); }
+
+    /** Convert a CivitAI image URL to a small thumbnail */
+    function thumbUrl(url) {
+        if (!url) return '';
+        // CivitAI CDN: insert /width=N before the filename
+        // e.g. https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/.../original=true/00123.jpeg
+        // →    https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/.../width=280/00123.jpeg
+        try {
+            const u = new URL(url);
+            const parts = u.pathname.split('/');
+            // Find and replace the segment that says "original=true" or "width=..."
+            for (let i = 0; i < parts.length; i++) {
+                if (parts[i].startsWith('original=') || parts[i].startsWith('width=')) {
+                    parts[i] = 'width=' + THUMB_W;
+                    u.pathname = parts.join('/');
+                    return u.toString();
+                }
+            }
+            // If no segment found, insert before last segment (the filename)
+            if (parts.length > 2) {
+                parts.splice(parts.length - 1, 0, 'width=' + THUMB_W);
+                u.pathname = parts.join('/');
+                return u.toString();
+            }
+        } catch (e) { /* fall through */ }
+        return url;
+    }
 
     function matchBM(model) {
         const vs = model.modelVersions || [];
@@ -73,7 +103,7 @@ const loraBrowser = (() => {
     }
     function verImgs(ver) {
         if (!ver || !ver.images) return [];
-        return ver.images.filter(i => st.nsfw || (!i.nsfw && (!i.nsfwLevel || i.nsfwLevel <= 2))).slice(0, 6);
+        return ver.images.filter(i => st.nsfw || (!i.nsfw && (!i.nsfwLevel || i.nsfwLevel <= 2))).slice(0, 1);
     }
 
     function showToast(msg, isErr) {
@@ -89,7 +119,7 @@ const loraBrowser = (() => {
         if (abortCtrl) abortCtrl.abort();
         abortCtrl = new AbortController();
         st.loading = true;
-        if (!append) renderGrid();
+        if (!append) { dom().grid.innerHTML = ''; }
         renderStatus();
 
         try {
@@ -101,7 +131,7 @@ const loraBrowser = (() => {
                 const p = [
                     'types=LORA',
                     'sort=' + encodeURIComponent(st.sort),
-                    'limit=100',
+                    'limit=20',  // smaller pages = faster response
                 ];
                 if (q) p.push('query=' + encodeURIComponent(q));
                 if (st.period) p.push('period=' + encodeURIComponent(st.period));
@@ -112,7 +142,9 @@ const loraBrowser = (() => {
             let filtered = [];
             let pages = 0;
 
-            while (url && pages < 3) {
+            // Fetch up to 2 pages (40 models max) — show results as soon
+            // as we have any instead of waiting for all pages
+            while (url && pages < 2) {
                 let data;
                 if (cache.has(url)) {
                     data = cache.get(url);
@@ -121,20 +153,45 @@ const loraBrowser = (() => {
                     if (!r.ok) throw new Error('CivitAI API ' + r.status);
                     data = await r.json();
                     cache.set(url, data);
-                    if (cache.size > 60) cache.delete(cache.keys().next().value);
+                    if (cache.size > 40) cache.delete(cache.keys().next().value);
                 }
-                filtered = filtered.concat(
-                    (data.items || []).filter(m => matchBM(m))
-                );
+
+                const matches = (data.items || []).filter(m => matchBM(m));
+                filtered = filtered.concat(matches);
                 st.nextUrl = data.metadata?.nextPage || null;
                 st.total = data.metadata?.totalItems || 0;
                 pages++;
-                if (filtered.length >= 12 || !st.nextUrl) break;
+
+                // Render first batch immediately so user sees results fast
+                if (pages === 1 && matches.length > 0) {
+                    if (append) {
+                        st.results = st.results.concat(matches);
+                    } else {
+                        st.results = matches;
+                    }
+                    appendCards(matches, append ? st.results.length - matches.length : 0);
+                    renderInfo();
+                }
+
+                if (filtered.length >= 8 || !st.nextUrl) break;
                 url = st.nextUrl;
             }
 
-            if (append) st.results = st.results.concat(filtered);
-            else st.results = filtered;
+            // If we fetched a second page, add those results too
+            if (pages > 1 && filtered.length > (append ? 0 : st.results.length)) {
+                const newItems = filtered.slice(st.results.length - (append ? st.results.length - filtered.length : 0));
+                if (append) {
+                    // Already added page 1 items above; add page 2
+                    const page2 = filtered.slice(st.results.length);
+                    st.results = st.results.concat(page2);
+                    appendCards(page2, st.results.length - page2.length);
+                } else if (filtered.length > st.results.length) {
+                    const extra = filtered.slice(st.results.length);
+                    st.results = st.results.concat(extra);
+                    appendCards(extra, st.results.length - extra.length);
+                }
+            }
+
             st.hasMore = !!st.nextUrl;
             dom().error.innerHTML = '';
         } catch (e) {
@@ -142,46 +199,54 @@ const loraBrowser = (() => {
                 dom().error.innerHTML = `<div class="lb-error">${esc(e.message)}</div>`;
         } finally {
             st.loading = false;
-            renderGrid();
             renderStatus();
             renderInfo();
             dom().sentinel.style.display = st.hasMore ? 'block' : 'none';
         }
     }
 
-    // ── Render grid ──
-    function renderGrid() {
-        const g = dom().grid;
-        if (st.loading && !st.results.length) { g.innerHTML = ''; return; }
+    // ── Build one card's HTML ──
+    function cardHTML(m, idx) {
+        const ver = m.modelVersions?.[0];
+        const imgs = verImgs(ver);
+        const img0 = imgs[0];
+        const s = m.stats || {};
+        const f = ver?.files?.[0];
+        const sz = f?.sizeKB ? f.sizeKB * 1024 : null;
+        const bm = getBM(m);
+        const imgSrc = img0 ? thumbUrl(img0.url) : '';
 
-        g.innerHTML = st.results.map((m, i) => {
-            const ver = m.modelVersions?.[0];
-            const imgs = verImgs(ver);
-            const img0 = imgs[0];
-            const s = m.stats || {};
-            const f = ver?.files?.[0];
-            const sz = f?.sizeKB ? f.sizeKB * 1024 : null;
-            const bm = getBM(m);
-
-            return `<div class="lb-card"><div class="lb-card-img">
-              ${img0 ? `<img data-src="${esc(img0.url)}" alt="" loading="lazy">` : '<div class="lb-no-img">No preview</div>'}
-              ${m.nsfw ? '<span class="lb-badge lb-badge-nsfw">NSFW</span>' : ''}
-              <span class="lb-badge lb-badge-bm">${esc(bm)}</span>
-              <div class="lb-card-ov">
-                <button class="lb-btn-use" onclick="event.stopPropagation();loraBrowser._pick(${i})">⚡ Use this LoRA</button>
-                <a class="lb-btn-civ" href="https://civitai.com/models/${m.id}" target="_blank" rel="noopener" onclick="event.stopPropagation()">View on CivitAI →</a>
-              </div>
-            </div><div class="lb-card-body">
-              <div class="lb-card-name" title="${esc(m.name)}">${esc(m.name)}</div>
-              <div class="lb-card-meta">by ${esc(m.creator?.username || '?')} · ${fmtSz(sz)}</div>
-              <div class="lb-card-stats"><span>⬇${fmtN(s.downloadCount)}</span><span>★${s.rating?.toFixed(1) || '—'}</span><span>♥${fmtN(s.favoriteCount)}</span></div>
-            </div></div>`;
-        }).join('');
-
-        requestAnimationFrame(lazyObserve);
+        return `<div class="lb-card"><div class="lb-card-img">
+          ${imgSrc ? `<img data-src="${esc(imgSrc)}" alt="" loading="lazy" decoding="async">` : '<div class="lb-no-img">No preview</div>'}
+          ${m.nsfw ? '<span class="lb-badge lb-badge-nsfw">NSFW</span>' : ''}
+          <span class="lb-badge lb-badge-bm">${esc(bm)}</span>
+          <div class="lb-card-ov">
+            <button class="lb-btn-use" onclick="event.stopPropagation();loraBrowser._pick(${idx})">⚡ Use this LoRA</button>
+            <a class="lb-btn-civ" href="https://civitai.com/models/${m.id}" target="_blank" rel="noopener" onclick="event.stopPropagation()">View on CivitAI →</a>
+          </div>
+        </div><div class="lb-card-body">
+          <div class="lb-card-name" title="${esc(m.name)}">${esc(m.name)}</div>
+          <div class="lb-card-meta">by ${esc(m.creator?.username || '?')} · ${fmtSz(sz)}</div>
+          <div class="lb-card-stats"><span>⬇${fmtN(s.downloadCount)}</span><span>★${s.rating?.toFixed(1) || '—'}</span><span>♥${fmtN(s.favoriteCount)}</span></div>
+        </div></div>`;
     }
 
-    // ── Lazy image loading ──
+    // ── Append cards incrementally (no full re-render) ──
+    function appendCards(items, startIdx) {
+        const g = dom().grid;
+        const frag = document.createDocumentFragment();
+        const tmp = document.createElement('div');
+
+        items.forEach((m, i) => {
+            tmp.innerHTML = cardHTML(m, startIdx + i);
+            while (tmp.firstChild) frag.appendChild(tmp.firstChild);
+        });
+
+        g.appendChild(frag);
+        lazyObserve();
+    }
+
+    // ── Lazy image loading via IntersectionObserver ──
     let imgObs;
     function lazyObserve() {
         if (!imgObs) {
@@ -189,19 +254,22 @@ const loraBrowser = (() => {
                 entries.forEach(e => {
                     if (e.isIntersecting) {
                         const img = e.target;
-                        if (img.dataset.src) { img.src = img.dataset.src; delete img.dataset.src; }
+                        if (img.dataset.src) {
+                            img.src = img.dataset.src;
+                            delete img.dataset.src;
+                        }
                         imgObs.unobserve(img);
                     }
                 });
-            }, { root: dom().scroll, rootMargin: '300px' });
+            }, { root: dom().scroll, rootMargin: '200px' });
         }
         dom().grid.querySelectorAll('img[data-src]').forEach(i => imgObs.observe(i));
     }
 
     function renderStatus() {
         const el = dom().status;
-        if (st.loading) el.innerHTML = '<div class="lb-loading"><div class="lb-spin"></div><div style="margin-top:8px">Searching CivitAI...</div></div>';
-        else if (!st.results.length) el.innerHTML = '<div class="lb-empty">No LoRAs found. Try a different search.</div>';
+        if (st.loading && !st.results.length) el.innerHTML = '<div class="lb-loading"><div class="lb-spin"></div><div style="margin-top:8px">Searching CivitAI...</div></div>';
+        else if (!st.loading && !st.results.length) el.innerHTML = '<div class="lb-empty">No LoRAs found. Try a different search.</div>';
         else el.innerHTML = '';
     }
     function renderInfo() {
@@ -216,11 +284,11 @@ const loraBrowser = (() => {
         sentinelObs = new IntersectionObserver(entries => {
             if (entries[0].isIntersecting && st.hasMore && !st.loading && st.results.length)
                 doFetch(true);
-        }, { root: dom().scroll, rootMargin: '600px' });
+        }, { root: dom().scroll, rootMargin: '400px' });
         sentinelObs.observe(dom().sentinel);
     }
 
-    // ── Pick handler — resolves HF repo or CivitAI download URL ──
+    // ── Pick handler ──
     function _pick(idx) {
         const m = st.results[idx];
         if (!m) return;
@@ -228,10 +296,6 @@ const loraBrowser = (() => {
         const f = ver?.files?.[0];
         if (!f) { showToast('No file found for this LoRA', true); return; }
 
-        // Try to find a HuggingFace-hosted version first
-        const hfUrl = f.hashes?.HF || null;
-
-        // Build info object for the callback
         const info = {
             name: m.name,
             civitaiId: m.id,
@@ -248,7 +312,6 @@ const loraBrowser = (() => {
             loraBrowser.onPick(info);
         }
 
-        // Close after a small delay so user sees the toast
         setTimeout(() => close(), 400);
     }
 
@@ -258,13 +321,22 @@ const loraBrowser = (() => {
         d.overlay.classList.add('open');
         if (!st.results.length) doFetch();
         initSentinelObs();
-        d.search.focus();
+        // Defer focus so modal transition completes first
+        requestAnimationFrame(() => d.search.focus());
     }
     function close() {
         dom().overlay.classList.remove('open');
     }
 
-    // ── Wire up events (called once after DOM is ready) ──
+    // ── Reset (for new searches) ──
+    function resetAndFetch() {
+        st.results = [];
+        st.nextUrl = null;
+        cache.clear();
+        doFetch();
+    }
+
+    // ── Wire up events ──
     let _bound = false;
     function bind() {
         if (_bound) return;
@@ -274,47 +346,38 @@ const loraBrowser = (() => {
         d.close.onclick = close;
         d.overlay.addEventListener('click', e => { if (e.target === d.overlay) close(); });
 
-        // Search
         d.search.addEventListener('input', e => {
             clearTimeout(debounce);
             debounce = setTimeout(() => {
                 st.query = e.target.value.trim();
-                st.results = []; st.nextUrl = null; cache.clear();
-                doFetch();
+                resetAndFetch();
             }, 350);
         });
 
-        // Sort
-        d.sort.onchange = e => { st.sort = e.target.value; st.results = []; st.nextUrl = null; cache.clear(); doFetch(); };
-        d.period.onchange = e => { st.period = e.target.value; st.results = []; st.nextUrl = null; cache.clear(); doFetch(); };
+        d.sort.onchange = e => { st.sort = e.target.value; resetAndFetch(); };
+        d.period.onchange = e => { st.period = e.target.value; resetAndFetch(); };
 
-        // NSFW
         d.nsfw.onclick = () => {
             st.nsfw = !st.nsfw;
             d.nsfw.classList.toggle('on', st.nsfw);
-            st.results = []; st.nextUrl = null; cache.clear();
-            doFetch();
+            resetAndFetch();
         };
 
-        // Escape to close
         document.addEventListener('keydown', e => {
             if (e.key === 'Escape' && d.overlay.classList.contains('open')) close();
         });
     }
 
-    // ── Init on DOMContentLoaded ──
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', bind);
     } else {
-        // DOM already ready (script loaded at bottom of body)
         setTimeout(bind, 0);
     }
 
-    // ── Public API ──
     return {
         open,
         close,
-        onPick: null,  // set by consumer: loraBrowser.onPick = function(info){ ... }
-        _pick,         // called from inline onclick in grid cards
+        onPick: null,
+        _pick,
     };
 })();

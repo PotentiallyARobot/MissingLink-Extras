@@ -1,11 +1,22 @@
 # ============================================================
-# 🎨 AI Image Edit Studio — Missing Link
+# 🎨 AI Image Edit Studio — GGUF Backend
 # ============================================================
+# Uses stable_diffusion_cpp with GGUF quantized models.
 # Model config lives in config.json (next to server.py).
-# Edit config.json to change models, then run this cell.
 # ============================================================
 
-import os
+import os, subprocess, sys
+
+# ── Install dependencies ─────────────────────────────────────
+print("📦 Installing dependencies...")
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
+    "stable-diffusion-cpp-python",
+    "huggingface_hub",
+    "Pillow",
+    "requests",
+    "fastapi",
+    "uvicorn[standard]",
+])
 
 # ── Server settings ──────────────────────────────────────────
 os.environ["PORT"] = "8000"
@@ -16,12 +27,6 @@ STUDIO_PATH = "/content/MissingLink-Extras/image-edit-studio"
 # ═════════════════════════════════════════════════════════════
 # Don't edit below this line
 # ═════════════════════════════════════════════════════════════
-import subprocess, sys
-try:
-    import requests
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "requests"])
-
 sys.path.insert(0, STUDIO_PATH)
 from server import launch
 launch()
