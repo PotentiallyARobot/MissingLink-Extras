@@ -243,7 +243,10 @@ const loraBrowser = (() => {
                     if (!img.dataset.src) continue;
                     const src = img.dataset.src;
                     delete img.dataset.src;
-                    img.onload = () => img.classList.add('loaded');
+                    img.onload = () => {
+                        img.classList.add('loaded');
+                        if (img.parentElement) img.parentElement.classList.add('done');
+                    };
                     img.onerror = () => { img.style.display = 'none'; };
                     img.src = src;
                 }

@@ -7,6 +7,9 @@
 
 import os, subprocess, sys
 
+# ── Disable Xet storage (stalls on large GGUF downloads) ─────
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+
 # ── Server settings ──────────────────────────────────────────
 os.environ["PORT"] = "8000"
 

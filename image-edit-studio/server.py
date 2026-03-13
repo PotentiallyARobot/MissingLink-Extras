@@ -3,7 +3,12 @@ server.py — Qwen Image Edit backend (GGUF / stable_diffusion_cpp)
 Run: python server.py
 """
 
-import io, os, sys, json, math, uuid, time, base64, subprocess
+# Disable HuggingFace Xet storage — it stalls/hangs on large GGUF files.
+# Must be set before importing huggingface_hub.
+import os
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+import io, sys, json, math, uuid, time, base64, subprocess
 import threading, asyncio, queue
 from pathlib import Path
 from PIL import Image, ImageFilter

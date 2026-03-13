@@ -1,17 +1,16 @@
 /* ══════════════════════════════════════════════════════════════
-   LoRA Browser — CivitAI modal for AI Image Edit Studio
-   Standalone styles — easy to update independently.
+   LoRA Browser — perf-optimized styles
    ══════════════════════════════════════════════════════════════ */
 
-/* Overlay */
+/* Overlay — NO backdrop-filter (huge perf killer) */
 .lb-overlay{
   position:fixed;inset:0;z-index:200;
-  background:rgba(0,0,0,.82);backdrop-filter:blur(6px);
+  background:rgba(0,0,0,.88);
   display:none;align-items:center;justify-content:center;
 }
 .lb-overlay.open{display:flex}
 
-/* Modal shell */
+/* Modal */
 .lb-modal{
   width:92vw;max-width:1080px;height:88vh;
   background:var(--surface);border:1px solid var(--border);
@@ -37,7 +36,7 @@
 }
 .lb-close:hover{color:var(--text);background:rgba(255,255,255,.06)}
 
-/* Toolbar / filters */
+/* Toolbar */
 .lb-toolbar{
   display:flex;gap:6px;padding:10px 16px;
   border-bottom:1px solid var(--border);
@@ -74,44 +73,51 @@
   font-size:.65rem;color:var(--dim);padding:0 16px 6px;flex-shrink:0;
 }
 
-/* Grid */
-.lb-scroll{flex:1;overflow-y:auto;padding:10px 16px 20px;-webkit-overflow-scrolling:touch;will-change:transform;transform:translateZ(0)}
+/* Grid — simple overflow, no forced GPU layer on container */
+.lb-scroll{
+  flex:1;overflow-y:auto;padding:10px 16px 20px;
+  -webkit-overflow-scrolling:touch;
+}
 .lb-grid{
   display:grid;
   grid-template-columns:repeat(auto-fill,minmax(190px,1fr));
   gap:10px;
 }
 
-/* Card */
+/* Card — content-visibility for offscreen cards, NO will-change */
 .lb-card{
   border-radius:10px;background:var(--bg);
   border:1px solid var(--border);overflow:hidden;
-  transition:transform .15s,box-shadow .15s,border-color .15s;
   contain:layout style paint;
   content-visibility:auto;
   contain-intrinsic-size:190px 260px;
-  will-change:transform;
 }
 .lb-card:hover{
   border-color:var(--accent);
-  transform:translateY(-2px);
   box-shadow:0 6px 20px rgba(0,0,0,.5);
 }
+
+/* Card image — static placeholder, shimmer stops once image loads */
 .lb-card-img{
   position:relative;aspect-ratio:1/1;overflow:hidden;
-  background:#0a0a0f;
+  background:#0e0e14;
+}
+/* Shimmer only while waiting (before .loaded) */
+.lb-card-img:not(.done){
   background:linear-gradient(110deg,#0a0a0f 30%,#151520 50%,#0a0a0f 70%);
   background-size:200% 100%;
   animation:lb-shimmer 1.5s ease-in-out infinite;
 }
 @keyframes lb-shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+
 .lb-card-img img{
   width:100%;height:100%;object-fit:cover;
-  transition:transform .3s,opacity .25s;
-  opacity:0;
+  opacity:0;transition:opacity .2s;
 }
 .lb-card-img img.loaded{opacity:1}
-.lb-card:hover .lb-card-img img{transform:scale(1.04)}
+/* Hover zoom only on hover — not tracked during scroll */
+.lb-card:hover .lb-card-img img.loaded{transform:scale(1.04)}
+
 .lb-card-img .lb-no-img{
   width:100%;height:100%;display:flex;
   align-items:center;justify-content:center;
@@ -166,18 +172,14 @@
 .lb-card-stats span{display:flex;align-items:center;gap:2px}
 
 /* States */
-.lb-loading{
-  text-align:center;padding:32px;color:var(--dim);font-size:.8rem;
-}
+.lb-loading{text-align:center;padding:32px;color:var(--dim);font-size:.8rem}
 .lb-spin{
   display:inline-block;width:16px;height:16px;
   border:2px solid var(--border);border-top-color:var(--gold);
   border-radius:50%;animation:lb-sp .7s linear infinite;
 }
 @keyframes lb-sp{to{transform:rotate(360deg)}}
-.lb-empty{
-  text-align:center;padding:40px;color:var(--dim);font-size:.8rem;
-}
+.lb-empty{text-align:center;padding:40px;color:var(--dim);font-size:.8rem}
 .lb-error{
   background:rgba(192,57,43,.08);border:1px solid rgba(192,57,43,.2);
   border-radius:var(--radius);padding:12px;margin:10px;
@@ -185,7 +187,7 @@
 }
 .lb-sentinel{height:1px}
 
-/* Toast inside modal */
+/* Toast */
 .lb-toast{
   position:absolute;bottom:16px;left:50%;transform:translateX(-50%);
   background:var(--surface2);color:var(--text);padding:8px 18px;
