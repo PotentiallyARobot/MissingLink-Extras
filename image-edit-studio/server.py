@@ -111,7 +111,9 @@ def run_generation_blocking(job_id, body, images, event_q):
             if body.get("negative_prompt"): pk["negative_prompt"] = body["negative_prompt"]
             gs = body.get("guidance_scale")
             if gs is not None: pk["guidance_scale"] = gs
-            msl = body.get("max_sequence_length") or 256
+            # Always pass max_sequence_length — older diffusers versions
+            # fail with "max_txt_seq_len must be provided" if omitted.
+            msl = body.get("max_sequence_length") or 512
             pk["max_sequence_length"] = int(msl)
             w = body.get("width"); hv = body.get("height")
             if w and hv: pk["width"] = int(w); pk["height"] = int(hv)
@@ -135,7 +137,7 @@ def run_generation_blocking(job_id, body, images, event_q):
             pk["callback_on_step_end"] = step_cb
             event_q.put({"type": "progress", "step": 0, "total": total_steps, "progress": 0, "per_step": "?", "remaining": 0})
 
-            print(f"🎨 Generating: steps={steps}, cfg={cfg}, batch={pk.get('num_images_per_prompt',1)}")
+            print(f"🎨 Generating: steps={steps}, cfg={cfg}, batch={pk.get('num_images_per_prompt',1)}, max_seq_len={msl}")
             result = pipeline(**pk)
             out_images = result.images
 
@@ -160,6 +162,22 @@ def run_generation_blocking(job_id, body, images, event_q):
 
         except Exception as e:
             import traceback; traceback.print_exc()
+            # ── VRAM cleanup: if generation crashes mid-forward,
+            #    modules may be stuck on GPU causing OOM on next try ──
+            import gc
+            try:
+                if pipeline is not None and hasattr(pipeline, '_all_hooks'):
+                    # Trigger CPU offload hooks to move everything off GPU
+                    for hook in pipeline._all_hooks:
+                        if hasattr(hook, 'offload'):
+                            try: hook.offload()
+                            except Exception: pass
+                torch.cuda.empty_cache()
+                gc.collect()
+                torch.cuda.empty_cache()
+                print("🧹 GPU memory cleaned up after error")
+            except Exception as ce:
+                print(f"⚠ Cleanup warning: {ce}")
             event_q.put({"type": "error", "error": str(e)})
         finally:
             gpu_sem.release()
@@ -307,6 +325,30 @@ def load_model():
             pipeline.enable_model_cpu_offload()
         else:
             pipeline.to("cuda")
+
+        # ── Patch: ensure max_sequence_length → max_txt_seq_len ──
+        # Older diffusers (< 0.37.0) don't pass max_txt_seq_len to the
+        # transformer, causing "max_txt_seq_len must be provided" with
+        # nunchaku models.  This wraps the transformer forward to inject
+        # it automatically from prompt_embeds shape when missing.
+        _orig_transformer_forward = pipeline.transformer.forward
+        def _patched_transformer_forward(*args, **kwargs):
+            if 'max_txt_seq_len' not in kwargs and 'txt_seq_lens' not in kwargs:
+                # Infer from encoder_hidden_states shape if available
+                ehs = kwargs.get('encoder_hidden_states') or (args[1] if len(args) > 1 else None)
+                if ehs is not None and hasattr(ehs, 'shape') and len(ehs.shape) >= 2:
+                    kwargs['max_txt_seq_len'] = ehs.shape[1]
+                else:
+                    kwargs['max_txt_seq_len'] = 512  # safe default
+            return _orig_transformer_forward(*args, **kwargs)
+
+        if hasattr(pipeline.transformer, '_old_forward'):
+            # accelerate hook wraps forward; patch the underlying one
+            pipeline.transformer._old_forward = _patched_transformer_forward
+            print("🩹 Patched transformer._old_forward for max_txt_seq_len")
+        else:
+            pipeline.transformer.forward = _patched_transformer_forward
+            print("🩹 Patched transformer.forward for max_txt_seq_len")
 
         status.update({"step": 5, "detail": "Finalizing..."})
         el = round(time.time() - t0, 1)
