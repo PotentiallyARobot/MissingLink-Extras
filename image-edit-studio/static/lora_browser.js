@@ -1,23 +1,45 @@
 /* ══════════════════════════════════════════════════════════════
-   LoRA Browser — CivitAI search & pick for AI Image Edit Studio
+   LoRA Browser — CivitAI search & pick
+   Perf-focused: single-page fetch, rAF DOM batching, sessionStorage
    ══════════════════════════════════════════════════════════════ */
 
 const loraBrowser = (() => {
     const CIVITAI = 'https://civitai.com/api/v1';
     const BASE_MATCH = ['qwen', 'qwen-image', 'qwen image'];
     const THUMB_W = 100;
-    const VIDEO_EXT = /\.(mp4|webm|mov|avi|gif)(\?|$)/i;
+    const VIDEO_RE = /\.(mp4|webm|mov|avi|gif)(\?|$)/i;
+    const SS_PREFIX = 'lb_';          // sessionStorage key prefix
+    const SS_MAX = 30;                // max cached pages
 
     const st = {
         query: '', sort: 'Most Downloaded', period: '', nsfw: false,
-        results: [], nextUrl: null, total: 0, hasMore: true, loading: false,
+        results: [], nextUrl: null, hasMore: true, loading: false,
     };
     let abortCtrl = null, debounce = null, toastTimer = null;
-    const cache = new Map();
 
+    // ── sessionStorage cache ──
+    // Survives modal close/reopen, cleared on tab close
+    function ssKey(url) { return SS_PREFIX + url; }
+    function ssGet(url) {
+        try { const v = sessionStorage.getItem(ssKey(url)); return v ? JSON.parse(v) : null; }
+        catch { return null; }
+    }
+    function ssPut(url, data) {
+        try {
+            // Evict oldest if over limit
+            const keys = []; for (let i = 0; i < sessionStorage.length; i++) {
+                const k = sessionStorage.key(i);
+                if (k && k.startsWith(SS_PREFIX)) keys.push(k);
+            }
+            while (keys.length >= SS_MAX) { sessionStorage.removeItem(keys.shift()); }
+            sessionStorage.setItem(ssKey(url), JSON.stringify(data));
+        } catch { /* quota exceeded — ignore */ }
+    }
+
+    // ── DOM ──
     let _dom = null;
     function dom() {
-        if (!_dom) _dom = {
+        return _dom || (_dom = {
             overlay:  document.getElementById('loraBrowserOverlay'),
             close:    document.getElementById('loraBrowserClose'),
             search:   document.getElementById('lbSearch'),
@@ -31,92 +53,74 @@ const loraBrowser = (() => {
             status:   document.getElementById('lbStatus'),
             sentinel: document.getElementById('lbSentinel'),
             toast:    document.getElementById('lbToast'),
-        };
-        return _dom;
+        });
     }
 
+    // ── Helpers ──
     const esc = s => s ? s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') : '';
-    function fmtSz(b) { if (!b) return '?'; if (b>1e9) return (b/1e9).toFixed(1)+' GB'; if (b>1e6) return (b/1e6).toFixed(0)+' MB'; return (b/1e3).toFixed(0)+' KB'; }
-    function fmtN(n) { if (!n) return '0'; return n>1000 ? (n/1000).toFixed(1)+'k' : String(n); }
+    const fmtSz = b => !b ? '?' : b>1e9 ? (b/1e9).toFixed(1)+' GB' : b>1e6 ? (b/1e6).toFixed(0)+' MB' : (b/1e3).toFixed(0)+' KB';
+    const fmtN = n => !n ? '0' : n>1000 ? (n/1000).toFixed(1)+'k' : String(n);
 
-    /** Is this URL a video? Check extension and known CivitAI video patterns */
-    function isVideoUrl(url) {
+    function isVideo(url) {
         if (!url) return false;
-        if (VIDEO_EXT.test(url)) return true;
-        // CivitAI sometimes serves video at .jpeg URLs with /transcode= path
-        if (url.includes('/transcode=')) return true;
-        return false;
+        return VIDEO_RE.test(url) || url.includes('/transcode=');
     }
 
     function thumbUrl(url) {
         if (!url) return '';
         try {
-            const u = new URL(url);
-            const parts = u.pathname.split('/');
-            for (let i = 0; i < parts.length; i++) {
-                if (parts[i].startsWith('original=') || parts[i].startsWith('width=')) {
-                    parts[i] = 'width=' + THUMB_W;
-                    u.pathname = parts.join('/');
-                    return u.toString();
+            const u = new URL(url), p = u.pathname.split('/');
+            for (let i = 0; i < p.length; i++) {
+                if (p[i].startsWith('original=') || p[i].startsWith('width=')) {
+                    p[i] = 'width=' + THUMB_W; u.pathname = p.join('/'); return u.toString();
                 }
             }
-            if (parts.length > 2) {
-                parts.splice(parts.length - 1, 0, 'width=' + THUMB_W);
-                u.pathname = parts.join('/');
-                return u.toString();
-            }
-        } catch (e) {}
+            if (p.length > 2) { p.splice(p.length-1, 0, 'width='+THUMB_W); u.pathname = p.join('/'); return u.toString(); }
+        } catch {}
         return url;
     }
 
-    function matchBM(model) {
-        return (model.modelVersions || []).some(v => {
-            const bm = (v.baseModel || '').toLowerCase();
-            return BASE_MATCH.some(pat => bm.includes(pat));
+    function matchBM(m) {
+        return (m.modelVersions||[]).some(v => {
+            const bm = (v.baseModel||'').toLowerCase();
+            return BASE_MATCH.some(p => bm.includes(p));
         });
     }
-    function matchLoose(model) {
-        if (matchBM(model)) return true;
-        const hay = [model.name||'', ...(model.tags||[]),
-            ...(model.modelVersions||[]).map(v=>v.name||'')].join(' ').toLowerCase();
-        return BASE_MATCH.some(pat => hay.includes(pat));
+    function matchLoose(m) {
+        if (matchBM(m)) return true;
+        const hay = [m.name||'', ...(m.tags||[]), ...(m.modelVersions||[]).map(v=>v.name||'')].join(' ').toLowerCase();
+        return BASE_MATCH.some(p => hay.includes(p));
     }
-    function getBM(model) {
-        for (const v of model.modelVersions||[]) {
+    function getBM(m) {
+        for (const v of m.modelVersions||[]) {
             const bm = (v.baseModel||'').toLowerCase();
-            if (BASE_MATCH.some(pat => bm.includes(pat))) return v.baseModel;
+            if (BASE_MATCH.some(p => bm.includes(p))) return v.baseModel;
         }
-        return model.modelVersions?.[0]?.baseModel || '?';
+        return m.modelVersions?.[0]?.baseModel || '?';
     }
-
-    /**
-     * Pick the best static image from a version's images array.
-     * Skips videos, NSFW (if not enabled), returns first valid image.
-     */
     function pickImage(ver) {
-        if (!ver || !ver.images) return null;
+        if (!ver?.images) return null;
         for (const img of ver.images) {
-            // Skip NSFW unless enabled
             if (!st.nsfw && (img.nsfw || (img.nsfwLevel && img.nsfwLevel > 2))) continue;
-            // Skip if the image has a video type field
             if (img.type && img.type.toLowerCase() === 'video') continue;
-            // Skip video URLs
-            if (isVideoUrl(img.url)) continue;
+            if (isVideo(img.url)) continue;
             return img;
         }
         return null;
     }
 
-    function showToast(msg, isErr) {
-        const t = dom().toast;
-        t.textContent = msg;
-        t.className = 'lb-toast show' + (isErr ? ' err' : '');
+    function showToast(msg, err) {
+        const t = dom().toast; t.textContent = msg;
+        t.className = 'lb-toast show' + (err ? ' err' : '');
         clearTimeout(toastTimer);
         toastTimer = setTimeout(() => t.className = 'lb-toast', 3000);
     }
 
-    // ── Fetch ──
+    // ══════════════════════════════════════════════════════════
+    //  FETCH — one page at a time, never blocks scroll
+    // ══════════════════════════════════════════════════════════
     async function doFetch(append) {
+        if (st.loading) return;              // don't stack fetches
         if (abortCtrl) abortCtrl.abort();
         abortCtrl = new AbortController();
         st.loading = true;
@@ -128,8 +132,7 @@ const loraBrowser = (() => {
             if (append && st.nextUrl) {
                 url = st.nextUrl;
             } else {
-                const userQ = st.query.trim();
-                const q = userQ || 'qwen image edit';
+                const q = st.query.trim() || 'qwen image edit';
                 const p = ['types=LORA','sort='+encodeURIComponent(st.sort),'limit=40'];
                 p.push('query='+encodeURIComponent(q));
                 if (st.period) p.push('period='+encodeURIComponent(st.period));
@@ -137,58 +140,53 @@ const loraBrowser = (() => {
                 url = CIVITAI + '/models?' + p.join('&');
             }
 
-            let filtered = [];
-            let pages = 0;
-            const matchFn = st.query.trim() ? matchLoose : matchBM;
-
-            while (url && pages < 5) {
-                let data;
-                if (cache.has(url)) {
-                    data = cache.get(url);
-                } else {
-                    const r = await fetch(url, { signal: abortCtrl.signal });
-                    if (!r.ok) throw new Error('CivitAI API ' + r.status);
-                    data = await r.json();
-                    cache.set(url, data);
-                    if (cache.size > 60) cache.delete(cache.keys().next().value);
-                }
-
-                const allItems = data.items || [];
-                const matches = allItems.filter(m => matchFn(m));
-                filtered = filtered.concat(matches);
-                st.nextUrl = data.metadata?.nextPage || null;
-                st.total = data.metadata?.totalItems || 0;
-                pages++;
-
-                if (matches.length > 0) {
-                    const prevLen = st.results.length;
-                    st.results = st.results.concat(matches);
-                    appendCards(matches, prevLen);
-                    renderInfo();
-                }
-
-                if (filtered.length >= 20 || !st.nextUrl || allItems.length === 0) break;
-                url = st.nextUrl;
+            // ── Fetch exactly ONE page ──
+            let data = ssGet(url);
+            if (!data) {
+                const r = await fetch(url, { signal: abortCtrl.signal });
+                if (!r.ok) throw new Error('CivitAI API ' + r.status);
+                data = await r.json();
+                ssPut(url, data);
             }
 
+            const matchFn = st.query.trim() ? matchLoose : matchBM;
+            const matches = (data.items || []).filter(m => matchFn(m));
+            st.nextUrl = data.metadata?.nextPage || null;
             st.hasMore = !!st.nextUrl;
-            dom().error.innerHTML = '';
 
-            if (!st.results.length && st.query.trim()) {
-                dom().status.innerHTML = '<div class="lb-empty">No Qwen-compatible LoRAs found for "'
-                    + esc(st.query) + '".<br>Try broader terms like "style", "anime", or "realistic".</div>';
+            if (matches.length > 0) {
+                const prevLen = st.results.length;
+                st.results = st.results.concat(matches);
+                // Insert cards off main thread via rAF
+                batchAppendCards(matches, prevLen);
+            }
+
+            dom().error.innerHTML = '';
+            if (!st.results.length && !st.hasMore && st.query.trim()) {
+                dom().status.innerHTML = '<div class="lb-empty">No Qwen-compatible LoRAs for "'
+                    + esc(st.query) + '".<br>Try broader terms.</div>';
+            }
+
+            // If we got 0 matches but there are more pages, auto-fetch next
+            // (do it after a frame so we don't block)
+            if (matches.length === 0 && st.hasMore) {
+                st.loading = false;  // unlock
+                requestAnimationFrame(() => doFetch(true));
+                return;
             }
         } catch (e) {
             if (e.name !== 'AbortError')
                 dom().error.innerHTML = '<div class="lb-error">' + esc(e.message) + '</div>';
         } finally {
             st.loading = false;
-            renderStatus();
-            renderInfo();
+            renderStatus(); renderInfo();
             dom().sentinel.style.display = st.hasMore ? 'block' : 'none';
         }
     }
 
+    // ══════════════════════════════════════════════════════════
+    //  DOM — batched card insertion via requestAnimationFrame
+    // ══════════════════════════════════════════════════════════
     function cardHTML(m, idx) {
         const ver = m.modelVersions?.[0];
         const img0 = pickImage(ver);
@@ -196,56 +194,63 @@ const loraBrowser = (() => {
         const f = ver?.files?.[0];
         const sz = f?.sizeKB ? f.sizeKB * 1024 : null;
         const bm = getBM(m);
-        const imgSrc = img0 ? thumbUrl(img0.url) : '';
+        const src = img0 ? thumbUrl(img0.url) : '';
 
-        // onerror hides the image if it turns out to be a video/broken
-        return `<div class="lb-card"><div class="lb-card-img">`
-          + (imgSrc
-            ? `<img data-src="${esc(imgSrc)}" alt="" loading="lazy" decoding="async">`
-            : '<div class="lb-no-img">No preview</div>')
+        return '<div class="lb-card"><div class="lb-card-img">'
+          + (src ? '<img data-src="'+esc(src)+'" alt="" decoding="async">' : '<div class="lb-no-img">No preview</div>')
           + (m.nsfw ? '<span class="lb-badge lb-badge-nsfw">NSFW</span>' : '')
-          + `<span class="lb-badge lb-badge-bm">${esc(bm)}</span>`
-          + `<div class="lb-card-ov">`
-          + `<button class="lb-btn-use" onclick="event.stopPropagation();loraBrowser._pick(${idx})">⚡ Use this LoRA</button>`
-          + `<a class="lb-btn-civ" href="https://civitai.com/models/${m.id}" target="_blank" rel="noopener" onclick="event.stopPropagation()">View on CivitAI →</a>`
-          + `</div></div><div class="lb-card-body">`
-          + `<div class="lb-card-name" title="${esc(m.name)}">${esc(m.name)}</div>`
-          + `<div class="lb-card-meta">by ${esc(m.creator?.username||'?')} · ${fmtSz(sz)}</div>`
-          + `<div class="lb-card-stats"><span>⬇${fmtN(s.downloadCount)}</span><span>★${s.rating?.toFixed(1)||'—'}</span><span>♥${fmtN(s.favoriteCount)}</span></div>`
-          + `</div></div>`;
+          + '<span class="lb-badge lb-badge-bm">'+esc(bm)+'</span>'
+          + '<div class="lb-card-ov">'
+          + '<button class="lb-btn-use" onclick="event.stopPropagation();loraBrowser._pick('+idx+')">⚡ Use this LoRA</button>'
+          + '<a class="lb-btn-civ" href="https://civitai.com/models/'+m.id+'" target="_blank" rel="noopener" onclick="event.stopPropagation()">View on CivitAI →</a>'
+          + '</div></div><div class="lb-card-body">'
+          + '<div class="lb-card-name" title="'+esc(m.name)+'">'+esc(m.name)+'</div>'
+          + '<div class="lb-card-meta">by '+esc(m.creator?.username||'?')+' · '+fmtSz(sz)+'</div>'
+          + '<div class="lb-card-stats"><span>⬇'+fmtN(s.downloadCount)+'</span><span>★'+(s.rating?.toFixed(1)||'—')+'</span><span>♥'+fmtN(s.favoriteCount)+'</span></div>'
+          + '</div></div>';
     }
 
-    function appendCards(items, startIdx) {
+    // Insert cards in batches of 6 per animation frame — keeps scroll buttery
+    const BATCH_SZ = 6;
+    function batchAppendCards(items, startIdx) {
         const g = dom().grid;
-        const frag = document.createDocumentFragment();
-        const tmp = document.createElement('div');
-        items.forEach((m, i) => {
-            tmp.innerHTML = cardHTML(m, startIdx + i);
-            while (tmp.firstChild) frag.appendChild(tmp.firstChild);
-        });
-        g.appendChild(frag);
-        lazyObserve();
+        let i = 0;
+        function tick() {
+            const frag = document.createDocumentFragment();
+            const tmp = document.createElement('div');
+            const end = Math.min(i + BATCH_SZ, items.length);
+            for (; i < end; i++) {
+                tmp.innerHTML = cardHTML(items[i], startIdx + i);
+                while (tmp.firstChild) frag.appendChild(tmp.firstChild);
+            }
+            g.appendChild(frag);
+            lazyObserve();
+            renderInfo();
+            if (i < items.length) requestAnimationFrame(tick);
+        }
+        requestAnimationFrame(tick);
     }
 
+    // ── Lazy image loading ──
     let imgObs;
     function lazyObserve() {
         if (!imgObs) {
             imgObs = new IntersectionObserver(entries => {
                 for (const e of entries) {
-                    if (e.isIntersecting) {
-                        const img = e.target;
-                        if (img.dataset.src) {
-                            img.onload = () => { img.classList.add('loaded'); };
-                            img.onerror = () => { img.style.display = 'none'; };
-                            img.src = img.dataset.src;
-                            delete img.dataset.src;
-                        }
-                        imgObs.unobserve(img);
-                    }
+                    if (!e.isIntersecting) continue;
+                    const img = e.target;
+                    imgObs.unobserve(img);
+                    if (!img.dataset.src) continue;
+                    const src = img.dataset.src;
+                    delete img.dataset.src;
+                    img.onload = () => img.classList.add('loaded');
+                    img.onerror = () => { img.style.display = 'none'; };
+                    img.src = src;
                 }
-            }, { root: dom().scroll, rootMargin: '400px' });
+            }, { root: dom().scroll, rootMargin: '500px' });
         }
-        dom().grid.querySelectorAll('img[data-src]').forEach(i => imgObs.observe(i));
+        // Only observe new unloaded images
+        dom().grid.querySelectorAll('img[data-src]:not([src])').forEach(i => imgObs.observe(i));
     }
 
     function renderStatus() {
@@ -258,47 +263,44 @@ const loraBrowser = (() => {
     }
     function renderInfo() {
         const n = st.results.length;
-        dom().info.textContent = n && !st.loading
-            ? n + ' Qwen-compatible LoRA' + (n !== 1 ? 's' : '') + ' found' : '';
+        dom().info.textContent = n && !st.loading ? n + ' Qwen-compatible LoRA' + (n!==1?'s':'') + ' found' : '';
     }
 
+    // ── Infinite scroll — fires doFetch(true) for next page ──
     let sentinelObs;
     function initSentinelObs() {
         if (sentinelObs) return;
         sentinelObs = new IntersectionObserver(entries => {
             if (entries[0].isIntersecting && st.hasMore && !st.loading && st.results.length)
                 doFetch(true);
-        }, { root: dom().scroll, rootMargin: '400px' });
+        }, { root: dom().scroll, rootMargin: '600px' });
         sentinelObs.observe(dom().sentinel);
     }
 
     function _pick(idx) {
         const m = st.results[idx]; if (!m) return;
-        const ver = m.modelVersions?.[0];
-        const f = ver?.files?.[0];
-        if (!f) { showToast('No file found for this LoRA', true); return; }
-        const info = {
+        const ver = m.modelVersions?.[0], f = ver?.files?.[0];
+        if (!f) { showToast('No file found', true); return; }
+        showToast('Selected: ' + m.name);
+        if (typeof loraBrowser.onPick === 'function') loraBrowser.onPick({
             name: m.name, civitaiId: m.id, versionId: ver.id,
             downloadUrl: f.downloadUrl,
             filename: f.name || m.name.replace(/[^a-zA-Z0-9_.-]/g,'_') + '.safetensors',
-            baseModel: getBM(m), fileSize: f.sizeKB ? f.sizeKB * 1024 : null,
-        };
-        showToast('Selected: ' + m.name);
-        if (typeof loraBrowser.onPick === 'function') loraBrowser.onPick(info);
-        setTimeout(() => close(), 400);
+            baseModel: getBM(m), fileSize: f.sizeKB ? f.sizeKB*1024 : null,
+        });
+        setTimeout(close, 400);
     }
 
     function open() {
-        const d = dom();
-        d.overlay.classList.add('open');
+        dom().overlay.classList.add('open');
         if (!st.results.length) doFetch();
         initSentinelObs();
-        requestAnimationFrame(() => d.search.focus());
+        requestAnimationFrame(() => dom().search.focus());
     }
     function close() { dom().overlay.classList.remove('open'); }
 
     function resetAndFetch() {
-        st.results = []; st.nextUrl = null; cache.clear(); doFetch();
+        st.results = []; st.nextUrl = null; doFetch();
     }
 
     let _bound = false;
@@ -307,7 +309,6 @@ const loraBrowser = (() => {
         const d = dom();
         d.close.onclick = close;
         d.overlay.addEventListener('click', e => { if (e.target === d.overlay) close(); });
-
         d.search.addEventListener('input', e => {
             clearTimeout(debounce);
             debounce = setTimeout(() => { st.query = e.target.value.trim(); resetAndFetch(); }, 450);
