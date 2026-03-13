@@ -616,7 +616,59 @@ def api_hw():
         props = torch.cuda.get_device_properties(0)
         hw["gpu_total_mb"] = round(props.total_memory / 1e6)
         hw["gpu_alloc_mb"] = round(torch.cuda.memory_allocated(0) / 1e6)
-        hw["gpu_free_mb"] = hw["gpu_total_mb"] - round(torch.cuda.memory_reserved(0) / 1e6)
+        hw["gpu_reserved_mb"] = round(torch.cuda.memory_reserved(0) / 1e6)
+        hw["gpu_free_mb"] = hw["gpu_total_mb"] - hw["gpu_reserved_mb"]
+    except Exception:
+        pass
+    # GPU utilization via nvidia-smi
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,temperature.gpu,power.draw,power.limit",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3
+        )
+        if result.returncode == 0:
+            parts = [x.strip() for x in result.stdout.strip().split(",")]
+            if len(parts) >= 4:
+                hw["gpu_util_pct"] = int(parts[0])
+                hw["gpu_temp_c"] = int(parts[1])
+                hw["gpu_power_w"] = float(parts[2])
+                hw["gpu_power_limit_w"] = float(parts[3])
+    except Exception:
+        pass
+    # CPU utilization
+    try:
+        # Read /proc/stat for CPU usage
+        with open("/proc/stat") as f:
+            line = f.readline()
+        vals = [int(x) for x in line.split()[1:]]
+        idle = vals[3]
+        total = sum(vals)
+        # Store for delta calculation
+        if not hasattr(api_hw, "_prev"):
+            api_hw._prev = (idle, total)
+        prev_idle, prev_total = api_hw._prev
+        d_idle = idle - prev_idle
+        d_total = total - prev_total
+        api_hw._prev = (idle, total)
+        if d_total > 0:
+            hw["cpu_util_pct"] = round(100.0 * (1.0 - d_idle / d_total), 1)
+        else:
+            hw["cpu_util_pct"] = 0
+        hw["cpu_count"] = os.cpu_count()
+    except Exception:
+        pass
+    # RAM
+    try:
+        with open("/proc/meminfo") as f:
+            mem = {}
+            for line in f:
+                parts = line.split()
+                if parts[0] in ("MemTotal:", "MemAvailable:", "MemFree:"):
+                    mem[parts[0].rstrip(":")] = int(parts[1])  # in kB
+        hw["ram_total_mb"] = round(mem.get("MemTotal", 0) / 1024)
+        hw["ram_available_mb"] = round(mem.get("MemAvailable", mem.get("MemFree", 0)) / 1024)
+        hw["ram_used_mb"] = hw["ram_total_mb"] - hw["ram_available_mb"]
     except Exception:
         pass
     hw["pipeline"] = current_pipeline["name"]
