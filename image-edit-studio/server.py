@@ -111,8 +111,8 @@ def run_generation_blocking(job_id, body, images, event_q):
             if body.get("negative_prompt"): pk["negative_prompt"] = body["negative_prompt"]
             gs = body.get("guidance_scale")
             if gs is not None: pk["guidance_scale"] = gs
-            msl = body.get("max_sequence_length")
-            if msl: pk["max_sequence_length"] = msl
+            msl = body.get("max_sequence_length") or 256
+            pk["max_sequence_length"] = int(msl)
             w = body.get("width"); hv = body.get("height")
             if w and hv: pk["width"] = int(w); pk["height"] = int(hv)
             seed = body.get("seed", -1)
@@ -979,4 +979,3 @@ def launch():
 
 if __name__ == "__main__":
     launch()
-
