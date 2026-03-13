@@ -12,8 +12,8 @@ const loraBrowser = (() => {
     const CIVITAI = 'https://civitai.com/api/v1';
     // Base model strings CivitAI uses for Qwen Image Edit variants
     const BASE_MATCH = ['qwen', 'qwen-image', 'qwen image'];
-    // Thumbnail width for card images (CivitAI CDN supports /width=N)
-    const THUMB_W = 280;
+    // Thumbnail width — small for fast loading (cards are ~190px wide)
+    const THUMB_W = 100;
 
     // ── State ──
     const st = {
@@ -63,13 +63,9 @@ const loraBrowser = (() => {
     /** Convert a CivitAI image URL to a small thumbnail */
     function thumbUrl(url) {
         if (!url) return '';
-        // CivitAI CDN: insert /width=N before the filename
-        // e.g. https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/.../original=true/00123.jpeg
-        // →    https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/.../width=280/00123.jpeg
         try {
             const u = new URL(url);
             const parts = u.pathname.split('/');
-            // Find and replace the segment that says "original=true" or "width=..."
             for (let i = 0; i < parts.length; i++) {
                 if (parts[i].startsWith('original=') || parts[i].startsWith('width=')) {
                     parts[i] = 'width=' + THUMB_W;
@@ -77,7 +73,6 @@ const loraBrowser = (() => {
                     return u.toString();
                 }
             }
-            // If no segment found, insert before last segment (the filename)
             if (parts.length > 2) {
                 parts.splice(parts.length - 1, 0, 'width=' + THUMB_W);
                 u.pathname = parts.join('/');
@@ -94,6 +89,20 @@ const loraBrowser = (() => {
             return BASE_MATCH.some(pat => bm.includes(pat));
         });
     }
+
+    /** Looser match: also check model name/tags for qwen keywords */
+    function matchLoose(model) {
+        // Strict base model match first
+        if (matchBM(model)) return true;
+        // Fallback: check name + tags for qwen references
+        const haystack = [
+            (model.name || ''),
+            ...(model.tags || []),
+            ...(model.modelVersions || []).map(v => v.name || ''),
+        ].join(' ').toLowerCase();
+        return BASE_MATCH.some(pat => haystack.includes(pat));
+    }
+
     function getBM(model) {
         for (const v of model.modelVersions || []) {
             const bm = (v.baseModel || '').toLowerCase();
@@ -119,7 +128,7 @@ const loraBrowser = (() => {
         if (abortCtrl) abortCtrl.abort();
         abortCtrl = new AbortController();
         st.loading = true;
-        if (!append) { dom().grid.innerHTML = ''; }
+        if (!append) { dom().grid.innerHTML = ''; st.results = []; }
         renderStatus();
 
         try {
@@ -127,11 +136,17 @@ const loraBrowser = (() => {
             if (append && st.nextUrl) {
                 url = st.nextUrl;
             } else {
-                const q = st.query || 'qwen image edit';
+                // Build search query:
+                // - Empty search → default "qwen image edit"
+                // - User typed something → send it directly to CivitAI
+                //   (don't force-prepend "qwen" — it breaks partial matches)
+                //   The matchLoose() filter will still catch Qwen models
+                const userQ = st.query.trim();
+                const q = userQ || 'qwen image edit';
                 const p = [
                     'types=LORA',
                     'sort=' + encodeURIComponent(st.sort),
-                    'limit=20',  // smaller pages = faster response
+                    'limit=40',
                 ];
                 if (q) p.push('query=' + encodeURIComponent(q));
                 if (st.period) p.push('period=' + encodeURIComponent(st.period));
@@ -141,10 +156,12 @@ const loraBrowser = (() => {
 
             let filtered = [];
             let pages = 0;
+            // Use loose matching when user typed a custom query,
+            // strict matching for default browse
+            const matchFn = st.query.trim() ? matchLoose : matchBM;
 
-            // Fetch up to 2 pages (40 models max) — show results as soon
-            // as we have any instead of waiting for all pages
-            while (url && pages < 2) {
+            // Fetch up to 5 pages to find enough matches
+            while (url && pages < 5) {
                 let data;
                 if (cache.has(url)) {
                     data = cache.get(url);
@@ -153,47 +170,38 @@ const loraBrowser = (() => {
                     if (!r.ok) throw new Error('CivitAI API ' + r.status);
                     data = await r.json();
                     cache.set(url, data);
-                    if (cache.size > 40) cache.delete(cache.keys().next().value);
+                    if (cache.size > 60) cache.delete(cache.keys().next().value);
                 }
 
-                const matches = (data.items || []).filter(m => matchBM(m));
+                const allItems = data.items || [];
+                const matches = allItems.filter(m => matchFn(m));
                 filtered = filtered.concat(matches);
                 st.nextUrl = data.metadata?.nextPage || null;
                 st.total = data.metadata?.totalItems || 0;
                 pages++;
 
-                // Render first batch immediately so user sees results fast
-                if (pages === 1 && matches.length > 0) {
-                    if (append) {
-                        st.results = st.results.concat(matches);
-                    } else {
-                        st.results = matches;
-                    }
-                    appendCards(matches, append ? st.results.length - matches.length : 0);
+                // Show results incrementally as they arrive
+                if (matches.length > 0) {
+                    const prevLen = st.results.length;
+                    st.results = st.results.concat(matches);
+                    appendCards(matches, prevLen);
                     renderInfo();
                 }
 
-                if (filtered.length >= 8 || !st.nextUrl) break;
+                // Stop if we have enough or no more pages
+                if (filtered.length >= 20 || !st.nextUrl) break;
+                // Stop if CivitAI returned 0 items (no more results at all)
+                if (allItems.length === 0) break;
                 url = st.nextUrl;
-            }
-
-            // If we fetched a second page, add those results too
-            if (pages > 1 && filtered.length > (append ? 0 : st.results.length)) {
-                const newItems = filtered.slice(st.results.length - (append ? st.results.length - filtered.length : 0));
-                if (append) {
-                    // Already added page 1 items above; add page 2
-                    const page2 = filtered.slice(st.results.length);
-                    st.results = st.results.concat(page2);
-                    appendCards(page2, st.results.length - page2.length);
-                } else if (filtered.length > st.results.length) {
-                    const extra = filtered.slice(st.results.length);
-                    st.results = st.results.concat(extra);
-                    appendCards(extra, st.results.length - extra.length);
-                }
             }
 
             st.hasMore = !!st.nextUrl;
             dom().error.innerHTML = '';
+
+            // If user searched and got 0 results, show a helpful message
+            if (!st.results.length && st.query.trim()) {
+                dom().status.innerHTML = '<div class="lb-empty">No Qwen-compatible LoRAs found for "' + esc(st.query) + '".<br>Try broader terms like "style", "anime", or "realistic".</div>';
+            }
         } catch (e) {
             if (e.name !== 'AbortError')
                 dom().error.innerHTML = `<div class="lb-error">${esc(e.message)}</div>`;
@@ -261,7 +269,7 @@ const loraBrowser = (() => {
                         imgObs.unobserve(img);
                     }
                 });
-            }, { root: dom().scroll, rootMargin: '200px' });
+            }, { root: dom().scroll, rootMargin: '300px' });
         }
         dom().grid.querySelectorAll('img[data-src]').forEach(i => imgObs.observe(i));
     }
@@ -273,8 +281,9 @@ const loraBrowser = (() => {
         else el.innerHTML = '';
     }
     function renderInfo() {
-        dom().info.textContent = st.results.length && !st.loading
-            ? `${st.results.length} LoRAs found (Qwen Image Edit)` : '';
+        const n = st.results.length;
+        dom().info.textContent = n && !st.loading
+            ? `${n} Qwen-compatible LoRA${n !== 1 ? 's' : ''} found` : '';
     }
 
     // ── Infinite scroll ──
@@ -321,7 +330,6 @@ const loraBrowser = (() => {
         d.overlay.classList.add('open');
         if (!st.results.length) doFetch();
         initSentinelObs();
-        // Defer focus so modal transition completes first
         requestAnimationFrame(() => d.search.focus());
     }
     function close() {
@@ -351,7 +359,7 @@ const loraBrowser = (() => {
             debounce = setTimeout(() => {
                 st.query = e.target.value.trim();
                 resetAndFetch();
-            }, 350);
+            }, 450);
         });
 
         d.sort.onchange = e => { st.sort = e.target.value; resetAndFetch(); };
