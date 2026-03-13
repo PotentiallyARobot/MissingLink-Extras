@@ -737,12 +737,39 @@ from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 CIVITAI_LORA_DIR = Path(__file__).parent / "civitai_loras"
 CIVITAI_LORA_DIR.mkdir(parents=True, exist_ok=True)
 
+def _validate_safetensors(path):
+    """Check if a file looks like a valid safetensors file (not HTML/redirect)."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(16)
+        if len(header) < 8:
+            return False, "File too small"
+        # safetensors starts with an 8-byte little-endian header size
+        import struct
+        header_size = struct.unpack("<Q", header[:8])[0]
+        # Valid header sizes are typically < 10MB; HTML pages have garbage here
+        if header_size > 50_000_000:
+            return False, "Header too large — file is probably not safetensors (HTML redirect page?)"
+        if header_size == 0:
+            return False, "Header size is 0 — corrupt file"
+        # Check if the file starts with HTML
+        try:
+            text_start = header.decode("utf-8", errors="ignore").lower()
+            if "<html" in text_start or "<!doc" in text_start:
+                return False, "File is HTML, not safetensors — CivitAI may require an API token"
+        except Exception:
+            pass
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
 @app.post("/api/lora/download_civitai")
 async def api_download_civitai(request: Request):
     """Download a LoRA from CivitAI and return the local path."""
     body = await request.json()
     url = body.get("url", "")
     filename = body.get("filename", "")
+    token = body.get("token", "")
     if not url:
         return {"error": "Missing download URL"}
 
@@ -753,13 +780,21 @@ async def api_download_civitai(request: Request):
 
     out_path = CIVITAI_LORA_DIR / filename
 
-    # Skip download if already exists
-    if out_path.exists() and out_path.stat().st_size > 1024:
-        print(f"📦 CivitAI LoRA already cached: {out_path}")
-        return {"ok": True, "path": str(out_path), "filename": filename, "cached": True}
+    # Check if cached file exists AND is valid
+    if out_path.exists():
+        if out_path.stat().st_size > 1024:
+            valid, reason = _validate_safetensors(str(out_path))
+            if valid:
+                print(f"📦 CivitAI LoRA already cached: {out_path}")
+                return {"ok": True, "path": str(out_path), "filename": filename, "cached": True}
+            else:
+                print(f"⚠ Cached file invalid ({reason}), re-downloading...")
+                out_path.unlink()
+        else:
+            out_path.unlink()
 
-    # Append API token if available
-    token = os.environ.get("CIVITAI_API_KEY", "")
+    # Resolve API token: explicit param > env var
+    token = token.strip() if token else os.environ.get("CIVITAI_API_KEY", "")
     if token:
         parts = urlparse(url)
         query = dict(parse_qsl(parts.query, keep_blank_values=True))
@@ -770,15 +805,21 @@ async def api_download_civitai(request: Request):
     try:
         print(f"⬇ Downloading CivitAI LoRA: {filename}")
         headers = {
-            "User-Agent": "Mozilla/5.0",
+            "User-Agent": "Mozilla/5.0 (CivitAI-Download)",
             "Referer": "https://civitai.com/",
             "Accept": "*/*",
         }
         with _http_requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=120) as r:
             r.raise_for_status()
+
+            # Check content-type — if HTML, it's a redirect/auth page
+            ct = r.headers.get("content-type", "")
+            if "text/html" in ct.lower():
+                return {"error": "CivitAI returned an HTML page instead of a file. You likely need a CivitAI API token. Set CIVITAI_API_KEY environment variable or enter your token when prompted."}
+
             # Resolve filename from content-disposition if needed
             cd = r.headers.get("content-disposition", "")
-            if "filename=" in cd and filename.startswith("civitai_lora_"):
+            if "filename=" in cd:
                 fname = cd.split("filename=")[-1].strip().strip('"')
                 if fname:
                     filename = fname.replace("/", "_").replace("\\", "_")
@@ -796,8 +837,21 @@ async def api_download_civitai(request: Request):
                             if pct % 20 == 0:
                                 print(f"  ⬇ {pct}% ({downloaded // (1024*1024)}MB / {total // (1024*1024)}MB)")
 
-        print(f"✅ Downloaded: {out_path} ({out_path.stat().st_size // (1024*1024)}MB)")
+        # Validate the downloaded file
+        valid, reason = _validate_safetensors(str(out_path))
+        if not valid:
+            print(f"⚠ Downloaded file is not valid safetensors: {reason}")
+            if out_path.exists():
+                out_path.unlink()
+            return {"error": f"Downloaded file is not valid: {reason}. You may need a CivitAI API token."}
+
+        size_mb = out_path.stat().st_size / (1024 * 1024)
+        print(f"✅ Downloaded: {out_path} ({size_mb:.1f}MB)")
         return {"ok": True, "path": str(out_path), "filename": filename}
+    except _http_requests.exceptions.HTTPError as he:
+        if he.response is not None and he.response.status_code == 401:
+            return {"error": "CivitAI returned 401 Unauthorized. Set CIVITAI_API_KEY or enter a valid API token."}
+        return {"error": f"Download failed: HTTP {he.response.status_code if he.response else '?'} — {str(he)}"}
     except Exception as e:
         import traceback; traceback.print_exc()
         # Clean up partial download

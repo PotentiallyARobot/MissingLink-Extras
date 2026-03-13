@@ -138,6 +138,7 @@ async function loraUnload() {
 // ========== LORA BROWSER INTEGRATION ==========
 // Called when user picks a LoRA from the CivitAI browser modal.
 // Downloads the safetensors via the backend proxy, then loads it.
+let _civitaiToken = '';  // cached for session
 if (typeof loraBrowser !== 'undefined') {
     loraBrowser.onPick = async function(info) {
         const ls = $('loraStatus');
@@ -146,17 +147,22 @@ if (typeof loraBrowser !== 'undefined') {
         $('loraLoadBtn').disabled = true;
         try {
             // Step 1: download from CivitAI via backend proxy
-            const dlResp = await fetch(API + '/api/lora/download_civitai', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    url: info.downloadUrl,
-                    filename: info.filename,
-                    civitai_id: info.civitaiId,
-                    version_id: info.versionId,
-                })
-            });
-            const dlData = await dlResp.json();
+            let dlData = await _civitaiDownload(info, _civitaiToken);
+
+            // If it failed due to auth, prompt for token and retry
+            if (dlData.error && (dlData.error.includes('token') || dlData.error.includes('401') || dlData.error.includes('HTML'))) {
+                const token = prompt(
+                    'CivitAI API token required.\n\n' +
+                    'Get one at: https://civitai.com/user/account (API Keys section)\n\n' +
+                    'Paste your token (or set CIVITAI_API_KEY env var before launching):',
+                    _civitaiToken || ''
+                );
+                if (!token) throw new Error('Download cancelled — no API token provided');
+                _civitaiToken = token.trim();
+                ls.textContent = '⏳ Retrying download with token...';
+                dlData = await _civitaiDownload(info, _civitaiToken);
+            }
+
             if (dlData.error) throw new Error(dlData.error);
 
             // Step 2: load the downloaded LoRA
@@ -187,6 +193,21 @@ if (typeof loraBrowser !== 'undefined') {
             $('loraLoadBtn').disabled = false;
         }
     };
+}
+
+async function _civitaiDownload(info, token) {
+    const resp = await fetch(API + '/api/lora/download_civitai', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            url: info.downloadUrl,
+            filename: info.filename,
+            civitai_id: info.civitaiId,
+            version_id: info.versionId,
+            token: token || '',
+        })
+    });
+    return await resp.json();
 }
 
 // ========== IMAGE SLOTS ==========
