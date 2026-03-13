@@ -730,6 +730,82 @@ async def api_lora_unload():
 async def api_lora_status():
     return {**lora_state}
 
+# ---- CivitAI LoRA download ----
+import requests as _http_requests
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+
+CIVITAI_LORA_DIR = Path(__file__).parent / "civitai_loras"
+CIVITAI_LORA_DIR.mkdir(parents=True, exist_ok=True)
+
+@app.post("/api/lora/download_civitai")
+async def api_download_civitai(request: Request):
+    """Download a LoRA from CivitAI and return the local path."""
+    body = await request.json()
+    url = body.get("url", "")
+    filename = body.get("filename", "")
+    if not url:
+        return {"error": "Missing download URL"}
+
+    # Sanitise filename
+    if not filename:
+        filename = f"civitai_lora_{body.get('civitai_id', 'unknown')}.safetensors"
+    filename = filename.replace("/", "_").replace("\\", "_")
+
+    out_path = CIVITAI_LORA_DIR / filename
+
+    # Skip download if already exists
+    if out_path.exists() and out_path.stat().st_size > 1024:
+        print(f"📦 CivitAI LoRA already cached: {out_path}")
+        return {"ok": True, "path": str(out_path), "filename": filename, "cached": True}
+
+    # Append API token if available
+    token = os.environ.get("CIVITAI_API_KEY", "")
+    if token:
+        parts = urlparse(url)
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        query["token"] = token
+        url = urlunparse((parts.scheme, parts.netloc, parts.path,
+                          parts.params, urlencode(query), parts.fragment))
+
+    try:
+        print(f"⬇ Downloading CivitAI LoRA: {filename}")
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://civitai.com/",
+            "Accept": "*/*",
+        }
+        with _http_requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=120) as r:
+            r.raise_for_status()
+            # Resolve filename from content-disposition if needed
+            cd = r.headers.get("content-disposition", "")
+            if "filename=" in cd and filename.startswith("civitai_lora_"):
+                fname = cd.split("filename=")[-1].strip().strip('"')
+                if fname:
+                    filename = fname.replace("/", "_").replace("\\", "_")
+                    out_path = CIVITAI_LORA_DIR / filename
+
+            total = int(r.headers.get("content-length", 0))
+            downloaded = 0
+            with open(str(out_path), "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            pct = int(downloaded / total * 100)
+                            if pct % 20 == 0:
+                                print(f"  ⬇ {pct}% ({downloaded // (1024*1024)}MB / {total // (1024*1024)}MB)")
+
+        print(f"✅ Downloaded: {out_path} ({out_path.stat().st_size // (1024*1024)}MB)")
+        return {"ok": True, "path": str(out_path), "filename": filename}
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        # Clean up partial download
+        if out_path.exists():
+            try: out_path.unlink()
+            except: pass
+        return {"error": f"Download failed: {str(e)}"}
+
 # ---- Log endpoints ----
 @app.get("/api/logs")
 async def api_logs(after: int = 0):
@@ -1021,3 +1097,4 @@ def launch():
 
 if __name__ == "__main__":
     launch()
+
