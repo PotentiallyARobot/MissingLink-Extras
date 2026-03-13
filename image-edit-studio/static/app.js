@@ -275,10 +275,10 @@ async function gen() {
     const imgs = {}; S.forEach((s, i) => { if (s.du) imgs[String(i)] = s.du });
     const params = {
         images: imgs, prompt: p, negative_prompt: $('neg').value.trim(),
-        true_cfg_scale: parseFloat($('cfg').value), guidance_scale: parseFloat($('gs').value),
+        true_cfg_scale: parseFloat($('cfg').value),
         num_inference_steps: parseInt($('steps').value), num_images_per_prompt: parseInt($('batch').value),
-        width: parseInt($('w').value) || null, height: parseInt($('h').value) || null,
-        seed: parseInt($('seed').value), max_sequence_length: parseInt($('msl').value) || null,
+        width: parseInt($('w').value) || 512, height: parseInt($('h').value) || 512,
+        seed: parseInt($('seed').value),
         mask: maskDU || null, mask_blur: parseInt($('maskBlur').value) || 0
     };
     genAC = new AbortController(); setG(1);

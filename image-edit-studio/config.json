@@ -1,40 +1,35 @@
 {
-    "_comment": "🎨 AI Image Edit Studio — Model Configuration",
-    "_comment2": "Edit these values to swap models. Restart runtime after changes.",
+    "_comment": "🎨 AI Image Edit Studio — GGUF Model Configuration",
+    "_comment2": "Uses stable_diffusion_cpp with GGUF quantized models.",
 
-    "transformer_repo": "QuantFunc/Nunchaku-Qwen-Image-EDIT-2511",
-    "transformer_rank": 256,
-    "transformer_filename_pattern": "nunchaku_qwen_image_edit_2511_{variant}_{precision}.safetensors",
-    "transformer_class": "nunchaku.NunchakuQwenImageTransformer2DModel",
+    "backend": "gguf",
 
-    "pipeline_repo": "Qwen/Qwen-Image-Edit-2511",
-    "pipeline_class": "diffusers.QwenImageEditPlusPipeline",
-
-    "scheduler_class": "diffusers.FlowMatchEulerDiscreteScheduler",
-    "scheduler_config": {
-        "base_image_seq_len": 256,
-        "base_shift": "log3",
-        "invert_sigmas": false,
-        "max_image_seq_len": 8192,
-        "max_shift": "log3",
-        "num_train_timesteps": 1000,
-        "shift": 1.0,
-        "shift_terminal": null,
-        "stochastic_sampling": false,
-        "time_shift_type": "exponential",
-        "use_beta_sigmas": false,
-        "use_dynamic_shifting": true,
-        "use_exponential_sigmas": false,
-        "use_karras_sigmas": false
+    "diffusion_model": {
+        "repo_id": "unsloth/Qwen-Image-Edit-2511-GGUF",
+        "filename": "qwen-image-edit-2511-Q4_K_M.gguf"
     },
 
-    "torch_dtype": "bfloat16",
-    "enable_cpu_offload": true,
-    "hf_cache_dir": "/root/.cache/huggingface",
+    "llm_model": {
+        "repo_id": "unsloth/Qwen2.5-VL-7B-Instruct-GGUF",
+        "filename": "Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf"
+    },
 
-    "rank_variants": {
-        "32": "ultimate_speed",
-        "128": "balance",
-        "256": "best_quality"
+    "vae_model": {
+        "repo_id": "Comfy-Org/Qwen-Image_ComfyUI",
+        "filename": "split_files/vae/qwen_image_vae.safetensors"
+    },
+
+    "offload_params_to_cpu": true,
+    "diffusion_flash_attn": true,
+
+    "lora_model_dir": "/content/loras",
+
+    "default_settings": {
+        "sample_steps": 25,
+        "cfg_scale": 4.0,
+        "width": 512,
+        "height": 512,
+        "seed": -1,
+        "batch_count": 1
     }
 }

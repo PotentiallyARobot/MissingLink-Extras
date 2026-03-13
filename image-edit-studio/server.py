@@ -1,5 +1,5 @@
 """
-server.py — Qwen Image Edit backend for Colab
+server.py — Qwen Image Edit backend (GGUF / stable_diffusion_cpp)
 Run: python server.py
 """
 
@@ -7,7 +7,6 @@ import io, os, sys, json, math, uuid, time, base64, subprocess
 import threading, asyncio, queue
 from pathlib import Path
 from PIL import Image, ImageFilter
-import torch
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -59,8 +58,8 @@ sys.stdout = LogCapture(sys.__stdout__, "stdout")
 sys.stderr = LogCapture(sys.__stderr__, "stderr")
 
 # ---- State ----
-status = {"status": "loading", "detail": "Starting...", "step": 0, "total": 5, "ready": False, "gpu": "", "model": "Qwen-Image-Edit-2511"}
-pipeline = None
+status = {"status": "loading", "detail": "Starting...", "step": 0, "total": 4, "ready": False, "gpu": "", "model": "Qwen-Image-Edit-2511-GGUF"}
+sd_model = None  # StableDiffusion instance
 history = []
 gpu_sem = threading.Semaphore(1)
 wait_list_lock = threading.Lock()
@@ -87,7 +86,65 @@ def b64_to_img(data):
     if data.startswith("data:"): _, data = data.split(",", 1)
     return Image.open(io.BytesIO(base64.b64decode(data))).convert("RGB")
 
+# ---- Config loading ----
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+def _load_config():
+    defaults = {
+        "backend": "gguf",
+        "diffusion_model": {
+            "repo_id": "unsloth/Qwen-Image-Edit-2511-GGUF",
+            "filename": "qwen-image-edit-2511-Q4_K_M.gguf",
+        },
+        "llm_model": {
+            "repo_id": "unsloth/Qwen2.5-VL-7B-Instruct-GGUF",
+            "filename": "Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf",
+        },
+        "vae_model": {
+            "repo_id": "Comfy-Org/Qwen-Image_ComfyUI",
+            "filename": "split_files/vae/qwen_image_vae.safetensors",
+        },
+        "offload_params_to_cpu": True,
+        "diffusion_flash_attn": True,
+        "lora_model_dir": "/content/loras",
+        "default_settings": {
+            "sample_steps": 25,
+            "cfg_scale": 4.0,
+            "width": 512,
+            "height": 512,
+            "seed": -1,
+            "batch_count": 1,
+        },
+    }
+    cfg = dict(defaults)
+    if os.path.isfile(_CONFIG_PATH):
+        try:
+            with open(_CONFIG_PATH) as f:
+                file_cfg = json.load(f)
+            # Deep merge for nested dicts
+            for k, v in file_cfg.items():
+                if k.startswith("_"):
+                    continue
+                if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+                    cfg[k].update(v)
+                else:
+                    cfg[k] = v
+            print(f"📄 Config loaded from {_CONFIG_PATH}")
+        except Exception as e:
+            print(f"⚠ Failed to read {_CONFIG_PATH}: {e} — using defaults")
+    return cfg
+
+MODEL_CONFIG = _load_config()
+
 # ---- Generation ----
+def _save_temp_image(img):
+    """Save a PIL image to a temp file and return the path."""
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    img.save(path, format="PNG")
+    return path
+
 def run_generation_blocking(job_id, body, images, event_q):
     with wait_list_lock: wait_list.append(job_id)
     try:
@@ -97,85 +154,103 @@ def run_generation_blocking(job_id, body, images, event_q):
             pos = get_queue_position(job_id)
             if pos > 0: event_q.put({"type": "queue", "position": pos, "queue_length": get_queue_length()})
         try:
-            if not pipeline or not status["ready"]:
+            if not sd_model or not status["ready"]:
                 event_q.put({"type": "error", "error": "Model still loading."}); return
+
+            prompt = body.get("prompt", "")
+            neg_prompt = body.get("negative_prompt", "")
             steps = body.get("num_inference_steps", 25)
-            cfg = body.get("true_cfg_scale", 4.0)
-            pk = {
-                "image": images if len(images) > 1 else images[0],
-                "prompt": body.get("prompt", ""),
-                "num_inference_steps": steps,
-                "true_cfg_scale": cfg,
-                "num_images_per_prompt": body.get("num_images_per_prompt", 1),
-            }
-            if body.get("negative_prompt"): pk["negative_prompt"] = body["negative_prompt"]
-            gs = body.get("guidance_scale")
-            if gs is not None: pk["guidance_scale"] = gs
-            # Always pass max_sequence_length — older diffusers versions
-            # fail with "max_txt_seq_len must be provided" if omitted.
-            msl = body.get("max_sequence_length") or 512
-            pk["max_sequence_length"] = int(msl)
-            w = body.get("width"); hv = body.get("height")
-            if w and hv: pk["width"] = int(w); pk["height"] = int(hv)
+            cfg_scale = body.get("true_cfg_scale", 4.0)
+            batch = body.get("num_images_per_prompt", 1)
+            w = body.get("width") or 512
+            h = body.get("height") or 512
             seed = body.get("seed", -1)
-            if seed is not None and int(seed) >= 0:
-                pk["generator"] = torch.Generator("cpu").manual_seed(int(seed))
+            if seed is None or int(seed) < 0:
+                import random
+                seed = random.randint(0, 2**31 - 1)
+
+            # stable_diffusion_cpp needs file paths for ref images
+            ref_paths = []
+            for img in images:
+                ref_paths.append(_save_temp_image(img))
 
             total_steps = steps
-            if cfg > 1.0 and body.get("negative_prompt"): total_steps = steps * 2
-
             gen_start = time.time()
 
-            def step_cb(po, si, ts, ck):
-                el = time.time() - gen_start
-                ps = round(el / (si + 1), 2)
-                rem = round(ps * (total_steps - si - 1), 1)
-                prog = min(99, int((si + 1) / total_steps * 100))
-                event_q.put({"type": "progress", "step": si + 1, "total": total_steps, "progress": prog, "per_step": ps, "remaining": rem})
-                return ck
-
-            pk["callback_on_step_end"] = step_cb
+            # Send initial progress
             event_q.put({"type": "progress", "step": 0, "total": total_steps, "progress": 0, "per_step": "?", "remaining": 0})
 
-            print(f"🎨 Generating: steps={steps}, cfg={cfg}, batch={pk.get('num_images_per_prompt',1)}, max_seq_len={msl}")
-            result = pipeline(**pk)
-            out_images = result.images
+            print(f"🎨 Generating: steps={steps}, cfg={cfg_scale}, batch={batch}, seed={seed}, size={w}x{h}")
 
+            all_outputs = []
+            for bi in range(batch):
+                cur_seed = seed + bi
+
+                try:
+                    gen_kwargs = dict(
+                        prompt=prompt,
+                        ref_images=ref_paths,
+                        sample_steps=int(steps),
+                        cfg_scale=float(cfg_scale),
+                        width=int(w),
+                        height=int(h),
+                        seed=int(cur_seed),
+                    )
+                    # Only pass negative_prompt if non-empty
+                    if neg_prompt:
+                        gen_kwargs["negative_prompt"] = neg_prompt
+
+                    result_images = sd_model.generate_image(**gen_kwargs)
+
+                    if result_images:
+                        for ri in result_images:
+                            all_outputs.append(ri)
+                except Exception as gen_err:
+                    print(f"⚠ Batch {bi+1} error: {gen_err}")
+                    import traceback; traceback.print_exc()
+
+                # Update progress per batch item
+                prog = min(99, int((bi + 1) / batch * 100))
+                el = time.time() - gen_start
+                ps = round(el / (bi + 1), 2)
+                rem = round(ps * (batch - bi - 1), 1)
+                event_q.put({"type": "progress", "step": bi + 1, "total": batch, "progress": prog, "per_step": ps, "remaining": rem})
+
+            # Cleanup temp files
+            for p in ref_paths:
+                try: os.unlink(p)
+                except: pass
+
+            if not all_outputs:
+                event_q.put({"type": "error", "error": "No images generated. Check console for details."})
+                return
+
+            # Apply mask compositing if provided
             mask_b64 = body.get("mask")
             if mask_b64:
                 mi = b64_to_img(mask_b64).convert("L")
                 mb = int(body.get("mask_blur", 0))
                 if mb > 0: mi = mi.filter(ImageFilter.GaussianBlur(radius=mb))
                 orig = images[0]; comp = []
-                for oi in out_images:
+                for oi in all_outputs:
                     or2 = orig.resize(oi.size, Image.LANCZOS) if orig.size != oi.size else orig
                     comp.append(Image.composite(oi, or2, mi.resize(oi.size, Image.LANCZOS)))
-                out_images = comp
+                all_outputs = comp
 
-            ob = [img_to_b64(i) for i in out_images]
-            entry = {"id": str(uuid.uuid4()), "ts": int(time.time()), "prompt": body.get("prompt", ""), "outputs": ob, "input_images": [img_to_b64(i) for i in images[:1]]}
+            ob = [img_to_b64(i) for i in all_outputs]
+            entry = {"id": str(uuid.uuid4()), "ts": int(time.time()), "prompt": prompt, "outputs": ob, "input_images": [img_to_b64(i) for i in images[:1]]}
             history.insert(0, entry)
             if len(history) > 50: history[:] = history[:50]
             et = round(time.time() - gen_start, 1)
-            print(f"✅ Done in {et}s")
+            print(f"✅ Done in {et}s — {len(all_outputs)} image(s)")
             event_q.put({"type": "done", "progress": 100, "results": ob, "history_entry": entry, "elapsed": et})
 
         except Exception as e:
             import traceback; traceback.print_exc()
-            # ── VRAM cleanup: if generation crashes mid-forward,
-            #    modules may be stuck on GPU causing OOM on next try ──
             import gc
             try:
-                if pipeline is not None and hasattr(pipeline, '_all_hooks'):
-                    # Trigger CPU offload hooks to move everything off GPU
-                    for hook in pipeline._all_hooks:
-                        if hasattr(hook, 'offload'):
-                            try: hook.offload()
-                            except Exception: pass
-                torch.cuda.empty_cache()
                 gc.collect()
-                torch.cuda.empty_cache()
-                print("🧹 GPU memory cleaned up after error")
+                print("🧹 Cleaned up after error")
             except Exception as ce:
                 print(f"⚠ Cleanup warning: {ce}")
             event_q.put({"type": "error", "error": str(e)})
@@ -187,202 +262,94 @@ def run_generation_blocking(job_id, body, images, event_q):
         event_q.put(None)
 
 # ---- Model loading ----
-# All model/class names are read from config.json next to this file.
-# Edit config.json (or the copy in launch.py) to change models without
-# touching server code.
-import json as _json
-
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-
-def _load_config():
-    """Load config.json, falling back to env vars, then defaults."""
-    defaults = {
-        "transformer_repo": "QuantFunc/Nunchaku-Qwen-Image-EDIT-2511",
-        "transformer_rank": 256,
-        "transformer_filename_pattern": "nunchaku_qwen_image_edit_2511_{variant}_{precision}.safetensors",
-        "transformer_class": "nunchaku.NunchakuQwenImageTransformer2DModel",
-        "pipeline_repo": "Qwen/Qwen-Image-Edit-2511",
-        "pipeline_class": "diffusers.QwenImageEditPlusPipeline",
-        "scheduler_class": "diffusers.FlowMatchEulerDiscreteScheduler",
-        "scheduler_config": {
-            "base_image_seq_len": 256,
-            "base_shift": "log3",
-            "invert_sigmas": False,
-            "max_image_seq_len": 8192,
-            "max_shift": "log3",
-            "num_train_timesteps": 1000,
-            "shift": 1.0,
-            "shift_terminal": None,
-            "stochastic_sampling": False,
-            "time_shift_type": "exponential",
-            "use_beta_sigmas": False,
-            "use_dynamic_shifting": True,
-            "use_exponential_sigmas": False,
-            "use_karras_sigmas": False,
-        },
-        "torch_dtype": "bfloat16",
-        "enable_cpu_offload": True,
-        "hf_cache_dir": "/root/.cache/huggingface",
-        "rank_variants": {
-            "32": "ultimate_speed",
-            "128": "balance",
-            "256": "best_quality"
-        },
-    }
-    cfg = dict(defaults)
-    # Layer 1: config.json on disk
-    if os.path.isfile(_CONFIG_PATH):
-        try:
-            with open(_CONFIG_PATH) as f:
-                file_cfg = _json.load(f)
-            cfg.update(file_cfg)
-            print(f"📄 Config loaded from {_CONFIG_PATH}")
-        except Exception as e:
-            print(f"⚠ Failed to read {_CONFIG_PATH}: {e} — using defaults")
-    # Layer 2: env var overrides (for backward compat)
-    env_map = {
-        "MLE_TRANSFORMER_REPO": "transformer_repo",
-        "MLE_TRANSFORMER_RANK": "transformer_rank",
-        "MLE_PIPELINE_REPO": "pipeline_repo",
-        "MLE_PIPELINE_CLASS": "pipeline_class",
-        "MLE_TRANSFORMER_CLASS": "transformer_class",
-        "MLE_SCHEDULER_CLASS": "scheduler_class",
-        "MLE_TORCH_DTYPE": "torch_dtype",
-        "HF_HOME": "hf_cache_dir",
-    }
-    for env_key, cfg_key in env_map.items():
-        v = os.environ.get(env_key)
-        if v is not None:
-            if cfg_key == "transformer_rank":
-                cfg[cfg_key] = int(v)
-            elif cfg_key == "enable_cpu_offload":
-                cfg[cfg_key] = v.lower() in ("1", "true", "yes")
-            else:
-                cfg[cfg_key] = v
-    return cfg
-
-MODEL_CONFIG = _load_config()
-
-def _import_class(dotted_path):
-    """Import 'package.module.ClassName' and return the class."""
-    parts = dotted_path.rsplit(".", 1)
-    if len(parts) == 2:
-        mod = __import__(parts[0], fromlist=[parts[1]])
-        return getattr(mod, parts[1])
-    raise ImportError(f"Cannot parse class path: {dotted_path}")
-
 def load_model():
-    global pipeline
+    global sd_model
     cfg = MODEL_CONFIG
 
     t0 = time.time()
-    cache_dir = cfg["hf_cache_dir"]
     try:
         go = subprocess.check_output(["nvidia-smi", "--query-gpu=name,memory.total,driver_version,compute_cap", "--format=csv,noheader,nounits"], text=True).strip()
         status["gpu"] = go; print(f"🖥️  GPU: {go}")
-        print(f"🖥️  CUDA: {torch.version.cuda}, PyTorch: {torch.__version__}, VRAM: {torch.cuda.get_device_properties(0).total_mem/1024**3:.1f} GB")
     except Exception as e: print(f"⚠️  GPU info: {e}")
 
     try:
-        # ── Transformer ──
-        status.update({"status": "loading", "step": 1, "detail": "Loading quantized transformer..."})
-        TransformerClass = _import_class(cfg["transformer_class"])
-        from nunchaku.utils import get_precision
-        precision = get_precision()
-        if "int4" in precision: precision = "int4"
-        elif "fp4" in precision: precision = "fp4"
-        rank = int(cfg["transformer_rank"])
-        variant = cfg["rank_variants"].get(str(rank), "balance")
-        filename = cfg["transformer_filename_pattern"].format(variant=variant, precision=precision)
-        hfp = f"{cfg['transformer_repo']}/{filename}"
-        print(f"Loading transformer: {hfp}")
-        transformer = TransformerClass.from_pretrained(hfp)
+        from huggingface_hub import hf_hub_download
 
-        # ── Scheduler ──
-        status.update({"step": 2, "detail": "Building scheduler..."})
-        SchedulerClass = _import_class(cfg["scheduler_class"])
-        sched_cfg = dict(cfg["scheduler_config"])
-        # Resolve special values
-        for k, v in sched_cfg.items():
-            if v == "log3":
-                sched_cfg[k] = math.log(3)
-        scheduler = SchedulerClass.from_config(sched_cfg)
+        # ── Step 1: Download diffusion model ──
+        diff_cfg = cfg["diffusion_model"]
+        status.update({"status": "loading", "step": 1, "detail": f"Downloading {diff_cfg['filename']}..."})
+        print(f"⬇ Downloading diffusion model: {diff_cfg['repo_id']}/{diff_cfg['filename']}")
+        diff_path = hf_hub_download(repo_id=diff_cfg["repo_id"], filename=diff_cfg["filename"])
+        print(f"  ✓ {diff_path}")
 
-        # ── Pipeline (text encoder + VAE + tokenizer) ──
-        status.update({"step": 3, "detail": "Loading text encoder + VAE..."})
-        PipelineClass = _import_class(cfg["pipeline_class"])
-        dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
-        torch_dtype = dtype_map.get(cfg["torch_dtype"], torch.bfloat16)
-        print(f"Loading pipeline: {cfg['pipeline_repo']}")
-        pipeline = PipelineClass.from_pretrained(
-            cfg["pipeline_repo"], transformer=transformer, scheduler=scheduler,
-            torch_dtype=torch_dtype, cache_dir=cache_dir,
+        # ── Step 2: Download LLM text encoder ──
+        llm_cfg = cfg["llm_model"]
+        status.update({"step": 2, "detail": f"Downloading {llm_cfg['filename']}..."})
+        print(f"⬇ Downloading LLM: {llm_cfg['repo_id']}/{llm_cfg['filename']}")
+        llm_path = hf_hub_download(repo_id=llm_cfg["repo_id"], filename=llm_cfg["filename"])
+        print(f"  ✓ {llm_path}")
+
+        # ── Step 3: Download VAE ──
+        vae_cfg = cfg["vae_model"]
+        status.update({"step": 3, "detail": f"Downloading VAE..."})
+        print(f"⬇ Downloading VAE: {vae_cfg['repo_id']}/{vae_cfg['filename']}")
+        vae_path = hf_hub_download(repo_id=vae_cfg["repo_id"], filename=vae_cfg["filename"])
+        print(f"  ✓ {vae_path}")
+
+        # ── Step 4: Initialize stable_diffusion_cpp ──
+        status.update({"step": 4, "detail": "Loading model into GPU..."})
+
+        # Ensure LoRA directory exists
+        lora_dir = cfg.get("lora_model_dir", "/content/loras")
+        os.makedirs(lora_dir, exist_ok=True)
+
+        from stable_diffusion_cpp import StableDiffusion
+
+        print(f"🔧 Initializing StableDiffusion...")
+        print(f"   diffusion_model: {diff_path}")
+        print(f"   llm_path:        {llm_path}")
+        print(f"   vae_path:        {vae_path}")
+        print(f"   lora_dir:        {lora_dir}")
+
+        sd_model = StableDiffusion(
+            diffusion_model_path=diff_path,
+            llm_path=llm_path,
+            vae_path=vae_path,
+            lora_model_dir=lora_dir,
+            offload_params_to_cpu=cfg.get("offload_params_to_cpu", True),
+            diffusion_flash_attn=cfg.get("diffusion_flash_attn", True),
         )
 
-        # ── GPU setup ──
-        status.update({"step": 4, "detail": "Enabling CPU offload..."})
-        if cfg.get("enable_cpu_offload", True):
-            pipeline.enable_model_cpu_offload()
-        else:
-            pipeline.to("cuda")
-
-        # ── Patch: ensure max_sequence_length → max_txt_seq_len ──
-        # Older diffusers (< 0.37.0) don't pass max_txt_seq_len to the
-        # transformer, causing "max_txt_seq_len must be provided" with
-        # nunchaku models.  This wraps the transformer forward to inject
-        # it automatically from prompt_embeds shape when missing.
-        _orig_transformer_forward = pipeline.transformer.forward
-        def _patched_transformer_forward(*args, **kwargs):
-            if 'max_txt_seq_len' not in kwargs and 'txt_seq_lens' not in kwargs:
-                # Infer from encoder_hidden_states shape if available
-                ehs = kwargs.get('encoder_hidden_states') or (args[1] if len(args) > 1 else None)
-                if ehs is not None and hasattr(ehs, 'shape') and len(ehs.shape) >= 2:
-                    kwargs['max_txt_seq_len'] = ehs.shape[1]
-                else:
-                    kwargs['max_txt_seq_len'] = 512  # safe default
-            return _orig_transformer_forward(*args, **kwargs)
-
-        if hasattr(pipeline.transformer, '_old_forward'):
-            # accelerate hook wraps forward; patch the underlying one
-            pipeline.transformer._old_forward = _patched_transformer_forward
-            print("🩹 Patched transformer._old_forward for max_txt_seq_len")
-        else:
-            pipeline.transformer.forward = _patched_transformer_forward
-            print("🩹 Patched transformer.forward for max_txt_seq_len")
-
-        status.update({"step": 5, "detail": "Finalizing..."})
         el = round(time.time() - t0, 1)
-        print(f"✅ Pipeline ready ({el}s)")
-        status.update({"status": "ready", "step": 5, "detail": f"Ready ({el}s startup)", "ready": True})
+        print(f"✅ Model ready ({el}s)")
+        status.update({"status": "ready", "step": 4, "detail": f"Ready ({el}s startup)", "ready": True})
     except Exception as e:
         import traceback; traceback.print_exc()
         status.update({"status": "error", "detail": f"Load failed: {str(e)}"})
 
 # ---- LoRA management ----
+# stable_diffusion_cpp handles LoRAs via the <lora:name:weight> tag in prompts
+# AND by placing .safetensors files in the lora_model_dir.
+# So loading = download the file into lora_dir, unloading = delete it.
 
-def _is_nunchaku_transformer():
-    """Check if the pipeline transformer is a Nunchaku quantized model."""
-    if not pipeline:
-        return False
-    transformer = getattr(pipeline, "transformer", None)
-    if transformer is None:
-        return False
-    cls_name = type(transformer).__name__
-    return "Nunchaku" in cls_name
+def _resolve_lora_path(repo):
+    """Download or locate a LoRA safetensors file and place it in lora_dir."""
+    from huggingface_hub import hf_hub_download, list_repo_files
 
-def _nunchaku_load_lora(repo, scale):
-    """Load a LoRA using Nunchaku's native _lora_slots / compose_loras_v2 mechanism."""
-    from safetensors.torch import load_file
-    from huggingface_hub import hf_hub_download
-    import re
+    lora_dir = MODEL_CONFIG.get("lora_model_dir", "/content/loras")
+    os.makedirs(lora_dir, exist_ok=True)
 
-    transformer = pipeline.transformer
-
-    # ── 1) Resolve repo to a local safetensors path ──
     if os.path.isfile(repo):
-        lora_path = repo
-    elif "/" in repo and repo.endswith(".safetensors"):
-        # e.g. "user/repo/file.safetensors"
+        # Already a local file — symlink/copy into lora_dir
+        fname = os.path.basename(repo)
+        dest = os.path.join(lora_dir, fname)
+        if not os.path.exists(dest):
+            import shutil
+            shutil.copy2(repo, dest)
+        return dest, os.path.splitext(fname)[0]
+
+    if repo.endswith(".safetensors") and "/" in repo:
+        # "user/repo/path/to/file.safetensors"
         parts = repo.split("/")
         if len(parts) >= 3:
             hf_repo = "/".join(parts[:2])
@@ -390,186 +357,52 @@ def _nunchaku_load_lora(repo, scale):
         else:
             hf_repo = repo
             filename = None
-        lora_path = hf_hub_download(repo_id=hf_repo, filename=filename)
-    else:
-        # Bare HF repo — try to find a .safetensors file
-        from huggingface_hub import list_repo_files
-        files = list_repo_files(repo)
-        st_files = [f for f in files if f.endswith(".safetensors")]
-        if not st_files:
-            raise RuntimeError(f"No .safetensors file found in {repo}")
-        # Prefer files with 'lora' in the name, else take the first
-        pick = next((f for f in st_files if "lora" in f.lower()), st_files[0])
-        print(f"  → Auto-selected LoRA file: {pick}")
-        lora_path = hf_hub_download(repo_id=repo, filename=pick)
+        path = hf_hub_download(repo_id=hf_repo, filename=filename, local_dir=lora_dir)
+        name = os.path.splitext(os.path.basename(path))[0]
+        return path, name
 
-    print(f"  → Loading safetensors: {lora_path}")
-    lora_sd = load_file(lora_path)
-
-    # ── 2) Try Nunchaku's built-in compose_loras_v2 (used by ComfyUI loaders) ──
-    try:
-        from nunchaku.lora.compose import compose_loras_v2, reset_lora_v2
-        print("  → Using compose_loras_v2 (nunchaku.lora.compose)")
-        reset_lora_v2(transformer)
-        compose_loras_v2(transformer, [(lora_sd, scale)])
-        return
-    except ImportError:
-        pass
-
-    # ── 3) Try alternate import paths for compose_loras_v2 ──
-    for mod_path in [
-        "nunchaku.lora.qwen.compose",
-        "nunchaku.lora.qwenimage.compose",
-    ]:
-        try:
-            mod = __import__(mod_path, fromlist=["compose_loras_v2", "reset_lora_v2"])
-            compose_fn = getattr(mod, "compose_loras_v2")
-            reset_fn = getattr(mod, "reset_lora_v2")
-            print(f"  → Using compose_loras_v2 from {mod_path}")
-            reset_fn(transformer)
-            compose_fn(transformer, [(lora_sd, scale)])
-            return
-        except (ImportError, AttributeError):
-            continue
-
-    # ── 4) Try update_lora_params if available (Flux-style, may work on newer nunchaku) ──
-    if hasattr(transformer, "update_lora_params"):
-        print("  → Using transformer.update_lora_params()")
-        transformer.update_lora_params(lora_path)
-        if hasattr(transformer, "set_lora_strength"):
-            transformer.set_lora_strength(scale)
-        return
-
-    # ── 5) Manual _lora_slots injection (last resort, mirrors ComfyUI loader logic) ──
-    has_slots = any(hasattr(m, "_lora_slots") for m in transformer.modules())
-    if has_slots:
-        print("  → Manual _lora_slots injection")
-        _manual_lora_slots_inject(transformer, lora_sd, scale)
-        return
-
-    raise RuntimeError(
-        "Could not find a compatible Nunchaku LoRA loading method. "
-        "Your nunchaku version may not yet support custom LoRA on Qwen-Image-Edit models. "
-        "Check https://github.com/mit-han-lab/nunchaku for updates, or try a non-quantized model."
-    )
-
-def _manual_lora_slots_inject(transformer, lora_sd, scale):
-    """
-    Inject LoRA weights directly into Nunchaku's pre-allocated _lora_slots.
-    This mirrors the approach used by ComfyUI-QwenImageLoraLoader.
-    """
-    import re
-    applied = 0
-    # Build a mapping from module name to module
-    module_map = {name: mod for name, mod in transformer.named_modules()}
-
-    for key, tensor in lora_sd.items():
-        # Typical keys: transformer_blocks.0.attn.to_q.lora_A.weight
-        # We need to find the parent module and check for _lora_slots
-        parts = key.split(".")
-        # Find lora_A or lora_B
-        lora_idx = None
-        for i, p in enumerate(parts):
-            if p in ("lora_A", "lora_B", "lora_down", "lora_up"):
-                lora_idx = i
-                break
-        if lora_idx is None:
-            continue
-
-        parent_path = ".".join(parts[:lora_idx])
-        parent_mod = module_map.get(parent_path)
-        if parent_mod is not None and hasattr(parent_mod, "_lora_slots"):
-            slot = parent_mod._lora_slots
-            lora_type = parts[lora_idx]
-            if "A" in lora_type or "down" in lora_type:
-                slot_key = "lora_down"
-            else:
-                slot_key = "lora_up"
-
-            if hasattr(slot, slot_key):
-                target = getattr(slot, slot_key)
-                if target.shape == tensor.shape:
-                    target.data.copy_(tensor * scale)
-                    applied += 1
-
-    if applied == 0:
-        raise RuntimeError(
-            f"Manual _lora_slots injection matched 0 layers. "
-            f"The LoRA format may be incompatible with this Nunchaku model."
-        )
-    print(f"  → Injected LoRA into {applied} slots")
-
-def _nunchaku_unload_lora():
-    """Unload LoRA from a Nunchaku transformer."""
-    transformer = pipeline.transformer
-
-    # Try reset_lora_v2
-    for mod_path in [
-        "nunchaku.lora.compose",
-        "nunchaku.lora.qwen.compose",
-        "nunchaku.lora.qwenimage.compose",
-    ]:
-        try:
-            mod = __import__(mod_path, fromlist=["reset_lora_v2"])
-            reset_fn = getattr(mod, "reset_lora_v2")
-            reset_fn(transformer)
-            print("✅ LoRA reset via reset_lora_v2")
-            return
-        except (ImportError, AttributeError):
-            continue
-
-    # Try set_lora_strength(0)
-    if hasattr(transformer, "set_lora_strength"):
-        transformer.set_lora_strength(0)
-        print("✅ LoRA strength set to 0")
-        return
-
-    # Manual slot reset
-    for mod in transformer.modules():
-        if hasattr(mod, "_lora_slots"):
-            slot = mod._lora_slots
-            for attr in ("lora_down", "lora_up"):
-                if hasattr(slot, attr):
-                    getattr(slot, attr).data.zero_()
-    print("✅ LoRA slots zeroed out")
+    # Bare HF repo — find a .safetensors file
+    files = list_repo_files(repo)
+    st_files = [f for f in files if f.endswith(".safetensors")]
+    if not st_files:
+        raise RuntimeError(f"No .safetensors file found in {repo}")
+    pick = next((f for f in st_files if "lora" in f.lower()), st_files[0])
+    print(f"  → Auto-selected LoRA file: {pick}")
+    path = hf_hub_download(repo_id=repo, filename=pick, local_dir=lora_dir)
+    name = os.path.splitext(os.path.basename(path))[0]
+    return path, name
 
 
 def _lora_load_thread(repo, scale):
-    global pipeline
+    """Download LoRA into lora_dir. The actual application happens at generation
+    time via <lora:name:scale> in the prompt."""
     with lora_lock:
         lora_state["loading"] = True
         lora_state["error"] = None
     try:
-        if not pipeline or not status["ready"]:
+        if not sd_model or not status["ready"]:
             raise RuntimeError("Model not ready yet")
 
         # Unload existing LoRA first
         if lora_state["loaded"]:
-            print(f"🔄 Unloading existing LoRA: {lora_state['loaded']}")
-            try:
-                if _is_nunchaku_transformer():
-                    _nunchaku_unload_lora()
-                else:
-                    pipeline.unload_lora_weights()
-            except Exception as ue:
-                print(f"⚠️  Unload warning: {ue}")
+            print(f"🔄 Previous LoRA state cleared: {lora_state['loaded']}")
 
         print(f"📦 Loading LoRA: {repo} (scale={scale})")
-
-        if _is_nunchaku_transformer():
-            # Use Nunchaku-native LoRA loading (bypasses PEFT entirely)
-            _nunchaku_load_lora(repo, scale)
-        else:
-            # Standard diffusers/PEFT path for non-quantized models
-            pipeline.load_lora_weights(repo)
-            pipeline.fuse_lora(lora_scale=scale)
-
-        print(f"✅ LoRA loaded: {repo}")
+        path, name = _resolve_lora_path(repo)
+        print(f"  ✓ LoRA ready: {path}")
+        print(f"  ℹ To use: prompt will auto-inject <lora:{name}:{scale}>")
+        print(f"  ⚠ Note: LoRAs may not work with quantized (GGUF) models.")
+        print(f"    If results look wrong, try a full-precision .safetensors base model.")
 
         with lora_lock:
             lora_state["loaded"] = repo
             lora_state["loading"] = False
             lora_state["error"] = None
+            lora_state["_lora_name"] = name
+            lora_state["_lora_path"] = path
+            lora_state["_lora_scale"] = scale
+
+        print(f"✅ LoRA loaded: {repo}")
     except Exception as e:
         import traceback; traceback.print_exc()
         with lora_lock:
@@ -577,37 +410,41 @@ def _lora_load_thread(repo, scale):
             lora_state["error"] = str(e)
 
 def _lora_unload_thread():
-    global pipeline
     with lora_lock:
         lora_state["loading"] = True
         lora_state["error"] = None
     try:
-        if not pipeline:
-            raise RuntimeError("Model not ready")
-        print(f"🔄 Unfusing and unloading LoRA: {lora_state['loaded']}")
-
-        if _is_nunchaku_transformer():
-            _nunchaku_unload_lora()
-        else:
-            try:
-                pipeline.unfuse_lora()
-            except Exception:
-                pass
-            try:
-                pipeline.unload_lora_weights()
-            except Exception:
-                pass
-
-        print("✅ LoRA unloaded")
+        old = lora_state.get("loaded")
+        print(f"🔄 Unloading LoRA: {old}")
         with lora_lock:
             lora_state["loaded"] = None
             lora_state["loading"] = False
             lora_state["error"] = None
+            lora_state.pop("_lora_name", None)
+            lora_state.pop("_lora_path", None)
+            lora_state.pop("_lora_scale", None)
+        print("✅ LoRA unloaded")
     except Exception as e:
         import traceback; traceback.print_exc()
         with lora_lock:
             lora_state["loading"] = False
             lora_state["error"] = str(e)
+
+def _inject_lora_tag(prompt):
+    """If a LoRA is loaded, auto-append <lora:name:scale> to the prompt
+    (unless the user already included a <lora:...> tag)."""
+    with lora_lock:
+        if not lora_state.get("loaded"):
+            return prompt
+        name = lora_state.get("_lora_name", "")
+        scale = lora_state.get("_lora_scale", 1.0)
+    if not name:
+        return prompt
+    # Don't double-inject if user already typed a lora tag
+    if f"<lora:" in prompt:
+        return prompt
+    return f"{prompt} <lora:{name}:{scale}>"
+
 
 # ---- FastAPI ----
 STATIC_DIR = Path(__file__).parent / "static"
@@ -622,7 +459,7 @@ async def serve_ui():
 
 @app.get("/api/health")
 async def health():
-    return {**status, "queue_length": get_queue_length(), "lora": {**lora_state}}
+    return {**status, "queue_length": get_queue_length(), "lora": {k: v for k, v in lora_state.items() if not k.startswith("_")}}
 
 @app.post("/api/generate")
 async def api_generate(request: Request):
@@ -632,26 +469,22 @@ async def api_generate(request: Request):
     if not images:
         async def e(): yield f"data: {json.dumps({'type':'error','error':'Upload at least one image.'})}\n\n"
         return StreamingResponse(e(), media_type="text/event-stream")
-    if not pipeline or not status["ready"]:
+    if not sd_model or not status["ready"]:
         async def e(): yield f"data: {json.dumps({'type':'error','error':'Model still loading.'})}\n\n"
         return StreamingResponse(e(), media_type="text/event-stream")
-    jid = str(uuid.uuid4()); eq = queue.Queue()
 
-    # Store progress in a dict so polling can access it too
+    # Auto-inject LoRA tag into prompt
+    body["prompt"] = _inject_lora_tag(body.get("prompt", ""))
+
+    jid = str(uuid.uuid4()); eq = queue.Queue()
     _gen_progress[jid] = {"type": "progress", "step": 0, "total": 0, "progress": 0}
 
     threading.Thread(target=run_generation_blocking, args=(jid, body, images, eq), daemon=True).start()
 
-    # Colab's proxy buffers SSE streams aggressively. To flush data through,
-    # we pad each event with a comment block so the total chunk exceeds the
-    # proxy's ~4-8KB buffer threshold.  This is invisible to EventSource /
-    # manual SSE parsers (lines starting with ":" are SSE comments).
-    _SSE_PAD = ": " + "x" * 2048 + "\n"  # ~2KB padding comment
+    _SSE_PAD = ": " + "x" * 2048 + "\n"
 
     async def stream():
         lt = time.time()
-        # Send initial padding burst to prime the proxy buffer
-        # Also send job_id so client can start polling fallback
         yield _SSE_PAD + _SSE_PAD + f"data: {json.dumps({'type': 'init', 'job_id': jid})}\n\n"
         while True:
             try: ev = eq.get_nowait()
@@ -661,10 +494,8 @@ async def api_generate(request: Request):
                     lt = time.time()
                 await asyncio.sleep(0.15); continue
             if ev is None:
-                # Store final state for polling fallback
                 _gen_progress[jid] = {"type": "done"}
                 break
-            # Update polling state
             _gen_progress[jid] = ev
             lt = time.time()
             yield _SSE_PAD + f"data: {json.dumps(ev)}\n\n"
@@ -676,7 +507,6 @@ async def api_generate(request: Request):
 async def api_queue():
     ql = get_queue_length(); return {"queue_length": ql, "busy": ql > 0 or not gpu_sem._value}
 
-# ---- Polling fallback for progress (Colab proxy can buffer SSE) ----
 @app.get("/api/gen_progress/{job_id}")
 async def api_gen_progress(job_id: str):
     p = _gen_progress.get(job_id)
@@ -700,8 +530,7 @@ async def api_lora_load(request: Request):
     scale = float(body.get("scale", 1.0))
     if not repo: return {"ok": False, "error": "Missing repo"}
     if lora_state["loading"]: return {"ok": False, "error": "Already loading a LoRA"}
-    if not pipeline or not status["ready"]: return {"ok": False, "error": "Model not ready"}
-    # Acquire GPU sem so we don't load during generation
+    if not sd_model or not status["ready"]: return {"ok": False, "error": "Model not ready"}
     if not gpu_sem.acquire(timeout=0.1):
         return {"ok": False, "error": "GPU busy — wait for generation to finish"}
     try:
@@ -728,35 +557,32 @@ async def api_lora_unload():
 
 @app.get("/api/lora/status")
 async def api_lora_status():
-    return {**lora_state}
+    return {k: v for k, v in lora_state.items() if not k.startswith("_")}
 
 # ---- CivitAI LoRA download ----
 import requests as _http_requests
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
-CIVITAI_LORA_DIR = Path(__file__).parent / "civitai_loras"
+CIVITAI_LORA_DIR = Path(MODEL_CONFIG.get("lora_model_dir", "/content/loras"))
 CIVITAI_LORA_DIR.mkdir(parents=True, exist_ok=True)
 
 def _validate_safetensors(path):
-    """Check if a file looks like a valid safetensors file (not HTML/redirect)."""
+    """Check if a file looks like a valid safetensors file."""
     try:
         with open(path, "rb") as f:
             header = f.read(16)
         if len(header) < 8:
             return False, "File too small"
-        # safetensors starts with an 8-byte little-endian header size
         import struct
         header_size = struct.unpack("<Q", header[:8])[0]
-        # Valid header sizes are typically < 10MB; HTML pages have garbage here
         if header_size > 50_000_000:
-            return False, "Header too large — file is probably not safetensors (HTML redirect page?)"
+            return False, "Header too large — probably not safetensors"
         if header_size == 0:
             return False, "Header size is 0 — corrupt file"
-        # Check if the file starts with HTML
         try:
             text_start = header.decode("utf-8", errors="ignore").lower()
             if "<html" in text_start or "<!doc" in text_start:
-                return False, "File is HTML, not safetensors — CivitAI may require an API token"
+                return False, "File is HTML, not safetensors"
         except Exception:
             pass
         return True, "ok"
@@ -765,7 +591,6 @@ def _validate_safetensors(path):
 
 @app.post("/api/lora/download_civitai")
 async def api_download_civitai(request: Request):
-    """Download a LoRA from CivitAI and return the local path."""
     body = await request.json()
     url = body.get("url", "")
     filename = body.get("filename", "")
@@ -773,14 +598,12 @@ async def api_download_civitai(request: Request):
     if not url:
         return {"error": "Missing download URL"}
 
-    # Sanitise filename
     if not filename:
         filename = f"civitai_lora_{body.get('civitai_id', 'unknown')}.safetensors"
     filename = filename.replace("/", "_").replace("\\", "_")
 
     out_path = CIVITAI_LORA_DIR / filename
 
-    # Check if cached file exists AND is valid
     if out_path.exists():
         if out_path.stat().st_size > 1024:
             valid, reason = _validate_safetensors(str(out_path))
@@ -793,7 +616,6 @@ async def api_download_civitai(request: Request):
         else:
             out_path.unlink()
 
-    # Resolve API token: explicit param > env var
     token = token.strip() if token else os.environ.get("CIVITAI_API_KEY", "")
     if token:
         parts = urlparse(url)
@@ -811,20 +633,15 @@ async def api_download_civitai(request: Request):
         }
         with _http_requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=120) as r:
             r.raise_for_status()
-
-            # Check content-type — if HTML, it's a redirect/auth page
             ct = r.headers.get("content-type", "")
             if "text/html" in ct.lower():
-                return {"error": "CivitAI returned an HTML page instead of a file. You likely need a CivitAI API token. Set CIVITAI_API_KEY environment variable or enter your token when prompted."}
-
-            # Resolve filename from content-disposition if needed
+                return {"error": "CivitAI returned HTML — you likely need a CivitAI API token."}
             cd = r.headers.get("content-disposition", "")
             if "filename=" in cd:
                 fname = cd.split("filename=")[-1].strip().strip('"')
                 if fname:
                     filename = fname.replace("/", "_").replace("\\", "_")
                     out_path = CIVITAI_LORA_DIR / filename
-
             total = int(r.headers.get("content-length", 0))
             downloaded = 0
             with open(str(out_path), "wb") as f:
@@ -837,7 +654,6 @@ async def api_download_civitai(request: Request):
                             if pct % 20 == 0:
                                 print(f"  ⬇ {pct}% ({downloaded // (1024*1024)}MB / {total // (1024*1024)}MB)")
 
-        # Validate the downloaded file
         valid, reason = _validate_safetensors(str(out_path))
         if not valid:
             print(f"⚠ Downloaded file is not valid safetensors: {reason}")
@@ -850,11 +666,10 @@ async def api_download_civitai(request: Request):
         return {"ok": True, "path": str(out_path), "filename": filename}
     except _http_requests.exceptions.HTTPError as he:
         if he.response is not None and he.response.status_code == 401:
-            return {"error": "CivitAI returned 401 Unauthorized. Set CIVITAI_API_KEY or enter a valid API token."}
+            return {"error": "CivitAI returned 401 Unauthorized."}
         return {"error": f"Download failed: HTTP {he.response.status_code if he.response else '?'} — {str(he)}"}
     except Exception as e:
         import traceback; traceback.print_exc()
-        # Clean up partial download
         if out_path.exists():
             try: out_path.unlink()
             except: pass
@@ -874,19 +689,9 @@ async def api_logs_clear():
     return {"ok": True}
 
 # ---- Launch ----
-# ══════════════════════════════════════════════════════════════
-# Robust 3-tier Colab launch (health-checked, with fallbacks)
-#
-#   Tier 1: proxyPort URL → verified new-tab link
-#   Tier 2: serve_kernel_port_as_iframe → embedded in cell
-#   Tier 3: serve_kernel_port_as_window → clickable Colab link
-#
-# Server is never advertised until localhost health-check passes.
-# ══════════════════════════════════════════════════════════════
 import socket as _socket
 
 def _find_free_port(preferred=8000):
-    """Return preferred if available, otherwise an OS-assigned free port."""
     with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
         try:
             s.bind(("0.0.0.0", preferred))
@@ -910,7 +715,8 @@ def launch():
     import requests as _requests
 
     print("=" * 60)
-    print("🎨 AI Image Edit Studio — Missing Link")
+    print("🎨 AI Image Edit Studio — GGUF Backend")
+    print("   Powered by stable_diffusion_cpp")
     print("=" * 60)
 
     # Load model in background
@@ -926,16 +732,11 @@ def launch():
             except: pass
     threading.Thread(target=_keepalive, daemon=True).start()
 
-    # Start server in background thread (non-blocking)
+    # Start server
     _server_error = [None]
 
     def _serve():
         try:
-            # uvicorn's log formatter can choke on the LogCapture tee
-            # that replaces sys.stdout/stderr earlier in this file.
-            # Passing log_config=None disables uvicorn's own log setup
-            # entirely, which sidesteps the "Unable to configure
-            # formatter 'default'" crash.
             uvicorn.run(
                 app, host="0.0.0.0", port=PORT,
                 log_level="warning", log_config=None,
@@ -947,10 +748,10 @@ def launch():
 
     threading.Thread(target=_serve, daemon=True).start()
 
-    # ── 1) Wait until server is actually responding on localhost ──
+    # Wait until server is responding
     _local_ready = False
     _last_err = None
-    for _attempt in range(80):  # ~40s total
+    for _attempt in range(80):
         if _server_error[0] is not None:
             break
         try:
@@ -973,14 +774,13 @@ def launch():
     print("📡 Model loading in background — UI status bar shows progress")
     print("=" * 60)
 
-    # ── 2) Display UI (Colab vs local) ──
+    # Display UI (Colab vs local)
     _launch_mode = None
     public_url = None
 
     if IN_COLAB:
         from IPython.display import display, HTML as _HTML
 
-        # ── Shared pop-out button (resolves proxy URL client-side) ──
         _POPOUT_BTN_JS = """
         <script>
         (function() {
@@ -1013,9 +813,9 @@ def launch():
             '">↗ Open in new tab</button>'
         )
 
-        # ── Tier 1: proxyPort URL with end-to-end verification ──
+        # Tier 1: proxyPort URL
         _last_proxy_err = None
-        for _proxy_attempt in range(20):  # ~10s
+        for _proxy_attempt in range(20):
             try:
                 _candidate = eval_js(
                     f"google.colab.kernel.proxyPort({PORT}, {{'cache': false}})"
@@ -1051,7 +851,6 @@ def launch():
             </div>
             """))
         else:
-            # ── Tier 2: Embed as iframe ──
             sys.__stdout__.write(
                 f"⚠ Proxy URL not reachable (last error: {_last_proxy_err}).\n"
                 f"  Falling back to embedded iframe...\n"
@@ -1073,7 +872,6 @@ def launch():
             except Exception as _iframe_err:
                 sys.__stdout__.write(f"  ⚠ iframe failed: {_iframe_err}\n")
 
-            # ── Tier 3: serve_kernel_port_as_window ──
             if not _iframe_ok:
                 try:
                     from google.colab import output as _colab_output
@@ -1088,7 +886,6 @@ def launch():
                     """))
                 except Exception as _window_err:
                     sys.__stdout__.write(f"  ⚠ window fallback also failed: {_window_err}\n")
-                    # ── Absolute last resort: raw JS iframe injection ──
                     try:
                         from IPython.display import Javascript as _JS
                         display(_JS("""
@@ -1123,7 +920,6 @@ def launch():
                             f"  window: {_window_err}\n"
                             f"  JS: {_js_err}\n"
                             f"  Server IS running on localhost:{PORT}.\n"
-                            f"  Try: Runtime → Disconnect and delete runtime, then reconnect."
                         )
 
         sys.__stdout__.write(f"🚀 Launch mode: {_launch_mode}\n")
@@ -1151,4 +947,3 @@ def launch():
 
 if __name__ == "__main__":
     launch()
-

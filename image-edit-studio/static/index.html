@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>AI Image Edit Studio — Missing Link</title>
+<title>AI Image Edit Studio — GGUF Backend</title>
 <link rel="icon" href="https://raw.githubusercontent.com/PotentiallyARobot/MissingLink/main/missing_link_logo_final_crop_small.png" type="image/png"/>
 <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;600&family=Barlow:wght@300;400;500&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet"/>
 <link rel="stylesheet" href="/static/style.css"/>
@@ -53,14 +53,12 @@
   </div></div>
 
   <div class="sec"><h3 onclick="togSec(this)">Settings</h3><div class="body">
-    <div class="fg"><label>True CFG</label><input type="range" id="cfg" min="1" max="10" step=".5" value="4" oninput="rv('cfgV',this.value)"/><span class="rv" id="cfgV">4</span></div>
-    <div class="fg"><label>Guidance</label><input type="range" id="gs" min="0" max="10" step=".5" value="1" oninput="rv('gsV',this.value)"/><span class="rv" id="gsV">1</span></div>
+    <div class="fg"><label>CFG Scale</label><input type="range" id="cfg" min="1" max="10" step=".5" value="4" oninput="rv('cfgV',this.value)"/><span class="rv" id="cfgV">4</span></div>
     <div class="fg"><label>Steps</label><input type="range" id="steps" min="1" max="80" step="1" value="25" oninput="rv('stV',this.value)"/><span class="rv" id="stV">25</span></div>
     <div class="fg"><label>Batch</label><input type="range" id="batch" min="1" max="4" step="1" value="1" oninput="rv('baV',this.value)"/><span class="rv" id="baV">1</span></div>
-    <div class="fg"><label>Width</label><input type="number" id="w" value="0" min="0" step="64" style="width:70px"/><span style="font-size:.65rem;color:var(--dim)">0=auto</span></div>
-    <div class="fg"><label>Height</label><input type="number" id="h" value="0" min="0" step="64" style="width:70px"/><span style="font-size:.65rem;color:var(--dim)">0=auto</span></div>
+    <div class="fg"><label>Width</label><input type="number" id="w" value="512" min="256" step="64" style="width:70px"/></div>
+    <div class="fg"><label>Height</label><input type="number" id="h" value="512" min="256" step="64" style="width:70px"/></div>
     <div class="fg"><label>Seed</label><input type="number" id="seed" value="-1" style="width:100px"/><span style="font-size:.65rem;color:var(--dim)">-1=random</span></div>
-    <div class="fg"><label>Max Seq Len</label><input type="number" id="msl" value="0" min="0" max="1024" style="width:70px"/></div>
   </div></div>
 
   <div class="gbar">
