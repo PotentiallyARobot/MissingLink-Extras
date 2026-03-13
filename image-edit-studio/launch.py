@@ -7,17 +7,6 @@
 
 import os, subprocess, sys
 
-# ── Install dependencies ─────────────────────────────────────
-print("📦 Installing dependencies...")
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
-    "stable-diffusion-cpp-python",
-    "huggingface_hub",
-    "Pillow",
-    "requests",
-    "fastapi",
-    "uvicorn[standard]",
-])
-
 # ── Server settings ──────────────────────────────────────────
 os.environ["PORT"] = "8000"
 
