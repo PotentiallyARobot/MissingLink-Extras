@@ -135,6 +135,60 @@ async function loraUnload() {
     } catch (e) { toast(e.message, 1) }
 }
 
+// ========== LORA BROWSER INTEGRATION ==========
+// Called when user picks a LoRA from the CivitAI browser modal.
+// Downloads the safetensors via the backend proxy, then loads it.
+if (typeof loraBrowser !== 'undefined') {
+    loraBrowser.onPick = async function(info) {
+        const ls = $('loraStatus');
+        ls.textContent = '⏳ Downloading ' + info.name + '...';
+        ls.className = 'lora-status busy';
+        $('loraLoadBtn').disabled = true;
+        try {
+            // Step 1: download from CivitAI via backend proxy
+            const dlResp = await fetch(API + '/api/lora/download_civitai', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: info.downloadUrl,
+                    filename: info.filename,
+                    civitai_id: info.civitaiId,
+                    version_id: info.versionId,
+                })
+            });
+            const dlData = await dlResp.json();
+            if (dlData.error) throw new Error(dlData.error);
+
+            // Step 2: load the downloaded LoRA
+            ls.textContent = '⏳ Loading ' + info.name + '...';
+            const repo = dlData.path;  // local path returned by backend
+            const scale = parseFloat($('loraScale').value) || 1.0;
+            const loadResp = await fetch(API + '/api/lora/load', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ repo, scale })
+            });
+            const loadData = await loadResp.json();
+            if (loadData.ok) {
+                $('loraRepo').value = info.name;
+                ls.textContent = '✓ Loaded: ' + info.name;
+                ls.className = 'lora-status ok';
+                $('loraUnloadBtn').style.display = '';
+                $('loraScaleRow').style.display = '';
+                toast('LoRA loaded: ' + info.name);
+            } else {
+                throw new Error(loadData.error || 'Load failed');
+            }
+        } catch (e) {
+            ls.textContent = '✗ ' + e.message;
+            ls.className = 'lora-status err';
+            toast(e.message, 1);
+        } finally {
+            $('loraLoadBtn').disabled = false;
+        }
+    };
+}
+
 // ========== IMAGE SLOTS ==========
 function addSlot(du) { if (!du) return; S.push({ id: nid++, du }); rS() }
 function rS() {

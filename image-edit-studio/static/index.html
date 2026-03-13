@@ -6,6 +6,7 @@
 <link rel="icon" href="https://raw.githubusercontent.com/PotentiallyARobot/MissingLink/main/missing_link_logo_final_crop_small.png" type="image/png"/>
 <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;600&family=Barlow:wght@300;400;500&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet"/>
 <link rel="stylesheet" href="/static/style.css"/>
+<link rel="stylesheet" href="/static/lora_browser.css"/>
 </head>
 <body>
 <div class="wrap">
@@ -41,6 +42,7 @@
       <input class="lora-input" id="loraRepo" placeholder="user/repo-name" spellcheck="false"/>
       <button class="btn bp bs" id="loraLoadBtn" onclick="loraLoad()">Load</button>
       <button class="btn bd bs" id="loraUnloadBtn" onclick="loraUnload()" style="display:none">Unload</button>
+      <button class="btn bg bs" id="loraBrowseBtn" onclick="loraBrowser.open()" title="Browse CivitAI LoRAs">Browse</button>
     </div>
     <div class="fg" id="loraScaleRow" style="display:none">
       <label>Scale</label>
@@ -122,6 +124,46 @@
 <div class="lb" id="lb" onclick="this.classList.remove('open')"><img id="lbi"/></div>
 <div class="toast" id="toast"></div>
 
+<!-- ══════════════════════════════════════════════════════════════
+     LoRA Browser — CivitAI browse modal
+     ══════════════════════════════════════════════════════════════ -->
+<div class="lb-overlay" id="loraBrowserOverlay">
+<div class="lb-modal">
+  <div class="lb-header">
+    <h3>Browse CivitAI LoRAs</h3>
+    <span style="font-size:.65rem;color:var(--dim);margin-left:4px">for Qwen Image Edit</span>
+    <button class="lb-close" id="loraBrowserClose" title="Close">&times;</button>
+  </div>
+  <div class="lb-toolbar">
+    <input type="text" class="lb-search" id="lbSearch" placeholder="Search LoRAs for Qwen Image Edit...">
+    <select class="lb-select" id="lbSort">
+      <option value="Most Downloaded">Most Downloaded</option>
+      <option value="Highest Rated">Highest Rated</option>
+      <option value="Newest">Newest</option>
+    </select>
+    <select class="lb-select" id="lbPeriod">
+      <option value="">All Time</option>
+      <option value="Year">Year</option>
+      <option value="Month">Month</option>
+      <option value="Week">Week</option>
+    </select>
+    <div class="lb-nsfw" id="lbNsfwTog">
+      <div class="lb-nsfw-dot"></div>
+      <span>NSFW</span>
+    </div>
+  </div>
+  <div class="lb-result-info" id="lbResultInfo"></div>
+  <div class="lb-scroll" id="lbScroll">
+    <div id="lbError"></div>
+    <div class="lb-grid" id="lbGrid"></div>
+    <div id="lbStatus"></div>
+    <div class="lb-sentinel" id="lbSentinel"></div>
+  </div>
+  <div class="lb-toast" id="lbToast"></div>
+</div>
+</div>
+
+<script src="/static/lora_browser.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>
