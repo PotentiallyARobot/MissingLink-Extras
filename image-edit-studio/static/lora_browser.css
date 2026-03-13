@@ -75,7 +75,7 @@
 }
 
 /* Grid */
-.lb-scroll{flex:1;overflow-y:auto;padding:10px 16px 20px;-webkit-overflow-scrolling:touch}
+.lb-scroll{flex:1;overflow-y:auto;padding:10px 16px 20px;-webkit-overflow-scrolling:touch;will-change:transform;transform:translateZ(0)}
 .lb-grid{
   display:grid;
   grid-template-columns:repeat(auto-fill,minmax(190px,1fr));
