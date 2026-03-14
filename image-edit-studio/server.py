@@ -608,7 +608,7 @@ def _find_free_port(preferred=8000):
         try: s.bind(("0.0.0.0", preferred)); return preferred
         except OSError: s.bind(("0.0.0.0", 0)); return s.getsockname()[1]
 
-PORT = _find_free_port(int(os.environ.get("PORT", "8000")))
+PORT = int(os.environ.get("PORT", "8000"))
 
 IN_COLAB = False
 try:
@@ -625,11 +625,21 @@ def launch():
     print("🎨 AI Image Edit Studio — diffusers + GGUF")
     print("=" * 60)
 
+    # Kill any previous server on this port
+    try:
+        import signal
+        _old_resp = _requests.get(f"http://127.0.0.1:{PORT}/api/health", timeout=1)
+        if _old_resp.status_code == 200:
+            print(f"⚠ Old server found on port {PORT}, it will be replaced.")
+    except Exception:
+        pass
+
     # Download GGUF model BLOCKING (visible in cell)
     try:
         download_models()
     except Exception as dl_err:
         print(f"\n❌ Download failed: {dl_err}")
+        _tb.print_exc()
         raise
 
     # Load into GPU in background
@@ -654,12 +664,17 @@ def launch():
             _server_error[0] = exc
             sys.__stderr__.write(f"\n❌ Server crashed: {exc}\n")
             _tb.print_exc(file=sys.__stderr__)
-    threading.Thread(target=_serve, daemon=True).start()
 
-    # Wait for server
+    _server_thread = threading.Thread(target=_serve, daemon=True)
+    _server_thread.start()
+
+    # Wait for server — with visible progress
+    print(f"⏳ Waiting for server on port {PORT}...")
     _local_ready = False
-    for _ in range(80):
-        if _server_error[0]: break
+    for _attempt in range(80):
+        if _server_error[0]:
+            print(f"❌ Server thread crashed: {_server_error[0]}")
+            break
         try:
             if _requests.get(f"http://127.0.0.1:{PORT}/api/health", timeout=0.75).status_code == 200:
                 _local_ready = True; break
@@ -667,7 +682,9 @@ def launch():
         time.sleep(0.5)
 
     if not _local_ready:
-        raise RuntimeError(f"Server never became reachable on localhost:{PORT}")
+        err_detail = f"Server error: {_server_error[0]}" if _server_error[0] else "No response after 40s"
+        print(f"❌ Server failed to start: {err_detail}")
+        raise RuntimeError(f"Server never became reachable on localhost:{PORT}. {err_detail}")
 
     sys.__stdout__.write(f"✅ Server healthy on localhost:{PORT}\n")
     print("📡 Model loading in background — UI shows progress")
