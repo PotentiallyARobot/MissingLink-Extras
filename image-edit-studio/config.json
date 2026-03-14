@@ -6,7 +6,7 @@
 
     "diffusion_model": {
         "repo_id": "Unsloth/Qwen-Image-Edit-2511-GGUF",
-        "filename": "qwen-image-edit-2511-Q4_K_M.gguf"
+        "filename": "qwen-image-edit-2511-Q4_0.gguf"
     },
 
     "llm_model": {
