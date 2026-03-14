@@ -25,13 +25,23 @@ log_entries = []  # [{"id": int, "text": str, "ts": float}]
 log_counter = 0
 
 class LogCapture:
-    """Tee stdout/stderr into log_entries while still printing to real console."""
+    """Tee stdout/stderr into log_entries while also printing to the real console.
+    
+    In Colab, background threads writing to sys.__stdout__ may not appear in the
+    cell output unless explicitly flushed. We flush after every write.
+    """
     def __init__(self, real_stream, name="stdout"):
         self.real = real_stream
         self.name = name
     def write(self, text):
-        self.real.write(text)
-        if text.strip():
+        # Write to real stream (Colab cell output)
+        try:
+            self.real.write(text)
+            self.real.flush()
+        except Exception:
+            pass
+        # Also capture for UI console
+        if text and text.strip():
             global log_counter
             with log_lock:
                 log_counter += 1
@@ -39,7 +49,10 @@ class LogCapture:
                 if len(log_entries) > 500:
                     log_entries[:] = log_entries[-500:]
     def flush(self):
-        self.real.flush()
+        try:
+            self.real.flush()
+        except Exception:
+            pass
     def isatty(self):
         return hasattr(self.real, 'isatty') and self.real.isatty()
     def fileno(self):
@@ -61,6 +74,63 @@ class LogCapture:
 
 sys.stdout = LogCapture(sys.__stdout__, "stdout")
 sys.stderr = LogCapture(sys.__stderr__, "stderr")
+
+# ── Capture C-level stdout/stderr (from stable_diffusion_cpp C++ code) ──
+# The C++ library writes directly to fd 1/2, bypassing Python sys.stdout.
+# We replace the fd with a pipe, read from it in a thread, and tee to both
+# the original fd (Colab cell output) and log_entries (UI console).
+import select as _select
+
+def _start_fd_capture():
+    """Redirect C-level stdout to a pipe, tee output to Colab + log_entries."""
+    _orig_fd = os.dup(1)  # save original stdout fd
+    _r, _w = os.pipe()
+    os.dup2(_w, 1)         # replace stdout fd with write end of pipe
+    os.close(_w)
+
+    def _reader():
+        global log_counter
+        buf = b''
+        while True:
+            try:
+                chunk = os.read(_r, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            # Write to original fd (Colab cell output)
+            try:
+                os.write(_orig_fd, chunk)
+            except OSError:
+                pass
+            # Decode and add to log_entries for UI console
+            buf += chunk
+            while b'\n' in buf:
+                line, buf = buf.split(b'\n', 1)
+                text = line.decode('utf-8', errors='replace').rstrip()
+                if text:
+                    with log_lock:
+                        log_counter += 1
+                        log_entries.append({"id": log_counter, "text": text, "ts": time.time()})
+                        if len(log_entries) > 500:
+                            log_entries[:] = log_entries[-500:]
+        # Flush remaining
+        if buf:
+            text = buf.decode('utf-8', errors='replace').rstrip()
+            if text:
+                with log_lock:
+                    log_counter += 1
+                    log_entries.append({"id": log_counter, "text": text, "ts": time.time()})
+        os.close(_r)
+        os.close(_orig_fd)
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+
+try:
+    _start_fd_capture()
+except Exception as _e:
+    print(f"⚠ fd capture setup failed (non-fatal): {_e}")
 
 # ---- State ----
 status = {"status": "loading", "detail": "Starting...", "step": 0, "total": 4, "ready": False, "gpu": "", "model": "Qwen-Image-Edit-2511-GGUF"}
