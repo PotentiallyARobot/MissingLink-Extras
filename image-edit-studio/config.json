@@ -19,7 +19,7 @@
         "filename": "split_files/vae/qwen_image_vae.safetensors"
     },
 
-    "offload_params_to_cpu": true,
+    "offload_params_to_cpu": false,
     "diffusion_flash_attn": true,
 
     "lora_model_dir": "/content/loras",
