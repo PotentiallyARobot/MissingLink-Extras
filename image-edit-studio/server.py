@@ -907,23 +907,10 @@ def launch():
         _launch_mode = "local"
         print(f"\n🎨 Image Edit Studio running at http://localhost:{PORT}\n")
 
-    print("Server running. Interrupt cell to stop.\n")
-
-    try:
-        _start_ts = time.time()
-        while True:
-            time.sleep(30)
-            _uptime = int(time.time() - _start_ts)
-            _h, _rem = divmod(_uptime, 3600)
-            _m, _s = divmod(_rem, 60)
-            sys.__stdout__.write(
-                f"\r🎨 Uptime: {_h:02d}:{_m:02d}:{_s:02d} | Port: {PORT} | Mode: {_launch_mode}   "
-            )
-            sys.__stdout__.flush()
-    except KeyboardInterrupt:
-        print("\n\n🛑 Server stopped.")
+    print("Server running in background. You can run other cells.\n")
+    print(f"🎨 Port: {PORT} | Mode: {_launch_mode}")
+    print("To stop: restart the runtime.\n")
 
 
 if __name__ == "__main__":
     launch()
-
