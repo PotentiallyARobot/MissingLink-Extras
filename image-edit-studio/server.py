@@ -317,7 +317,7 @@ def load_model():
         # ── Step 5: GPU setup — auto-detect GPU and configure offloading ──
         status.update({"step": 5, "detail": "Setting up GPU offload..."})
 
-        vram_gb = torch.cuda.get_device_properties(0).total_mem / 1024**3
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
         gpu_name = torch.cuda.get_device_name(0).lower()
 
         if vram_gb >= 38 or "a100" in gpu_name or "h100" in gpu_name:
