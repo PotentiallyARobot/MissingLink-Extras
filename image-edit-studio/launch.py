@@ -7,8 +7,21 @@
 
 import os, subprocess, sys
 
-# ── Disable Xet storage (stalls on large GGUF downloads) ─────
+# ── Kill Xet storage BEFORE anything imports huggingface_hub ──
+# Xet causes downloads to stall/hang on large GGUF files.
+# Belt AND suspenders: env var + uninstall the package.
 os.environ["HF_HUB_DISABLE_XET"] = "1"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+
+# Uninstall hf_xet if present (some HF hub versions ignore the env var)
+try:
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "uninstall", "-y", "-q", "hf_xet"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    print("🗑️  Uninstalled hf_xet (prevents download stalls)")
+except Exception:
+    pass  # not installed, fine
 
 # ── Server settings ──────────────────────────────────────────
 os.environ["PORT"] = "8000"

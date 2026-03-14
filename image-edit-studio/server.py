@@ -361,49 +361,113 @@ def run_generation_blocking(job_id, body, images, event_q):
             if job_id in wait_list: wait_list.remove(job_id)
         event_q.put(None)
 
-# ---- Model loading ----
-def load_model():
+# ---- Model downloading & loading ----
+_model_paths = {}  # filled by download_models, read by init_model
+
+def _robust_download(repo_id, filename):
+    """Download with hf_hub_download, falling back to wget if it stalls."""
+    from huggingface_hub import hf_hub_download, try_to_load_from_cache
+
+    # Check if already cached
+    cached = try_to_load_from_cache(repo_id, filename)
+    if cached and os.path.isfile(cached):
+        sz_mb = os.path.getsize(cached) / (1024 * 1024)
+        print(f"  ✓ Cached ({sz_mb:.0f} MB): {cached}")
+        return cached
+
+    # Try hf_hub_download first
+    print(f"  Downloading via huggingface_hub...")
+    try:
+        path = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            resume_download=True,
+        )
+        if path and os.path.isfile(path):
+            sz_mb = os.path.getsize(path) / (1024 * 1024)
+            print(f"  ✓ Downloaded ({sz_mb:.0f} MB): {path}")
+            return path
+    except Exception as e:
+        print(f"  ⚠ hf_hub_download failed: {e}")
+
+    # Fallback: direct URL download with wget
+    print(f"  Retrying with wget...")
+    url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
+    cache_dir = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    out_dir = os.path.join(cache_dir, "hub", "manual_downloads")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, filename.replace("/", "_"))
+
+    try:
+        subprocess.check_call([
+            "wget", "-c", "-q", "--show-progress",
+            "-O", out_path, url,
+        ])
+        if os.path.isfile(out_path) and os.path.getsize(out_path) > 1024:
+            print(f"  ✓ wget download complete: {out_path}")
+            return out_path
+    except Exception as we:
+        print(f"  ⚠ wget also failed: {we}")
+
+    raise RuntimeError(f"Could not download {repo_id}/{filename} — check your network and HuggingFace login.")
+
+
+def download_models():
+    """Download all model files. Runs BLOCKING before server starts."""
+    cfg = MODEL_CONFIG
+    t0 = time.time()
+
+    try:
+        go = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name,memory.total,driver_version,compute_cap",
+             "--format=csv,noheader,nounits"], text=True
+        ).strip()
+        status["gpu"] = go
+        print(f"🖥️  GPU: {go}")
+    except Exception as e:
+        print(f"⚠️  GPU info: {e}")
+
+    print("\n📦 Downloading models (this may take a few minutes on first run)...\n")
+
+    # ── Download diffusion model ──
+    diff_cfg = cfg["diffusion_model"]
+    status.update({"status": "loading", "step": 1, "total": 4, "detail": f"Downloading {diff_cfg['filename']}..."})
+    print(f"[1/3] Diffusion model: {diff_cfg['repo_id']}/{diff_cfg['filename']}")
+    _model_paths["diffusion"] = _robust_download(diff_cfg["repo_id"], diff_cfg["filename"])
+
+    # ── Download LLM text encoder ──
+    llm_cfg = cfg["llm_model"]
+    status.update({"step": 2, "detail": f"Downloading {llm_cfg['filename']}..."})
+    print(f"[2/3] Text encoder:    {llm_cfg['repo_id']}/{llm_cfg['filename']}")
+    _model_paths["llm"] = _robust_download(llm_cfg["repo_id"], llm_cfg["filename"])
+
+    # ── Download VAE ──
+    vae_cfg = cfg["vae_model"]
+    status.update({"step": 3, "detail": f"Downloading VAE..."})
+    print(f"[3/3] VAE:             {vae_cfg['repo_id']}/{vae_cfg['filename']}")
+    _model_paths["vae"] = _robust_download(vae_cfg["repo_id"], vae_cfg["filename"])
+
+    el = round(time.time() - t0, 1)
+    print(f"\n✅ All models downloaded ({el}s)\n")
+
+
+def init_model():
+    """Load downloaded models into GPU. Runs in background thread after server starts."""
     global sd_model
     cfg = MODEL_CONFIG
-
     t0 = time.time()
-    try:
-        go = subprocess.check_output(["nvidia-smi", "--query-gpu=name,memory.total,driver_version,compute_cap", "--format=csv,noheader,nounits"], text=True).strip()
-        status["gpu"] = go; print(f"🖥️  GPU: {go}")
-    except Exception as e: print(f"⚠️  GPU info: {e}")
 
     try:
-        from huggingface_hub import hf_hub_download
+        status.update({"status": "loading", "step": 4, "total": 4, "detail": "Loading model into GPU..."})
 
-        # ── Step 1: Download diffusion model ──
-        diff_cfg = cfg["diffusion_model"]
-        status.update({"status": "loading", "step": 1, "detail": f"Downloading {diff_cfg['filename']}..."})
-        print(f"⬇ Downloading diffusion model: {diff_cfg['repo_id']}/{diff_cfg['filename']}")
-        diff_path = hf_hub_download(repo_id=diff_cfg["repo_id"], filename=diff_cfg["filename"])
-        print(f"  ✓ {diff_path}")
-
-        # ── Step 2: Download LLM text encoder ──
-        llm_cfg = cfg["llm_model"]
-        status.update({"step": 2, "detail": f"Downloading {llm_cfg['filename']}..."})
-        print(f"⬇ Downloading LLM: {llm_cfg['repo_id']}/{llm_cfg['filename']}")
-        llm_path = hf_hub_download(repo_id=llm_cfg["repo_id"], filename=llm_cfg["filename"])
-        print(f"  ✓ {llm_path}")
-
-        # ── Step 3: Download VAE ──
-        vae_cfg = cfg["vae_model"]
-        status.update({"step": 3, "detail": f"Downloading VAE..."})
-        print(f"⬇ Downloading VAE: {vae_cfg['repo_id']}/{vae_cfg['filename']}")
-        vae_path = hf_hub_download(repo_id=vae_cfg["repo_id"], filename=vae_cfg["filename"])
-        print(f"  ✓ {vae_path}")
-
-        # ── Step 4: Initialize stable_diffusion_cpp ──
-        status.update({"step": 4, "detail": "Loading model into GPU..."})
-
-        # Ensure LoRA directory exists
         lora_dir = cfg.get("lora_model_dir", "/content/loras")
         os.makedirs(lora_dir, exist_ok=True)
 
         from stable_diffusion_cpp import StableDiffusion
+
+        diff_path = _model_paths["diffusion"]
+        llm_path = _model_paths["llm"]
+        vae_path = _model_paths["vae"]
 
         print(f"🔧 Initializing StableDiffusion...")
         print(f"   diffusion_model: {diff_path}")
@@ -422,7 +486,7 @@ def load_model():
 
         el = round(time.time() - t0, 1)
         print(f"✅ Model ready ({el}s)")
-        status.update({"status": "ready", "step": 4, "detail": f"Ready ({el}s startup)", "ready": True})
+        status.update({"status": "ready", "step": 4, "detail": f"Ready ({el}s)", "ready": True})
     except Exception as e:
         import traceback; traceback.print_exc()
         status.update({"status": "error", "detail": f"Load failed: {str(e)}"})
@@ -819,8 +883,19 @@ def launch():
     print("   Powered by stable_diffusion_cpp")
     print("=" * 60)
 
-    # Load model in background
-    threading.Thread(target=load_model, daemon=True).start()
+    # ── Step 1: Download models FIRST (blocking) ──
+    # This runs in the cell so progress is visible in Colab output.
+    try:
+        download_models()
+    except Exception as dl_err:
+        print(f"\n❌ Model download failed: {dl_err}")
+        print("   Check your network connection and HuggingFace login.")
+        print("   You can login with: !huggingface-cli login")
+        raise
+
+    # ── Step 2: Load model into GPU (background thread) ──
+    # This takes ~20-30s and happens while the server is already serving the UI.
+    threading.Thread(target=init_model, daemon=True).start()
 
     # Keepalive thread
     def _keepalive():
