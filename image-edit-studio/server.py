@@ -99,6 +99,13 @@ def run_generation_blocking(job_id, body, images, event_q):
         try:
             if not pipeline or not status["ready"]:
                 event_q.put({"type": "error", "error": "Model still loading."}); return
+
+            # Normalize all images to same size to avoid token/feature mismatch
+            w = body.get("width") or 512
+            h = body.get("height") or 512
+            w, h = int(w), int(h)
+            images = [img.resize((w, h), Image.LANCZOS) for img in images]
+
             # Default to Lightning 4-step settings
             default_steps = MODEL_CONFIG.get("num_inference_steps", 4)
             steps = body.get("num_inference_steps", default_steps)
@@ -111,8 +118,8 @@ def run_generation_blocking(job_id, body, images, event_q):
                 "num_images_per_prompt": body.get("num_images_per_prompt", 1),
             }
             if body.get("negative_prompt"): pk["negative_prompt"] = body["negative_prompt"]
-            w = body.get("width"); hv = body.get("height")
-            if w and hv: pk["width"] = int(w); pk["height"] = int(hv)
+            pk["width"] = w
+            pk["height"] = h
             seed = body.get("seed", -1)
             if seed is not None and int(seed) >= 0:
                 pk["generator"] = torch.Generator("cpu").manual_seed(int(seed))
@@ -321,17 +328,17 @@ def load_model():
         gpu_name = torch.cuda.get_device_name(0).lower()
 
         if vram_gb >= 38 or "a100" in gpu_name or "h100" in gpu_name:
-            # A100 / H100 — everything fits in VRAM, no offload needed
+            # A100 / H100 — everything fits in VRAM, no offload
             transformer.set_offload(False)
             pipeline = pipeline.to("cuda")
             offload_mode = f"none (full GPU, {vram_gb:.0f}GB)"
         elif vram_gb >= 20 or "l4" in gpu_name or "l40" in gpu_name or "a10" in gpu_name or "3090" in gpu_name or "4090" in gpu_name:
-            # L4 / L40 / A10 / 3090 / 4090 — partial offload, keep 5 blocks on GPU
+            # L4 / L40 / A10 / 3090 / 4090 — partial offload, 5 blocks on GPU
             transformer.set_offload(True, use_pin_memory=False, num_blocks_on_gpu=5)
             pipeline = pipeline.to("cuda")
             offload_mode = f"partial (5 blocks on GPU, {vram_gb:.0f}GB)"
         else:
-            # T4 / other low-VRAM — aggressive offload, 1 block on GPU
+            # T4 / other low-VRAM — sequential CPU offload
             transformer.set_offload(True, use_pin_memory=False, num_blocks_on_gpu=1)
             pipeline._exclude_from_cpu_offload.append("transformer")
             pipeline.enable_sequential_cpu_offload()
@@ -347,22 +354,52 @@ def load_model():
         status.update({"status": "error", "detail": f"Load failed: {str(e)}"})
 
 # ---- LoRA management ----
-# NOTE: Nunchaku INT4 models do NOT support custom LoRA injection in diffusers.
-# The pre-fused Lightning LoRA is already baked into the model weights.
-# LoRA browser/endpoints are kept for future use when support improves.
+# Diffusers' load_lora_weights / fuse_lora works with the Nunchaku pipeline
+# because the pipeline applies LoRA at the diffusers level.
+
+def _resolve_lora_source(repo):
+    """Resolve a HF repo or local path to args for load_lora_weights."""
+    if os.path.isfile(repo):
+        return {"pretrained_model_name_or_path_or_dict": repo}
+    if "/" in repo and repo.endswith(".safetensors"):
+        parts = repo.split("/")
+        if len(parts) >= 3:
+            return {
+                "pretrained_model_name_or_path_or_dict": "/".join(parts[:2]),
+                "weight_name": "/".join(parts[2:]),
+            }
+    return {"pretrained_model_name_or_path_or_dict": repo}
 
 def _lora_load_thread(repo, scale):
+    global pipeline
     with lora_lock:
         lora_state["loading"] = True
         lora_state["error"] = None
     try:
         if not pipeline or not status["ready"]:
             raise RuntimeError("Model not ready yet")
-        raise RuntimeError(
-            "Custom LoRA is not supported with the Nunchaku INT4 backend. "
-            "The Lightning distillation LoRA is already pre-fused into the model. "
-            "To use custom LoRAs, switch to the GGUF or full-precision backend."
-        )
+
+        # Unload existing LoRA first
+        if lora_state["loaded"]:
+            print(f"🔄 Unloading existing LoRA: {lora_state['loaded']}")
+            try:
+                pipeline.unfuse_lora()
+                pipeline.unload_lora_weights()
+            except Exception as ue:
+                print(f"⚠️  Unload warning: {ue}")
+
+        print(f"📦 Loading LoRA: {repo} (scale={scale})")
+
+        lora_args = _resolve_lora_source(repo)
+        pipeline.load_lora_weights(**lora_args)
+        pipeline.fuse_lora(lora_scale=scale)
+
+        print(f"✅ LoRA loaded and fused: {repo}")
+
+        with lora_lock:
+            lora_state["loaded"] = repo
+            lora_state["loading"] = False
+            lora_state["error"] = None
     except Exception as e:
         import traceback; traceback.print_exc()
         with lora_lock:
@@ -370,16 +407,31 @@ def _lora_load_thread(repo, scale):
             lora_state["error"] = str(e)
 
 def _lora_unload_thread():
+    global pipeline
     with lora_lock:
         lora_state["loading"] = True
         lora_state["error"] = None
     try:
-        print("ℹ No custom LoRA to unload (Nunchaku pre-fused model)")
+        if not pipeline:
+            raise RuntimeError("Model not ready")
+        print(f"🔄 Unfusing and unloading LoRA: {lora_state['loaded']}")
+
+        try:
+            pipeline.unfuse_lora()
+        except Exception:
+            pass
+        try:
+            pipeline.unload_lora_weights()
+        except Exception:
+            pass
+
+        print("✅ LoRA unloaded")
         with lora_lock:
             lora_state["loaded"] = None
             lora_state["loading"] = False
             lora_state["error"] = None
     except Exception as e:
+        import traceback; traceback.print_exc()
         with lora_lock:
             lora_state["loading"] = False
             lora_state["error"] = str(e)
@@ -688,8 +740,14 @@ def launch():
     print("🎨 AI Image Edit Studio — Missing Link")
     print("=" * 60)
 
-    # Load model in background
-    threading.Thread(target=load_model, daemon=True).start()
+    # ── Load model FIRST (blocking) — downloads happen here ──
+    print("📦 Loading model (this downloads on first run)...")
+    load_model()
+
+    if not status["ready"]:
+        print(f"\n❌ Model failed to load: {status.get('detail', 'unknown error')}")
+        print("Cannot start UI without a working model.")
+        return
 
     # Keepalive thread
     def _keepalive():
