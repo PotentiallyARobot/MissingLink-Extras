@@ -1,27 +1,32 @@
 # ============================================================
-# 🎨 AI Image Edit Studio — GGUF Backend
-# ============================================================
-# Uses stable_diffusion_cpp with GGUF quantized models.
-# Model config lives in config.json (next to server.py).
+# 🎨 AI Image Edit Studio — diffusers + GGUF Backend
 # ============================================================
 
 import os, subprocess, sys
 
-# ── Kill Xet storage BEFORE anything imports huggingface_hub ──
-# Xet causes downloads to stall/hang on large GGUF files.
-# Belt AND suspenders: env var + uninstall the package.
-os.environ["HF_HUB_DISABLE_XET"] = "1"
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
 
-# Uninstall hf_xet if present (some HF hub versions ignore the env var)
-try:
-    subprocess.check_call(
-        [sys.executable, "-m", "pip", "uninstall", "-y", "-q", "hf_xet"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    print("🗑️  Uninstalled hf_xet (prevents download stalls)")
-except Exception:
-    pass  # not installed, fine
+# ── Install dependencies (skip if already present) ────────────
+_deps = [
+    ("huggingface_hub[hf_transfer]", "huggingface_hub"),
+    ("diffusers", "diffusers"),
+    ("transformers", "transformers"),
+    ("accelerate", "accelerate"),
+    ("gguf", "gguf"),
+    ("sentencepiece", "sentencepiece"),
+    ("protobuf", "google.protobuf"),
+    ("Pillow", "PIL"),
+    ("requests", "requests"),
+    ("fastapi", "fastapi"),
+    ("uvicorn[standard]", "uvicorn"),
+    ("peft", "peft"),
+]
+for pkg, mod in _deps:
+    try:
+        __import__(mod)
+    except ImportError:
+        print(f"📦 Installing {pkg}...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
 
 # ── Server settings ──────────────────────────────────────────
 os.environ["PORT"] = "8000"
@@ -29,8 +34,6 @@ os.environ["PORT"] = "8000"
 # ── Path to the image-edit-studio folder ─────────────────────
 STUDIO_PATH = "/content/MissingLink-Extras/image-edit-studio"
 
-# ═════════════════════════════════════════════════════════════
-# Don't edit below this line
 # ═════════════════════════════════════════════════════════════
 sys.path.insert(0, STUDIO_PATH)
 from server import launch

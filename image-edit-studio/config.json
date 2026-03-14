@@ -1,31 +1,20 @@
 {
-    "_comment": "🎨 AI Image Edit Studio — GGUF Model Configuration",
-    "_comment2": "Uses stable_diffusion_cpp with GGUF quantized models.",
+    "_comment": "🎨 AI Image Edit Studio — diffusers + GGUF",
+    "_comment2": "Only the GGUF transformer needs manual download. Text encoder + VAE auto-download from pipeline_repo.",
 
-    "backend": "gguf",
+    "local_dir": "/content/models",
 
     "diffusion_model": {
-        "repo_id": "Unsloth/Qwen-Image-Edit-2511-GGUF",
+        "repo_id": "unsloth/Qwen-Image-Edit-2511-GGUF",
         "filename": "qwen-image-edit-2511-Q4_0.gguf"
     },
 
-    "llm_model": {
-        "repo_id": "unsloth/Qwen2.5-VL-7B-Instruct-GGUF",
-        "filename": "Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf"
-    },
-
-    "vae_model": {
-        "repo_id": "Comfy-Org/Qwen-Image_ComfyUI",
-        "filename": "split_files/vae/qwen_image_vae.safetensors"
-    },
-
-    "offload_params_to_cpu": false,
-    "diffusion_flash_attn": true,
+    "pipeline_repo": "Qwen/Qwen-Image-Edit-2511",
 
     "lora_model_dir": "/content/loras",
 
     "default_settings": {
-        "sample_steps": 25,
+        "sample_steps": 5,
         "cfg_scale": 4.0,
         "width": 512,
         "height": 512,
