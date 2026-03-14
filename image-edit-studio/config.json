@@ -1,24 +1,9 @@
 {
-    "_comment": "🎨 AI Image Edit Studio — diffusers + GGUF",
-    "_comment2": "Only the GGUF transformer needs manual download. Text encoder + VAE auto-download from pipeline_repo.",
+    "_comment": "🎨 AI Image Edit Studio — Nunchaku Lightning Backend",
+    "_comment2": "Pre-fused INT4 + Lightning 4-step. No custom LoRA support.",
 
-    "local_dir": "/content/models",
-
-    "diffusion_model": {
-        "repo_id": "unsloth/Qwen-Image-Edit-2511-GGUF",
-        "filename": "qwen-image-edit-2511-Q4_0.gguf"
-    },
-
-    "pipeline_repo": "Qwen/Qwen-Image-Edit-2511",
-
-    "lora_model_dir": "/content/loras",
-
-    "default_settings": {
-        "sample_steps": 5,
-        "cfg_scale": 4.0,
-        "width": 512,
-        "height": 512,
-        "seed": -1,
-        "batch_count": 1
-    }
+    "transformer_path": "nunchaku-tech/nunchaku-qwen-image-edit/svdq-int4_r128-qwen-image-edit-lightningv1.0-4steps.safetensors",
+    "pipeline_repo": "Qwen/Qwen-Image-Edit",
+    "num_inference_steps": 4,
+    "rank": 128
 }
