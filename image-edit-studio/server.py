@@ -182,8 +182,28 @@ def run_generation_blocking(job_id, body, images, event_q):
             total_steps = steps
             gen_start = time.time()
 
-            # Send initial progress
-            event_q.put({"type": "progress", "step": 0, "total": total_steps, "progress": 0, "per_step": "?", "remaining": 0})
+            # stable_diffusion_cpp runs all steps internally with no per-step callback.
+            # Send indeterminate progress ticks from a timer thread so the UI stays alive.
+            _gen_done = threading.Event()
+
+            def _tick_progress():
+                while not _gen_done.is_set():
+                    el = round(time.time() - gen_start, 1)
+                    event_q.put({
+                        "type": "progress",
+                        "indeterminate": True,
+                        "elapsed": el,
+                        "step": 0,
+                        "total": total_steps,
+                        "progress": -1,  # signals indeterminate to frontend
+                        "per_step": "?",
+                        "remaining": 0,
+                        "detail": f"Generating... {el}s elapsed",
+                    })
+                    _gen_done.wait(timeout=1.5)
+
+            tick_thread = threading.Thread(target=_tick_progress, daemon=True)
+            tick_thread.start()
 
             print(f"🎨 Generating: steps={steps}, cfg={cfg_scale}, batch={batch}, seed={seed}, size={w}x{h}")
 
@@ -221,6 +241,9 @@ def run_generation_blocking(job_id, body, images, event_q):
                 rem = round(ps * (batch - bi - 1), 1)
                 event_q.put({"type": "progress", "step": bi + 1, "total": batch, "progress": prog, "per_step": ps, "remaining": rem})
 
+            # Stop the progress ticker
+            _gen_done.set()
+
             # Cleanup temp files
             for p in ref_paths:
                 try: os.unlink(p)
@@ -252,6 +275,8 @@ def run_generation_blocking(job_id, body, images, event_q):
 
         except Exception as e:
             import traceback; traceback.print_exc()
+            try: _gen_done.set()
+            except: pass
             import gc
             try:
                 gc.collect()
@@ -933,22 +958,20 @@ def launch():
         _launch_mode = "local"
         print(f"\n🎨 Image Edit Studio running at http://localhost:{PORT}\n")
 
-    print("Server running. Interrupt cell to stop.\n")
+    print("Server running in background. You can run other cells.\n")
+    print("  ⚡ The server stays alive as long as this runtime is active.")
+    print("  🛑 To stop: Runtime → Disconnect and delete runtime\n")
 
-    try:
-        _start_ts = time.time()
-        while True:
-            time.sleep(30)
-            _uptime = int(time.time() - _start_ts)
-            _h, _rem = divmod(_uptime, 3600)
-            _m, _s = divmod(_rem, 60)
-            sys.__stdout__.write(
-                f"\r🎨 Uptime: {_h:02d}:{_m:02d}:{_s:02d} | Port: {PORT} | Mode: {_launch_mode}   "
-            )
-            sys.__stdout__.flush()
-    except KeyboardInterrupt:
-        print("\n\n🛑 Server stopped.")
+    # Return immediately — server and model-loading threads are daemonic
+    # and will keep running in the background.
+    return
 
 
 if __name__ == "__main__":
     launch()
+    # When run as a script (not from Colab), block so the process doesn't exit
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        print("\n🛑 Server stopped.")

@@ -237,29 +237,64 @@ document.addEventListener('drop', e => { e.preventDefault(); [...e.dataTransfer.
 rS();
 
 // ========== PROGRESS RING HELPER ==========
-function setProgress(pct, step, total, perStep, remaining) {
+let _indeterminateAnim = null;
+
+function setProgress(pct, step, total, perStep, remaining, detail) {
     const overlay = $('genOverlay');
     overlay.classList.add('active');
-    // Ring: circumference = 2*PI*45 ≈ 283
-    const offset = 283 - (283 * pct / 100);
-    $('genRing').style.strokeDashoffset = offset;
-    $('genPct').textContent = pct + '%';
-    if (step !== undefined && total !== undefined) {
-        $('genStep').textContent = `Step ${step} / ${total}`;
-    }
-    if (perStep !== undefined && perStep !== '?') {
-        $('genDetail').textContent = `${perStep}s per step`;
-    }
-    if (remaining !== undefined && remaining > 0) {
-        $('genEta').textContent = `~${Math.round(remaining)}s remaining`;
-    } else {
+    const ring = $('genRing');
+
+    if (pct < 0) {
+        // Indeterminate mode — pulse the ring
+        $('genPct').textContent = '';
+        ring.style.strokeDashoffset = 283 * 0.75;  // partial fill
+        if (!_indeterminateAnim) {
+            ring.style.transition = 'none';
+            let angle = 0;
+            _indeterminateAnim = setInterval(() => {
+                angle = (angle + 4) % 360;
+                ring.closest('svg').style.transform = 'rotate(' + (angle - 90) + 'deg)';
+            }, 30);
+        }
+        $('genStep').textContent = detail || 'Generating...';
+        $('genDetail').textContent = step > 0 ? `Image ${step} of ${total}` : `${total} steps`;
         $('genEta').textContent = '';
+    } else {
+        // Determinate mode
+        _stopIndeterminate();
+        ring.style.transition = 'stroke-dashoffset .4s ease';
+        ring.closest('svg').style.transform = 'rotate(-90deg)';
+        const offset = 283 - (283 * pct / 100);
+        ring.style.strokeDashoffset = offset;
+        $('genPct').textContent = pct + '%';
+        if (step !== undefined && total !== undefined) {
+            $('genStep').textContent = `Step ${step} / ${total}`;
+        }
+        if (perStep !== undefined && perStep !== '?') {
+            $('genDetail').textContent = `${perStep}s per step`;
+        }
+        if (remaining !== undefined && remaining > 0) {
+            $('genEta').textContent = `~${Math.round(remaining)}s remaining`;
+        } else {
+            $('genEta').textContent = '';
+        }
+    }
+}
+
+function _stopIndeterminate() {
+    if (_indeterminateAnim) {
+        clearInterval(_indeterminateAnim);
+        _indeterminateAnim = null;
     }
 }
 
 function hideProgress() {
+    _stopIndeterminate();
     $('genOverlay').classList.remove('active');
-    $('genRing').style.strokeDashoffset = 283;
+    const ring = $('genRing');
+    ring.style.strokeDashoffset = 283;
+    ring.style.transition = 'none';
+    ring.closest('svg').style.transform = 'rotate(-90deg)';
     $('genPct').textContent = '0%';
     $('genStep').textContent = '';
     $('genDetail').textContent = '';
@@ -296,11 +331,18 @@ async function gen() {
                 const pd = await pr.json();
                 if (pd.type === 'progress') {
                     $('pill').textContent = 'RUNNING'; $('pill').className = 'pill run';
-                    const pct = pd.progress || Math.round(pd.step / pd.total * 100);
-                    setProgress(pct, pd.step, pd.total, pd.per_step, pd.remaining);
-                    $('gpf').style.width = pct + '%';
-                    const eta = pd.remaining > 0 ? ' · ~' + Math.round(pd.remaining) + 's' : '';
-                    $('gsl').textContent = `Step ${pd.step}/${pd.total} (${pd.per_step || '?'}s/step${eta})`;
+                    if (pd.indeterminate || pd.progress < 0) {
+                        setProgress(-1, pd.step, pd.total, pd.per_step, 0, pd.detail || ('Generating... ' + (pd.elapsed || 0) + 's'));
+                        $('gpf').style.width = '100%'; $('gpf').style.opacity = '.3';
+                        $('gsl').textContent = pd.detail || ('Generating... ' + (pd.elapsed || '?') + 's');
+                    } else {
+                        $('gpf').style.opacity = '1';
+                        const pct = pd.progress || Math.round(pd.step / pd.total * 100);
+                        setProgress(pct, pd.step, pd.total, pd.per_step, pd.remaining);
+                        $('gpf').style.width = pct + '%';
+                        const eta = pd.remaining > 0 ? ' · ~' + Math.round(pd.remaining) + 's' : '';
+                        $('gsl').textContent = `Step ${pd.step}/${pd.total} (${pd.per_step || '?'}s/step${eta})`;
+                    }
                 } else if (pd.type === 'queue') {
                     $('genStep').textContent = `Queue position: ${pd.position} of ${pd.queue_length}`;
                 }
@@ -332,15 +374,24 @@ async function gen() {
                         $('pill').textContent = 'QUEUED'; $('pill').className = 'pill loading';
                     } else if (d.type === 'done') {
                         hideProgress();
+                        $('gpf').style.opacity = '1';
                         showR(d.results); rH();
                         toast('Done!' + (d.elapsed ? ' in ' + d.elapsed + 's' : ''));
                     } else if (d.type === 'progress') {
                         $('pill').textContent = 'RUNNING'; $('pill').className = 'pill run';
-                        const pct = d.progress || Math.round(d.step / d.total * 100);
-                        setProgress(pct, d.step, d.total, d.per_step, d.remaining);
-                        $('gpf').style.width = pct + '%';
-                        const eta = d.remaining > 0 ? ' · ~' + Math.round(d.remaining) + 's' : '';
-                        $('gsl').textContent = `Step ${d.step}/${d.total} (${d.per_step || '?'}s/step${eta})`;
+                        if (d.indeterminate || d.progress < 0) {
+                            // GGUF backend — no per-step progress
+                            setProgress(-1, d.step, d.total, d.per_step, 0, d.detail || ('Generating... ' + (d.elapsed || 0) + 's'));
+                            $('gpf').style.width = '100%'; $('gpf').style.opacity = '.3';
+                            $('gsl').textContent = d.detail || ('Generating... ' + (d.elapsed || '?') + 's');
+                        } else {
+                            $('gpf').style.opacity = '1';
+                            const pct = d.progress || Math.round(d.step / d.total * 100);
+                            setProgress(pct, d.step, d.total, d.per_step, d.remaining);
+                            $('gpf').style.width = pct + '%';
+                            const eta = d.remaining > 0 ? ' · ~' + Math.round(d.remaining) + 's' : '';
+                            $('gsl').textContent = `Step ${d.step}/${d.total} (${d.per_step || '?'}s/step${eta})`;
+                        }
                     }
                 } catch (pe) { if (pe.message && !pe.message.includes('JSON')) throw pe }
             }
