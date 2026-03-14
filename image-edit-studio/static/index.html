@@ -2,8 +2,8 @@
 <html lang="en">
 <head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>AI Image Edit Studio — GGUF Backend</title>
-<link rel="icon" href="/static/app_logo.png" type="image/png"/>
+<title>AI Image Edit Studio — Missing Link</title>
+<link rel="icon" href="https://raw.githubusercontent.com/PotentiallyARobot/MissingLink/main/missing_link_logo_final_crop_small.png" type="image/png"/>
 <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;600&family=Barlow:wght@300;400;500&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet"/>
 <link rel="stylesheet" href="/static/style.css"/>
 <link rel="stylesheet" href="/static/lora_browser.css"/>
@@ -13,7 +13,7 @@
 
 <!-- Top bar -->
 <div class="topbar">
-  <img class="topbar-logo" src="/static/app_logo.png" alt="Missing Link"/>
+  <img class="topbar-logo" src="https://raw.githubusercontent.com/PotentiallyARobot/MissingLink/main/missing_link_logo_final_crop_small.png" alt="Missing Link"/>
   <div class="topbar-divider"></div>
   <span class="app-title">AI Image Edit Studio</span>
   <span class="tagline">Stop Compiling. <b>Start Building.</b></span>
@@ -53,12 +53,14 @@
   </div></div>
 
   <div class="sec"><h3 onclick="togSec(this)">Settings</h3><div class="body">
-    <div class="fg"><label>CFG Scale</label><input type="range" id="cfg" min="1" max="10" step=".5" value="4" oninput="rv('cfgV',this.value)"/><span class="rv" id="cfgV">4</span></div>
-    <div class="fg"><label>Steps</label><input type="range" id="steps" min="1" max="80" step="1" value="25" oninput="rv('stV',this.value)"/><span class="rv" id="stV">25</span></div>
+    <div class="fg"><label>True CFG</label><input type="range" id="cfg" min="1" max="10" step=".5" value="1" oninput="rv('cfgV',this.value)"/><span class="rv" id="cfgV">1</span></div>
+    <input type="hidden" id="gs" value="1"/>
+    <div class="fg"><label>Steps</label><input type="range" id="steps" min="1" max="80" step="1" value="4" oninput="rv('stV',this.value)"/><span class="rv" id="stV">4</span></div>
     <div class="fg"><label>Batch</label><input type="range" id="batch" min="1" max="4" step="1" value="1" oninput="rv('baV',this.value)"/><span class="rv" id="baV">1</span></div>
     <div class="fg"><label>Width</label><input type="number" id="w" value="512" min="256" step="64" style="width:70px"/></div>
     <div class="fg"><label>Height</label><input type="number" id="h" value="512" min="256" step="64" style="width:70px"/></div>
     <div class="fg"><label>Seed</label><input type="number" id="seed" value="-1" style="width:100px"/><span style="font-size:.65rem;color:var(--dim)">-1=random</span></div>
+    <input type="hidden" id="msl" value="0"/>
   </div></div>
 
   <div class="gbar">
@@ -91,7 +93,7 @@
     <button class="btn bg bs" onclick="undoLasso()">Undo</button>
   </div>
   <div class="ce" id="ce">
-    <img class="ce-logo" src="/static/app_logo.png" alt="Missing Link"/>
+    <img class="ce-logo" src="https://raw.githubusercontent.com/PotentiallyARobot/MissingLink/main/missing_link_logo_final_crop_small.png" alt="Missing Link"/>
     <h3>AI Image Edit Studio</h3>
     <p style="margin-top:6px;font-size:.85rem">Add images, write a prompt, hit Generate.<br/>Model is loading in the background...</p>
     <p style="margin-top:8px;font-size:.65rem;color:var(--dim);letter-spacing:.3px">Powered by <b style="color:var(--gold)">Missing Link</b></p>
