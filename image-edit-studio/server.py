@@ -264,7 +264,7 @@ def load_model():
     try:
         go = subprocess.check_output(["nvidia-smi", "--query-gpu=name,memory.total,driver_version,compute_cap", "--format=csv,noheader,nounits"], text=True).strip()
         status["gpu"] = go; print(f"🖥️  GPU: {go}")
-        print(f"🖥️  CUDA: {torch.version.cuda}, PyTorch: {torch.__version__}, VRAM: {torch.cuda.get_device_properties(0).total_mem/1024**3:.1f} GB")
+        print(f"🖥️  CUDA: {torch.version.cuda}, PyTorch: {torch.__version__}, VRAM: {torch.cuda.get_device_properties(0).total_memory/1024**3:.1f} GB")
     except Exception as e: print(f"⚠️  GPU info: {e}")
 
     try:
