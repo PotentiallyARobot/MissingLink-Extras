@@ -611,28 +611,34 @@ def compose_soundscape(
             # Random occurrences
             if layer.random_occurrences:
                 rc = layer.random_occurrences
-                count = rc.get("count", 5)
-                min_gap = rc.get("min_gap_ms", 2000)
-                vol_var = rc.get("volume_var_db", 3.0)
-                pan_var = rc.get("pan_var", 0.2)
-                rate_var = rc.get("rate_var", 0.0)
+                # GPT sometimes sends a list of occurrence dicts instead of
+                # the config dict — treat those as explicit occurrences
+                if isinstance(rc, list):
+                    all_occurrences.extend(_coerce_occurrence(o) for o in rc)
+                    rc = None
+                if rc is not None:
+                    count = rc.get("count", 5)
+                    min_gap = rc.get("min_gap_ms", 2000)
+                    vol_var = rc.get("volume_var_db", 3.0)
+                    pan_var = rc.get("pan_var", 0.2)
+                    rate_var = rc.get("rate_var", 0.0)
 
-                rng = np.random.default_rng()
-                times = []
-                for _ in range(count * 10):  # attempts
-                    t = int(rng.uniform(layer_start, max(layer_start + 1, layer_end - len(source))))
-                    if all(abs(t - existing) >= min_gap for existing in times):
-                        times.append(t)
-                    if len(times) >= count:
-                        break
+                    rng = np.random.default_rng()
+                    times = []
+                    for _ in range(count * 10):  # attempts
+                        t = int(rng.uniform(layer_start, max(layer_start + 1, layer_end - len(source))))
+                        if all(abs(t - existing) >= min_gap for existing in times):
+                            times.append(t)
+                        if len(times) >= count:
+                            break
 
-                for t in times:
-                    all_occurrences.append(Occurrence(
-                        start_ms=t,
-                        volume_db=rng.uniform(-vol_var, vol_var) if vol_var else None,
-                        pan=layer.pan + rng.uniform(-pan_var, pan_var) if pan_var else None,
-                        playback_rate=layer.playback_rate + rng.uniform(-rate_var, rate_var) if rate_var else 1.0,
-                    ))
+                    for t in times:
+                        all_occurrences.append(Occurrence(
+                            start_ms=t,
+                            volume_db=rng.uniform(-vol_var, vol_var) if vol_var else None,
+                            pan=layer.pan + rng.uniform(-pan_var, pan_var) if pan_var else None,
+                            playback_rate=layer.playback_rate + rng.uniform(-rate_var, rate_var) if rate_var else 1.0,
+                        ))
 
             # Place each occurrence
             for occ in all_occurrences:
