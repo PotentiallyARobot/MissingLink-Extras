@@ -462,13 +462,26 @@ def _apply_pan_automation(
 def _coerce_occurrence(o: dict | Occurrence) -> Occurrence:
     if isinstance(o, Occurrence):
         return o
-    return Occurrence(**o)
+    import dataclasses as _dc
+    valid_keys = {f.name for f in _dc.fields(Occurrence)}
+    cleaned = {k: v for k, v in o.items() if k in valid_keys}
+    return Occurrence(**cleaned)
 
 
 def _coerce_automation_point(p: dict | AutomationPoint) -> AutomationPoint:
     if isinstance(p, AutomationPoint):
         return p
-    return AutomationPoint(**p)
+    d = dict(p)
+    # GPT sometimes outputs "value_db" or "value_pan" instead of "value"
+    if "value" not in d:
+        for alias in ("value_db", "value_pan", "db", "pan_value"):
+            if alias in d:
+                d["value"] = d.pop(alias)
+                break
+    # Strip any keys that AutomationPoint doesn't accept
+    valid_keys = {"time_ms", "value"}
+    d = {k: v for k, v in d.items() if k in valid_keys}
+    return AutomationPoint(**d)
 
 
 # ─── Main Compose Function ─────────────────────────────────────────────────────
@@ -551,7 +564,10 @@ def compose_soundscape(
     for layer_input in layers:
         # Accept dicts or TrackLayer instances
         if isinstance(layer_input, dict):
-            layer = TrackLayer(**layer_input)
+            import dataclasses as _dc
+            valid_keys = {f.name for f in _dc.fields(TrackLayer)}
+            cleaned_input = {k: v for k, v in layer_input.items() if k in valid_keys}
+            layer = TrackLayer(**cleaned_input)
         else:
             layer = layer_input
 
