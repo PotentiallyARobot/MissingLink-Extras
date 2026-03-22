@@ -1,10 +1,16 @@
 """
-AI Soundscape Generator
-=======================
-Takes a natural-language scene description, inventories your sound library,
-asks GPT-5.2 to design a rich layered soundscape, generates any missing
-sounds via ElevenLabs Sound Effects API, then renders the final mix using
-soundscape_composer.compose_soundscape().
+AI Soundscape Generator + Refinement
+=====================================
+Two core functions:
+
+    generate_soundscape(...)  → creates audio + writes a .score.json file
+    refine_soundscape(...)    → reads the score, sends it + your instruction
+                                to GPT-5.2, generates new sounds as needed,
+                                re-renders, writes an updated .score.json
+
+The .score.json is the persistent textual representation of the composition.
+It contains the full layer spec, generated sounds manifest, scene description,
+and duration — everything the LLM needs to understand and modify the piece.
 
 Requirements:
     pip install openai elevenlabs pydub numpy
@@ -13,395 +19,244 @@ Requirements:
 Environment variables:
     OPENAI_API_KEY      — OpenAI API key
     ELEVENLABS_API_KEY  — ElevenLabs API key
-
-Usage:
-    python ai_soundscape.py --prompt "A peaceful Japanese garden at dawn with \
-        a koi pond, wind chimes, and distant temple bells" \
-        --duration 180 --library ./library --output output/japanese_garden.wav
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
-import sys
-import time
 import textwrap
+import warnings
 from pathlib import Path
+from datetime import datetime
 
 import openai
 from elevenlabs import ElevenLabs
 
-from soundscape_composer import (
-    compose_soundscape,
-    list_library,
-    TrackLayer,
-)
+from soundscape_composer import compose_soundscape, list_library
 
 
-# ─── Configuration ──────────────────────────────────────────────────────────────
+# ─── Config ─────────────────────────────────────────────────────────────────────
 
 OPENAI_MODEL = "gpt-5.2"
 
-ELEVENLABS_OUTPUT_FORMAT = "mp3_44100_128"
 
-# Where ElevenLabs-generated sounds get saved
-GENERATED_DIR = "library/_generated"
+# ─── Score file I/O ─────────────────────────────────────────────────────────────
 
-# ─── System prompt for the planner ─────────────────────────────────────────────
+def _score_path(audio_path: str) -> str:
+    """Derive the .score.json path from the audio output path."""
+    p = Path(audio_path)
+    return str(p.with_suffix(".score.json"))
 
-PLANNER_SYSTEM_PROMPT = textwrap.dedent("""\
-You are an expert sound designer and foley artist. Your job is to design
-immersive, cinematic soundscapes by composing multiple layered audio tracks.
 
-You will be given:
-1. A natural-language description of a scene.
-2. The desired duration in seconds.
-3. A catalogue of available sound files with their paths, names, durations,
-   and folders.
+def write_score(
+    audio_path: str,
+    plan: dict,
+    scene_description: str,
+    duration_seconds: float,
+    library_dir: str,
+    revision: int = 0,
+    history: list[str] | None = None,
+) -> str:
+    """
+    Write the full score file next to the audio file.
+    Returns the score file path.
 
-Your output must be a single JSON object (no markdown, no commentary) with
-exactly two top-level keys:
+    The score contains everything needed to understand, reproduce,
+    or further refine the soundscape:
+      - scene_description: the original prompt
+      - duration_seconds
+      - revision: how many refinements have been applied
+      - history: list of all instructions (original + refinements)
+      - library_dir: where sounds live
+      - sounds_generated: manifest of ElevenLabs-created sounds
+      - layers: the full composition spec (every parameter)
+      - human_readable_score: a plain-text breakdown for quick reading
+    """
+    score_file = _score_path(audio_path)
 
-{
-  "sounds_to_generate": [
-    {
-      "id": "gen_01",
-      "description": "A short, clear description for an AI sound-effects
-                       generator. Be specific about the sound, not the scene.
-                       e.g. 'Gentle wooden wind chimes tinkling in a light
-                       breeze' rather than 'Japanese garden ambience'.",
-      "suggested_filename": "wind_chimes_gentle.mp3",
-      "duration_seconds": 12.0
+    # Build human-readable text version of the score
+    readable_lines = []
+    readable_lines.append(f"SOUNDSCAPE: {scene_description}")
+    readable_lines.append(f"Duration: {duration_seconds}s | Revision: {revision}")
+    readable_lines.append(f"Layers: {len(plan.get('layers', []))}")
+    readable_lines.append("")
+
+    for i, L in enumerate(plan.get("layers", []), 1):
+        readable_lines.append(f"[{i}] {L.get('label', 'Untitled')}")
+        readable_lines.append(f"    file: {L.get('file', '?')}")
+        readable_lines.append(f"    vol: {L.get('volume_db', 0)}dB  pan: {L.get('pan', 0)}  loop: {L.get('loop', False)}")
+        readable_lines.append(f"    window: {L.get('start_ms', 0)}ms -> {L.get('end_ms', 'END')}")
+        readable_lines.append(f"    fade_in: {L.get('fade_in_ms', 0)}ms ({L.get('fade_in_curve', 'linear')})  fade_out: {L.get('fade_out_ms', 0)}ms ({L.get('fade_out_curve', 'linear')})")
+
+        if L.get("low_pass_hz") or L.get("high_pass_hz"):
+            readable_lines.append(f"    filters: LP={L.get('low_pass_hz', '-')}Hz  HP={L.get('high_pass_hz', '-')}Hz")
+        if L.get("playback_rate", 1.0) != 1.0:
+            readable_lines.append(f"    rate: {L['playback_rate']}x")
+        if L.get("reverse"):
+            readable_lines.append(f"    REVERSED")
+
+        if L.get("volume_automation"):
+            pts = " -> ".join(
+                f"{p.get('time_ms', 0)}ms:{p.get('value', p.get('value_db', 0))}dB"
+                for p in L["volume_automation"]
+            )
+            readable_lines.append(f"    vol_auto: {pts}")
+        if L.get("pan_automation"):
+            pts = " -> ".join(
+                f"{p.get('time_ms', 0)}ms:{p.get('value', p.get('pan', 0))}"
+                for p in L["pan_automation"]
+            )
+            readable_lines.append(f"    pan_auto: {pts}")
+        if L.get("occurrences"):
+            readable_lines.append(f"    occurrences: {len(L['occurrences'])} hits")
+            for j, occ in enumerate(L["occurrences"][:6]):
+                t = occ.get("start_ms", occ.get("time_ms", "?"))
+                readable_lines.append(f"      @{t}ms  pan={occ.get('pan', '-')}  vol={occ.get('volume_db', occ.get('gain_db', '-'))}dB")
+            if len(L["occurrences"]) > 6:
+                readable_lines.append(f"      ... +{len(L['occurrences'])-6} more")
+        if L.get("random_occurrences"):
+            ro = L["random_occurrences"]
+            if isinstance(ro, dict):
+                readable_lines.append(f"    random: count={ro.get('count','?')} gap>={ro.get('min_gap_ms','?')}ms vol+-{ro.get('volume_var_db','?')}dB pan+-{ro.get('pan_var','?')}")
+        readable_lines.append("")
+
+    gens = plan.get("sounds_to_generate", [])
+    if gens:
+        readable_lines.append("GENERATED SOUNDS:")
+        for g in gens:
+            readable_lines.append(f"  * {g.get('suggested_filename', '?')}: {g.get('description', '?')} ({g.get('duration_seconds', '?')}s)")
+
+    score_data = {
+        "scene_description": scene_description,
+        "duration_seconds": duration_seconds,
+        "revision": revision,
+        "history": history or [scene_description],
+        "library_dir": library_dir,
+        "sounds_generated": plan.get("sounds_to_generate", []),
+        "layers": plan.get("layers", []),
+        "human_readable_score": "\n".join(readable_lines),
     }
-  ],
-  "layers": [
-    {
-      "file": "path/to/file.wav  OR  _generated/suggested_filename.mp3",
-      "label": "Human-readable name",
-      "volume_db": -6.0,
-      "pan": 0.0,
-      "loop": true,
-      "loop_crossfade_ms": 150,
-      "start_ms": 0,
-      "end_ms": null,
-      "fade_in_ms": 3000,
-      "fade_out_ms": 3000,
-      "fade_in_curve": "scurve",
-      "fade_out_curve": "linear",
-      "playback_rate": 1.0,
-      "reverse": false,
-      "low_pass_hz": null,
-      "high_pass_hz": null,
-      "occurrences": null,
-      "random_occurrences": null,
-      "volume_automation": null,
-      "pan_automation": null
-    }
-  ]
-}
 
-Design principles:
-- Build depth with 5–15 layers: a base ambience bed, mid-ground textures,
-  foreground details, and sporadic one-shots for realism.
-- Use pan (-1.0 to 1.0) to spread sounds across the stereo field.
-  Don't put everything at center.
-- Use volume_automation and pan_automation for movement and life.
-  e.g. wind that sweeps, birds that move, traffic that swells.
-- Use low_pass_hz to push sounds into the "distance" (400–1200 Hz).
-- Use random_occurrences for natural sporadic sounds (birds, drips, cracks)
-  with volume_var_db and pan_var for variation.
-- Use occurrences for precisely timed dramatic moments.
-- Loop ambient beds. Don't loop one-shots.
-- Fade everything in/out — no hard cuts. Use scurve or logarithmic fades
-  for natural-sounding transitions.
-- Stagger start_ms so layers don't all begin at once — build the scene.
-- Keep the master peak around -3 to -6 dB. Set base layers around -4 to -8 dB,
-  details at -10 to -18 dB, and one-shots at -12 to -20 dB.
-- If a sound in the library is close but not ideal, use it and adjust with
-  playback_rate, low_pass_hz, high_pass_hz, or volume to reshape it.
-- Only request generation for sounds that truly don't exist in the library
-  and are essential for the scene. Prefer reusing library sounds creatively.
-- For generated sounds, write descriptions that are specific and physical:
-  describe the actual sound, not the mood. ElevenLabs needs concrete audio
-  descriptions like "Heavy rain on a tin roof" not "Melancholic atmosphere".
-- Keep generated sound durations practical: 5–15s for loops, 2–8s for one-shots.
-
-For files from the library, use their exact path as listed in the catalogue.
-For generated files, use: "_generated/<suggested_filename>".
-The system will replace _generated/ with the actual path after generation.
-""")
+    Path(score_file).parent.mkdir(parents=True, exist_ok=True)
+    Path(score_file).write_text(json.dumps(score_data, indent=2))
+    print(f"[score] Written: {score_file}")
+    return score_file
 
 
-# ─── ElevenLabs sound generation ────────────────────────────────────────────────
+def read_score(score_path: str) -> dict:
+    """Load a score file."""
+    return json.loads(Path(score_path).read_text())
 
 
-def generate_sound_effect(
+# ─── ElevenLabs generation ──────────────────────────────────────────────────────
+
+def _generate_sound(
     client: ElevenLabs,
     description: str,
     filename: str,
     duration_seconds: float,
-    output_dir: str = GENERATED_DIR,
+    output_dir: str,
 ) -> str:
-    """
-    Generate a sound effect using ElevenLabs and save it to disk.
-
-    Returns the path to the saved file.
-    """
+    """Generate a single sound via ElevenLabs. Caches by filename."""
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / filename
 
-    # Skip if already generated (cache)
     if out_path.exists():
-        print(f"  [cache] {filename} already exists, skipping generation")
+        print(f"  [cache] {filename}")
         return str(out_path)
 
-    print(f"  [elevenlabs] Generating: {description!r} → {filename} ({duration_seconds}s)")
-
+    print(f"  [elevenlabs] {description!r} -> {filename} ({duration_seconds}s)")
     result = client.text_to_sound_effects.convert(
         text=description,
-        duration_seconds=min(duration_seconds, 22.0),  # ElevenLabs max is 22s
+        duration_seconds=min(duration_seconds, 22.0),
         prompt_influence=0.5,
     )
-
-    # result is a generator of bytes chunks
     audio_bytes = b"".join(chunk for chunk in result)
-
     out_path.write_bytes(audio_bytes)
-    print(f"  [elevenlabs] Saved: {out_path} ({len(audio_bytes)} bytes)")
-
+    print(f"  [elevenlabs] Saved ({len(audio_bytes)} bytes)")
     return str(out_path)
 
 
-# ─── GPT-5.2 planner ───────────────────────────────────────────────────────────
+def _generate_all(
+    sounds: list[dict],
+    library_dir: str,
+    el_client: ElevenLabs | None,
+) -> list[dict]:
+    """Generate all requested sounds. Returns manifest of what was created."""
+    if not sounds:
+        return []
 
+    if not el_client:
+        print(f"[warning] {len(sounds)} sounds need generation but no ElevenLabs client.")
+        return []
 
-def plan_soundscape(
-    scene_description: str,
-    duration_seconds: float,
-    library_catalogue: list[dict],
-    openai_client: openai.OpenAI,
-) -> dict:
-    """
-    Ask GPT-5.2 to design a soundscape composition plan.
+    gen_dir = str(Path(library_dir) / "_generated")
+    generated = []
+    print(f"\n[generate] {len(sounds)} sounds:\n")
 
-    Returns the parsed JSON plan with 'sounds_to_generate' and 'layers'.
-    """
-    catalogue_text = json.dumps(library_catalogue, indent=2)
-
-    user_message = textwrap.dedent(f"""\
-    Scene description: {scene_description}
-
-    Desired duration: {duration_seconds} seconds
-
-    Available sound library:
-    {catalogue_text}
-    """)
-
-    print(f"[gpt-5.2] Planning soundscape for: {scene_description!r}")
-    print(f"[gpt-5.2] Library has {len(library_catalogue)} sounds available")
-
-    response = openai_client.chat.completions.create(
-        model=OPENAI_MODEL,
-        temperature=0.7,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-    )
-
-    raw = response.choices[0].message.content
-    plan = json.loads(raw)
-
-    n_gen = len(plan.get("sounds_to_generate", []))
-    n_layers = len(plan.get("layers", []))
-    print(f"[gpt-5.2] Plan: {n_layers} layers, {n_gen} sounds to generate")
-
-    return plan
-
-
-# ─── Orchestrator ───────────────────────────────────────────────────────────────
-
-
-def generate_soundscape(
-    scene_description: str,
-    duration_seconds: float = 120,
-    library_dir: str = "library",
-    output_path: str = "output/soundscape.wav",
-    output_format: str = "wav",
-    sample_rate: int = 44100,
-    channels: int = 2,
-    normalize: bool = True,
-    master_volume_db: float = -1.0,
-    master_fade_in_ms: int = 3000,
-    master_fade_out_ms: int = 5000,
-    openai_api_key: str | None = None,
-    elevenlabs_api_key: str | None = None,
-) -> dict:
-    """
-    End-to-end: describe a scene → get a rendered soundscape file.
-
-    Parameters
-    ----------
-    scene_description : str
-        Natural language description of the desired soundscape.
-        e.g. "A bustling Tokyo street at night with rain, neon hum,
-              distant sirens, and a street musician playing saxophone"
-
-    duration_seconds : float
-        Length of the output file in seconds.
-
-    library_dir : str
-        Path to the root sound library folder.
-
-    output_path : str
-        Where to save the final rendered file.
-
-    output_format : str
-        "wav", "mp3", "ogg", or "flac".
-
-    sample_rate : int
-        Output sample rate (default 44100).
-
-    channels : int
-        1 = mono, 2 = stereo (default 2).
-
-    normalize : bool
-        Normalize the final mix to prevent clipping.
-
-    master_volume_db : float
-        Master gain for the final mix.
-
-    master_fade_in_ms : int
-        Fade-in on the master output.
-
-    master_fade_out_ms : int
-        Fade-out on the master output.
-
-    openai_api_key : str | None
-        OpenAI API key. Falls back to OPENAI_API_KEY env var.
-
-    elevenlabs_api_key : str | None
-        ElevenLabs API key. Falls back to ELEVENLABS_API_KEY env var.
-
-    Returns
-    -------
-    dict with keys:
-        - path: output file path
-        - duration_ms: actual duration
-        - layers_processed: number of layers rendered
-        - peak_db: peak level
-        - clipped: whether clipping occurred
-        - plan: the raw GPT-5.2 plan (for inspection/debugging)
-        - generated_sounds: list of sounds that were created via ElevenLabs
-    """
-
-    # ── Resolve API keys ────────────────────────────────────────────────
-    oai_key = openai_api_key or os.environ.get("OPENAI_API_KEY")
-    el_key = elevenlabs_api_key or os.environ.get("ELEVENLABS_API_KEY")
-
-    if not oai_key:
-        raise ValueError(
-            "OpenAI API key required. Pass openai_api_key= or set OPENAI_API_KEY."
-        )
-
-    oai_client = openai.OpenAI(api_key=oai_key)
-
-    # ── Scan the library ────────────────────────────────────────────────
-    print(f"\n{'='*60}")
-    print(f"  AI Soundscape Generator")
-    print(f"{'='*60}")
-    print(f"  Scene:    {scene_description}")
-    print(f"  Duration: {duration_seconds}s")
-    print(f"  Library:  {library_dir}")
-    print(f"  Output:   {output_path}")
-    print(f"{'='*60}\n")
-
-    catalogue = list_library(library_dir)
-    print(f"[library] Found {len(catalogue)} audio files\n")
-
-    # ── Plan with GPT-5.2 ──────────────────────────────────────────────
-    plan = plan_soundscape(
-        scene_description=scene_description,
-        duration_seconds=duration_seconds,
-        library_catalogue=catalogue,
-        openai_client=oai_client,
-    )
-
-    # ── Generate missing sounds via ElevenLabs ──────────────────────────
-    generated_sounds = []
-    sounds_to_gen = plan.get("sounds_to_generate", [])
-
-    if sounds_to_gen:
-        if not el_key:
-            print("[warning] No ElevenLabs API key — skipping sound generation.")
-            print("          Set ELEVENLABS_API_KEY or pass elevenlabs_api_key=.")
-            print("          Layers using generated sounds will be silent/skipped.\n")
-        else:
-            el_client = ElevenLabs(api_key=el_key)
-            gen_dir = str(Path(library_dir) / "_generated")
-
-            print(f"\n[generate] {len(sounds_to_gen)} sounds to create:\n")
-
-            for sound in sounds_to_gen:
-                try:
-                    path = generate_sound_effect(
-                        client=el_client,
-                        description=sound["description"],
-                        filename=sound["suggested_filename"],
-                        duration_seconds=sound.get("duration_seconds", 10.0),
-                        output_dir=gen_dir,
-                    )
-                    generated_sounds.append({
-                        "id": sound.get("id", ""),
-                        "description": sound["description"],
-                        "path": path,
-                    })
-                except Exception as e:
-                    print(f"  [error] Failed to generate {sound['suggested_filename']}: {e}")
-
-            print()
-
-    # ── Resolve file paths in the plan ──────────────────────────────────
-    gen_dir_prefix = "_generated/"
-    layers = []
-
-    for layer_data in plan.get("layers", []):
-        file_path = layer_data.get("file", "")
-
-        # Resolve _generated/ prefix to actual library path
-        if file_path.startswith(gen_dir_prefix):
-            file_path = str(
-                Path(library_dir) / "_generated" / file_path[len(gen_dir_prefix):]
+    for s in sounds:
+        try:
+            path = _generate_sound(
+                client=el_client,
+                description=s["description"],
+                filename=s["suggested_filename"],
+                duration_seconds=s.get("duration_seconds", 10.0),
+                output_dir=gen_dir,
             )
-        elif not Path(file_path).is_absolute():
-            # Paths from catalogue are already relative to library_dir
-            # but double-check they exist
-            if not Path(file_path).exists():
-                candidate = Path(library_dir) / file_path
-                if candidate.exists():
-                    file_path = str(candidate)
+            generated.append({"id": s.get("id", ""), "description": s["description"], "path": path})
+        except Exception as e:
+            print(f"  [error] {s.get('suggested_filename', '?')}: {e}")
 
-        layer_data["file"] = file_path
+    return generated
 
-        # Clean up null values to let TrackLayer defaults apply
+
+# ─── Path resolution ────────────────────────────────────────────────────────────
+
+def _resolve_paths(layers: list[dict], library_dir: str) -> list[dict]:
+    """Resolve _generated/ prefixes and relative paths."""
+    resolved = []
+    for layer in layers:
+        layer = dict(layer)
+        fp = layer.get("file", "")
+
+        if fp.startswith("_generated/"):
+            fp = str(Path(library_dir) / fp)
+        elif not Path(fp).is_absolute() and not Path(fp).exists():
+            candidate = Path(library_dir) / fp
+            if candidate.exists():
+                fp = str(candidate)
+
+        layer["file"] = fp
+
+        # Clean nulls (keep end_ms=None explicitly)
         cleaned = {}
-        for k, v in layer_data.items():
+        for k, v in layer.items():
             if v is not None:
                 cleaned[k] = v
             elif k == "end_ms":
-                # Explicitly keep None for end_ms (means "to end of soundscape")
                 cleaned[k] = None
+        resolved.append(cleaned)
+    return resolved
 
-        layers.append(cleaned)
 
-    # ── Render ──────────────────────────────────────────────────────────
-    print(f"\n[render] Composing {len(layers)} layers into {duration_seconds}s soundscape...\n")
+# ─── Render helper ───────────────────────────────────────────────────────────────
 
-    result = compose_soundscape(
+def _render(
+    layers: list[dict],
+    output_path: str,
+    duration_seconds: float,
+    output_format: str = "wav",
+    sample_rate: int = 44100,
+    channels: int = 2,
+    master_volume_db: float = -1.0,
+    master_fade_in_ms: int = 3000,
+    master_fade_out_ms: int = 5000,
+) -> dict:
+    """Render layers to an audio file."""
+    print(f"\n[render] {len(layers)} layers -> {duration_seconds}s ...\n")
+    return compose_soundscape(
         output_path=output_path,
         duration_seconds=duration_seconds,
         layers=layers,
@@ -411,133 +266,337 @@ def generate_soundscape(
         sample_rate=sample_rate,
         channels=channels,
         output_format=output_format,
-        normalize=normalize,
+        normalize=True,
         normalize_headroom_db=-1.0,
     )
 
-    result["plan"] = plan
-    result["generated_sounds"] = generated_sounds
 
-    print(f"[done] Exported: {result['path']}")
-    print(f"       Duration: {result['duration_ms'] / 1000:.1f}s")
-    print(f"       Layers:   {result['layers_processed']}")
-    print(f"       Peak:     {result['peak_db']} dB")
-    print(f"       Clipped:  {result['clipped']}")
+# ─── System prompts ─────────────────────────────────────────────────────────────
 
-    if generated_sounds:
-        print(f"       Generated: {len(generated_sounds)} new sounds via ElevenLabs")
+_SCHEMA_RULES = """\
+OUTPUT FORMAT: A single JSON object with two keys: "sounds_to_generate" and "layers".
+No markdown, no commentary, no backticks. Raw JSON only.
 
-    return result
+SCHEMA RULES (follow exactly or the renderer will crash):
+- volume_automation points: {"time_ms": int, "value": float}  (NOT "value_db")
+- pan_automation points: {"time_ms": int, "value": float}  (NOT "pan")
+- occurrences: [{"start_ms": int, "volume_db": float, "pan": float, ...}]
+  Valid occurrence keys ONLY: start_ms, volume_db, pan, fade_in_ms, fade_out_ms,
+  playback_rate, trim_start_ms, trim_end_ms, reverse. NO other keys like
+  "gain_db", "time_ms", "pitch_var_semitones" etc.
+- random_occurrences MUST be a DICT with keys: count, min_gap_ms,
+  volume_var_db, pan_var, rate_var.  It must NEVER be a list.
+- Layer valid keys ONLY: file, label, volume_db, pan, loop, loop_crossfade_ms,
+  start_ms, end_ms, fade_in_ms, fade_out_ms, fade_in_curve, fade_out_curve,
+  playback_rate, reverse, low_pass_hz, high_pass_hz, occurrences,
+  random_occurrences, volume_automation, pan_automation.
+  Do NOT invent keys like "min_interval_ms", "max_interval_ms",
+  "pitch_var_semitones" etc.
+- For generated sounds, set file to: "_generated/<filename>"
+- For existing library sounds, use their exact path from the catalogue.
+- sounds_to_generate entries: {"id": str, "description": str,
+  "suggested_filename": str, "duration_seconds": float}.
+  Description must be concrete and physical (the actual sound, not mood).
+  Keep durations practical: 5-15s for loops, 2-8s for one-shots.
+- fade_in_curve / fade_out_curve valid values: "linear", "logarithmic",
+  "exponential", "scurve"."""
+
+CREATE_SYSTEM_PROMPT = textwrap.dedent(f"""\
+You are an expert sound designer. Design immersive, cinematic soundscapes
+by composing multiple layered audio tracks.
+
+You will receive a scene description, duration, and a catalogue of
+available sound files.
+
+{_SCHEMA_RULES}
+
+MIXING PRINCIPLES:
+- Build depth with 5-15 layers: base ambient bed, mid-ground textures,
+  foreground details, sporadic one-shots.
+- Spread sounds across the stereo field with pan (-1.0 to 1.0).
+- Use volume_automation and pan_automation for movement and life.
+- Use low_pass_hz (400-1200) to push sounds into the "distance".
+- Use random_occurrences for natural sporadic sounds with variation.
+- Loop ambient beds. Don't loop one-shots.
+- Fade everything. No hard cuts. Use scurve or logarithmic curves.
+- Stagger start_ms so layers build the scene gradually.
+- Base beds: -4 to -8 dB. Details: -10 to -18 dB. One-shots: -12 to -20 dB.
+- Prefer reusing library sounds creatively (rate, filters, reverse) over
+  generating new ones. Only generate what truly does not exist.
+""")
+
+REFINE_SYSTEM_PROMPT = textwrap.dedent(f"""\
+You are an expert sound designer refining an existing soundscape composition.
+
+You will receive:
+1. The current composition score (full layer-by-layer breakdown).
+2. The user's corrective instruction.
+3. The available sound library catalogue.
+4. The total duration.
+
+{_SCHEMA_RULES}
+
+REFINEMENT RULES:
+- PRESERVE layers the user did not mention. Do not drop untouched layers.
+- When told "make X louder/quieter" -> adjust volume_db or volume_automation.
+- When told "add Y" -> design a new layer. Generate the sound if not in library.
+- When told "remove Y" -> drop that layer entirely.
+- When told "X sounds bad/wrong" -> either replace the sound file
+  (generate if needed) or heavily adjust parameters (filters, volume, timing).
+- When told qualitative things like "more dramatic", "calmer", "build tension"
+  -> interpret via automation curves, volume shifts, new layers, timing changes.
+- When told "move X earlier/later" -> shift start_ms / end_ms / occurrences.
+- You can split one layer into two, merge layers, or restructure freely.
+- Always output the COMPLETE layer list including unchanged layers.
+""")
 
 
-# ─── CLI ────────────────────────────────────────────────────────────────────────
+# ─── GPT calls ──────────────────────────────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="AI Soundscape Generator — describe a scene, get an audio file.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=textwrap.dedent("""\
+def _call_gpt(
+    system_prompt: str,
+    user_message: str,
+    oai_client: openai.OpenAI,
+    temperature: float = 0.7,
+) -> dict:
+    """Call GPT-5.2 and parse JSON response."""
+    response = oai_client.chat.completions.create(
+        model=OPENAI_MODEL,
+        temperature=temperature,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+    )
+    return json.loads(response.choices[0].message.content)
+
+
+# ─── generate_soundscape ────────────────────────────────────────────────────────
+
+def generate_soundscape(
+    scene_description: str,
+    duration_seconds: float = 120,
+    library_dir: str = "library",
+    output_path: str = "output/soundscape.wav",
+    output_format: str = "wav",
+    sample_rate: int = 44100,
+    channels: int = 2,
+    master_volume_db: float = -1.0,
+    master_fade_in_ms: int = 3000,
+    master_fade_out_ms: int = 5000,
+    openai_api_key: str | None = None,
+    elevenlabs_api_key: str | None = None,
+) -> dict:
+    """
+    Generate a soundscape from a natural-language scene description.
+
+    Produces:
+      1. The audio file at output_path
+      2. A .score.json next to it with the full composition spec
+
+    The .score.json is what refine_soundscape() reads to understand
+    and modify the composition.
+
+    Returns dict with: path, duration_ms, layers_processed, peak_db,
+    clipped, plan, generated_sounds, score_file.
+    """
+    oai_key = openai_api_key or os.environ.get("OPENAI_API_KEY")
+    el_key = elevenlabs_api_key or os.environ.get("ELEVENLABS_API_KEY")
+    if not oai_key:
+        raise ValueError("OpenAI API key required.")
+
+    oai_client = openai.OpenAI(api_key=oai_key)
+    el_client = ElevenLabs(api_key=el_key) if el_key else None
+
+    # Scan library
+    catalogue = list_library(library_dir)
+    print(f"[library] {len(catalogue)} audio files found")
+
+    # Plan
+    print(f"[gpt-5.2] Planning: {scene_description!r}")
+    user_msg = (
+        f"Scene: {scene_description}\n"
+        f"Duration: {duration_seconds} seconds\n\n"
+        f"Available library:\n{json.dumps(catalogue, indent=2)}"
+    )
+    plan = _call_gpt(CREATE_SYSTEM_PROMPT, user_msg, oai_client)
+
+    n_gen = len(plan.get("sounds_to_generate", []))
+    n_layers = len(plan.get("layers", []))
+    print(f"[gpt-5.2] Plan: {n_layers} layers, {n_gen} sounds to generate")
+
+    # Generate missing sounds
+    generated = _generate_all(plan.get("sounds_to_generate", []), library_dir, el_client)
+
+    # Resolve paths and render
+    layers = _resolve_paths(plan.get("layers", []), library_dir)
+    render_result = _render(
+        layers, output_path, duration_seconds, output_format,
+        sample_rate, channels, master_volume_db,
+        master_fade_in_ms, master_fade_out_ms,
+    )
+
+    # Write score
+    score_file = write_score(
+        audio_path=output_path,
+        plan=plan,
+        scene_description=scene_description,
+        duration_seconds=duration_seconds,
+        library_dir=library_dir,
+        revision=0,
+        history=[scene_description],
+    )
+
+    render_result["plan"] = plan
+    render_result["generated_sounds"] = generated
+    render_result["score_file"] = score_file
+
+    print(f"\n[done] Audio: {render_result['path']}")
+    print(f"       Score: {score_file}")
+    print(f"       Layers: {render_result['layers_processed']}  Peak: {render_result['peak_db']}dB")
+
+    return render_result
+
+
+# ─── refine_soundscape ──────────────────────────────────────────────────────────
+
+def refine_soundscape(
+    instruction: str,
+    score_path: str | None = None,
+    audio_path: str | None = None,
+    output_path: str | None = None,
+    output_format: str = "wav",
+    sample_rate: int = 44100,
+    channels: int = 2,
+    master_volume_db: float = -1.0,
+    master_fade_in_ms: int = 3000,
+    master_fade_out_ms: int = 5000,
+    openai_api_key: str | None = None,
+    elevenlabs_api_key: str | None = None,
+) -> dict:
+    """
+    Refine an existing soundscape by sending a corrective instruction.
+
+    Reads the .score.json, sends the full human-readable score + raw layer
+    JSON + your instruction + the current library catalogue to GPT-5.2.
+    GPT returns a revised plan. Any new sounds are generated via ElevenLabs.
+    The composition is re-rendered and a new .score.json is written.
+
+    Parameters
+    ----------
+    instruction : str
+        Natural-language instruction describing what to change.
         Examples:
-          %(prog)s --prompt "A rainy café in Paris with soft jazz, espresso machine,
-                             quiet chatter, and rain on windows" --duration 300
+          "Remove the cockpit beeps, they sound unrealistic"
+          "Make the wind much more aggressive in the first 60 seconds"
+          "Add a deep metallic groaning sound throughout the descent"
+          "The landing needs more impact, add a shockwave boom at touchdown"
+          "Everything is too busy, simplify to just wind and thrusters"
+          "Pan the hull creaks to the left and make them quieter"
+          "Add a radio static crackle that fades in around 90 seconds"
 
-          %(prog)s --prompt "Deep space: reactor hum, distant radio chatter,
-                             occasional metallic creaks, warning beeps"
-                   --duration 600 --output output/space_station.mp3 --format mp3
+    score_path : str | None
+        Path to the .score.json file. If None, derived from audio_path.
 
-          %(prog)s --prompt "Tropical beach at sunset with waves, seagulls,
-                             steel drums in the distance, and a bonfire"
-                   --duration 180 --library ./my_sounds
-        """),
-    )
+    audio_path : str | None
+        Path to the previous audio file. Used to find the score if
+        score_path is not given.
 
-    parser.add_argument(
-        "--prompt", "-p",
-        required=True,
-        help="Natural language description of the soundscape.",
-    )
-    parser.add_argument(
-        "--duration", "-d",
-        type=float,
-        default=120,
-        help="Duration in seconds (default: 120).",
-    )
-    parser.add_argument(
-        "--library", "-l",
-        default="library",
-        help="Path to the sound library folder (default: ./library).",
-    )
-    parser.add_argument(
-        "--output", "-o",
-        default="output/soundscape.wav",
-        help="Output file path (default: output/soundscape.wav).",
-    )
-    parser.add_argument(
-        "--format", "-f",
-        default="wav",
-        choices=["wav", "mp3", "ogg", "flac"],
-        help="Output format (default: wav).",
-    )
-    parser.add_argument(
-        "--sample-rate",
-        type=int,
-        default=44100,
-        help="Sample rate in Hz (default: 44100).",
-    )
-    parser.add_argument(
-        "--mono",
-        action="store_true",
-        help="Output mono instead of stereo.",
-    )
-    parser.add_argument(
-        "--no-normalize",
-        action="store_true",
-        help="Skip normalization of the final mix.",
-    )
-    parser.add_argument(
-        "--master-volume",
-        type=float,
-        default=-1.0,
-        help="Master volume in dB (default: -1.0).",
-    )
-    parser.add_argument(
-        "--openai-key",
-        default=None,
-        help="OpenAI API key (or set OPENAI_API_KEY env var).",
-    )
-    parser.add_argument(
-        "--elevenlabs-key",
-        default=None,
-        help="ElevenLabs API key (or set ELEVENLABS_API_KEY env var).",
-    )
-    parser.add_argument(
-        "--save-plan",
-        default=None,
-        help="Save the GPT-5.2 composition plan to a JSON file for inspection.",
+    output_path : str | None
+        Where to write the new audio. If None, auto-generates a
+        versioned filename next to the score.
+
+    Returns dict with: path, duration_ms, layers_processed, peak_db,
+    clipped, plan, generated_sounds, score_file.
+    """
+    # Resolve score path
+    if score_path is None and audio_path is not None:
+        score_path = _score_path(audio_path)
+    if score_path is None:
+        raise ValueError("Provide either score_path or audio_path.")
+    if not Path(score_path).exists():
+        raise FileNotFoundError(f"Score not found: {score_path}")
+
+    oai_key = openai_api_key or os.environ.get("OPENAI_API_KEY")
+    el_key = elevenlabs_api_key or os.environ.get("ELEVENLABS_API_KEY")
+    if not oai_key:
+        raise ValueError("OpenAI API key required.")
+
+    oai_client = openai.OpenAI(api_key=oai_key)
+    el_client = ElevenLabs(api_key=el_key) if el_key else None
+
+    # Load current score
+    score = read_score(score_path)
+    scene = score["scene_description"]
+    duration = score["duration_seconds"]
+    library_dir = score["library_dir"]
+    revision = score.get("revision", 0) + 1
+    history = score.get("history", [scene])
+
+    print(f"[refine] Revision {revision}")
+    print(f"[refine] Instruction: {instruction!r}")
+    print(f"[refine] Current: {len(score.get('layers', []))} layers")
+
+    # Scan library (includes previously generated sounds)
+    catalogue = list_library(library_dir)
+
+    # Build user message with full context
+    user_msg = (
+        f"CURRENT COMPOSITION SCORE:\n"
+        f"{score['human_readable_score']}\n\n"
+        f"FULL LAYER DATA (JSON):\n"
+        f"{json.dumps(score['layers'], indent=2)}\n\n"
+        f"DURATION: {duration} seconds\n\n"
+        f"AVAILABLE LIBRARY ({len(catalogue)} files):\n"
+        f"{json.dumps(catalogue, indent=2)}\n\n"
+        f"INSTRUCTION:\n{instruction}"
     )
 
-    args = parser.parse_args()
+    # Get revised plan
+    print(f"[gpt-5.2] Refining...")
+    new_plan = _call_gpt(REFINE_SYSTEM_PROMPT, user_msg, oai_client, temperature=0.6)
 
-    result = generate_soundscape(
-        scene_description=args.prompt,
-        duration_seconds=args.duration,
-        library_dir=args.library,
-        output_path=args.output,
-        output_format=args.format,
-        sample_rate=args.sample_rate,
-        channels=1 if args.mono else 2,
-        normalize=not args.no_normalize,
-        master_volume_db=args.master_volume,
-        openai_api_key=args.openai_key,
-        elevenlabs_api_key=args.elevenlabs_key,
+    n_gen = len(new_plan.get("sounds_to_generate", []))
+    n_layers = len(new_plan.get("layers", []))
+    print(f"[gpt-5.2] Revised: {n_layers} layers, {n_gen} new sounds")
+
+    # Generate new sounds
+    generated = _generate_all(new_plan.get("sounds_to_generate", []), library_dir, el_client)
+
+    # Resolve paths and render
+    layers = _resolve_paths(new_plan.get("layers", []), library_dir)
+
+    if output_path is None:
+        base = Path(score_path).stem.replace(".score", "")
+        ts = datetime.now().strftime("%H%M%S")
+        output_path = str(Path(score_path).parent / f"{base}_v{revision}_{ts}.wav")
+
+    render_result = _render(
+        layers, output_path, duration, output_format,
+        sample_rate, channels, master_volume_db,
+        master_fade_in_ms, master_fade_out_ms,
     )
 
-    if args.save_plan and result.get("plan"):
-        plan_path = Path(args.save_plan)
-        plan_path.parent.mkdir(parents=True, exist_ok=True)
-        plan_path.write_text(json.dumps(result["plan"], indent=2))
-        print(f"\n[plan] Saved composition plan to: {plan_path}")
+    # Write updated score
+    history = history + [instruction]
+    score_file = write_score(
+        audio_path=output_path,
+        plan=new_plan,
+        scene_description=scene,
+        duration_seconds=duration,
+        library_dir=library_dir,
+        revision=revision,
+        history=history,
+    )
 
+    render_result["plan"] = new_plan
+    render_result["generated_sounds"] = generated
+    render_result["score_file"] = score_file
 
-if __name__ == "__main__":
-    main()
+    print(f"\n[done] Audio: {render_result['path']}")
+    print(f"       Score: {score_file}")
+    print(f"       Layers: {render_result['layers_processed']}  Peak: {render_result['peak_db']}dB")
+    print(f"       Revision: {revision}  History: {len(history)} instructions")
+
+    return render_result
