@@ -33,6 +33,10 @@
 
     <div class="sec">
         <div class="sec-label"><span class="icon">🎥</span> CAMERA POSE</div>
+        <!-- 3D viewport widget — compact, inside sidebar -->
+        <div class="viewport-widget">
+            <canvas id="viewport-canvas"></canvas>
+        </div>
         <div class="field"><label>Azimuth</label>
             <select id="selAz" onchange="syncFromDropdowns()">
                 <option value="front view">Front (0°)</option><option value="front-right quarter view">Front-Right (45°)</option>
@@ -64,21 +68,12 @@
     </div>
 
     <div class="sec">
-        <div class="sec-label"><span class="icon">⚡</span> MODEL</div>
-        <div class="field"><label>GGUF Variant</label>
-            <select id="selVariant"><option value="Q4_K_M" selected>Q4_K_M</option><option value="Q2_K">Q2_K</option><option value="Q8_0">Q8_0</option></select>
-        </div>
-        <button class="load-btn" id="btnLoad" onclick="loadModel()">LOAD MODEL</button>
-    </div>
-
-    <div class="sec">
         <button class="gen-btn" id="btnGen" onclick="doGenerate()" disabled>⚡ GENERATE</button>
     </div>
 </div>
 
-<!-- MAIN -->
+<!-- MAIN — output image is the star -->
 <div class="main">
-    <canvas id="viewport-canvas"></canvas>
     <div class="prompt-bar">
         <input class="prompt-input" id="promptInput" value="<sks> front view eye-level shot medium shot" spellcheck="false">
         <span class="prompt-lock" id="promptLock" onclick="toggleLock()" title="Lock prompt (camera won't overwrite)">🔓</span>
