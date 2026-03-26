@@ -16,7 +16,7 @@ const GP=new THREE.Plane(new THREE.Vector3(0,1,0),0);
 
 function initViewport(){
     canv=document.getElementById('viewport-canvas'); if(!canv) return;
-    const W=canv.clientWidth||700,H=canv.clientHeight||340;
+    const W=canv.clientWidth||288,H=canv.clientHeight||200;
     scene=new THREE.Scene(); scene.background=new THREE.Color(0x0d0d0f);
     cam=new THREE.PerspectiveCamera(38,W/H,.1,100);
     cam.position.set(7,5.5,7); cam.lookAt(0,CY,0);
@@ -182,6 +182,6 @@ function syncFromDropdowns(){
 
 window.addEventListener('resize',()=>{
     if(!canv||!ren)return;
-    const W=canv.clientWidth,H=canv.clientHeight||340;
+    const W=canv.clientWidth,H=canv.clientHeight||200;
     cam.aspect=W/H; cam.updateProjectionMatrix(); ren.setSize(W,H);
 });

@@ -97,5 +97,11 @@ else:
     print(f"\n🎬 Camera Studio: http://localhost:{PORT}\n")
 
 print("\n"+"="*60)
-print("  ✅ Server running. Load model from the UI.")
+print("  ✅ Server running. Auto-loading model...")
 print("="*60)
+
+# Auto-load the pipeline in background
+import threading as _thr
+_thr.Thread(target=load_pipeline, args=(VARIANT,), daemon=True).start()
+print(f"  ⏳ Model loading in background (GGUF {VARIANT})...")
+print("  📺 UI is usable now — model status shown in header.")

@@ -14,20 +14,18 @@ document.addEventListener('DOMContentLoaded',()=>{
 async function pollStatus(){
     try{
         const r=await fetch('/api/status'),d=await r.json();
-        const dot=$('connDot'),lbl=$('connLabel'),bl=$('btnLoad'),bg=$('btnGen');
+        const dot=$('connDot'),lbl=$('connLabel'),bg=$('btnGen');
         if(d.ready){
-            dot.className='dot on'; lbl.textContent='Connected';
-            bl.textContent='✅ LOADED'; bl.disabled=true; ready=true;
+            dot.className='dot on'; lbl.textContent='Connected'; ready=true;
             bg.disabled=!imageId;
         } else if(d.loading){
             dot.className='dot'; dot.style.background='var(--gold)';
-            lbl.textContent='Loading model...'; bl.textContent='⏳ LOADING...'; bl.disabled=true; ready=false; bg.disabled=true;
+            lbl.textContent='Loading model...'; ready=false; bg.disabled=true;
         } else if(d.error){
             dot.className='dot'; dot.style.background='var(--red)';
-            lbl.textContent='Error'; bl.disabled=false; bl.textContent='⚠ RETRY'; ready=false; bg.disabled=true;
+            lbl.textContent='Error'; ready=false; bg.disabled=true;
         } else {
-            dot.className='dot'; lbl.textContent='Model not loaded';
-            bl.disabled=false; bl.textContent='LOAD MODEL'; ready=false; bg.disabled=true;
+            dot.className='dot'; lbl.textContent='Waiting...'; ready=false; bg.disabled=true;
         }
         // HW
         if(d.gpu){

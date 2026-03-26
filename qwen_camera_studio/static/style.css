@@ -70,8 +70,13 @@ body{background:var(--black);color:var(--text);font-family:var(--font-body);font
 
 /* Main */
 .main{grid-area:main;display:flex;flex-direction:column;overflow:hidden;background:var(--black)}
-#viewport-canvas{width:100%;height:340px;display:block;cursor:grab;background:#0d0d0f}
-#viewport-canvas:active{cursor:grabbing}
+
+/* Viewport widget — compact, inside sidebar */
+.viewport-widget{border:1px solid var(--border);border-radius:6px;overflow:hidden;margin-bottom:10px;background:#0d0d0f}
+.viewport-widget canvas{width:100%!important;height:200px!important;display:block;cursor:grab}
+.viewport-widget canvas:active{cursor:grabbing}
+
+#viewport-canvas{width:100%;height:200px;display:block;cursor:grab;background:#0d0d0f}
 
 /* Prompt bar */
 .prompt-bar{display:flex;align-items:center;gap:8px;padding:6px 12px;background:var(--surface);border-bottom:1px solid var(--border)}
