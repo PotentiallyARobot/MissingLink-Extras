@@ -31,10 +31,24 @@ async function pollStatus(){
         if(d.gpu){
             $('hwGpu').textContent=d.gpu;
             $('hwVram').textContent=`${d.vram} / ${d.vram_total} MB`;
-            const pct=d.vram_total?Math.round(d.vram/d.vram_total*100):0;
-            $('hwVramBar').style.width=pct+'%';
-            $('gpuInfo').innerHTML=`<span class="gi-dot" style="background:var(--green)"></span> ${d.gpu} · VRAM ${d.vram}/${d.vram_total}MB`;
+            const vpct=d.vram_total?Math.round(d.vram/d.vram_total*100):0;
+            $('hwVramBar').style.width=vpct+'%';
         }
+        // CPU
+        $('hwCpu').textContent=d.cpu_pct+'%';
+        $('hwCpuBar').style.width=d.cpu_pct+'%';
+        // RAM
+        if(d.ram_total){
+            $('hwRam').textContent=`${d.ram} / ${d.ram_total} MB`;
+            $('hwRamBar').style.width=Math.round(d.ram/d.ram_total*100)+'%';
+        }
+        // Disk
+        if(d.disk_total){
+            $('hwDisk').textContent=`${d.disk} / ${d.disk_total} GB`;
+            $('hwDiskBar').style.width=Math.round(d.disk/d.disk_total*100)+'%';
+        }
+        // Console footer
+        $('gpuInfo').innerHTML=`<span class="gi-dot" style="background:var(--green)"></span> ${d.gpu||'—'} · VRAM ${d.vram}/${d.vram_total}MB · CPU ${d.cpu_pct}% · RAM ${d.ram}/${d.ram_total}MB`;
         // Progress
         if(d.generating && d.progress.active){
             $('genOverlay').classList.add('active');
@@ -83,7 +97,7 @@ async function loadModel(){
         body:JSON.stringify({variant:$('selVariant').value})});}catch(e){}
 }
 
-// ── Upload ────────────────────────────────────────
+// ── Upload (single image) ─────────────────────────
 function initDrop(){
     const z=$('dropzone'),inp=$('fileInput');
     ['dragenter','dragover'].forEach(e=>z.addEventListener(e,ev=>{ev.preventDefault();z.classList.add('over');}));
@@ -91,22 +105,45 @@ function initDrop(){
     z.addEventListener('drop',ev=>{if(ev.dataTransfer.files.length)uploadFile(ev.dataTransfer.files[0]);});
     inp.addEventListener('change',()=>{if(inp.files.length)uploadFile(inp.files[0]);inp.value='';});
 }
+
+function setInputImage(id, url) {
+    imageId = id; imageUrl = url;
+    $('dropzone').style.display = 'none';
+    $('inputPreview').style.display = '';
+    $('inputImg').src = url;
+    setViewportImage(url);
+    $('btnGen').disabled = !ready;
+}
+
 async function uploadFile(file){
     const fd=new FormData();fd.append('image',file);
-    $('dropzone').innerHTML='<div class="dz-text">Uploading...</div>';
     try{
         const r=await fetch('/api/upload',{method:'POST',body:fd}),d=await r.json();
-        if(d.error){$('dropzone').innerHTML=`<div class="dz-text">${d.error}</div>`;return;}
-        imageId=d.id; imageUrl=d.url;
-        // Thumb
-        const ts=$('thumbs'); ts.innerHTML='';
-        const th=document.createElement('div');th.className='thumb';
-        const img=document.createElement('img');img.src=d.url;th.appendChild(img);ts.appendChild(th);
-        $('dropzone').innerHTML='<input type="file" accept="image/*" id="fileInput"><div class="dz-text">Drop images or <b>browse</b></div>';
-        document.getElementById('fileInput').addEventListener('change',function(){if(this.files.length)uploadFile(this.files[0]);this.value='';});
-        setViewportImage(d.url);
-        $('btnGen').disabled=!ready;
-    }catch(e){$('dropzone').innerHTML='<div class="dz-text">Upload failed</div>';}
+        if(d.error){alert(d.error);return;}
+        setInputImage(d.id, d.url);
+    }catch(e){alert('Upload failed');}
+}
+
+function clearInput(){
+    imageId=null; imageUrl=null;
+    $('dropzone').style.display='';
+    $('inputPreview').style.display='none';
+    $('inputImg').src='';
+    $('btnGen').disabled=true;
+}
+
+// ── Use output as input ───────────────────────────
+let lastOutputFilename = null;
+
+async function useAsInput(){
+    if(!lastOutputFilename) return;
+    try{
+        const r=await fetch('/api/use_output',{method:'POST',headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({filename:lastOutputFilename})});
+        const d=await r.json();
+        if(d.error){alert(d.error);return;}
+        setInputImage(d.id, d.url);
+    }catch(e){alert('Failed');}
 }
 
 // ── Prompt lock ───────────────────────────────────
@@ -135,10 +172,14 @@ async function doGenerate(){
     try{
         const r=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
         const d=await r.json();
-        if(d.error){alert(d.error);return;}
+        if(d.error){$('genText').textContent=d.error;return;}
         $('outImg').src=d.url; $('outImg').style.display='';
         $('rngSeed').value=d.seed; $('vSeed').textContent=d.seed;
-        $('resultBar').style.display=''; $('resultBar').textContent=`${d.w}×${d.h} · ${d.elapsed}s · seed:${d.seed} · ${d.prompt}`;
+        $('resultBar').style.display='flex';
+        $('resultText').textContent=`${d.w}×${d.h} · ${d.elapsed}s · seed:${d.seed}`;
+        // Track output for use-as-input
+        lastOutputFilename=d.url.split('/').pop();
+        $('btnUseAsInput').style.display='';
     }catch(e){alert('Request failed: '+e.message);}
     finally{
         btn.disabled=false; btn.textContent='⚡ GENERATE';
