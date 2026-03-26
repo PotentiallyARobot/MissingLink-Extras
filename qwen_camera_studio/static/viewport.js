@@ -1,320 +1,187 @@
-// ============================================================
-// viewport.js — Three.js 3D camera control viewport
-// Properly draggable handles for azimuth/elevation/distance
-// ============================================================
+// viewport.js — Free-drag 3D camera, snaps on release
+const AZ=[{d:0,l:"front view"},{d:45,l:"front-right quarter view"},{d:90,l:"right side view"},
+  {d:135,l:"back-right quarter view"},{d:180,l:"back view"},{d:225,l:"back-left quarter view"},
+  {d:270,l:"left side view"},{d:315,l:"front-left quarter view"}];
+const EL=[{l:"low-angle shot",a:-30},{l:"eye-level shot",a:0},{l:"elevated shot",a:20},{l:"high-angle shot",a:45}];
+const DI=[{l:"close-up",r:2.2},{l:"medium shot",r:3.8},{l:"wide shot",r:5.5}];
+const R=4,CY=.6;
 
-const AZIMUTH_MAP = [
-    { deg: 0,   label: "front view" },
-    { deg: 45,  label: "front-right quarter view" },
-    { deg: 90,  label: "right side view" },
-    { deg: 135, label: "back-right quarter view" },
-    { deg: 180, label: "back view" },
-    { deg: 225, label: "back-left quarter view" },
-    { deg: 270, label: "left side view" },
-    { deg: 315, label: "front-left quarter view" },
-];
+let azDeg=0,elDeg=0,distR=3.8; // continuous values during drag
+let snappedAz=0,snappedEl=1,snappedDist=1; // indices after snap
+let scene,cam,ren,canv;
+let hAz,hEl,hDist,camMdl,imgPlane,ray,elArc;
+let rc,ms;
+let drag=null,dragStart={x:0,y:0},dragAzStart=0,dragElStart=0,dragDistStart=0;
+const GP=new THREE.Plane(new THREE.Vector3(0,1,0),0);
 
-const ELEVATION_MAP = [
-    { label: "low-angle shot",  angle: -30 },
-    { label: "eye-level shot",  angle: 0 },
-    { label: "elevated shot",   angle: 20 },
-    { label: "high-angle shot", angle: 45 },
-];
+function initViewport(){
+    canv=document.getElementById('viewport-canvas'); if(!canv) return;
+    const W=canv.clientWidth||700,H=canv.clientHeight||340;
+    scene=new THREE.Scene(); scene.background=new THREE.Color(0x0d0d0f);
+    cam=new THREE.PerspectiveCamera(38,W/H,.1,100);
+    cam.position.set(7,5.5,7); cam.lookAt(0,CY,0);
+    ren=new THREE.WebGLRenderer({canvas:canv,antialias:true});
+    ren.setSize(W,H); ren.setPixelRatio(Math.min(devicePixelRatio,2));
 
-const DISTANCE_MAP = [
-    { label: "close-up",    dist: 2.2 },
-    { label: "medium shot", dist: 3.8 },
-    { label: "wide shot",   dist: 5.5 },
-];
+    scene.add(new THREE.GridHelper(12,24,0x222226,0x18181c));
 
-const RING_R = 4.0;
-const CTR_Y = 0.6;
+    // Ring
+    const ring=new THREE.Mesh(new THREE.TorusGeometry(R,.04,8,80),new THREE.MeshBasicMaterial({color:0xE8A917,transparent:true,opacity:.5}));
+    ring.rotation.x=Math.PI/2; scene.add(ring);
 
-let azimuthDeg = 0;
-let elevationIdx = 1;
-let distanceIdx = 1;
+    // Elev arc
+    elArc=new THREE.Line(new THREE.BufferGeometry(),new THREE.LineBasicMaterial({color:0xE8A917,transparent:true,opacity:.3}));
+    scene.add(elArc);
 
-let scene, viewCam, renderer;
-let handleAz, handleEl, handleDist;
-let cameraModel, imagePlane, rayLine, elevArc;
-let raycaster, mouse;
-let dragging = null;
-let canvasEl;
-const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
-
-function initViewport() {
-    canvasEl = document.getElementById('viewport-canvas');
-    if (!canvasEl) return;
-
-    const W = canvasEl.clientWidth || 700;
-    const H = canvasEl.clientHeight || 360;
-
-    scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x1a1a22);
-
-    viewCam = new THREE.PerspectiveCamera(38, W / H, 0.1, 100);
-    viewCam.position.set(7, 5.5, 7);
-    viewCam.lookAt(0, CTR_Y, 0);
-
-    renderer = new THREE.WebGLRenderer({ canvas: canvasEl, antialias: true });
-    renderer.setSize(W, H);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-
-    // Grid
-    scene.add(new THREE.GridHelper(12, 24, 0x2a2a35, 0x1f1f28));
-
-    // Azimuth ring
-    const ring = new THREE.Mesh(
-        new THREE.TorusGeometry(RING_R, 0.045, 8, 80),
-        new THREE.MeshBasicMaterial({ color: 0x00e5a0 })
-    );
-    ring.rotation.x = Math.PI / 2;
-    scene.add(ring);
-
-    // Elevation arc (rebuilt on each update to follow azimuth)
-    elevArc = new THREE.Line(
-        new THREE.BufferGeometry(),
-        new THREE.LineBasicMaterial({ color: 0xff6eb4 })
-    );
-    scene.add(elevArc);
-
-    // Handles — bigger spheres
-    const hGeo = new THREE.SphereGeometry(0.3, 16, 16);
-    handleAz = new THREE.Mesh(hGeo, new THREE.MeshBasicMaterial({ color: 0x00e5a0 }));
-    handleAz.userData.h = 'azimuth';
-    scene.add(handleAz);
-
-    handleEl = new THREE.Mesh(hGeo, new THREE.MeshBasicMaterial({ color: 0xff6eb4 }));
-    handleEl.userData.h = 'elevation';
-    scene.add(handleEl);
-
-    handleDist = new THREE.Mesh(hGeo, new THREE.MeshBasicMaterial({ color: 0xffd426 }));
-    handleDist.userData.h = 'distance';
-    scene.add(handleDist);
+    // Handles
+    const hg=new THREE.SphereGeometry(.3,16,16);
+    hAz=new THREE.Mesh(hg,new THREE.MeshBasicMaterial({color:0x22C55E})); hAz.userData.h='az'; scene.add(hAz);
+    hEl=new THREE.Mesh(hg,new THREE.MeshBasicMaterial({color:0xE8A917})); hEl.userData.h='el'; scene.add(hEl);
+    hDist=new THREE.Mesh(hg,new THREE.MeshBasicMaterial({color:0xEF4444})); hDist.userData.h='dist'; scene.add(hDist);
 
     // Camera model
-    const cg = new THREE.Group();
-    cg.add(new THREE.Mesh(
-        new THREE.BoxGeometry(0.5, 0.35, 0.35),
-        new THREE.MeshBasicMaterial({ color: 0x3a3a55 })
-    ));
-    const lens = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.06, 0.12, 0.22, 8),
-        new THREE.MeshBasicMaterial({ color: 0x222233 })
-    );
-    lens.rotation.x = Math.PI / 2;
-    lens.position.z = -0.28;
-    cg.add(lens);
-    cameraModel = cg;
-    scene.add(cameraModel);
+    const cg=new THREE.Group();
+    cg.add(new THREE.Mesh(new THREE.BoxGeometry(.45,.3,.3),new THREE.MeshBasicMaterial({color:0x3a3a50})));
+    const lens=new THREE.Mesh(new THREE.CylinderGeometry(.06,.12,.2,8),new THREE.MeshBasicMaterial({color:0x222233}));
+    lens.rotation.x=Math.PI/2; lens.position.z=-.25; cg.add(lens);
+    camMdl=cg; scene.add(camMdl);
 
-    // Ray line
-    rayLine = new THREE.Line(
-        new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
-        new THREE.LineBasicMaterial({ color: 0xff8c42, transparent: true, opacity: 0.5 })
-    );
-    scene.add(rayLine);
+    // Ray
+    ray=new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(),new THREE.Vector3()]),
+        new THREE.LineBasicMaterial({color:0xE8A917,transparent:true,opacity:.35}));
+    scene.add(ray);
 
     // Image plane
-    imagePlane = new THREE.Mesh(
-        new THREE.PlaneGeometry(1.6, 1.6),
-        new THREE.MeshBasicMaterial({ color: 0x555566, side: THREE.DoubleSide, transparent: true, opacity: 0.85 })
-    );
-    imagePlane.position.set(0, CTR_Y, 0);
-    scene.add(imagePlane);
+    imgPlane=new THREE.Mesh(new THREE.PlaneGeometry(1.6,1.6),
+        new THREE.MeshBasicMaterial({color:0x333340,side:THREE.DoubleSide,transparent:true,opacity:.85}));
+    imgPlane.position.set(0,CY,0); scene.add(imgPlane);
 
-    raycaster = new THREE.Raycaster();
-    mouse = new THREE.Vector2();
+    rc=new THREE.Raycaster(); ms=new THREE.Vector2();
 
-    canvasEl.addEventListener('pointerdown', onDown);
-    canvasEl.addEventListener('pointermove', onMove);
-    canvasEl.addEventListener('pointerup', onUp);
-    canvasEl.addEventListener('pointerleave', onUp);
+    canv.addEventListener('pointerdown',onDown);
+    canv.addEventListener('pointermove',onMove);
+    canv.addEventListener('pointerup',onUp);
+    canv.addEventListener('pointerleave',onUp);
 
-    updateScene();
-    requestAnimationFrame(loop);
+    updateScene(); requestAnimationFrame(loop);
 }
 
-function setViewportImage(url) {
-    new THREE.TextureLoader().load(url, tex => {
-        const ar = tex.image.width / tex.image.height;
-        const h = 1.6, w = Math.min(h * ar, 2.4);
-        imagePlane.geometry.dispose();
-        imagePlane.geometry = new THREE.PlaneGeometry(w, h);
-        imagePlane.material.map = tex;
-        imagePlane.material.color.set(0xffffff);
-        imagePlane.material.opacity = 1;
-        imagePlane.material.needsUpdate = true;
+function setViewportImage(url){
+    new THREE.TextureLoader().load(url,tex=>{
+        const ar=tex.image.width/tex.image.height,h=1.6,w=Math.min(h*ar,2.4);
+        imgPlane.geometry.dispose(); imgPlane.geometry=new THREE.PlaneGeometry(w,h);
+        imgPlane.material.map=tex; imgPlane.material.color.set(0xffffff);
+        imgPlane.material.opacity=1; imgPlane.material.needsUpdate=true;
     });
 }
 
-function updateScene() {
-    const azRad = THREE.MathUtils.degToRad(azimuthDeg);
-    const elAng = ELEVATION_MAP[elevationIdx].angle;
-    const elRad = THREE.MathUtils.degToRad(elAng);
-    const dist = DISTANCE_MAP[distanceIdx].dist;
+function updateScene(){
+    const azR=THREE.MathUtils.degToRad(azDeg), elR=THREE.MathUtils.degToRad(elDeg);
+    const cx=distR*Math.cos(elR)*Math.sin(azR), cy=distR*Math.sin(elR)+CY, cz=distR*Math.cos(elR)*Math.cos(azR);
+    camMdl.position.set(cx,cy,cz); camMdl.lookAt(0,CY,0);
+    hAz.position.set(R*Math.sin(azR),0,R*Math.cos(azR));
 
-    // Camera position
-    const cx = dist * Math.cos(elRad) * Math.sin(azRad);
-    const cy = dist * Math.sin(elRad) + CTR_Y;
-    const cz = dist * Math.cos(elRad) * Math.cos(azRad);
+    // Arc in azimuth plane
+    const pts=[];
+    for(let a=-40;a<=55;a+=3){const r=THREE.MathUtils.degToRad(a);
+        pts.push(new THREE.Vector3(R*Math.cos(r)*Math.sin(azR),R*Math.sin(r)+CY,R*Math.cos(r)*Math.cos(azR)));}
+    elArc.geometry.dispose(); elArc.geometry=new THREE.BufferGeometry().setFromPoints(pts);
 
-    cameraModel.position.set(cx, cy, cz);
-    cameraModel.lookAt(0, CTR_Y, 0);
+    hEl.position.set(R*Math.cos(elR)*Math.sin(azR),R*Math.sin(elR)+CY,R*Math.cos(elR)*Math.cos(azR));
+    hDist.position.set(cx*.55,cy*.55+CY*.45,cz*.55);
 
-    // Azimuth handle on ring
-    handleAz.position.set(RING_R * Math.sin(azRad), 0, RING_R * Math.cos(azRad));
+    const p=ray.geometry.attributes.position.array;
+    p[0]=cx;p[1]=cy;p[2]=cz;p[3]=0;p[4]=CY;p[5]=0;
+    ray.geometry.attributes.position.needsUpdate=true;
 
-    // Elevation arc — semicircle in the azimuth plane
-    const arcPts = [];
-    for (let a = -40; a <= 55; a += 3) {
-        const r = THREE.MathUtils.degToRad(a);
-        arcPts.push(new THREE.Vector3(
-            RING_R * Math.cos(r) * Math.sin(azRad),
-            RING_R * Math.sin(r) + CTR_Y,
-            RING_R * Math.cos(r) * Math.cos(azRad)
-        ));
-    }
-    elevArc.geometry.dispose();
-    elevArc.geometry = new THREE.BufferGeometry().setFromPoints(arcPts);
-
-    // Elevation handle on arc
-    handleEl.position.set(
-        RING_R * Math.cos(elRad) * Math.sin(azRad),
-        RING_R * Math.sin(elRad) + CTR_Y,
-        RING_R * Math.cos(elRad) * Math.cos(azRad)
-    );
-
-    // Distance handle — along the ray at 55%
-    handleDist.position.set(cx * 0.55, cy * 0.55 + CTR_Y * 0.45, cz * 0.55);
-
-    // Ray line
-    const p = rayLine.geometry.attributes.position.array;
-    p[0] = cx; p[1] = cy; p[2] = cz;
-    p[3] = 0;  p[4] = CTR_Y; p[5] = 0;
-    rayLine.geometry.attributes.position.needsUpdate = true;
-
-    updatePromptDisplay();
+    updatePromptFromCamera();
 }
 
-function updatePromptDisplay() {
-    const azL = snapAz(azimuthDeg);
-    const elL = ELEVATION_MAP[elevationIdx].label;
-    const dL = DISTANCE_MAP[distanceIdx].label;
-    const el = document.getElementById('prompt-display');
-    if (el) el.textContent = `<sks> ${azL} ${elL} ${dL}`;
-    const s1 = document.getElementById('sel-azimuth');
-    const s2 = document.getElementById('sel-elevation');
-    const s3 = document.getElementById('sel-distance');
-    if (s1) s1.value = azL;
-    if (s2) s2.value = elL;
-    if (s3) s3.value = dL;
+function updatePromptFromCamera(){
+    if(window._promptLocked) return;
+    const azL=snapAzLabel(azDeg), elL=snapElLabel(elDeg), dL=snapDistLabel(distR);
+    const pi=document.getElementById('promptInput');
+    if(pi) pi.value=`<sks> ${azL} ${elL} ${dL}`;
+    // Sync dropdowns
+    const s1=document.getElementById('selAz'),s2=document.getElementById('selEl'),s3=document.getElementById('selDist');
+    if(s1) s1.value=azL; if(s2) s2.value=elL; if(s3) s3.value=dL;
 }
 
-function snapAz(deg) {
-    deg = ((deg % 360) + 360) % 360;
-    let best = AZIMUTH_MAP[0], bd = 999;
-    for (const a of AZIMUTH_MAP) {
-        let d = Math.abs(a.deg - deg);
-        if (d > 180) d = 360 - d;
-        if (d < bd) { bd = d; best = a; }
-    }
-    return best.label;
+function snapAzLabel(d){d=((d%360)+360)%360;let b=AZ[0],bd=999;for(const a of AZ){let df=Math.abs(a.d-d);if(df>180)df=360-df;if(df<bd){bd=df;b=a;}}return b.l;}
+function snapElLabel(d){let b=EL[0],bd=999;for(const e of EL){const df=Math.abs(e.a-d);if(df<bd){bd=df;b=e;}}return b.l;}
+function snapDistLabel(r){let b=DI[0],bd=999;for(const d of DI){const df=Math.abs(d.r-r);if(df<bd){bd=df;b=d;}}return b.l;}
+
+function snapValues(){
+    // Snap to nearest discrete values
+    let bd=999,bi=0;AZ.forEach((a,i)=>{let d=Math.abs(((azDeg%360+360)%360)-a.d);if(d>180)d=360-d;if(d<bd){bd=d;bi=i;}});
+    azDeg=AZ[bi].d;
+    bd=999;bi=0;EL.forEach((e,i)=>{const d=Math.abs(elDeg-e.a);if(d<bd){bd=d;bi=i;}});
+    elDeg=EL[bi].a;
+    bd=999;bi=0;DI.forEach((d,i)=>{const df=Math.abs(distR-d.r);if(df<bd){bd=df;bi=i;}});
+    distR=DI[bi].r;
+    updateScene();
 }
 
-// ── Pointer events ────────────────────────────────────────────
+// ── Pointer events ────────────────────────────────
 
-function getNDC(e) {
-    const r = canvasEl.getBoundingClientRect();
-    return new THREE.Vector2(
-        ((e.clientX - r.left) / r.width) * 2 - 1,
-        -((e.clientY - r.top) / r.height) * 2 + 1
-    );
+function ndc(e){
+    const r=canv.getBoundingClientRect();
+    return new THREE.Vector2(((e.clientX-r.left)/r.width)*2-1,-((e.clientY-r.top)/r.height)*2+1);
 }
+function hitGround(n){rc.setFromCamera(n,cam);const v=new THREE.Vector3();return rc.ray.intersectPlane(GP,v)?v:null;}
 
-function hitGround(ndc) {
-    raycaster.setFromCamera(ndc, viewCam);
-    const v = new THREE.Vector3();
-    return raycaster.ray.intersectPlane(groundPlane, v) ? v : null;
-}
-
-function onDown(e) {
-    const ndc = getNDC(e);
-    raycaster.setFromCamera(ndc, viewCam);
-    const hits = raycaster.intersectObjects([handleAz, handleEl, handleDist]);
-    if (hits.length) {
-        dragging = hits[0].object.userData.h;
-        canvasEl.setPointerCapture(e.pointerId);
-        canvasEl.style.cursor = 'grabbing';
-        e.preventDefault();
+function onDown(e){
+    const n=ndc(e); rc.setFromCamera(n,cam);
+    const hits=rc.intersectObjects([hAz,hEl,hDist]);
+    if(hits.length){
+        drag=hits[0].object.userData.h;
+        dragStart={x:e.clientX,y:e.clientY};
+        dragAzStart=azDeg; dragElStart=elDeg; dragDistStart=distR;
+        canv.setPointerCapture(e.pointerId);
+        canv.style.cursor='grabbing'; e.preventDefault();
     }
 }
 
-function onMove(e) {
-    if (!dragging) {
-        const ndc = getNDC(e);
-        raycaster.setFromCamera(ndc, viewCam);
-        const h = raycaster.intersectObjects([handleAz, handleEl, handleDist]);
-        canvasEl.style.cursor = h.length ? 'pointer' : 'grab';
+function onMove(e){
+    if(!drag){
+        const n=ndc(e); rc.setFromCamera(n,cam);
+        canv.style.cursor=rc.intersectObjects([hAz,hEl,hDist]).length?'pointer':'grab';
         return;
     }
-
-    const ndc = getNDC(e);
-
-    if (dragging === 'azimuth') {
-        const g = hitGround(ndc);
-        if (g) {
-            let deg = THREE.MathUtils.radToDeg(Math.atan2(g.x, g.z));
-            deg = ((deg % 360) + 360) % 360;
-            azimuthDeg = Math.round(deg / 45) * 45;
-            if (azimuthDeg >= 360) azimuthDeg = 0;
-        }
-    } else if (dragging === 'elevation') {
-        // Screen Y → elevation index  (top=high angle, bottom=low angle)
-        const t = 1 - (ndc.y + 1) / 2; // 0=top 1=bottom
-        const idx = Math.round(t * (ELEVATION_MAP.length - 1));
-        elevationIdx = Math.max(0, Math.min(ELEVATION_MAP.length - 1, idx));
-    } else if (dragging === 'distance') {
-        const g = hitGround(ndc);
-        if (g) {
-            const d = Math.sqrt(g.x * g.x + g.z * g.z);
-            if (d < 2.8) distanceIdx = 0;
-            else if (d < 4.5) distanceIdx = 1;
-            else distanceIdx = 2;
-        }
+    const n=ndc(e);
+    if(drag==='az'){
+        const g=hitGround(n);
+        if(g) azDeg=THREE.MathUtils.radToDeg(Math.atan2(g.x,g.z));
+    } else if(drag==='el'){
+        // Drag UP = higher elevation (positive pitch), drag DOWN = lower
+        const dy=e.clientY-dragStart.y;
+        elDeg=THREE.MathUtils.clamp(dragElStart-dy*0.3,-35,50);
+    } else if(drag==='dist'){
+        const g=hitGround(n);
+        if(g){const d=Math.sqrt(g.x*g.x+g.z*g.z); distR=THREE.MathUtils.clamp(d*0.9,1.5,7);}
     }
-
     updateScene();
 }
 
-function onUp(e) {
-    if (dragging) {
-        try { canvasEl.releasePointerCapture(e.pointerId); } catch(_) {}
-        dragging = null;
-        canvasEl.style.cursor = 'grab';
+function onUp(e){
+    if(drag){
+        try{canv.releasePointerCapture(e.pointerId);}catch(_){}
+        drag=null; canv.style.cursor='grab';
+        snapValues(); // snap to nearest supported pose
     }
 }
 
-function loop() {
-    requestAnimationFrame(loop);
-    renderer.render(scene, viewCam);
-}
+function loop(){requestAnimationFrame(loop);ren.render(scene,cam);}
 
-// Dropdown → 3D sync
-function syncFromDropdowns() {
-    const m = AZIMUTH_MAP.find(a => a.label === document.getElementById('sel-azimuth').value);
-    if (m) azimuthDeg = m.deg;
-    const ei = ELEVATION_MAP.findIndex(e => e.label === document.getElementById('sel-elevation').value);
-    if (ei >= 0) elevationIdx = ei;
-    const di = DISTANCE_MAP.findIndex(d => d.label === document.getElementById('sel-distance').value);
-    if (di >= 0) distanceIdx = di;
+function syncFromDropdowns(){
+    const m=AZ.find(a=>a.l===document.getElementById('selAz').value); if(m) azDeg=m.d;
+    const ei=EL.find(e=>e.l===document.getElementById('selEl').value); if(ei) elDeg=ei.a;
+    const di=DI.find(d=>d.l===document.getElementById('selDist').value); if(di) distR=di.r;
     updateScene();
 }
 
-window.addEventListener('resize', () => {
-    if (!canvasEl || !renderer) return;
-    const W = canvasEl.clientWidth, H = canvasEl.clientHeight || 360;
-    viewCam.aspect = W / H;
-    viewCam.updateProjectionMatrix();
-    renderer.setSize(W, H);
+window.addEventListener('resize',()=>{
+    if(!canv||!ren)return;
+    const W=canv.clientWidth,H=canv.clientHeight||340;
+    cam.aspect=W/H; cam.updateProjectionMatrix(); ren.setSize(W,H);
 });
