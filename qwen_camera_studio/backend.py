@@ -51,7 +51,7 @@ def load_pipeline(variant="Q4_K_M"):
         # Verify gguf is installed FIRST
         try:
             import gguf
-            log(f"gguf package version: {gguf.__version__}")
+            log(f"gguf package: installed")
         except ImportError:
             raise ImportError(
                 "gguf package not installed! Run: pip install 'gguf>=0.10.0' and restart runtime"
