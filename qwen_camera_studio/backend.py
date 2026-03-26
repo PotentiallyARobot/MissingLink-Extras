@@ -6,10 +6,6 @@
 # ============================================================================
 
 import os, sys, math, gc, io, time, base64, uuid, json, traceback
-import torch
-from PIL import Image
-from flask import Flask, request, jsonify, send_from_directory, send_file
-from werkzeug.utils import secure_filename
 
 # ── Detect Colab ───────────────────────────────────────────────────────────
 IN_COLAB = "google.colab" in sys.modules
@@ -17,15 +13,53 @@ if IN_COLAB:
     from google.colab import output as colab_output
     from google.colab.output import eval_js
 
-# ── Flask app ──────────────────────────────────────────────────────────────
-STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
+# ── Resolve project root robustly ──────────────────────────────────────────
+# Works whether imported via sys.path, %cd, or direct execution
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in dir() else os.getcwd()
+# If we're not in the project dir, try to find it
+if not os.path.isdir(os.path.join(_THIS_DIR, "static")):
+    # Check common Colab locations
+    for _candidate in [
+        "/content/qwen_camera_studio",
+        os.path.join(os.getcwd(), "qwen_camera_studio"),
+        os.getcwd(),
+    ]:
+        if os.path.isdir(os.path.join(_candidate, "static")):
+            _THIS_DIR = _candidate
+            break
+
+PROJECT_DIR = _THIS_DIR
+STATIC_DIR = os.path.join(PROJECT_DIR, "static")
+UPLOAD_DIR = os.path.join(PROJECT_DIR, "uploads")
+OUTPUT_DIR = os.path.join(PROJECT_DIR, "outputs")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(STATIC_DIR, exist_ok=True)
+
+print(f"[Backend] Project dir: {PROJECT_DIR}")
+print(f"[Backend] Static dir:  {STATIC_DIR} (exists: {os.path.isdir(STATIC_DIR)})")
+
+# ── Flask app ──────────────────────────────────────────────────────────────
+from flask import Flask, request, jsonify, send_from_directory, send_file
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="/static")
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB
+
+# ── Lazy imports for heavy deps (torch, PIL, diffusers) ────────────────────
+# These are imported when actually needed, not at module load time,
+# so `from backend import *` won't fail if torch isn't imported yet.
+torch = None
+Image = None
+
+def _ensure_torch():
+    global torch, Image
+    if torch is None:
+        import torch as _t
+        torch = _t
+    if Image is None:
+        from PIL import Image as _I
+        Image = _I
 
 # ── Global pipeline state ──────────────────────────────────────────────────
 pipeline = None
@@ -37,6 +71,7 @@ _generating = False
 
 def resize_for_qwen(image, max_edge=1024, multiple=8):
     """Resize preserving aspect ratio, dims rounded to multiple of 8."""
+    _ensure_torch()
     w, h = image.size
     scale = min(max_edge / max(w, h), 1.0)
     new_w = max(round(w * scale / multiple) * multiple, multiple)
@@ -49,6 +84,7 @@ def resize_for_qwen(image, max_edge=1024, multiple=8):
 def load_pipeline(gguf_variant="Q4_K_M"):
     """Load the full GGUF + Lightning + Angles pipeline."""
     global pipeline, _qwen_edit_module, _pipeline_loading, _pipeline_error
+    _ensure_torch()
 
     if pipeline is not None:
         return
@@ -150,13 +186,22 @@ def keepalive():
 
 @app.route("/api/status")
 def status():
+    gpu_name = None
+    vram = 0
+    try:
+        _ensure_torch()
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            vram = round(torch.cuda.memory_allocated() / 1e9, 2)
+    except Exception:
+        pass
     return jsonify({
         "pipeline_ready": pipeline is not None,
         "pipeline_loading": _pipeline_loading,
         "pipeline_error": _pipeline_error,
         "generating": _generating,
-        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
-        "vram_used_gb": round(torch.cuda.memory_allocated() / 1e9, 2) if torch.cuda.is_available() else 0,
+        "gpu": gpu_name,
+        "vram_used_gb": vram,
     })
 
 
@@ -188,6 +233,7 @@ def upload_image():
     path = os.path.join(UPLOAD_DIR, fname)
     f.save(path)
 
+    _ensure_torch()
     img = Image.open(path).convert("RGB")
     w, h = img.size
 
@@ -221,6 +267,7 @@ def generate():
 
     _generating = True
     try:
+        _ensure_torch()
         data = request.get_json()
         image_id = data.get("image_id")
         azimuth = data.get("azimuth", "front view")
