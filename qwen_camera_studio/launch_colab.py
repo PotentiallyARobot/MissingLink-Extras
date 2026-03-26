@@ -101,9 +101,10 @@ print("  ✅ Server running. Auto-loading model...")
 print("="*60)
 
 # Verify gguf is importable before trying to load
+# Verify gguf is importable before trying to load
 try:
     import gguf as _gguf_check
-    print(f"  ✓ gguf package: v{_gguf_check.__version__}")
+    print(f"  ✓ gguf package installed")
 except ImportError:
     print("  ⚠️  WARNING: gguf package not found!")
     print("  Run this in a cell and restart runtime:")
