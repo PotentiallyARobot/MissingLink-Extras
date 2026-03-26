@@ -100,6 +100,15 @@ print("\n"+"="*60)
 print("  ✅ Server running. Auto-loading model...")
 print("="*60)
 
+# Verify gguf is importable before trying to load
+try:
+    import gguf as _gguf_check
+    print(f"  ✓ gguf package: v{_gguf_check.__version__}")
+except ImportError:
+    print("  ⚠️  WARNING: gguf package not found!")
+    print("  Run this in a cell and restart runtime:")
+    print('    !pip install "gguf>=0.10.0"')
+
 # Auto-load the pipeline in background
 import threading as _thr
 _thr.Thread(target=load_pipeline, args=(VARIANT,), daemon=True).start()

@@ -48,6 +48,15 @@ def load_pipeline(variant="Q4_K_M"):
     if pipeline: return
     _loading=True; _error=None
     try:
+        # Verify gguf is installed FIRST
+        try:
+            import gguf
+            log(f"gguf package version: {gguf.__version__}")
+        except ImportError:
+            raise ImportError(
+                "gguf package not installed! Run: pip install 'gguf>=0.10.0' and restart runtime"
+            )
+
         from diffusers import (QwenImageEditPlusPipeline,QwenImageTransformer2DModel,
             FlowMatchEulerDiscreteScheduler,GGUFQuantizationConfig)
         from huggingface_hub import hf_hub_download
@@ -61,6 +70,8 @@ def load_pipeline(variant="Q4_K_M"):
         gf=f"qwen-image-edit-2511-{variant}.gguf"
         log(f"Loading GGUF transformer ({gf})...")
         gp=hf_hub_download(repo_id="unsloth/Qwen-Image-Edit-2511-GGUF",filename=gf)
+        log(f"GGUF path: {gp}")
+        log(f"GGUF file size: {os.path.getsize(gp)/1e9:.2f} GB")
         tr=QwenImageTransformer2DModel.from_single_file(gp,
             quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
             torch_dtype=torch.bfloat16,config="Qwen/Qwen-Image-Edit-2511",subfolder="transformer")
@@ -78,7 +89,12 @@ def load_pipeline(variant="Q4_K_M"):
         global _qem; _qem=_qem_ref; pipeline=p
         log("Pipeline ready!","success")
     except Exception as e:
-        _error=str(e); log(f"Pipeline failed: {e}","error"); traceback.print_exc()
+        import traceback as tb
+        full_tb = tb.format_exc()
+        _error=str(e)
+        log(f"Pipeline failed: {e}","error")
+        log(f"Full traceback:\n{full_tb}","error")
+        print(full_tb, file=sys.stderr)
     finally: _loading=False
 
 @app.route("/")
