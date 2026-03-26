@@ -1,17 +1,121 @@
 # ============================================================
 # Qwen Camera Studio — Colab Launch Script
 #
-# Usage (Colab cell):
+# Usage (Colab cell — just ONE line needed):
+#   exec(open("/content/qwen_camera_studio/launch_colab.py").read())
+#
+# Or:
 #   %cd /content/qwen_camera_studio
-#   from backend import *
 #   exec(open("launch_colab.py").read())
 # ============================================================
 
-import time, threading, traceback, sys
+import os, time, threading, traceback, sys
 import socket as _socket
 import requests as _requests
 
-# app, IN_COLAB, eval_js come from `from backend import *`
+# ── Auto-import backend if not already imported ────────────────
+if 'app' not in dir():
+    # Find the project directory
+    _project_dir = None
+    for _p in [
+        os.path.dirname(os.path.abspath(__file__)) if '__file__' in dir() else None,
+        "/content/qwen_camera_studio",
+        os.path.join(os.getcwd(), "qwen_camera_studio"),
+        os.getcwd(),
+    ]:
+        if _p and os.path.isfile(os.path.join(_p, "backend.py")):
+            _project_dir = _p
+            break
+
+    if _project_dir is None:
+        raise FileNotFoundError(
+            "Cannot find backend.py. Make sure qwen_camera_studio/ is in /content/ "
+            "or the current directory."
+        )
+
+    print(f"[Launch] Found project at: {_project_dir}")
+    if _project_dir not in sys.path:
+        sys.path.insert(0, _project_dir)
+    os.chdir(_project_dir)
+
+    from backend import *  # noqa: imports app, IN_COLAB, etc.
+
+# ══════════════════════════════════════════════════════════════
+# 0) Pre-download all model files (with progress visible in notebook)
+# ══════════════════════════════════════════════════════════════
+
+GGUF_VARIANT = os.environ.get("GGUF_VARIANT", "Q4_K_M")
+
+print()
+print("=" * 60)
+print("  📦 Pre-downloading model files (this only happens once)")
+print("=" * 60)
+print()
+
+from huggingface_hub import hf_hub_download, snapshot_download
+
+# 1) GGUF transformer
+_gguf_file = f"qwen-image-edit-2511-{GGUF_VARIANT}.gguf"
+print(f"[1/4] GGUF transformer: {_gguf_file}")
+hf_hub_download(
+    repo_id="unsloth/Qwen-Image-Edit-2511-GGUF",
+    filename=_gguf_file,
+)
+print(f"  ✓ GGUF cached")
+
+# 2) Base model (text encoder, VAE, config — NOT the full transformer)
+print(f"[2/4] Base pipeline config + text encoder + VAE...")
+# Download specific files, not the full 57GB repo
+for _sub in [
+    "model_index.json",
+    "scheduler/scheduler_config.json",
+    "vae/config.json", "vae/diffusion_pytorch_model.safetensors",
+    "tokenizer/tokenizer_config.json", "tokenizer/tokenizer.json",
+    "tokenizer/special_tokens_map.json", "tokenizer/vocab.json", "tokenizer/merges.txt",
+    "processor/preprocessor_config.json",
+    "transformer/config.json",
+]:
+    try:
+        hf_hub_download(repo_id="Qwen/Qwen-Image-Edit-2511", filename=_sub)
+    except Exception:
+        pass  # some files may not exist with these exact names
+# Text encoder is large — download its shards
+print("  Downloading text encoder (Qwen2.5-VL-7B)...")
+for _shard in [
+    "text_encoder/config.json",
+    "text_encoder/model-00001-of-00005.safetensors",
+    "text_encoder/model-00002-of-00005.safetensors",
+    "text_encoder/model-00003-of-00005.safetensors",
+    "text_encoder/model-00004-of-00005.safetensors",
+    "text_encoder/model-00005-of-00005.safetensors",
+    "text_encoder/model.safetensors.index.json",
+]:
+    try:
+        hf_hub_download(repo_id="Qwen/Qwen-Image-Edit-2511", filename=_shard)
+    except Exception:
+        pass
+print(f"  ✓ Base pipeline cached")
+
+# 3) Lightning LoRA
+print(f"[3/4] Lightning 4-step LoRA...")
+hf_hub_download(
+    repo_id="lightx2v/Qwen-Image-Edit-2511-Lightning",
+    filename="Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors",
+)
+print(f"  ✓ Lightning LoRA cached")
+
+# 4) Multi-Angles LoRA
+print(f"[4/4] Multi-Angles LoRA...")
+hf_hub_download(
+    repo_id="fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA",
+    filename="qwen-image-edit-2511-multiple-angles-lora.safetensors",
+)
+print(f"  ✓ Multi-Angles LoRA cached")
+
+print()
+print("  ✅ All model files downloaded!")
+print("=" * 60)
+print()
 
 
 def _find_free_port(preferred=5000):
