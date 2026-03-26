@@ -23,12 +23,15 @@
 <!-- SIDEBAR -->
 <div class="sidebar">
     <div class="sec">
-        <div class="sec-label"><span class="icon">📁</span> IMAGES</div>
+        <div class="sec-label"><span class="icon">📁</span> INPUT IMAGE</div>
         <div class="dropzone" id="dropzone">
             <input type="file" accept="image/*" id="fileInput">
-            <div class="dz-text">Drop images or <b>browse</b></div>
+            <div class="dz-text">Drop image or <b>browse</b></div>
         </div>
-        <div class="thumb-strip" id="thumbs"></div>
+        <div class="input-preview" id="inputPreview" style="display:none">
+            <img id="inputImg">
+            <button class="preview-clear" onclick="clearInput()" title="Remove">×</button>
+        </div>
     </div>
 
     <div class="sec">
@@ -87,7 +90,10 @@
             <div class="gen-text" id="genText">Generating...</div>
         </div>
     </div>
-    <div class="result-bar" id="resultBar"></div>
+    <div class="result-bar" id="resultBar" style="display:none">
+        <span id="resultText"></span>
+        <button class="use-input-btn" id="btnUseAsInput" onclick="useAsInput()" style="display:none">↩ Use as Input</button>
+    </div>
 </div>
 
 <!-- HW Panel -->
@@ -95,7 +101,13 @@
     <div class="hw-title"><span class="icon">⚡</span> HARDWARE MONITOR</div>
     <div class="hw-row"><span class="hl">VRAM</span><span class="hv" id="hwVram">—</span></div>
     <div class="hw-bar"><div class="gold" id="hwVramBar" style="width:0"></div></div>
-    <div class="hw-row"><span class="hl">GPU</span><span class="hv" id="hwGpu">—</span></div>
+    <div class="hw-row"><span class="hl">CPU</span><span class="hv" id="hwCpu">—</span></div>
+    <div class="hw-bar"><div class="green" id="hwCpuBar" style="width:0"></div></div>
+    <div class="hw-row"><span class="hl">RAM</span><span class="hv" id="hwRam">—</span></div>
+    <div class="hw-bar"><div class="blue" id="hwRamBar" style="width:0"></div></div>
+    <div class="hw-row"><span class="hl">DISK</span><span class="hv" id="hwDisk">—</span></div>
+    <div class="hw-bar"><div class="gold" id="hwDiskBar" style="width:0"></div></div>
+    <div class="hw-row" style="margin-top:6px"><span class="hl">GPU</span><span class="hv" id="hwGpu" style="font-size:9px">—</span></div>
 </div>
 
 <!-- CONSOLE -->

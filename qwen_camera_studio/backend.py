@@ -103,14 +103,27 @@ def index(): return send_from_directory(STATIC,"index.html")
 def keepalive(): return jsonify({"status":"ok"})
 @app.route("/api/status")
 def status():
-    gpu=None;vram=0;vt=0
+    gpu=None;vram=0;vt=0;cpu_pct=0;ram=0;ram_total=0;disk=0;disk_total=0;gpu_temp=0;gpu_util=0
     try:
         _t()
         if torch.cuda.is_available():
-            gpu=torch.cuda.get_device_name(0);vram=round(torch.cuda.memory_allocated()/1e6);vt=round(torch.cuda.get_device_properties(0).total_mem/1e6)
+            gpu=torch.cuda.get_device_name(0)
+            vram=round(torch.cuda.memory_allocated()/1e6)
+            vt=round(torch.cuda.get_device_properties(0).total_memory/1e6)
+    except: pass
+    try:
+        import psutil
+        cpu_pct=round(psutil.cpu_percent(interval=0))
+        mem=psutil.virtual_memory()
+        ram=round(mem.used/1e6);ram_total=round(mem.total/1e6)
+        dk=psutil.disk_usage('/')
+        disk=round(dk.used/1e9,1);disk_total=round(dk.total/1e9,1)
     except: pass
     return jsonify({"ready":pipeline is not None,"loading":_loading,"error":_error,
-        "generating":_generating,"progress":_progress,"gpu":gpu,"vram":vram,"vram_total":vt})
+        "generating":_generating,"progress":_progress,
+        "gpu":gpu,"vram":vram,"vram_total":vt,
+        "cpu_pct":cpu_pct,"ram":ram,"ram_total":ram_total,
+        "disk":disk,"disk_total":disk_total})
 @app.route("/api/logs")
 def get_logs():
     s=float(request.args.get("since",0))
@@ -149,11 +162,11 @@ def generate():
         if not ms: return jsonify({"error":"Image not found"}),404
         inp=Image.open(os.path.join(UPLOADS,ms[0])).convert("RGB"); inp=resize_for_qwen(inp)
         iw,ih=inp.size; _qem.VAE_IMAGE_SIZE=iw*ih
-        pipeline.set_adapters(["lightning","angles"],adapter_weights=[1.0,ls])
         _progress["total"]=steps
         log(f"Generating: {prompt} | {iw}x{ih} seed={seed} steps={steps}")
         t0=time.time()
         with torch.inference_mode():
+            pipeline.set_adapters(["lightning","angles"],adapter_weights=[1.0,ls])
             out=pipeline(image=inp,prompt=prompt,generator=torch.manual_seed(seed),
                 num_inference_steps=steps,guidance_scale=1.0,true_cfg_scale=cfg,
                 negative_prompt=" ",height=ih,width=iw,callback_on_step_end=_prog_cb)
@@ -166,3 +179,16 @@ def generate():
         log(f"Generate failed: {e}","error"); traceback.print_exc()
         return jsonify({"error":str(e)}),500
     finally: _generating=False; _progress["active"]=False; _progress["step"]=0
+
+@app.route("/api/use_output",methods=["POST"])
+def use_output():
+    """Copy an output image to uploads so it becomes the new input."""
+    _t()
+    d=request.get_json(); src=d.get("filename","")
+    src_path=os.path.join(OUTPUTS,os.path.basename(src))
+    if not os.path.isfile(src_path): return jsonify({"error":"Output not found"}),404
+    uid=uuid.uuid4().hex[:8]; fn=f"{uid}.png"
+    import shutil; shutil.copy2(src_path,os.path.join(UPLOADS,fn))
+    img=Image.open(os.path.join(UPLOADS,fn)).convert("RGB")
+    log(f"Output → Input: {fn} ({img.size[0]}x{img.size[1]})")
+    return jsonify({"id":uid,"filename":fn,"w":img.size[0],"h":img.size[1],"url":f"/api/uploads/{fn}"})
