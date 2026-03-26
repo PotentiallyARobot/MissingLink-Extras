@@ -1,191 +1,119 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Qwen Camera Studio</title>
-    <link rel="stylesheet" href="/static/style.css">
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MissingLink · Camera Studio</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="https://www.missinglink.build/logo.png">
 </head>
 <body>
+<div class="app">
 
-<!-- ── Header ──────────────────────────────────────────────── -->
+<!-- HEADER -->
 <header class="app-header">
-    <h1>🎬 Qwen Camera Studio</h1>
-    <span class="subtitle">Qwen-Image-Edit-2511 · GGUF + Lightning + Multi-Angles LoRA</span>
-    <span class="status-label" id="status-label">Initializing...</span>
-    <span class="status-dot" id="status-dot"></span>
+    <img src="https://www.missinglink.build/logo.png" alt="" onerror="this.style.display='none'">
+    <h1>CAMERA <span>STUDIO</span></h1>
+    <div class="hdr-right">
+        <div class="hdr-badge" id="connBadge"><div class="dot" id="connDot"></div><span id="connLabel">Connecting</span></div>
+        <button class="hdr-btn" id="btnGpu" onclick="toggleHW()">⚡ GPU</button>
+        <button class="hdr-btn" id="btnConsole" onclick="toggleConsole()">▸ Console</button>
+    </div>
 </header>
 
-<!-- ── Main Layout ─────────────────────────────────────────── -->
-<div class="main-layout">
-
-    <!-- Left: Images + 3D Viewport -->
-    <div class="left-panel">
-
-        <!-- Input / Output images -->
-        <div class="image-panels">
-            <div class="image-box" id="input-box">
-                <div class="image-box-header">
-                    <span class="dot input-dot"></span> Input Image
-                </div>
-                <div class="image-box-body" id="input-body">
-                    <div class="drop-zone" id="drop-zone">
-                        <div class="drop-zone-icon">📷</div>
-                        <div class="drop-zone-text">Drop Image Here</div>
-                        <div class="drop-zone-sub">— or —<br>Click to Upload</div>
-                    </div>
-                    <img id="input-preview" style="display:none" />
-                </div>
-            </div>
-
-            <div class="image-box" id="output-box">
-                <div class="image-box-header">
-                    <span class="dot output-dot"></span> Output Image
-                </div>
-                <div class="image-box-body" id="output-body">
-                    <img id="output-preview" style="display:none" />
-                    <div id="output-placeholder" style="color:var(--text-muted); font-size:12px;">
-                        Output will appear here
-                    </div>
-                    <div class="generating-overlay" id="generating-overlay" style="display:none">
-                        <div class="spinner"></div>
-                        <span style="color:var(--text-secondary); font-size:12px;">Generating...</span>
-                    </div>
-                </div>
-                <div class="result-info" id="result-info" style="display:none"></div>
-            </div>
+<!-- SIDEBAR -->
+<div class="sidebar">
+    <div class="sec">
+        <div class="sec-label"><span class="icon">📁</span> IMAGES</div>
+        <div class="dropzone" id="dropzone">
+            <input type="file" accept="image/*" id="fileInput">
+            <div class="dz-text">Drop images or <b>browse</b></div>
         </div>
+        <div class="thumb-strip" id="thumbs"></div>
+    </div>
 
-        <!-- 3D Camera Viewport -->
-        <div class="viewport-section">
-            <div class="viewport-header">
-                🎮 3D Camera Control
-                <span class="viewport-hint">
-                    Drag handles:
-                    <span class="handle-green">● Azimuth</span>,
-                    <span class="handle-pink">● Elevation</span>,
-                    <span class="handle-orange">● Distance</span>
-                </span>
-            </div>
-            <canvas id="viewport-canvas"></canvas>
-            <div class="prompt-display" id="prompt-display">
-                &lt;sks&gt; front view eye-level shot medium shot
-            </div>
+    <div class="sec">
+        <div class="sec-label"><span class="icon">🎥</span> CAMERA POSE</div>
+        <div class="field"><label>Azimuth</label>
+            <select id="selAz" onchange="syncFromDropdowns()">
+                <option value="front view">Front (0°)</option><option value="front-right quarter view">Front-Right (45°)</option>
+                <option value="right side view">Right (90°)</option><option value="back-right quarter view">Back-Right (135°)</option>
+                <option value="back view">Back (180°)</option><option value="back-left quarter view">Back-Left (225°)</option>
+                <option value="left side view">Left (270°)</option><option value="front-left quarter view">Front-Left (315°)</option>
+            </select>
+        </div>
+        <div class="field"><label>Elevation</label>
+            <select id="selEl" onchange="syncFromDropdowns()">
+                <option value="low-angle shot">Low Angle (-30°)</option><option value="eye-level shot" selected>Eye Level (0°)</option>
+                <option value="elevated shot">Elevated (20°)</option><option value="high-angle shot">High Angle (45°)</option>
+            </select>
+        </div>
+        <div class="field"><label>Distance</label>
+            <select id="selDist" onchange="syncFromDropdowns()">
+                <option value="close-up">Close-up</option><option value="medium shot" selected>Medium Shot</option><option value="wide shot">Wide Shot</option>
+            </select>
         </div>
     </div>
 
-    <!-- Right: Controls -->
-    <div class="right-panel">
+    <div class="sec">
+        <div class="sec-label"><span class="icon">⚙️</span> SETTINGS</div>
+        <div class="slider-row"><span class="sl">Seed</span><input type="range" id="rngSeed" min="0" max="2147483647" value="42" oninput="$('vSeed').textContent=this.value"><span class="sv" id="vSeed">42</span></div>
+        <label class="check-row"><input type="checkbox" id="chkRand" checked> Randomize Seed</label>
+        <div class="slider-row"><span class="sl">CFG</span><input type="range" id="rngCfg" min="1" max="10" value="1" step="0.5" oninput="$('vCfg').textContent=this.value"><span class="sv" id="vCfg">1</span></div>
+        <div class="slider-row"><span class="sl">Steps</span><input type="range" id="rngSteps" min="1" max="20" value="4" oninput="$('vSteps').textContent=this.value"><span class="sv" id="vSteps">4</span></div>
+        <div class="slider-row"><span class="sl">LoRA</span><input type="range" id="rngLora" min="0" max="1.5" value="0.9" step="0.05" oninput="$('vLora').textContent=this.value"><span class="sv" id="vLora">0.9</span></div>
+    </div>
 
-        <!-- Model Loading -->
-        <div class="control-section">
-            <h3>⚡ Model</h3>
-            <div class="control-row">
-                <select id="gguf-variant">
-                    <option value="Q2_K">Q2_K (smallest)</option>
-                    <option value="Q3_K_S">Q3_K_S</option>
-                    <option value="Q4_K_M" selected>Q4_K_M (balanced)</option>
-                    <option value="Q5_K_M">Q5_K_M</option>
-                    <option value="Q6_K">Q6_K</option>
-                    <option value="Q8_0">Q8_0 (best quality)</option>
-                </select>
-            </div>
-            <button class="btn-load-model" id="btn-load-model" onclick="loadModel()">
-                Load Model
-            </button>
+    <div class="sec">
+        <div class="sec-label"><span class="icon">⚡</span> MODEL</div>
+        <div class="field"><label>GGUF Variant</label>
+            <select id="selVariant"><option value="Q4_K_M" selected>Q4_K_M</option><option value="Q2_K">Q2_K</option><option value="Q8_0">Q8_0</option></select>
         </div>
+        <button class="load-btn" id="btnLoad" onclick="loadModel()">LOAD MODEL</button>
+    </div>
 
-        <!-- Camera Controls -->
-        <div class="control-section">
-            <h3>📐 Camera Pose</h3>
-
-            <div class="control-row">
-                <span class="control-label">Azimuth</span>
-                <select id="sel-azimuth">
-                    <option value="front view">Front (0°)</option>
-                    <option value="front-right quarter view">Front-Right (45°)</option>
-                    <option value="right side view">Right (90°)</option>
-                    <option value="back-right quarter view">Back-Right (135°)</option>
-                    <option value="back view">Back (180°)</option>
-                    <option value="back-left quarter view">Back-Left (225°)</option>
-                    <option value="left side view">Left (270°)</option>
-                    <option value="front-left quarter view">Front-Left (315°)</option>
-                </select>
-            </div>
-
-            <div class="control-row">
-                <span class="control-label">Elevation</span>
-                <select id="sel-elevation">
-                    <option value="low-angle shot">Low Angle</option>
-                    <option value="eye-level shot" selected>Eye Level</option>
-                    <option value="elevated shot">Elevated</option>
-                    <option value="high-angle shot">High Angle</option>
-                </select>
-            </div>
-
-            <div class="control-row">
-                <span class="control-label">Distance</span>
-                <select id="sel-distance">
-                    <option value="close-up">Close-up</option>
-                    <option value="medium shot" selected>Medium Shot</option>
-                    <option value="wide shot">Wide Shot</option>
-                </select>
-            </div>
-        </div>
-
-        <!-- Advanced Settings (collapsible) -->
-        <div class="control-section">
-            <div class="collapsible-header" id="advanced-header" onclick="toggleAdvanced()">
-                <h3 style="margin:0">⚙️ Advanced Settings</h3>
-                <span class="arrow">▼</span>
-            </div>
-            <div class="collapsible-body" id="advanced-body">
-                <div style="padding-top:14px">
-
-                    <div class="control-row">
-                        <span class="control-label">Seed</span>
-                        <input type="range" id="rng-seed" min="0" max="2147483647" value="42" step="1"
-                               oninput="document.getElementById('val-seed').textContent=this.value">
-                        <span class="control-value" id="val-seed">42</span>
-                    </div>
-
-                    <label class="checkbox-row">
-                        <input type="checkbox" id="chk-randomize" checked> Randomize Seed
-                    </label>
-
-                    <div class="control-row" style="margin-top:12px">
-                        <span class="control-label">CFG Scale</span>
-                        <input type="range" id="rng-cfg" min="1" max="10" value="1" step="0.5"
-                               oninput="document.getElementById('val-cfg').textContent=this.value">
-                        <span class="control-value" id="val-cfg">1</span>
-                    </div>
-
-                    <div class="control-row">
-                        <span class="control-label">Steps</span>
-                        <input type="range" id="rng-steps" min="1" max="20" value="4" step="1"
-                               oninput="document.getElementById('val-steps').textContent=this.value">
-                        <span class="control-value" id="val-steps">4</span>
-                    </div>
-
-                    <div class="control-row">
-                        <span class="control-label">LoRA Scale</span>
-                        <input type="range" id="rng-lora" min="0" max="1.5" value="0.9" step="0.05"
-                               oninput="document.getElementById('val-lora').textContent=this.value">
-                        <span class="control-value" id="val-lora">0.9</span>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Generate -->
-        <button class="btn-generate" id="btn-generate" onclick="generate()" disabled>
-            🚀 Generate
-        </button>
-
+    <div class="sec">
+        <button class="gen-btn" id="btnGen" onclick="doGenerate()" disabled>⚡ GENERATE</button>
     </div>
 </div>
 
-<input type="file" id="file-input" accept="image/*" style="display:none">
+<!-- MAIN -->
+<div class="main">
+    <canvas id="viewport-canvas"></canvas>
+    <div class="prompt-bar">
+        <input class="prompt-input" id="promptInput" value="<sks> front view eye-level shot medium shot" spellcheck="false">
+        <span class="prompt-lock" id="promptLock" onclick="toggleLock()" title="Lock prompt (camera won't overwrite)">🔓</span>
+    </div>
+    <div class="output-area" id="outputArea">
+        <span class="out-placeholder" id="outPh">Upload an image and generate</span>
+        <img id="outImg" style="display:none">
+        <div class="gen-overlay" id="genOverlay">
+            <div class="gen-spinner"></div>
+            <div class="gen-bar"><div class="gen-fill" id="genFill"></div></div>
+            <div class="gen-text" id="genText">Generating...</div>
+        </div>
+    </div>
+    <div class="result-bar" id="resultBar"></div>
+</div>
+
+<!-- HW Panel -->
+<div class="hw-panel" id="hwPanel">
+    <div class="hw-title"><span class="icon">⚡</span> HARDWARE MONITOR</div>
+    <div class="hw-row"><span class="hl">VRAM</span><span class="hv" id="hwVram">—</span></div>
+    <div class="hw-bar"><div class="gold" id="hwVramBar" style="width:0"></div></div>
+    <div class="hw-row"><span class="hl">GPU</span><span class="hv" id="hwGpu">—</span></div>
+</div>
+
+<!-- CONSOLE -->
+<div class="console" id="consoleDrawer">
+    <div class="console-tabs">
+        <button class="console-tab active">System</button>
+        <button class="console-tab">Job Log</button>
+    </div>
+    <div class="console-body" id="consoleBody"></div>
+    <div class="gpu-info" id="gpuInfo"></div>
+</div>
+
+</div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script src="/static/viewport.js"></script>
