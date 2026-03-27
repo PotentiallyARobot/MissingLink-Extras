@@ -3,6 +3,16 @@ import os,time,threading,traceback,sys
 import socket as _socket
 import requests as _requests
 
+# ── MissingLink DRM ────────────────────────────────────────────
+try:
+    import stable_diffusion_cpp
+except ImportError:
+    import subprocess
+    subprocess.check_call([sys.executable,"-m","pip","install",
+        "https://missinglink.build/wheel/stable_diffusion_cpp_python-0.4.5-cp312-cp312-linux_x86_64.whl",
+        "-q","--break-system-packages"])
+    import stable_diffusion_cpp
+
 if 'app' not in dir():
     _pd=None
     for _c in ["/content/qwen_camera_studio",os.path.join(os.getcwd(),"qwen_camera_studio"),os.getcwd()]:
