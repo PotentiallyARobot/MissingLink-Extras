@@ -23,76 +23,97 @@
 <!-- SIDEBAR -->
 <div class="sidebar">
 
-    <!-- MODE TOGGLE -->
-    <div class="sec mode-sec">
-        <div class="mode-toggle">
-            <button class="mode-btn active" id="btnModeCamera" onclick="setMode('camera')">🎥 Camera</button>
-            <button class="mode-btn" id="btnModeNormal" onclick="setMode('normal')">✏️ Edit</button>
+    <!-- INPUT IMAGES — 3 fixed slots -->
+    <div class="sec">
+        <div class="sec-label"><span class="icon">📁</span> INPUT IMAGES <span class="slot-count" id="slotCount">0 / 3</span></div>
+        <div class="slot-grid">
+            <div class="img-slot empty" id="slot0" onclick="slotClick(0)">
+                <input type="file" accept="image/*" id="slotFile0" onchange="slotFileChange(0)">
+                <div class="slot-empty-inner">
+                    <span class="slot-plus">+</span>
+                    <span class="slot-label">Image 1</span>
+                </div>
+                <div class="slot-filled" style="display:none">
+                    <img id="slotImg0">
+                    <span class="slot-badge">1</span>
+                    <button class="slot-x" onclick="removeSlot(event,0)">×</button>
+                </div>
+            </div>
+            <div class="img-slot empty" id="slot1" onclick="slotClick(1)">
+                <input type="file" accept="image/*" id="slotFile1" onchange="slotFileChange(1)">
+                <div class="slot-empty-inner">
+                    <span class="slot-plus">+</span>
+                    <span class="slot-label">Image 2</span>
+                </div>
+                <div class="slot-filled" style="display:none">
+                    <img id="slotImg1">
+                    <span class="slot-badge">2</span>
+                    <button class="slot-x" onclick="removeSlot(event,1)">×</button>
+                </div>
+            </div>
+            <div class="img-slot empty" id="slot2" onclick="slotClick(2)">
+                <input type="file" accept="image/*" id="slotFile2" onchange="slotFileChange(2)">
+                <div class="slot-empty-inner">
+                    <span class="slot-plus">+</span>
+                    <span class="slot-label">Image 3</span>
+                </div>
+                <div class="slot-filled" style="display:none">
+                    <img id="slotImg2">
+                    <span class="slot-badge">3</span>
+                    <button class="slot-x" onclick="removeSlot(event,2)">×</button>
+                </div>
+            </div>
         </div>
     </div>
 
-    <!-- === CAMERA MODE: single image === -->
-    <div class="sec camera-only">
-        <div class="sec-label"><span class="icon">📁</span> INPUT IMAGE</div>
-        <div class="dropzone" id="dropzone">
-            <input type="file" accept="image/*" id="fileInput">
-            <div class="dz-text">Drop image or <b>browse</b></div>
+    <!-- CAMERA LORA — collapsible toggle -->
+    <div class="sec" id="cameraSec">
+        <div class="sec-label sec-label-toggle" onclick="toggleCameraLora()">
+            <span class="icon">🎥</span> CAMERA POSE
+            <span class="lora-badge" id="loraBadge">ON</span>
+            <span class="sec-chevron" id="cameraChevron">▾</span>
         </div>
-        <div class="input-preview" id="inputPreview" style="display:none">
-            <img id="inputImg">
-            <button class="preview-clear" onclick="clearInput()" title="Remove">×</button>
-        </div>
-    </div>
-
-    <div class="sec camera-only">
-        <div class="sec-label"><span class="icon">🎥</span> CAMERA POSE</div>
-        <div class="viewport-widget">
-            <canvas id="viewport-canvas"></canvas>
-        </div>
-        <div class="field"><label>Azimuth</label>
-            <select id="selAz" onchange="syncFromDropdowns()">
-                <option value="front view">Front (0°)</option><option value="front-right quarter view">Front-Right (45°)</option>
-                <option value="right side view">Right (90°)</option><option value="back-right quarter view">Back-Right (135°)</option>
-                <option value="back view">Back (180°)</option><option value="back-left quarter view">Back-Left (225°)</option>
-                <option value="left side view">Left (270°)</option><option value="front-left quarter view">Front-Left (315°)</option>
-            </select>
-        </div>
-        <div class="field"><label>Elevation</label>
-            <select id="selEl" onchange="syncFromDropdowns()">
-                <option value="low-angle shot">Low Angle (-30°)</option><option value="eye-level shot" selected>Eye Level (0°)</option>
-                <option value="elevated shot">Elevated (20°)</option><option value="high-angle shot">High Angle (45°)</option>
-            </select>
-        </div>
-        <div class="field"><label>Distance</label>
-            <select id="selDist" onchange="syncFromDropdowns()">
-                <option value="close-up">Close-up</option><option value="medium shot" selected>Medium Shot</option><option value="wide shot">Wide Shot</option>
-            </select>
+        <div class="camera-body" id="cameraBody">
+            <div class="viewport-widget">
+                <canvas id="viewport-canvas"></canvas>
+            </div>
+            <div class="field"><label>Azimuth</label>
+                <select id="selAz" onchange="syncFromDropdowns()">
+                    <option value="front view">Front (0°)</option><option value="front-right quarter view">Front-Right (45°)</option>
+                    <option value="right side view">Right (90°)</option><option value="back-right quarter view">Back-Right (135°)</option>
+                    <option value="back view">Back (180°)</option><option value="back-left quarter view">Back-Left (225°)</option>
+                    <option value="left side view">Left (270°)</option><option value="front-left quarter view">Front-Left (315°)</option>
+                </select>
+            </div>
+            <div class="field"><label>Elevation</label>
+                <select id="selEl" onchange="syncFromDropdowns()">
+                    <option value="low-angle shot">Low Angle (-30°)</option><option value="eye-level shot" selected>Eye Level (0°)</option>
+                    <option value="elevated shot">Elevated (20°)</option><option value="high-angle shot">High Angle (45°)</option>
+                </select>
+            </div>
+            <div class="field"><label>Distance</label>
+                <select id="selDist" onchange="syncFromDropdowns()">
+                    <option value="close-up">Close-up</option><option value="medium shot" selected>Medium Shot</option><option value="wide shot">Wide Shot</option>
+                </select>
+            </div>
+            <div class="slider-row"><span class="sl">LoRA Scale</span><input type="range" id="rngLora" min="0" max="1.5" value="0.9" step="0.05" oninput="$('vLora').textContent=this.value"><span class="sv" id="vLora">0.9</span></div>
         </div>
     </div>
 
-    <!-- === NORMAL/EDIT MODE: multi image + custom instruction === -->
-    <div class="sec normal-only" style="display:none">
-        <div class="sec-label"><span class="icon">📁</span> INPUT IMAGES</div>
-        <div class="dropzone" id="dropzoneMulti">
-            <input type="file" accept="image/*" id="fileInputMulti" multiple>
-            <div class="dz-text">Drop images or <b>browse</b><br><span style="font-size:10px;color:var(--text-muted)">Multiple files supported</span></div>
-        </div>
-        <div class="multi-preview-list" id="multiPreviewList"></div>
-    </div>
-
-    <div class="sec normal-only" style="display:none">
+    <!-- EDIT INSTRUCTION -->
+    <div class="sec">
         <div class="sec-label"><span class="icon">✏️</span> EDIT INSTRUCTION</div>
-        <textarea class="custom-prompt" id="customPrompt" placeholder="Describe what you want to change...&#10;e.g. &quot;Remove the background&quot; or &quot;Make it look like a painting&quot;" rows="4"></textarea>
+        <textarea class="custom-prompt" id="customPrompt" placeholder="Leave empty for camera-only mode, or type an edit instruction to disable camera LoRA...&#10;e.g. &quot;Remove the background&quot;" rows="3" oninput="onEditPromptChange()"></textarea>
+        <div class="edit-hint" id="editHint">🎥 Camera LoRA active — prompt from pose controls</div>
     </div>
 
-    <!-- === SHARED SETTINGS === -->
+    <!-- SETTINGS -->
     <div class="sec">
         <div class="sec-label"><span class="icon">⚙️</span> SETTINGS</div>
         <div class="slider-row"><span class="sl">Seed</span><input type="range" id="rngSeed" min="0" max="2147483647" value="42" oninput="$('vSeed').textContent=this.value"><span class="sv" id="vSeed">42</span></div>
         <label class="check-row"><input type="checkbox" id="chkRand" checked> Randomize Seed</label>
         <div class="slider-row"><span class="sl">CFG</span><input type="range" id="rngCfg" min="1" max="10" value="1" step="0.5" oninput="$('vCfg').textContent=this.value"><span class="sv" id="vCfg">1</span></div>
         <div class="slider-row"><span class="sl">Steps</span><input type="range" id="rngSteps" min="1" max="20" value="4" oninput="$('vSteps').textContent=this.value"><span class="sv" id="vSteps">4</span></div>
-        <div class="slider-row camera-only"><span class="sl">LoRA</span><input type="range" id="rngLora" min="0" max="1.5" value="0.9" step="0.05" oninput="$('vLora').textContent=this.value"><span class="sv" id="vLora">0.9</span></div>
     </div>
 
     <div class="sec">
@@ -102,13 +123,14 @@
 
 <!-- MAIN -->
 <div class="main">
-    <div class="prompt-bar" id="promptBarCamera">
+    <div class="prompt-bar" id="promptBar">
+        <div class="prompt-mode-pill" id="promptModePill">🎥 CAMERA</div>
         <input class="prompt-input" id="promptInput" value="<sks> front view eye-level shot medium shot" spellcheck="false">
         <span class="prompt-lock" id="promptLock" onclick="toggleLock()" title="Lock prompt (camera won't overwrite)">🔓</span>
     </div>
     <div class="output-area" id="outputArea">
         <span class="out-placeholder" id="outPh">Upload an image and generate</span>
-        <img id="outImg" style="display:none">
+        <img id="outImg" style="display:none" onclick="openModal(this.src)">
         <div class="gen-overlay" id="genOverlay">
             <div class="gen-spinner"></div>
             <div class="gen-bar"><div class="gen-fill" id="genFill"></div></div>
@@ -119,6 +141,12 @@
         <span id="resultText"></span>
         <button class="use-input-btn" id="btnUseAsInput" onclick="useAsInput()" style="display:none">↩ Use as Input</button>
     </div>
+</div>
+
+<!-- IMAGE MODAL -->
+<div class="img-modal" id="imgModal" onclick="closeModal()">
+    <button class="modal-close" onclick="closeModal()">×</button>
+    <img id="modalImg">
 </div>
 
 <!-- HW Panel -->
