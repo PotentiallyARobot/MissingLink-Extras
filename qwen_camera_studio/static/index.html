@@ -129,10 +129,10 @@
     <div class="sec">
         <div class="sec-label"><span class="icon">⚙️</span> SETTINGS</div>
         <div class="dim-row">
-            <div class="dim-field"><label>Width</label><input type="number" id="inpWidth" value="0" min="0" max="2048" step="8" placeholder="auto"></div>
+            <div class="dim-field"><label>Width</label><input type="number" id="inpWidth" min="8" max="2048" step="8" placeholder="auto"></div>
             <span class="dim-x">×</span>
-            <div class="dim-field"><label>Height</label><input type="number" id="inpHeight" value="0" min="0" max="2048" step="8" placeholder="auto"></div>
-            <span class="dim-hint">0 = match input</span>
+            <div class="dim-field"><label>Height</label><input type="number" id="inpHeight" min="8" max="2048" step="8" placeholder="auto"></div>
+            <span class="dim-hint">Set by upload</span>
         </div>
         <div class="slider-row"><span class="sl">Seed</span><input type="range" id="rngSeed" min="0" max="2147483647" value="42" oninput="$('vSeed').textContent=this.value"><span class="sv" id="vSeed">42</span></div>
         <label class="check-row"><input type="checkbox" id="chkRand" checked> Randomize Seed</label>
