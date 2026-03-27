@@ -130,13 +130,19 @@ function initDrop(){
     inp.addEventListener('change',()=>{if(inp.files.length)uploadFile(inp.files[0]);inp.value='';});
 }
 
-function setInputImage(id, url) {
+function setInputImage(id, url, w, h) {
     imageId = id; imageUrl = url;
     $('dropzone').style.display = 'none';
     $('inputPreview').style.display = '';
     $('inputImg').src = url;
     setViewportImage(url);
+    if(w && h) setDimensions(w, h);
     updateGenButton();
+}
+
+function setDimensions(w, h){
+    $('inpWidth').value = w;
+    $('inpHeight').value = h;
 }
 
 async function uploadFile(file){
@@ -144,7 +150,7 @@ async function uploadFile(file){
     try{
         const r=await fetch('/api/upload',{method:'POST',body:fd}),d=await r.json();
         if(d.error){alert(d.error);return;}
-        setInputImage(d.id, d.url);
+        setInputImage(d.id, d.url, d.w, d.h);
     }catch(e){alert('Upload failed');}
 }
 
@@ -153,6 +159,7 @@ function clearInput(){
     $('dropzone').style.display='';
     $('inputPreview').style.display='none';
     $('inputImg').src='';
+    $('inpWidth').value=0; $('inpHeight').value=0;
     updateGenButton();
 }
 
@@ -188,7 +195,8 @@ async function uploadToSlot(i,file){
     try{
         const r=await fetch('/api/upload',{method:'POST',body:fd}),d=await r.json();
         if(d.error){alert(d.error);return;}
-        slots[i]={id:d.id, url:d.url, filename:d.filename};
+        slots[i]={id:d.id, url:d.url, filename:d.filename, w:d.w, h:d.h};
+        setDimensions(d.w, d.h);
         renderSlot(i);
         updateGenButton();
     }catch(e){alert('Upload failed');}
@@ -238,11 +246,12 @@ async function useAsInput(){
         const d=await r.json();
         if(d.error){alert(d.error);return;}
         if(currentMode==='camera'){
-            setInputImage(d.id, d.url);
+            setInputImage(d.id, d.url, d.w, d.h);
         } else {
             let target=slots.findIndex(s=>s===null);
             if(target===-1) target=0;
-            slots[target]={id:d.id, url:d.url, filename:d.filename};
+            slots[target]={id:d.id, url:d.url, filename:d.filename, w:d.w, h:d.h};
+            setDimensions(d.w, d.h);
             renderSlot(target);
             updateGenButton();
         }
