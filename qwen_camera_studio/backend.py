@@ -113,6 +113,19 @@ def _snap_dim(v,mul=8):
     """Snap a dimension to nearest multiple of mul."""
     return max(mul,round(v/mul)*mul)
 
+def _set_lora_scales(scales):
+    """Directly set PEFT LoRA scaling dicts without triggering requires_grad.
+    scales: dict like {"lightning":1.0, "angles":0.9}
+    Works by walking the transformer's modules and updating the .scaling dict
+    on any LoraLayer that has our adapter names."""
+    transformer = pipeline.transformer
+    for module in transformer.modules():
+        # PEFT LoRA layers have a .scaling dict keyed by adapter name
+        if hasattr(module, 'scaling') and isinstance(module.scaling, dict):
+            for name, weight in scales.items():
+                if name in module.scaling:
+                    module.scaling[name] = weight
+
 @app.route("/")
 def index(): return send_from_directory(STATIC,"index.html")
 @app.route("/api/keepalive")
@@ -194,7 +207,9 @@ def generate():
         _qem.VAE_IMAGE_SIZE=ow*oh
         _progress["total"]=steps
 
-        # Set adapter weights BEFORE inference_mode using torch.no_grad
+        # Set adapter weights by directly updating PEFT scaling dicts.
+        # This avoids set_adapters() which triggers requires_grad=True
+        # and crashes after the first inference_mode() call.
         # Camera mode: angles LoRA at user-set strength
         # Edit mode: angles LoRA at 0 (disabled)
         if mode=='camera':
@@ -206,8 +221,7 @@ def generate():
             log(f"[edit] {prompt} | in:{iw}x{ih} out:{ow}x{oh} seed={seed} steps={steps} imgs={len(imgs)}")
             img_input=imgs if len(imgs)>1 else imgs[0]
 
-        with torch.no_grad():
-            pipeline.set_adapters(["lightning","angles"],adapter_weights=[1.0,angles_w])
+        _set_lora_scales({"lightning":1.0,"angles":angles_w})
 
         t0=time.time()
         with torch.inference_mode():
