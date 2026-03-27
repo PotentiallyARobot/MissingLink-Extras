@@ -1,10 +1,11 @@
-// app.js — Camera Studio client
+// app.js — Qwen Studio client
 const $=id=>document.getElementById(id);
 
 let imageId=null,imageUrl=null,ready=false,consoleOpen=false,hwOpen=false;
 window._promptLocked=false;
 let lastLogT=0;
 let currentMode='camera';
+let backendMode='camera'; // tracks what the backend actually has loaded
 
 // Edit mode: 3 image slots
 let slots=[null,null,null]; // {id,url,filename} or null
@@ -15,7 +16,8 @@ document.addEventListener('DOMContentLoaded',()=>{
 });
 
 // ── Mode switching ────────────────────────────────
-function setMode(mode){
+async function setMode(mode){
+    if(mode===currentMode) return;
     currentMode=mode;
     const isCam=mode==='camera';
     $('btnModeCamera').classList.toggle('active',isCam);
@@ -25,6 +27,15 @@ function setMode(mode){
     $('outPh').textContent=isCam
         ?'Upload an image and generate'
         :'Add image(s) and describe your edit';
+
+    // Tell backend to switch LoRA config
+    $('btnGen').disabled=true;
+    try{
+        await fetch('/api/switch_mode',{method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({mode:mode})});
+    }catch(e){}
+    // pollStatus will pick up the switching state and re-enable when done
     updateGenButton();
 }
 
@@ -43,8 +54,12 @@ async function pollStatus(){
     try{
         const r=await fetch('/api/status'),d=await r.json();
         const dot=$('connDot'),lbl=$('connLabel');
-        if(d.ready){
-            dot.className='dot on'; lbl.textContent='Connected'; ready=true;
+        if(d.switching){
+            dot.className='dot'; dot.style.background='var(--gold)';
+            lbl.textContent='Switching mode...'; ready=false; $('btnGen').disabled=true;
+        } else if(d.ready){
+            dot.className='dot on'; lbl.textContent='Connected';
+            ready=true; backendMode=d.mode||'camera';
             updateGenButton();
         } else if(d.loading){
             dot.className='dot'; dot.style.background='var(--gold)';
@@ -168,7 +183,6 @@ function initSlots(){
         emptyDiv.addEventListener('drop',ev=>{
             if(ev.dataTransfer.files.length) uploadToSlot(i,ev.dataTransfer.files[0]);
         });
-        // Also allow drop on filled
         const filledDiv=el.querySelector('.slot-filled');
         ['dragenter','dragover'].forEach(e=>filledDiv.addEventListener(e,ev=>{ev.preventDefault();el.classList.add('drag-over');}));
         ['dragleave','drop'].forEach(e=>filledDiv.addEventListener(e,ev=>{ev.preventDefault();el.classList.remove('drag-over');}));
@@ -213,7 +227,6 @@ function renderSlot(i){
         emptyDiv.style.display='';
         filledDiv.style.display='none';
     }
-    // Update counter
     const count=slots.filter(s=>s!==null).length;
     $('slotCounter').textContent=`${count} / 3`;
 }
@@ -242,9 +255,8 @@ async function useAsInput(){
         if(currentMode==='camera'){
             setInputImage(d.id, d.url);
         } else {
-            // Put into first empty slot
             let target=slots.findIndex(s=>s===null);
-            if(target===-1) target=0; // overwrite first if all full
+            if(target===-1) target=0;
             slots[target]={id:d.id, url:d.url, filename:d.filename};
             renderSlot(target);
             updateGenButton();
@@ -279,7 +291,6 @@ async function doGenerateCamera(){
         randomize_seed:$('chkRand').checked,
         guidance_scale:parseFloat($('rngCfg').value),
         inference_steps:parseInt($('rngSteps').value),
-        lora_scale:parseFloat($('rngLora').value),
     };
     try{
         const r=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
@@ -308,7 +319,6 @@ async function doGenerateEdit(){
     $('genOverlay').classList.add('active'); $('genFill').style.width='0';
     $('outImg').style.display='none'; $('outPh').style.display='none';
 
-    // Collect IDs in slot order (skip nulls)
     const imageIds=slots.filter(s=>s!==null).map(s=>s.id);
 
     const payload={

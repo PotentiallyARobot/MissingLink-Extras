@@ -1,4 +1,4 @@
-# backend.py — MissingLink Camera Studio
+# backend.py — MissingLink Qwen Studio
 import os,sys,math,gc,io,time,base64,uuid,json,traceback,threading
 IN_COLAB="google.colab" in sys.modules
 if IN_COLAB:
@@ -33,6 +33,8 @@ def log(msg,level="info"):
 
 pipeline=None; _qem=None; _loading=False; _error=None; _generating=False
 _progress={"step":0,"total":0,"active":False}
+_current_mode="camera"   # "camera" (lightning+angles) or "edit" (lightning only)
+_switching=False
 
 def resize_for_qwen(img,mx=1024,mul=8):
     _t(); w,h=img.size; s=min(mx/max(w,h),1.0)
@@ -43,7 +45,7 @@ def _prog_cb(pipe,step,ts,kwargs):
     _progress["step"]=step+1; return kwargs
 
 def load_pipeline(variant="Q4_K_M"):
-    global pipeline,_qem,_loading,_error
+    global pipeline,_qem,_loading,_error,_current_mode
     _t()
     if pipeline: return
     _loading=True; _error=None
@@ -85,8 +87,9 @@ def load_pipeline(variant="Q4_K_M"):
         p.load_lora_weights("fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA",
             weight_name="qwen-image-edit-2511-multiple-angles-lora.safetensors",adapter_name="angles")
         p.set_adapters(["lightning","angles"],adapter_weights=[1.0,0.9])
+        _current_mode="camera"
         global _qem; _qem=_qem_ref; pipeline=p
-        log("Pipeline ready!","success")
+        log("Pipeline ready! (camera mode — angles LoRA loaded)","success")
     except Exception as e:
         import traceback as tb
         full_tb = tb.format_exc()
@@ -108,6 +111,47 @@ def _load_images(image_ids):
             img=Image.open(fp).convert("RGB")
             imgs.append(resize_for_qwen(img))
     return imgs
+
+# ── Mode switching: properly load/unload angles LoRA ──
+def _do_switch_mode(target):
+    """Switch between camera (lightning+angles) and edit (lightning only).
+    Properly deletes or reloads the angles LoRA adapter and clears VRAM."""
+    global _current_mode,_switching,pipeline
+    if not pipeline or _current_mode==target:
+        return
+    _switching=True
+    _t()
+    try:
+        if target=="edit":
+            # Remove angles LoRA, keep lightning only
+            log("Switching to EDIT mode — removing angles LoRA...")
+            try:
+                pipeline.delete_adapters("angles")
+            except Exception as e:
+                log(f"delete_adapters warning: {e}","info")
+            torch.cuda.empty_cache(); gc.collect()
+            pipeline.set_adapters(["lightning"],adapter_weights=[1.0])
+            _current_mode="edit"
+            torch.cuda.empty_cache(); gc.collect()
+            vram=round(torch.cuda.memory_allocated()/1e6) if torch.cuda.is_available() else 0
+            log(f"EDIT mode ready (lightning only) — VRAM: {vram}MB","success")
+
+        elif target=="camera":
+            # Reload angles LoRA
+            log("Switching to CAMERA mode — loading angles LoRA...")
+            torch.cuda.empty_cache(); gc.collect()
+            pipeline.load_lora_weights("fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA",
+                weight_name="qwen-image-edit-2511-multiple-angles-lora.safetensors",adapter_name="angles")
+            pipeline.set_adapters(["lightning","angles"],adapter_weights=[1.0,0.9])
+            _current_mode="camera"
+            torch.cuda.empty_cache(); gc.collect()
+            vram=round(torch.cuda.memory_allocated()/1e6) if torch.cuda.is_available() else 0
+            log(f"CAMERA mode ready (lightning+angles) — VRAM: {vram}MB","success")
+    except Exception as e:
+        log(f"Mode switch failed: {e}","error")
+        traceback.print_exc()
+    finally:
+        _switching=False
 
 @app.route("/")
 def index(): return send_from_directory(STATIC,"index.html")
@@ -131,8 +175,9 @@ def status():
         dk=psutil.disk_usage('/')
         disk=round(dk.used/1e9,1);disk_total=round(dk.total/1e9,1)
     except: pass
-    return jsonify({"ready":pipeline is not None,"loading":_loading,"error":_error,
-        "generating":_generating,"progress":_progress,
+    return jsonify({"ready":pipeline is not None and not _switching,
+        "loading":_loading,"switching":_switching,"error":_error,
+        "generating":_generating,"progress":_progress,"mode":_current_mode,
         "gpu":gpu,"vram":vram,"vram_total":vt,
         "cpu_pct":cpu_pct,"ram":ram,"ram_total":ram_total,
         "disk":disk,"disk_total":disk_total})
@@ -148,6 +193,22 @@ def api_load():
     d=request.get_json(silent=True) or {}
     threading.Thread(target=load_pipeline,args=(d.get("variant","Q4_K_M"),),daemon=True).start()
     return jsonify({"status":"started"})
+
+@app.route("/api/switch_mode",methods=["POST"])
+def switch_mode():
+    """Switch between camera and edit mode — loads/unloads angles LoRA."""
+    if not pipeline: return jsonify({"error":"Model not loaded"}),503
+    if _generating: return jsonify({"error":"Busy generating"}),429
+    if _switching: return jsonify({"error":"Already switching"}),429
+    d=request.get_json(silent=True) or {}
+    target=d.get("mode","camera")
+    if target not in ("camera","edit"):
+        return jsonify({"error":"Invalid mode"}),400
+    if target==_current_mode:
+        return jsonify({"status":"already","mode":_current_mode})
+    threading.Thread(target=_do_switch_mode,args=(target,),daemon=True).start()
+    return jsonify({"status":"switching","mode":target})
+
 @app.route("/api/upload",methods=["POST"])
 def upload():
     if "image" not in request.files: return jsonify({"error":"No image"}),400
@@ -165,6 +226,7 @@ def generate():
     global _generating
     if not pipeline: return jsonify({"error":"Model not loaded"}),503
     if _generating: return jsonify({"error":"Busy"}),429
+    if _switching: return jsonify({"error":"Switching modes, please wait"}),429
     _generating=True; _progress["active"]=True; _progress["step"]=0
     try:
         _t(); d=request.get_json()
@@ -185,18 +247,13 @@ def generate():
         _progress["total"]=steps
 
         if mode=='camera':
-            # Camera mode: single image, angles + lightning LoRA
-            ls=float(d.get("lora_scale",0.9))
             log(f"[camera] {prompt} | {iw}x{ih} seed={seed} steps={steps}")
-            pipeline.set_adapters(["lightning","angles"],adapter_weights=[1.0,ls])
             img_input=imgs[0]
         else:
-            # Edit mode: multi-image list, lightning LoRA only (no angles)
             log(f"[edit] {prompt} | {iw}x{ih} seed={seed} steps={steps} imgs={len(imgs)}")
-            pipeline.set_adapters(["lightning"],adapter_weights=[1.0])
-            # Pipeline accepts list for multi-image
             img_input=imgs if len(imgs)>1 else imgs[0]
 
+        # NO set_adapters here — adapters are configured at switch_mode time
         t0=time.time()
         with torch.inference_mode():
             out=pipeline(image=img_input,prompt=prompt,generator=torch.manual_seed(seed),
