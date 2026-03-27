@@ -1,193 +1,44 @@
-// app.js — Camera Studio client (unified)
+// app.js — Camera Studio client
 const $=id=>document.getElementById(id);
 
-let ready=false,consoleOpen=false,hwOpen=false;
+let imageId=null,imageUrl=null,ready=false,consoleOpen=false,hwOpen=false;
 window._promptLocked=false;
 let lastLogT=0;
+let currentMode='camera';
 
-// ── 3-slot image state ────────────────────────────
-const MAX_SLOTS=3;
-let slots=[null,null,null]; // each: {id,url,filename} or null
-
-// ── Camera LoRA state ─────────────────────────────
-let cameraLoraOn=true;
+// Edit mode: 3 image slots
+let slots=[null,null,null]; // {id,url,filename} or null
 
 document.addEventListener('DOMContentLoaded',()=>{
-    initViewport();initSlotDragDrop();pollStatus();pollLogs();
+    initViewport();initDrop();initSlots();pollStatus();pollLogs();
     setInterval(pollStatus,2500);setInterval(pollLogs,1500);
-    syncUI();
 });
 
-// ── Effective mode ────────────────────────────────
-function effectiveMode(){
-    const cp=$('customPrompt').value.trim();
-    if(cp) return 'edit';
-    if(cameraLoraOn) return 'camera';
-    return 'edit';
-}
-
-function filledSlots(){ return slots.filter(s=>s!==null); }
-
-// ── UI sync ───────────────────────────────────────
-function syncUI(){
-    const mode=effectiveMode();
-    const pill=$('promptModePill');
-    const hint=$('editHint');
-
-    // Prompt bar
-    if(mode==='camera'){
-        pill.textContent='🎥 CAMERA';
-        pill.className='prompt-mode-pill pill-camera';
-        $('promptLock').style.display='';
-        hint.textContent='🎥 Camera LoRA active — prompt from pose controls';
-        hint.className='edit-hint hint-camera';
-    } else {
-        pill.textContent='✏️ EDIT';
-        pill.className='prompt-mode-pill pill-edit';
-        $('promptInput').value=$('customPrompt').value.trim()||'';
-        $('promptLock').style.display='none';
-        if(cameraLoraOn){
-            hint.textContent='✏️ Edit prompt entered — camera LoRA auto-disabled for this generation';
-            hint.className='edit-hint hint-edit';
-        } else {
-            hint.textContent='✏️ Camera LoRA off — using custom edit prompt';
-            hint.className='edit-hint hint-edit';
-        }
-    }
-
-    // Camera panel dim
-    $('cameraBody').classList.toggle('disabled',!cameraLoraOn);
-    $('loraBadge').textContent=cameraLoraOn?'ON':'OFF';
-    $('loraBadge').classList.toggle('off',!cameraLoraOn);
-
-    // Slot count
-    $('slotCount').textContent=`${filledSlots().length} / ${MAX_SLOTS}`;
-
-    // Render slots
-    for(let i=0;i<MAX_SLOTS;i++){
-        const el=$('slot'+i);
-        const filled=el.querySelector('.slot-filled');
-        const empty=el.querySelector('.slot-empty-inner');
-        if(slots[i]){
-            el.classList.remove('empty');
-            filled.style.display=''; empty.style.display='none';
-            $('slotImg'+i).src=slots[i].url;
-        } else {
-            el.classList.add('empty');
-            filled.style.display='none'; empty.style.display='';
-        }
-    }
-
-    // Viewport image = first slot
-    if(slots[0]) setViewportImage(slots[0].url);
-
+// ── Mode switching ────────────────────────────────
+function setMode(mode){
+    currentMode=mode;
+    const isCam=mode==='camera';
+    $('btnModeCamera').classList.toggle('active',isCam);
+    $('btnModeEdit').classList.toggle('active',!isCam);
+    document.querySelectorAll('.camera-only').forEach(el=>el.style.display=isCam?'':'none');
+    document.querySelectorAll('.edit-only').forEach(el=>el.style.display=isCam?'none':'');
+    $('outPh').textContent=isCam
+        ?'Upload an image and generate'
+        :'Add image(s) and describe your edit';
     updateGenButton();
 }
 
 function updateGenButton(){
-    const mode=effectiveMode();
-    const has=filledSlots().length>0;
-    if(mode==='camera'){
-        $('btnGen').disabled=!(ready && has);
+    if(currentMode==='camera'){
+        $('btnGen').disabled=!(ready && imageId);
     } else {
+        const filled=slots.filter(s=>s!==null);
         const cp=$('customPrompt').value.trim();
-        $('btnGen').disabled=!(ready && has && cp);
+        $('btnGen').disabled=!(ready && filled.length>0 && cp);
     }
 }
 
-// ── Camera LoRA toggle ────────────────────────────
-function toggleCameraLora(){
-    cameraLoraOn=!cameraLoraOn;
-    $('cameraBody').style.display=cameraLoraOn?'':'none';
-    $('cameraChevron').textContent=cameraLoraOn?'▾':'▸';
-    if(cameraLoraOn && !$('customPrompt').value.trim()){
-        if(typeof updatePromptFromCamera==='function') updatePromptFromCamera();
-    }
-    syncUI();
-}
-
-function onEditPromptChange(){ syncUI(); }
-
-// ── Image slots ───────────────────────────────────
-function slotClick(i){
-    if(slots[i]){
-        // Open modal
-        openModal(slots[i].url);
-    } else {
-        $('slotFile'+i).click();
-    }
-}
-
-function slotFileChange(i){
-    const inp=$('slotFile'+i);
-    if(inp.files.length) uploadToSlot(i,inp.files[0]);
-    inp.value='';
-}
-
-function removeSlot(ev,i){
-    ev.stopPropagation();
-    slots[i]=null;
-    syncUI();
-}
-
-async function uploadToSlot(i,file){
-    const fd=new FormData();fd.append('image',file);
-    try{
-        const r=await fetch('/api/upload',{method:'POST',body:fd}),d=await r.json();
-        if(d.error){alert(d.error);return;}
-        slots[i]={id:d.id, url:d.url, filename:d.filename};
-        syncUI();
-    }catch(e){alert('Upload failed');}
-}
-
-// Drag and drop onto slots
-function initSlotDragDrop(){
-    for(let i=0;i<MAX_SLOTS;i++){
-        const el=$('slot'+i);
-        ['dragenter','dragover'].forEach(e=>el.addEventListener(e,ev=>{ev.preventDefault();el.classList.add('drag-over');}));
-        ['dragleave','drop'].forEach(e=>el.addEventListener(e,ev=>{ev.preventDefault();el.classList.remove('drag-over');}));
-        el.addEventListener('drop',ev=>{
-            if(ev.dataTransfer.files.length) uploadToSlot(i,ev.dataTransfer.files[0]);
-        });
-    }
-}
-
-// ── Modal ─────────────────────────────────────────
-function openModal(src){
-    $('modalImg').src=src;
-    $('imgModal').classList.add('open');
-}
-function closeModal(){
-    $('imgModal').classList.remove('open');
-}
-document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeModal(); });
-
-// ── Use output as input ───────────────────────────
-let lastOutputFilename=null;
-
-async function useAsInput(){
-    if(!lastOutputFilename) return;
-    try{
-        const r=await fetch('/api/use_output',{method:'POST',headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({filename:lastOutputFilename})});
-        const d=await r.json();
-        if(d.error){alert(d.error);return;}
-        // Put in first empty slot, or replace slot 0
-        let target=slots.findIndex(s=>s===null);
-        if(target===-1) target=0;
-        slots[target]={id:d.id, url:d.url, filename:d.filename};
-        syncUI();
-    }catch(e){alert('Failed');}
-}
-
-// ── Prompt lock ───────────────────────────────────
-function toggleLock(){
-    window._promptLocked=!window._promptLocked;
-    $('promptLock').classList.toggle('locked',window._promptLocked);
-    $('promptLock').textContent=window._promptLocked?'🔒':'🔓';
-}
-
-// ── Status poll ───────────────────────────────────
+// ── Status ────────────────────────────────────────
 async function pollStatus(){
     try{
         const r=await fetch('/api/status'),d=await r.json();
@@ -207,7 +58,8 @@ async function pollStatus(){
         if(d.gpu){
             $('hwGpu').textContent=d.gpu;
             $('hwVram').textContent=`${d.vram} / ${d.vram_total} MB`;
-            $('hwVramBar').style.width=(d.vram_total?Math.round(d.vram/d.vram_total*100):0)+'%';
+            const vpct=d.vram_total?Math.round(d.vram/d.vram_total*100):0;
+            $('hwVramBar').style.width=vpct+'%';
         }
         $('hwCpu').textContent=d.cpu_pct+'%';
         $('hwCpuBar').style.width=d.cpu_pct+'%';
@@ -229,7 +81,7 @@ async function pollStatus(){
     }catch(e){}
 }
 
-// ── Logs poll ─────────────────────────────────────
+// ── Logs ──────────────────────────────────────────
 async function pollLogs(){
     try{
         const r=await fetch(`/api/logs?since=${lastLogT}`),d=await r.json();
@@ -260,43 +112,175 @@ function toggleHW(){
     $('btnGpu').classList.toggle('active',hwOpen);
 }
 
-// ── Model load (if used externally) ───────────────
+// ── Model load ────────────────────────────────────
 async function loadModel(){
     $('btnLoad').disabled=true; $('btnLoad').textContent='⏳ STARTING...';
     try{await fetch('/api/load',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({variant:$('selVariant').value})});}catch(e){}
 }
 
+// ══════════════════════════════════════════════════
+//  CAMERA MODE — single image (original logic)
+// ══════════════════════════════════════════════════
+function initDrop(){
+    const z=$('dropzone'),inp=$('fileInput');
+    ['dragenter','dragover'].forEach(e=>z.addEventListener(e,ev=>{ev.preventDefault();z.classList.add('over');}));
+    ['dragleave','drop'].forEach(e=>z.addEventListener(e,ev=>{ev.preventDefault();z.classList.remove('over');}));
+    z.addEventListener('drop',ev=>{if(ev.dataTransfer.files.length)uploadFile(ev.dataTransfer.files[0]);});
+    inp.addEventListener('change',()=>{if(inp.files.length)uploadFile(inp.files[0]);inp.value='';});
+}
+
+function setInputImage(id, url) {
+    imageId = id; imageUrl = url;
+    $('dropzone').style.display = 'none';
+    $('inputPreview').style.display = '';
+    $('inputImg').src = url;
+    setViewportImage(url);
+    updateGenButton();
+}
+
+async function uploadFile(file){
+    const fd=new FormData();fd.append('image',file);
+    try{
+        const r=await fetch('/api/upload',{method:'POST',body:fd}),d=await r.json();
+        if(d.error){alert(d.error);return;}
+        setInputImage(d.id, d.url);
+    }catch(e){alert('Upload failed');}
+}
+
+function clearInput(){
+    imageId=null; imageUrl=null;
+    $('dropzone').style.display='';
+    $('inputPreview').style.display='none';
+    $('inputImg').src='';
+    updateGenButton();
+}
+
+// ══════════════════════════════════════════════════
+//  EDIT MODE — 3 stacked image slots
+// ══════════════════════════════════════════════════
+function initSlots(){
+    for(let i=0;i<3;i++){
+        const el=$('slot'+i);
+        const emptyDiv=el.querySelector('.slot-empty');
+        ['dragenter','dragover'].forEach(e=>emptyDiv.addEventListener(e,ev=>{ev.preventDefault();el.classList.add('drag-over');}));
+        ['dragleave','drop'].forEach(e=>emptyDiv.addEventListener(e,ev=>{ev.preventDefault();el.classList.remove('drag-over');}));
+        emptyDiv.addEventListener('drop',ev=>{
+            if(ev.dataTransfer.files.length) uploadToSlot(i,ev.dataTransfer.files[0]);
+        });
+        // Also allow drop on filled
+        const filledDiv=el.querySelector('.slot-filled');
+        ['dragenter','dragover'].forEach(e=>filledDiv.addEventListener(e,ev=>{ev.preventDefault();el.classList.add('drag-over');}));
+        ['dragleave','drop'].forEach(e=>filledDiv.addEventListener(e,ev=>{ev.preventDefault();el.classList.remove('drag-over');}));
+        filledDiv.addEventListener('drop',ev=>{
+            if(ev.dataTransfer.files.length) uploadToSlot(i,ev.dataTransfer.files[0]);
+        });
+    }
+}
+
+function slotFileChange(i){
+    const inp=$('slotFile'+i);
+    if(inp.files.length) uploadToSlot(i,inp.files[0]);
+    inp.value='';
+}
+
+async function uploadToSlot(i,file){
+    const fd=new FormData();fd.append('image',file);
+    try{
+        const r=await fetch('/api/upload',{method:'POST',body:fd}),d=await r.json();
+        if(d.error){alert(d.error);return;}
+        slots[i]={id:d.id, url:d.url, filename:d.filename};
+        renderSlot(i);
+        updateGenButton();
+    }catch(e){alert('Upload failed');}
+}
+
+function removeSlot(i){
+    slots[i]=null;
+    renderSlot(i);
+    updateGenButton();
+}
+
+function renderSlot(i){
+    const el=$('slot'+i);
+    const emptyDiv=el.querySelector('.slot-empty');
+    const filledDiv=el.querySelector('.slot-filled');
+    if(slots[i]){
+        emptyDiv.style.display='none';
+        filledDiv.style.display='';
+        $('slotImg'+i).src=slots[i].url;
+    } else {
+        emptyDiv.style.display='';
+        filledDiv.style.display='none';
+    }
+    // Update counter
+    const count=slots.filter(s=>s!==null).length;
+    $('slotCounter').textContent=`${count} / 3`;
+}
+
+// ── Modal ─────────────────────────────────────────
+function openModal(src){
+    if(!src)return;
+    $('modalImg').src=src;
+    $('imgModal').classList.add('open');
+}
+function closeModal(){
+    $('imgModal').classList.remove('open');
+}
+document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeModal(); });
+
+// ── Use output as input ───────────────────────────
+let lastOutputFilename = null;
+
+async function useAsInput(){
+    if(!lastOutputFilename) return;
+    try{
+        const r=await fetch('/api/use_output',{method:'POST',headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({filename:lastOutputFilename})});
+        const d=await r.json();
+        if(d.error){alert(d.error);return;}
+        if(currentMode==='camera'){
+            setInputImage(d.id, d.url);
+        } else {
+            // Put into first empty slot
+            let target=slots.findIndex(s=>s===null);
+            if(target===-1) target=0; // overwrite first if all full
+            slots[target]={id:d.id, url:d.url, filename:d.filename};
+            renderSlot(target);
+            updateGenButton();
+        }
+    }catch(e){alert('Failed');}
+}
+
+// ── Prompt lock ───────────────────────────────────
+function toggleLock(){
+    window._promptLocked=!window._promptLocked;
+    $('promptLock').classList.toggle('locked',window._promptLocked);
+    $('promptLock').textContent=window._promptLocked?'🔒':'🔓';
+}
+
 // ── Generate ──────────────────────────────────────
 async function doGenerate(){
-    const filled=filledSlots();
-    if(!filled.length||!ready)return;
-    const mode=effectiveMode();
+    if(currentMode==='camera') return doGenerateCamera();
+    return doGenerateEdit();
+}
 
+async function doGenerateCamera(){
+    if(!imageId||!ready)return;
     const btn=$('btnGen'); btn.disabled=true; btn.textContent='⏳ GENERATING...';
     $('genOverlay').classList.add('active'); $('genFill').style.width='0';
     $('outImg').style.display='none'; $('outPh').style.display='none';
 
-    // Collect image IDs in slot order (preserving order)
-    const imageIds=slots.filter(s=>s!==null).map(s=>s.id);
-
     const payload={
-        image_ids:imageIds,
+        mode:'camera',
+        image_ids:[imageId],
+        prompt:$('promptInput').value,
         seed:parseInt($('rngSeed').value),
         randomize_seed:$('chkRand').checked,
         guidance_scale:parseFloat($('rngCfg').value),
         inference_steps:parseInt($('rngSteps').value),
+        lora_scale:parseFloat($('rngLora').value),
     };
-
-    if(mode==='camera'){
-        payload.mode='camera';
-        payload.prompt=$('promptInput').value;
-        payload.lora_scale=parseFloat($('rngLora').value);
-    } else {
-        payload.mode='edit';
-        payload.prompt=$('customPrompt').value.trim();
-    }
-
     try{
         const r=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
         const d=await r.json();
@@ -304,8 +288,46 @@ async function doGenerate(){
         $('outImg').src=d.url; $('outImg').style.display='';
         $('rngSeed').value=d.seed; $('vSeed').textContent=d.seed;
         $('resultBar').style.display='flex';
-        const tag=d.mode==='camera'?'🎥 camera':'✏️ edit';
-        $('resultText').textContent=`${tag} · ${d.w}×${d.h} · ${d.elapsed}s · seed:${d.seed}`;
+        $('resultText').textContent=`${d.w}×${d.h} · ${d.elapsed}s · seed:${d.seed}`;
+        lastOutputFilename=d.url.split('/').pop();
+        $('btnUseAsInput').style.display='';
+    }catch(e){alert('Request failed: '+e.message);}
+    finally{
+        btn.disabled=false; btn.textContent='⚡ GENERATE';
+        $('genOverlay').classList.remove('active');
+    }
+}
+
+async function doGenerateEdit(){
+    const filled=slots.filter(s=>s!==null);
+    if(!filled.length||!ready)return;
+    const prompt=$('customPrompt').value.trim();
+    if(!prompt){alert('Please enter an edit instruction.');return;}
+
+    const btn=$('btnGen'); btn.disabled=true; btn.textContent='⏳ GENERATING...';
+    $('genOverlay').classList.add('active'); $('genFill').style.width='0';
+    $('outImg').style.display='none'; $('outPh').style.display='none';
+
+    // Collect IDs in slot order (skip nulls)
+    const imageIds=slots.filter(s=>s!==null).map(s=>s.id);
+
+    const payload={
+        mode:'edit',
+        image_ids:imageIds,
+        prompt:prompt,
+        seed:parseInt($('rngSeed').value),
+        randomize_seed:$('chkRand').checked,
+        guidance_scale:parseFloat($('rngCfg').value),
+        inference_steps:parseInt($('rngSteps').value),
+    };
+    try{
+        const r=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+        const d=await r.json();
+        if(d.error){$('genText').textContent=d.error;return;}
+        $('outImg').src=d.url; $('outImg').style.display='';
+        $('rngSeed').value=d.seed; $('vSeed').textContent=d.seed;
+        $('resultBar').style.display='flex';
+        $('resultText').textContent=`✏️ ${d.w}×${d.h} · ${d.elapsed}s · seed:${d.seed}`;
         lastOutputFilename=d.url.split('/').pop();
         $('btnUseAsInput').style.display='';
     }catch(e){alert('Request failed: '+e.message);}
