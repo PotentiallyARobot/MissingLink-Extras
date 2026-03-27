@@ -102,13 +102,24 @@ def _find_upload(iid):
     if not ms: return None
     return os.path.join(UPLOADS,ms[0])
 
+def _load_images(image_ids):
+    """Load and resize a list of images from their IDs."""
+    _t(); imgs=[]
+    for iid in image_ids:
+        fpath=_find_upload(iid)
+        if not fpath: continue
+        img=Image.open(fpath).convert("RGB")
+        img=resize_for_qwen(img)
+        imgs.append(img)
+    return imgs
+
 @app.route("/")
 def index(): return send_from_directory(STATIC,"index.html")
 @app.route("/api/keepalive")
 def keepalive(): return jsonify({"status":"ok"})
 @app.route("/api/status")
 def status():
-    gpu=None;vram=0;vt=0;cpu_pct=0;ram=0;ram_total=0;disk=0;disk_total=0;gpu_temp=0;gpu_util=0
+    gpu=None;vram=0;vt=0;cpu_pct=0;ram=0;ram_total=0;disk=0;disk_total=0
     try:
         _t()
         if torch.cuda.is_available():
@@ -162,72 +173,49 @@ def generate():
     try:
         _t(); d=request.get_json()
         mode=d.get("mode","camera")
+        image_ids=d.get("image_ids",[])
+        if not image_ids: return jsonify({"error":"No images provided"}),400
+        prompt=d.get("prompt","")
         seed=d.get("seed",42)
         if d.get("randomize_seed"): import random; seed=random.randint(0,2147483647)
         cfg=float(d.get("guidance_scale",1.0))
         steps=int(d.get("inference_steps",4))
 
-        if mode=="camera":
-            return _generate_camera(d, seed, cfg, steps)
+        # Load images
+        imgs=_load_images(image_ids)
+        if not imgs: return jsonify({"error":"No valid images found"}),404
+
+        # Use first image dimensions for output sizing
+        iw,ih=imgs[0].size
+        _qem.VAE_IMAGE_SIZE=iw*ih
+        _progress["total"]=steps
+
+        # Build image input — single or list
+        img_input=imgs if len(imgs)>1 else imgs[0]
+
+        if mode=='camera':
+            ls=float(d.get("lora_scale",0.9))
+            log(f"[camera] {prompt} | {iw}x{ih} seed={seed} steps={steps} imgs={len(imgs)}")
+            pipeline.set_adapters(["lightning","angles"],adapter_weights=[1.0,ls])
         else:
-            return _generate_normal(d, seed, cfg, steps)
+            log(f"[edit] {prompt} | {iw}x{ih} seed={seed} steps={steps} imgs={len(imgs)}")
+            pipeline.set_adapters(["lightning"],adapter_weights=[1.0])
+
+        t0=time.time()
+        with torch.inference_mode():
+            out=pipeline(image=img_input,prompt=prompt,generator=torch.manual_seed(seed),
+                num_inference_steps=steps,guidance_scale=1.0,true_cfg_scale=cfg,
+                negative_prompt=" ",height=ih,width=iw,callback_on_step_end=_prog_cb)
+        el=time.time()-t0; oi=out.images[0]
+        of=f"out_{uuid.uuid4().hex[:8]}.png"; oi.save(os.path.join(OUTPUTS,of))
+        torch.cuda.empty_cache(); gc.collect()
+        log(f"Done {el:.1f}s — {oi.size[0]}x{oi.size[1]}","success")
+        return jsonify({"url":f"/api/outputs/{of}","w":oi.size[0],"h":oi.size[1],
+            "prompt":prompt,"seed":seed,"elapsed":round(el,1),"mode":mode})
     except Exception as e:
         log(f"Generate failed: {e}","error"); traceback.print_exc()
         return jsonify({"error":str(e)}),500
     finally: _generating=False; _progress["active"]=False; _progress["step"]=0
-
-def _generate_camera(d, seed, cfg, steps):
-    """Camera mode: single image, camera LoRA + angles LoRA enabled."""
-    iid=d["image_id"]
-    prompt=d.get("prompt","<sks> front view eye-level shot medium shot")
-    ls=float(d.get("lora_scale",0.9))
-
-    fpath=_find_upload(iid)
-    if not fpath: return jsonify({"error":"Image not found"}),404
-
-    inp=Image.open(fpath).convert("RGB"); inp=resize_for_qwen(inp)
-    iw,ih=inp.size; _qem.VAE_IMAGE_SIZE=iw*ih
-    _progress["total"]=steps
-    log(f"[camera] Generating: {prompt} | {iw}x{ih} seed={seed} steps={steps}")
-    t0=time.time()
-    with torch.inference_mode():
-        pipeline.set_adapters(["lightning","angles"],adapter_weights=[1.0,ls])
-        out=pipeline(image=inp,prompt=prompt,generator=torch.manual_seed(seed),
-            num_inference_steps=steps,guidance_scale=1.0,true_cfg_scale=cfg,
-            negative_prompt=" ",height=ih,width=iw,callback_on_step_end=_prog_cb)
-    el=time.time()-t0; oi=out.images[0]
-    of=f"out_{uuid.uuid4().hex[:8]}.png"; oi.save(os.path.join(OUTPUTS,of))
-    torch.cuda.empty_cache(); gc.collect()
-    log(f"Done {el:.1f}s — {oi.size[0]}x{oi.size[1]}","success")
-    return jsonify({"url":f"/api/outputs/{of}","w":oi.size[0],"h":oi.size[1],"prompt":prompt,"seed":seed,"elapsed":round(el,1)})
-
-def _generate_normal(d, seed, cfg, steps):
-    """Normal/edit mode: use first image, custom prompt, lightning LoRA only (no angles)."""
-    image_ids=d.get("image_ids",[])
-    if not image_ids: return jsonify({"error":"No images provided"}),400
-    prompt=d.get("prompt","")
-    if not prompt.strip(): return jsonify({"error":"No prompt provided"}),400
-
-    # Use the first image as the base input
-    fpath=_find_upload(image_ids[0])
-    if not fpath: return jsonify({"error":"Image not found"}),404
-
-    inp=Image.open(fpath).convert("RGB"); inp=resize_for_qwen(inp)
-    iw,ih=inp.size; _qem.VAE_IMAGE_SIZE=iw*ih
-    _progress["total"]=steps
-    log(f"[normal] Generating: {prompt} | {iw}x{ih} seed={seed} steps={steps} images={len(image_ids)}")
-    t0=time.time()
-    with torch.inference_mode():
-        # Only lightning LoRA, no camera angles LoRA
-        pipeline.set_adapters(["lightning"],adapter_weights=[1.0])
-        out=pipeline(image=inp,prompt=prompt,generator=torch.manual_seed(seed),
-            num_inference_steps=steps,guidance_scale=1.0,true_cfg_scale=cfg,
-            negative_prompt=" ",height=ih,width=iw,callback_on_step_end=_prog_cb)
-    el=time.time()-t0; oi=out.images[0]
-    of=f"out_{uuid.uuid4().hex[:8]}.png"; oi.save(os.path.join(OUTPUTS,of))
-    torch.cuda.empty_cache(); gc.collect()
-    log(f"Done {el:.1f}s — {oi.size[0]}x{oi.size[1]}","success")
-    return jsonify({"url":f"/api/outputs/{of}","w":oi.size[0],"h":oi.size[1],"prompt":prompt,"seed":seed,"elapsed":round(el,1)})
 
 @app.route("/api/use_output",methods=["POST"])
 def use_output():
