@@ -5,18 +5,17 @@ let imageId=null,imageUrl=null,ready=false,consoleOpen=false,hwOpen=false;
 window._promptLocked=false;
 let lastLogT=0;
 let currentMode='camera';
-let backendMode='camera'; // tracks what the backend actually has loaded
 
 // Edit mode: 3 image slots
-let slots=[null,null,null]; // {id,url,filename} or null
+let slots=[null,null,null];
 
 document.addEventListener('DOMContentLoaded',()=>{
     initViewport();initDrop();initSlots();pollStatus();pollLogs();
     setInterval(pollStatus,2500);setInterval(pollLogs,1500);
 });
 
-// ── Mode switching ────────────────────────────────
-async function setMode(mode){
+// ── Mode switching (instant, UI only) ─────────────
+function setMode(mode){
     if(mode===currentMode) return;
     currentMode=mode;
     const isCam=mode==='camera';
@@ -27,15 +26,6 @@ async function setMode(mode){
     $('outPh').textContent=isCam
         ?'Upload an image and generate'
         :'Add image(s) and describe your edit';
-
-    // Tell backend to switch LoRA config
-    $('btnGen').disabled=true;
-    try{
-        await fetch('/api/switch_mode',{method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({mode:mode})});
-    }catch(e){}
-    // pollStatus will pick up the switching state and re-enable when done
     updateGenButton();
 }
 
@@ -54,12 +44,8 @@ async function pollStatus(){
     try{
         const r=await fetch('/api/status'),d=await r.json();
         const dot=$('connDot'),lbl=$('connLabel');
-        if(d.switching){
-            dot.className='dot'; dot.style.background='var(--gold)';
-            lbl.textContent='Switching mode...'; ready=false; $('btnGen').disabled=true;
-        } else if(d.ready){
-            dot.className='dot on'; lbl.textContent='Connected';
-            ready=true; backendMode=d.mode||'camera';
+        if(d.ready){
+            dot.className='dot on'; lbl.textContent='Connected'; ready=true;
             updateGenButton();
         } else if(d.loading){
             dot.className='dot'; dot.style.background='var(--gold)';
@@ -127,7 +113,6 @@ function toggleHW(){
     $('btnGpu').classList.toggle('active',hwOpen);
 }
 
-// ── Model load ────────────────────────────────────
 async function loadModel(){
     $('btnLoad').disabled=true; $('btnLoad').textContent='⏳ STARTING...';
     try{await fetch('/api/load',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -135,7 +120,7 @@ async function loadModel(){
 }
 
 // ══════════════════════════════════════════════════
-//  CAMERA MODE — single image (original logic)
+//  CAMERA MODE — single image
 // ══════════════════════════════════════════════════
 function initDrop(){
     const z=$('dropzone'),inp=$('fileInput');
@@ -291,17 +276,15 @@ async function doGenerateCamera(){
         randomize_seed:$('chkRand').checked,
         guidance_scale:parseFloat($('rngCfg').value),
         inference_steps:parseInt($('rngSteps').value),
+        lora_scale:parseFloat($('rngLora').value),
+        width:parseInt($('inpWidth').value)||0,
+        height:parseInt($('inpHeight').value)||0,
     };
     try{
         const r=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
         const d=await r.json();
         if(d.error){$('genText').textContent=d.error;return;}
-        $('outImg').src=d.url; $('outImg').style.display='';
-        $('rngSeed').value=d.seed; $('vSeed').textContent=d.seed;
-        $('resultBar').style.display='flex';
-        $('resultText').textContent=`${d.w}×${d.h} · ${d.elapsed}s · seed:${d.seed}`;
-        lastOutputFilename=d.url.split('/').pop();
-        $('btnUseAsInput').style.display='';
+        showResult(d);
     }catch(e){alert('Request failed: '+e.message);}
     finally{
         btn.disabled=false; btn.textContent='⚡ GENERATE';
@@ -329,20 +312,27 @@ async function doGenerateEdit(){
         randomize_seed:$('chkRand').checked,
         guidance_scale:parseFloat($('rngCfg').value),
         inference_steps:parseInt($('rngSteps').value),
+        width:parseInt($('inpWidth').value)||0,
+        height:parseInt($('inpHeight').value)||0,
     };
     try{
         const r=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
         const d=await r.json();
         if(d.error){$('genText').textContent=d.error;return;}
-        $('outImg').src=d.url; $('outImg').style.display='';
-        $('rngSeed').value=d.seed; $('vSeed').textContent=d.seed;
-        $('resultBar').style.display='flex';
-        $('resultText').textContent=`✏️ ${d.w}×${d.h} · ${d.elapsed}s · seed:${d.seed}`;
-        lastOutputFilename=d.url.split('/').pop();
-        $('btnUseAsInput').style.display='';
+        showResult(d);
     }catch(e){alert('Request failed: '+e.message);}
     finally{
         btn.disabled=false; btn.textContent='⚡ GENERATE';
         $('genOverlay').classList.remove('active');
     }
+}
+
+function showResult(d){
+    $('outImg').src=d.url; $('outImg').style.display='';
+    $('rngSeed').value=d.seed; $('vSeed').textContent=d.seed;
+    $('resultBar').style.display='flex';
+    const tag=d.mode==='camera'?'':'✏️ ';
+    $('resultText').textContent=`${tag}${d.w}×${d.h} · ${d.elapsed}s · seed:${d.seed}`;
+    lastOutputFilename=d.url.split('/').pop();
+    $('btnUseAsInput').style.display='';
 }
