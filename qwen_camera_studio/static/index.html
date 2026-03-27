@@ -22,7 +22,17 @@
 
 <!-- SIDEBAR -->
 <div class="sidebar">
-    <div class="sec">
+
+    <!-- MODE TOGGLE -->
+    <div class="sec mode-sec">
+        <div class="mode-toggle">
+            <button class="mode-btn active" id="btnModeCamera" onclick="setMode('camera')">🎥 Camera</button>
+            <button class="mode-btn" id="btnModeNormal" onclick="setMode('normal')">✏️ Edit</button>
+        </div>
+    </div>
+
+    <!-- === CAMERA MODE: single image === -->
+    <div class="sec camera-only">
         <div class="sec-label"><span class="icon">📁</span> INPUT IMAGE</div>
         <div class="dropzone" id="dropzone">
             <input type="file" accept="image/*" id="fileInput">
@@ -34,9 +44,8 @@
         </div>
     </div>
 
-    <div class="sec">
+    <div class="sec camera-only">
         <div class="sec-label"><span class="icon">🎥</span> CAMERA POSE</div>
-        <!-- 3D viewport widget — compact, inside sidebar -->
         <div class="viewport-widget">
             <canvas id="viewport-canvas"></canvas>
         </div>
@@ -61,13 +70,29 @@
         </div>
     </div>
 
+    <!-- === NORMAL/EDIT MODE: multi image + custom instruction === -->
+    <div class="sec normal-only" style="display:none">
+        <div class="sec-label"><span class="icon">📁</span> INPUT IMAGES</div>
+        <div class="dropzone" id="dropzoneMulti">
+            <input type="file" accept="image/*" id="fileInputMulti" multiple>
+            <div class="dz-text">Drop images or <b>browse</b><br><span style="font-size:10px;color:var(--text-muted)">Multiple files supported</span></div>
+        </div>
+        <div class="multi-preview-list" id="multiPreviewList"></div>
+    </div>
+
+    <div class="sec normal-only" style="display:none">
+        <div class="sec-label"><span class="icon">✏️</span> EDIT INSTRUCTION</div>
+        <textarea class="custom-prompt" id="customPrompt" placeholder="Describe what you want to change...&#10;e.g. &quot;Remove the background&quot; or &quot;Make it look like a painting&quot;" rows="4"></textarea>
+    </div>
+
+    <!-- === SHARED SETTINGS === -->
     <div class="sec">
         <div class="sec-label"><span class="icon">⚙️</span> SETTINGS</div>
         <div class="slider-row"><span class="sl">Seed</span><input type="range" id="rngSeed" min="0" max="2147483647" value="42" oninput="$('vSeed').textContent=this.value"><span class="sv" id="vSeed">42</span></div>
         <label class="check-row"><input type="checkbox" id="chkRand" checked> Randomize Seed</label>
         <div class="slider-row"><span class="sl">CFG</span><input type="range" id="rngCfg" min="1" max="10" value="1" step="0.5" oninput="$('vCfg').textContent=this.value"><span class="sv" id="vCfg">1</span></div>
         <div class="slider-row"><span class="sl">Steps</span><input type="range" id="rngSteps" min="1" max="20" value="4" oninput="$('vSteps').textContent=this.value"><span class="sv" id="vSteps">4</span></div>
-        <div class="slider-row"><span class="sl">LoRA</span><input type="range" id="rngLora" min="0" max="1.5" value="0.9" step="0.05" oninput="$('vLora').textContent=this.value"><span class="sv" id="vLora">0.9</span></div>
+        <div class="slider-row camera-only"><span class="sl">LoRA</span><input type="range" id="rngLora" min="0" max="1.5" value="0.9" step="0.05" oninput="$('vLora').textContent=this.value"><span class="sv" id="vLora">0.9</span></div>
     </div>
 
     <div class="sec">
@@ -75,9 +100,9 @@
     </div>
 </div>
 
-<!-- MAIN — output image is the star -->
+<!-- MAIN -->
 <div class="main">
-    <div class="prompt-bar">
+    <div class="prompt-bar" id="promptBarCamera">
         <input class="prompt-input" id="promptInput" value="<sks> front view eye-level shot medium shot" spellcheck="false">
         <span class="prompt-lock" id="promptLock" onclick="toggleLock()" title="Lock prompt (camera won't overwrite)">🔓</span>
     </div>
