@@ -1,4 +1,4 @@
-# launch_colab.py — MissingLink Camera Studio
+# launch_colab.py — MissingLink Qwen Studio
 import os,time,threading,traceback,sys
 import socket as _socket
 import requests as _requests
@@ -82,7 +82,7 @@ if IN_COLAB:
         time.sleep(.5)
     if url:
         display(_H(f'''<div style="margin:12px 0;padding:14px 20px;background:#111113;border:1px solid #E8A917;border-radius:8px;font-family:monospace">
-            <span style="color:#71717A;font-size:12px">🎬 Camera Studio live:</span>
+            <span style="color:#71717A;font-size:12px">🎬 Qwen Studio live:</span>
             <a href="{url}" target="_blank" style="color:#E8A917;font-size:16px;font-weight:bold;margin-left:8px">{url}</a></div>'''))
     else:
         try:
@@ -90,11 +90,11 @@ if IN_COLAB:
             _co.serve_kernel_port_as_iframe(PORT,height='850')
         except: pass
         display(_H(f'''<div style="margin:8px 0;padding:10px 16px;background:#111113;border:1px solid #E8A917;border-radius:8px;font-family:monospace;display:flex;align-items:center;gap:8px">
-            <span style="color:#E8A917;font-weight:bold">🎬 Camera Studio</span><span style="color:#71717A;font-size:12px">embedded above ↑</span>
+            <span style="color:#E8A917;font-weight:bold">🎬 Qwen Studio</span><span style="color:#71717A;font-size:12px">embedded above ↑</span>
             <button onclick="(async()=>{{const u=await google.colab.kernel.proxyPort({PORT},{{cache:false}});window.open(u.startsWith('http')?u:'https://'+u,'_blank')}})()"
                 style="margin-left:auto;padding:5px 12px;background:#E8A917;color:#000;border:none;border-radius:5px;font-family:monospace;font-size:11px;font-weight:bold;cursor:pointer">↗ New Tab</button></div>'''))
 else:
-    print(f"\n🎬 Camera Studio: http://localhost:{PORT}\n")
+    print(f"\n🎬 Qwen Studio: http://localhost:{PORT}\n")
 
 print("\n"+"="*60)
 print("  ✅ Server running. Auto-loading model...")
