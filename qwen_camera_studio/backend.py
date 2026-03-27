@@ -97,20 +97,16 @@ def load_pipeline(variant="Q4_K_M"):
     finally: _loading=False
 
 def _find_upload(iid):
-    """Find an uploaded file by its ID prefix."""
     ms=[f for f in os.listdir(UPLOADS) if f.startswith(iid)]
-    if not ms: return None
-    return os.path.join(UPLOADS,ms[0])
+    return os.path.join(UPLOADS,ms[0]) if ms else None
 
 def _load_images(image_ids):
-    """Load and resize a list of images from their IDs."""
     _t(); imgs=[]
     for iid in image_ids:
-        fpath=_find_upload(iid)
-        if not fpath: continue
-        img=Image.open(fpath).convert("RGB")
-        img=resize_for_qwen(img)
-        imgs.append(img)
+        fp=_find_upload(iid)
+        if fp:
+            img=Image.open(fp).convert("RGB")
+            imgs.append(resize_for_qwen(img))
     return imgs
 
 @app.route("/")
@@ -181,25 +177,25 @@ def generate():
         cfg=float(d.get("guidance_scale",1.0))
         steps=int(d.get("inference_steps",4))
 
-        # Load images
         imgs=_load_images(image_ids)
         if not imgs: return jsonify({"error":"No valid images found"}),404
 
-        # Use first image dimensions for output sizing
         iw,ih=imgs[0].size
         _qem.VAE_IMAGE_SIZE=iw*ih
         _progress["total"]=steps
 
-        # Build image input — single or list
-        img_input=imgs if len(imgs)>1 else imgs[0]
-
         if mode=='camera':
+            # Camera mode: single image, angles + lightning LoRA
             ls=float(d.get("lora_scale",0.9))
-            log(f"[camera] {prompt} | {iw}x{ih} seed={seed} steps={steps} imgs={len(imgs)}")
+            log(f"[camera] {prompt} | {iw}x{ih} seed={seed} steps={steps}")
             pipeline.set_adapters(["lightning","angles"],adapter_weights=[1.0,ls])
+            img_input=imgs[0]
         else:
+            # Edit mode: multi-image list, lightning LoRA only (no angles)
             log(f"[edit] {prompt} | {iw}x{ih} seed={seed} steps={steps} imgs={len(imgs)}")
             pipeline.set_adapters(["lightning"],adapter_weights=[1.0])
+            # Pipeline accepts list for multi-image
+            img_input=imgs if len(imgs)>1 else imgs[0]
 
         t0=time.time()
         with torch.inference_mode():
@@ -219,7 +215,6 @@ def generate():
 
 @app.route("/api/use_output",methods=["POST"])
 def use_output():
-    """Copy an output image to uploads so it becomes the new input."""
     _t()
     d=request.get_json(); src=d.get("filename","")
     src_path=os.path.join(OUTPUTS,os.path.basename(src))
