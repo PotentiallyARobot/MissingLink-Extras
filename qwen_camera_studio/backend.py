@@ -185,10 +185,12 @@ def generate():
         imgs=_load_images(image_ids)
         if not imgs: return jsonify({"error":"No valid images found"}),404
 
-        # Output dimensions: use custom if provided, else match input
+        # Output dimensions: use custom if provided and >0, else match input
         iw,ih=imgs[0].size
-        ow=_snap_dim(int(d.get("width",iw)))
-        oh=_snap_dim(int(d.get("height",ih)))
+        ow=int(d.get("width",0)) or iw
+        oh=int(d.get("height",0)) or ih
+        ow=_snap_dim(ow)
+        oh=_snap_dim(oh)
         _qem.VAE_IMAGE_SIZE=ow*oh
         _progress["total"]=steps
 

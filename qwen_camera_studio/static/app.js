@@ -159,7 +159,7 @@ function clearInput(){
     $('dropzone').style.display='';
     $('inputPreview').style.display='none';
     $('inputImg').src='';
-    $('inpWidth').value=0; $('inpHeight').value=0;
+    $('inpWidth').value=''; $('inpHeight').value='';
     updateGenButton();
 }
 
