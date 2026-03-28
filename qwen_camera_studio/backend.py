@@ -183,11 +183,22 @@ def generate():
     if not pipeline: return jsonify({"error":"Model not loaded"}),503
     if _generating: return jsonify({"error":"Busy"}),429
     _generating=True; _progress["active"]=True; _progress["step"]=0
+    d=request.get_json()
+    job_id=uuid.uuid4().hex[:8]
+    _jobs[job_id]={"status":"running","result":None,"error":None}
+    threading.Thread(target=_run_generate,args=(job_id,d),daemon=True).start()
+    return jsonify({"job_id":job_id,"status":"started"})
+
+_jobs={}
+
+def _run_generate(job_id,d):
+    global _generating
     try:
-        _t(); d=request.get_json()
+        _t()
         mode=d.get("mode","camera")
         image_ids=d.get("image_ids",[])
-        if not image_ids: return jsonify({"error":"No images provided"}),400
+        if not image_ids:
+            _jobs[job_id]={"status":"error","error":"No images provided"}; return
         prompt=d.get("prompt","")
         seed=d.get("seed",42)
         if d.get("randomize_seed"): import random; seed=random.randint(0,2147483647)
@@ -196,9 +207,9 @@ def generate():
         lora_scale=float(d.get("lora_scale",0.9))
 
         imgs=_load_images(image_ids)
-        if not imgs: return jsonify({"error":"No valid images found"}),404
+        if not imgs:
+            _jobs[job_id]={"status":"error","error":"No valid images found"}; return
 
-        # Output dimensions: use custom if provided and >0, else match input
         iw,ih=imgs[0].size
         ow=int(d.get("width",0)) or iw
         oh=int(d.get("height",0)) or ih
@@ -207,11 +218,6 @@ def generate():
         _qem.VAE_IMAGE_SIZE=ow*oh
         _progress["total"]=steps
 
-        # Set adapter weights by directly updating PEFT scaling dicts.
-        # This avoids set_adapters() which triggers requires_grad=True
-        # and crashes after the first inference_mode() call.
-        # Camera mode: angles LoRA at user-set strength
-        # Edit mode: angles LoRA at 0 (disabled)
         if mode=='camera':
             angles_w=lora_scale
             log(f"[camera] {prompt} | in:{iw}x{ih} out:{ow}x{oh} seed={seed} steps={steps} angles={angles_w}")
@@ -232,12 +238,26 @@ def generate():
         of=f"out_{uuid.uuid4().hex[:8]}.png"; oi.save(os.path.join(OUTPUTS,of))
         torch.cuda.empty_cache(); gc.collect()
         log(f"Done {el:.1f}s — {oi.size[0]}x{oi.size[1]}","success")
-        return jsonify({"url":f"/api/outputs/{of}","w":oi.size[0],"h":oi.size[1],
-            "prompt":prompt,"seed":seed,"elapsed":round(el,1),"mode":mode})
+        _jobs[job_id]={"status":"done","result":{
+            "url":f"/api/outputs/{of}","w":oi.size[0],"h":oi.size[1],
+            "prompt":prompt,"seed":seed,"elapsed":round(el,1),"mode":mode}}
     except Exception as e:
         log(f"Generate failed: {e}","error"); traceback.print_exc()
-        return jsonify({"error":str(e)}),500
-    finally: _generating=False; _progress["active"]=False; _progress["step"]=0
+        _jobs[job_id]={"status":"error","error":str(e)}
+    finally:
+        _generating=False; _progress["active"]=False; _progress["step"]=0
+
+@app.route("/api/job/<job_id>")
+def get_job(job_id):
+    j=_jobs.get(job_id)
+    if not j: return jsonify({"error":"Job not found"}),404
+    if j["status"]=="done":
+        _jobs.pop(job_id,None)  # clean up
+        return jsonify({"status":"done","result":j["result"]})
+    elif j["status"]=="error":
+        _jobs.pop(job_id,None)
+        return jsonify({"status":"error","error":j["error"]})
+    return jsonify({"status":"running","progress":_progress})
 
 @app.route("/api/use_output",methods=["POST"])
 def use_output():
