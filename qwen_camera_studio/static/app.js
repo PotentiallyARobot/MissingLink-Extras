@@ -265,7 +265,7 @@ function toggleLock(){
     $('promptLock').textContent=window._promptLocked?'🔒':'🔓';
 }
 
-// ── Generate ──────────────────────────────────────
+// ── Generate (polling-based to avoid proxy timeouts) ──
 async function doGenerate(){
     if(currentMode==='camera') return doGenerateCamera();
     return doGenerateEdit();
@@ -273,10 +273,6 @@ async function doGenerate(){
 
 async function doGenerateCamera(){
     if(!imageId||!ready)return;
-    const btn=$('btnGen'); btn.disabled=true; btn.textContent='⏳ GENERATING...';
-    $('genOverlay').classList.add('active'); $('genFill').style.width='0';
-    $('outImg').style.display='none'; $('outPh').style.display='none';
-
     const payload={
         mode:'camera',
         image_ids:[imageId],
@@ -289,16 +285,7 @@ async function doGenerateCamera(){
         width:parseInt($('inpWidth').value)||0,
         height:parseInt($('inpHeight').value)||0,
     };
-    try{
-        const r=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-        const d=await r.json();
-        if(d.error){$('genText').textContent=d.error;return;}
-        showResult(d);
-    }catch(e){alert('Request failed: '+e.message);}
-    finally{
-        btn.disabled=false; btn.textContent='⚡ GENERATE';
-        $('genOverlay').classList.remove('active');
-    }
+    await submitAndPoll(payload);
 }
 
 async function doGenerateEdit(){
@@ -306,16 +293,9 @@ async function doGenerateEdit(){
     if(!filled.length||!ready)return;
     const prompt=$('customPrompt').value.trim();
     if(!prompt){alert('Please enter an edit instruction.');return;}
-
-    const btn=$('btnGen'); btn.disabled=true; btn.textContent='⏳ GENERATING...';
-    $('genOverlay').classList.add('active'); $('genFill').style.width='0';
-    $('outImg').style.display='none'; $('outPh').style.display='none';
-
-    const imageIds=slots.filter(s=>s!==null).map(s=>s.id);
-
     const payload={
         mode:'edit',
-        image_ids:imageIds,
+        image_ids:filled.map(s=>s.id),
         prompt:prompt,
         seed:parseInt($('rngSeed').value),
         randomize_seed:$('chkRand').checked,
@@ -324,12 +304,46 @@ async function doGenerateEdit(){
         width:parseInt($('inpWidth').value)||0,
         height:parseInt($('inpHeight').value)||0,
     };
+    await submitAndPoll(payload);
+}
+
+async function submitAndPoll(payload){
+    const btn=$('btnGen'); btn.disabled=true; btn.textContent='⏳ GENERATING...';
+    $('genOverlay').classList.add('active'); $('genFill').style.width='0';
+    $('outImg').style.display='none'; $('outPh').style.display='none';
+    $('genText').textContent='Starting...';
+
     try{
+        // Submit job
         const r=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-        const d=await r.json();
-        if(d.error){$('genText').textContent=d.error;return;}
-        showResult(d);
-    }catch(e){alert('Request failed: '+e.message);}
+        const start=await r.json();
+        if(start.error){$('genText').textContent=start.error;return;}
+        const jobId=start.job_id;
+
+        // Poll until done
+        while(true){
+            await new Promise(ok=>setTimeout(ok,1500));
+            try{
+                const pr=await fetch(`/api/job/${jobId}`);
+                const j=await pr.json();
+                if(j.status==='done'){
+                    showResult(j.result);
+                    return;
+                } else if(j.status==='error'){
+                    $('genText').textContent=j.error||'Generation failed';
+                    return;
+                }
+                // Still running — update progress from status poll
+                if(j.progress && j.progress.total){
+                    const pct=Math.round(j.progress.step/j.progress.total*100);
+                    $('genFill').style.width=pct+'%';
+                    $('genText').textContent=`Step ${j.progress.step}/${j.progress.total}`;
+                }
+            }catch(e){
+                // Poll fetch failed (network blip), just retry
+            }
+        }
+    }catch(e){$('genText').textContent='Request failed: '+e.message;}
     finally{
         btn.disabled=false; btn.textContent='⚡ GENERATE';
         $('genOverlay').classList.remove('active');
