@@ -113,6 +113,19 @@ def _snap_dim(v,mul=8):
     """Snap a dimension to nearest multiple of mul."""
     return max(mul,round(v/mul)*mul)
 
+MAX_PIXELS=1536*1536  # ~2.36MP — safe ceiling for L4/T4 with GGUF Q4
+
+def _cap_resolution(w,h):
+    """Cap output resolution so total pixels don't exceed MAX_PIXELS.
+    Preserves aspect ratio, snaps to mul of 8."""
+    total=w*h
+    if total<=MAX_PIXELS:
+        return _snap_dim(w),_snap_dim(h)
+    scale=math.sqrt(MAX_PIXELS/total)
+    w=_snap_dim(int(w*scale))
+    h=_snap_dim(int(h*scale))
+    return w,h
+
 def _set_lora_scales(scales):
     """Directly set PEFT LoRA scaling dicts without triggering requires_grad.
     scales: dict like {"lightning":1.0, "angles":0.9}
@@ -132,6 +145,7 @@ def index(): return send_from_directory(STATIC,"index.html")
 def keepalive(): return jsonify({"status":"ok"})
 @app.route("/api/status")
 def status():
+    _cleanup_jobs()  # tidy old jobs
     gpu=None;vram=0;vt=0;cpu_pct=0;ram=0;ram_total=0;disk=0;disk_total=0
     try:
         _t()
@@ -213,8 +227,7 @@ def _run_generate(job_id,d):
         iw,ih=imgs[0].size
         ow=int(d.get("width",0)) or iw
         oh=int(d.get("height",0)) or ih
-        ow=_snap_dim(ow)
-        oh=_snap_dim(oh)
+        ow,oh=_cap_resolution(ow,oh)
         _qem.VAE_IMAGE_SIZE=ow*oh
         _progress["total"]=steps
 
@@ -252,12 +265,19 @@ def get_job(job_id):
     j=_jobs.get(job_id)
     if not j: return jsonify({"error":"Job not found"}),404
     if j["status"]=="done":
-        _jobs.pop(job_id,None)  # clean up
+        # Mark when it was first read, keep for 5 min so refreshed pages can get it
+        if "read_at" not in j: j["read_at"]=time.time()
         return jsonify({"status":"done","result":j["result"]})
     elif j["status"]=="error":
-        _jobs.pop(job_id,None)
+        if "read_at" not in j: j["read_at"]=time.time()
         return jsonify({"status":"error","error":j["error"]})
     return jsonify({"status":"running","progress":_progress})
+
+def _cleanup_jobs():
+    """Remove completed jobs older than 5 minutes."""
+    now=time.time()
+    expired=[k for k,v in _jobs.items() if v.get("read_at") and now-v["read_at"]>300]
+    for k in expired: _jobs.pop(k,None)
 
 @app.route("/api/use_output",methods=["POST"])
 def use_output():

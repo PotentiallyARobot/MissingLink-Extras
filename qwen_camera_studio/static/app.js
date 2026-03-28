@@ -5,18 +5,101 @@ let imageId=null,imageUrl=null,ready=false,consoleOpen=false,hwOpen=false;
 window._promptLocked=false;
 let lastLogT=0;
 let currentMode='camera';
+let activeJobId=null; // currently polling job
 
 // Edit mode: 3 image slots
 let slots=[null,null,null];
 
+// ── Session persistence ───────────────────────────
+function saveSession(){
+    try{
+        const s={
+            mode:currentMode,
+            imageId, imageUrl,
+            slots,
+            activeJobId,
+            lastOutputFilename,
+            promptInput:$('promptInput')?$('promptInput').value:'',
+            customPrompt:$('customPrompt')?$('customPrompt').value:'',
+            seed:$('rngSeed')?$('rngSeed').value:'42',
+            cfg:$('rngCfg')?$('rngCfg').value:'1',
+            steps:$('rngSteps')?$('rngSteps').value:'4',
+            lora:$('rngLora')?$('rngLora').value:'0.9',
+            width:$('inpWidth')?$('inpWidth').value:'',
+            height:$('inpHeight')?$('inpHeight').value:'',
+            chkRand:$('chkRand')?$('chkRand').checked:true,
+            lastResult:lastResult,
+        };
+        sessionStorage.setItem('qwen_studio',JSON.stringify(s));
+    }catch(e){}
+}
+
+let lastResult=null; // last successful result data
+
+function restoreSession(){
+    try{
+        const raw=sessionStorage.getItem('qwen_studio');
+        if(!raw) return;
+        const s=JSON.parse(raw);
+
+        // Restore mode
+        if(s.mode && s.mode!==currentMode) setMode(s.mode);
+
+        // Restore camera input
+        if(s.imageId && s.imageUrl){
+            imageId=s.imageId; imageUrl=s.imageUrl;
+            $('dropzone').style.display='none';
+            $('inputPreview').style.display='';
+            $('inputImg').src=s.imageUrl;
+            setViewportImage(s.imageUrl);
+        }
+
+        // Restore edit slots
+        if(s.slots){
+            for(let i=0;i<3;i++){
+                slots[i]=s.slots[i]||null;
+                renderSlot(i);
+            }
+        }
+
+        // Restore settings
+        if(s.promptInput && $('promptInput')) $('promptInput').value=s.promptInput;
+        if(s.customPrompt && $('customPrompt')) $('customPrompt').value=s.customPrompt;
+        if(s.seed){ $('rngSeed').value=s.seed; $('vSeed').textContent=s.seed; }
+        if(s.cfg){ $('rngCfg').value=s.cfg; $('vCfg').textContent=s.cfg; }
+        if(s.steps){ $('rngSteps').value=s.steps; $('vSteps').textContent=s.steps; }
+        if(s.lora){ $('rngLora').value=s.lora; $('vLora').textContent=s.lora; }
+        if(s.width) $('inpWidth').value=s.width;
+        if(s.height) $('inpHeight').value=s.height;
+        if(s.chkRand!==undefined) $('chkRand').checked=s.chkRand;
+
+        lastOutputFilename=s.lastOutputFilename||null;
+
+        // Restore last result image
+        if(s.lastResult){
+            lastResult=s.lastResult;
+            showResult(s.lastResult);
+        }
+
+        // Resume polling if a job was active
+        if(s.activeJobId){
+            activeJobId=s.activeJobId;
+            resumePolling(s.activeJobId);
+        }
+
+        updateGenButton();
+    }catch(e){ console.warn('Session restore failed:',e); }
+}
+
+// ── Init ──────────────────────────────────────────
 document.addEventListener('DOMContentLoaded',()=>{
     initViewport();initDrop();initSlots();pollStatus();pollLogs();
     setInterval(pollStatus,2500);setInterval(pollLogs,1500);
+    restoreSession();
 });
 
 // ── Mode switching (instant, UI only) ─────────────
 function setMode(mode){
-    if(mode===currentMode) return;
     currentMode=mode;
     const isCam=mode==='camera';
     $('btnModeCamera').classList.toggle('active',isCam);
@@ -27,14 +110,16 @@ function setMode(mode){
         ?'Upload an image and generate'
         :'Add image(s) and describe your edit';
     updateGenButton();
+    saveSession();
 }
 
 function updateGenButton(){
+    if(activeJobId){ $('btnGen').disabled=true; return; }
     if(currentMode==='camera'){
         $('btnGen').disabled=!(ready && imageId);
     } else {
         const filled=slots.filter(s=>s!==null);
-        const cp=$('customPrompt').value.trim();
+        const cp=$('customPrompt')?$('customPrompt').value.trim():'';
         $('btnGen').disabled=!(ready && filled.length>0 && cp);
     }
 }
@@ -138,6 +223,7 @@ function setInputImage(id, url, w, h) {
     setViewportImage(url);
     if(w && h) setDimensions(w, h);
     updateGenButton();
+    saveSession();
 }
 
 function setDimensions(w, h){
@@ -161,6 +247,7 @@ function clearInput(){
     $('inputImg').src='';
     $('inpWidth').value=''; $('inpHeight').value='';
     updateGenButton();
+    saveSession();
 }
 
 // ══════════════════════════════════════════════════
@@ -199,6 +286,7 @@ async function uploadToSlot(i,file){
         setDimensions(d.w, d.h);
         renderSlot(i);
         updateGenButton();
+        saveSession();
     }catch(e){alert('Upload failed');}
 }
 
@@ -206,10 +294,12 @@ function removeSlot(i){
     slots[i]=null;
     renderSlot(i);
     updateGenButton();
+    saveSession();
 }
 
 function renderSlot(i){
     const el=$('slot'+i);
+    if(!el) return;
     const emptyDiv=el.querySelector('.slot-empty');
     const filledDiv=el.querySelector('.slot-filled');
     if(slots[i]){
@@ -221,7 +311,7 @@ function renderSlot(i){
         filledDiv.style.display='none';
     }
     const count=slots.filter(s=>s!==null).length;
-    $('slotCounter').textContent=`${count} / 3`;
+    if($('slotCounter')) $('slotCounter').textContent=`${count} / 3`;
 }
 
 // ── Modal ─────────────────────────────────────────
@@ -254,6 +344,7 @@ async function useAsInput(){
             setDimensions(d.w, d.h);
             renderSlot(target);
             updateGenButton();
+            saveSession();
         }
     }catch(e){alert('Failed');}
 }
@@ -265,7 +356,9 @@ function toggleLock(){
     $('promptLock').textContent=window._promptLocked?'🔒':'🔓';
 }
 
-// ── Generate (polling-based to avoid proxy timeouts) ──
+// ══════════════════════════════════════════════════
+//  GENERATE — polling-based
+// ══════════════════════════════════════════════════
 async function doGenerate(){
     if(currentMode==='camera') return doGenerateCamera();
     return doGenerateEdit();
@@ -314,40 +407,87 @@ async function submitAndPoll(payload){
     $('genText').textContent='Starting...';
 
     try{
-        // Submit job
         const r=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
         const start=await r.json();
         if(start.error){$('genText').textContent=start.error;return;}
-        const jobId=start.job_id;
-
-        // Poll until done
-        while(true){
-            await new Promise(ok=>setTimeout(ok,1500));
-            try{
-                const pr=await fetch(`/api/job/${jobId}`);
-                const j=await pr.json();
-                if(j.status==='done'){
-                    showResult(j.result);
-                    return;
-                } else if(j.status==='error'){
-                    $('genText').textContent=j.error||'Generation failed';
-                    return;
-                }
-                // Still running — update progress from status poll
-                if(j.progress && j.progress.total){
-                    const pct=Math.round(j.progress.step/j.progress.total*100);
-                    $('genFill').style.width=pct+'%';
-                    $('genText').textContent=`Step ${j.progress.step}/${j.progress.total}`;
-                }
-            }catch(e){
-                // Poll fetch failed (network blip), just retry
-            }
-        }
+        activeJobId=start.job_id;
+        saveSession();
+        await pollJob(activeJobId);
     }catch(e){$('genText').textContent='Request failed: '+e.message;}
     finally{
-        btn.disabled=false; btn.textContent='⚡ GENERATE';
-        $('genOverlay').classList.remove('active');
+        finishJob();
     }
+}
+
+// Resume polling for a job (e.g. after page refresh)
+async function resumePolling(jobId){
+    $('btnGen').disabled=true; $('btnGen').textContent='⏳ GENERATING...';
+    $('genOverlay').classList.add('active');
+    $('genText').textContent='Resuming...';
+    try{
+        await pollJob(jobId);
+    }catch(e){$('genText').textContent='Poll failed: '+e.message;}
+    finally{
+        finishJob();
+    }
+}
+
+async function pollJob(jobId){
+    // Poll with max 600 attempts (~15 min at 1.5s intervals)
+    for(let attempt=0;attempt<600;attempt++){
+        await new Promise(ok=>setTimeout(ok,1500));
+        try{
+            const pr=await fetch(`/api/job/${jobId}`);
+            if(pr.status===404){
+                // Job gone — was already consumed or server restarted
+                // Check if backend is still generating
+                try{
+                    const sr=await fetch('/api/status');
+                    const st=await sr.json();
+                    if(st.generating){
+                        // Still generating but job ID lost (server restart?)
+                        // Just keep waiting and show progress from status
+                        if(st.progress && st.progress.total){
+                            const pct=Math.round(st.progress.step/st.progress.total*100);
+                            $('genFill').style.width=pct+'%';
+                            $('genText').textContent=`Step ${st.progress.step}/${st.progress.total}`;
+                        }
+                        continue;
+                    }
+                }catch(e){}
+                // Not generating and job 404 — it's truly gone
+                $('genText').textContent='Job completed or expired';
+                return;
+            }
+            const j=await pr.json();
+            if(j.status==='done'){
+                lastResult=j.result;
+                showResult(j.result);
+                saveSession();
+                return;
+            } else if(j.status==='error'){
+                $('genText').textContent=j.error||'Generation failed';
+                return;
+            }
+            // Still running
+            if(j.progress && j.progress.total){
+                const pct=Math.round(j.progress.step/j.progress.total*100);
+                $('genFill').style.width=pct+'%';
+                $('genText').textContent=`Step ${j.progress.step}/${j.progress.total}`;
+            }
+        }catch(e){
+            // Network blip — just retry
+        }
+    }
+    $('genText').textContent='Timed out waiting for result';
+}
+
+function finishJob(){
+    activeJobId=null;
+    $('btnGen').disabled=false; $('btnGen').textContent='⚡ GENERATE';
+    $('genOverlay').classList.remove('active');
+    updateGenButton();
+    saveSession();
 }
 
 function showResult(d){
