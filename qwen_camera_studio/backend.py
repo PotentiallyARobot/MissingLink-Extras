@@ -1,4 +1,4 @@
-# backend.py — MissingLink Qwen Studio
+# backend.py — MissingLink Qwen Studio (hardened)
 import os,sys,math,gc,io,time,base64,uuid,json,traceback,threading
 IN_COLAB="google.colab" in sys.modules
 if IN_COLAB:
@@ -10,8 +10,13 @@ if not os.path.isdir(os.path.join(_D,"static")):
     for _c in ["/content/qwen_camera_studio",os.path.join(os.getcwd(),"qwen_camera_studio"),os.getcwd()]:
         if os.path.isdir(os.path.join(_c,"static")): _D=_c; break
 PROJECT_DIR=_D; STATIC=os.path.join(_D,"static"); UPLOADS=os.path.join(_D,"uploads"); OUTPUTS=os.path.join(_D,"outputs")
-for d in [UPLOADS,OUTPUTS,STATIC]: os.makedirs(d,exist_ok=True)
+STATE_DIR=os.path.join(_D,".state")
+for d in [UPLOADS,OUTPUTS,STATIC,STATE_DIR]: os.makedirs(d,exist_ok=True)
 print(f"[backend] project={PROJECT_DIR}")
+
+# ── Persistent state files ─────────────────────────
+JOBS_FILE=os.path.join(STATE_DIR,"jobs.json")
+UI_STATE_FILE=os.path.join(STATE_DIR,"ui_state.json")
 
 from flask import Flask,request,jsonify,send_from_directory
 app=Flask(__name__,static_folder=STATIC,static_url_path="/static")
@@ -33,6 +38,75 @@ def log(msg,level="info"):
 
 pipeline=None; _qem=None; _loading=False; _error=None; _generating=False
 _progress={"step":0,"total":0,"active":False}
+
+# ── Persistent jobs store ──────────────────────────
+_jobs={}
+_jobs_lock=threading.Lock()
+
+def _save_jobs():
+    """Persist completed/errored jobs to disk so they survive restarts."""
+    try:
+        with _jobs_lock:
+            persist={k:v for k,v in _jobs.items()
+                     if v.get("status") in ("done","error")}
+        tmp=JOBS_FILE+".tmp"
+        with open(tmp,"w") as f:
+            json.dump(persist,f)
+        os.replace(tmp,JOBS_FILE)
+    except Exception as e:
+        print(f"[warn] Failed to save jobs: {e}")
+
+def _load_jobs():
+    """Restore completed jobs from disk after restart."""
+    global _jobs
+    try:
+        if os.path.isfile(JOBS_FILE):
+            with open(JOBS_FILE) as f:
+                loaded=json.load(f)
+            with _jobs_lock:
+                for k,v in loaded.items():
+                    if v.get("status")=="done" and v.get("result",{}).get("url"):
+                        fn=os.path.basename(v["result"]["url"])
+                        if os.path.isfile(os.path.join(OUTPUTS,fn)):
+                            _jobs[k]=v
+                    elif v.get("status")=="error":
+                        _jobs[k]=v
+            log(f"Restored {len(_jobs)} jobs from disk","info")
+    except Exception as e:
+        print(f"[warn] Failed to load jobs: {e}")
+
+_load_jobs()
+
+def _cleanup_jobs():
+    """Remove completed jobs older than 30 minutes after being read."""
+    now=time.time()
+    with _jobs_lock:
+        expired=[k for k,v in _jobs.items()
+                 if v.get("read_at") and now-v["read_at"]>1800]
+        for k in expired: _jobs.pop(k,None)
+    if expired:
+        _save_jobs()
+
+# ── UI state persistence ──────────────────────────
+def _save_ui_state(state):
+    try:
+        state["_saved_at"]=time.time()
+        tmp=UI_STATE_FILE+".tmp"
+        with open(tmp,"w") as f:
+            json.dump(state,f)
+        os.replace(tmp,UI_STATE_FILE)
+    except Exception as e:
+        print(f"[warn] Failed to save UI state: {e}")
+
+def _load_ui_state():
+    try:
+        if os.path.isfile(UI_STATE_FILE):
+            with open(UI_STATE_FILE) as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"[warn] Failed to load UI state: {e}")
+    return None
+
 
 def resize_for_qwen(img,mx=1024,mul=8):
     _t(); w,h=img.size; s=min(mx/max(w,h),1.0)
@@ -110,14 +184,11 @@ def _load_images(image_ids):
     return imgs
 
 def _snap_dim(v,mul=8):
-    """Snap a dimension to nearest multiple of mul."""
     return max(mul,round(v/mul)*mul)
 
-MAX_PIXELS=1536*1536  # ~2.36MP — safe ceiling for L4/T4 with GGUF Q4
+MAX_PIXELS=1536*1536
 
 def _cap_resolution(w,h):
-    """Cap output resolution so total pixels don't exceed MAX_PIXELS.
-    Preserves aspect ratio, snaps to mul of 8."""
     total=w*h
     if total<=MAX_PIXELS:
         return _snap_dim(w),_snap_dim(h)
@@ -127,13 +198,8 @@ def _cap_resolution(w,h):
     return w,h
 
 def _set_lora_scales(scales):
-    """Directly set PEFT LoRA scaling dicts without triggering requires_grad.
-    scales: dict like {"lightning":1.0, "angles":0.9}
-    Works by walking the transformer's modules and updating the .scaling dict
-    on any LoraLayer that has our adapter names."""
     transformer = pipeline.transformer
     for module in transformer.modules():
-        # PEFT LoRA layers have a .scaling dict keyed by adapter name
         if hasattr(module, 'scaling') and isinstance(module.scaling, dict):
             for name, weight in scales.items():
                 if name in module.scaling:
@@ -143,9 +209,10 @@ def _set_lora_scales(scales):
 def index(): return send_from_directory(STATIC,"index.html")
 @app.route("/api/keepalive")
 def keepalive(): return jsonify({"status":"ok"})
+
 @app.route("/api/status")
 def status():
-    _cleanup_jobs()  # tidy old jobs
+    _cleanup_jobs()
     gpu=None;vram=0;vt=0;cpu_pct=0;ram=0;ram_total=0;disk=0;disk_total=0
     try:
         _t()
@@ -167,11 +234,13 @@ def status():
         "gpu":gpu,"vram":vram,"vram_total":vt,
         "cpu_pct":cpu_pct,"ram":ram,"ram_total":ram_total,
         "disk":disk,"disk_total":disk_total})
+
 @app.route("/api/logs")
 def get_logs():
     s=float(request.args.get("since",0))
     with _lock: n=[e for e in _logs if e["t"]>s]
     return jsonify({"logs":n})
+
 @app.route("/api/load",methods=["POST"])
 def api_load():
     if pipeline: return jsonify({"status":"loaded"})
@@ -179,6 +248,7 @@ def api_load():
     d=request.get_json(silent=True) or {}
     threading.Thread(target=load_pipeline,args=(d.get("variant","Q4_K_M"),),daemon=True).start()
     return jsonify({"status":"started"})
+
 @app.route("/api/upload",methods=["POST"])
 def upload():
     if "image" not in request.files: return jsonify({"error":"No image"}),400
@@ -186,10 +256,60 @@ def upload():
     uid=uuid.uuid4().hex[:8]; fn=f"{uid}{ext}"; f.save(os.path.join(UPLOADS,fn))
     _t(); img=Image.open(os.path.join(UPLOADS,fn)).convert("RGB")
     return jsonify({"id":uid,"filename":fn,"w":img.size[0],"h":img.size[1],"url":f"/api/uploads/{fn}"})
+
 @app.route("/api/uploads/<path:fn>")
 def srv_up(fn): return send_from_directory(UPLOADS,fn)
 @app.route("/api/outputs/<path:fn>")
 def srv_out(fn): return send_from_directory(OUTPUTS,fn)
+
+# ── Persistent UI state endpoints ──────────────────
+@app.route("/api/state",methods=["GET"])
+def get_state():
+    """Return saved UI state + inventory of available files."""
+    state=_load_ui_state() or {}
+    uploads=[]
+    for fn in sorted(os.listdir(UPLOADS)):
+        uid=fn.split(".")[0]
+        uploads.append({"id":uid,"filename":fn,"url":f"/api/uploads/{fn}"})
+    outputs=[]
+    for fn in sorted(os.listdir(OUTPUTS)):
+        outputs.append({"filename":fn,"url":f"/api/outputs/{fn}"})
+    state["_uploads"]=uploads
+    state["_outputs"]=outputs
+    with _jobs_lock:
+        completed={k:v for k,v in _jobs.items() if v.get("status") in ("done","error")}
+    state["_completed_jobs"]=completed
+    return jsonify(state)
+
+@app.route("/api/state",methods=["POST"])
+def save_state():
+    """Save UI state from the client."""
+    d=request.get_json(silent=True) or {}
+    d.pop("_uploads",None)
+    d.pop("_outputs",None)
+    d.pop("_completed_jobs",None)
+    _save_ui_state(d)
+    return jsonify({"status":"ok"})
+
+@app.route("/api/validate_refs",methods=["POST"])
+def validate_refs():
+    """Client sends image IDs; backend confirms which still exist on disk."""
+    d=request.get_json(silent=True) or {}
+    image_ids=d.get("image_ids",[])
+    output_files=d.get("output_files",[])
+    valid_images={}
+    for iid in image_ids:
+        fp=_find_upload(iid)
+        if fp:
+            fn=os.path.basename(fp)
+            valid_images[iid]={"filename":fn,"url":f"/api/uploads/{fn}"}
+    valid_outputs={}
+    for fn in output_files:
+        bf=os.path.basename(fn)
+        if os.path.isfile(os.path.join(OUTPUTS,bf)):
+            valid_outputs[fn]={"url":f"/api/outputs/{bf}"}
+    return jsonify({"valid_images":valid_images,"valid_outputs":valid_outputs})
+
 
 @app.route("/api/generate",methods=["POST"])
 def generate():
@@ -199,11 +319,11 @@ def generate():
     _generating=True; _progress["active"]=True; _progress["step"]=0
     d=request.get_json()
     job_id=uuid.uuid4().hex[:8]
-    _jobs[job_id]={"status":"running","result":None,"error":None}
+    with _jobs_lock:
+        _jobs[job_id]={"status":"running","result":None,"error":None,"started_at":time.time()}
+    _save_jobs()
     threading.Thread(target=_run_generate,args=(job_id,d),daemon=True).start()
     return jsonify({"job_id":job_id,"status":"started"})
-
-_jobs={}
 
 def _run_generate(job_id,d):
     global _generating
@@ -212,7 +332,9 @@ def _run_generate(job_id,d):
         mode=d.get("mode","camera")
         image_ids=d.get("image_ids",[])
         if not image_ids:
-            _jobs[job_id]={"status":"error","error":"No images provided"}; return
+            with _jobs_lock:
+                _jobs[job_id]={"status":"error","error":"No images provided","finished_at":time.time()}
+            _save_jobs(); return
         prompt=d.get("prompt","")
         seed=d.get("seed",42)
         if d.get("randomize_seed"): import random; seed=random.randint(0,2147483647)
@@ -222,7 +344,9 @@ def _run_generate(job_id,d):
 
         imgs=_load_images(image_ids)
         if not imgs:
-            _jobs[job_id]={"status":"error","error":"No valid images found"}; return
+            with _jobs_lock:
+                _jobs[job_id]={"status":"error","error":"No valid images found","finished_at":time.time()}
+            _save_jobs(); return
 
         iw,ih=imgs[0].size
         ow=int(d.get("width",0)) or iw
@@ -251,21 +375,26 @@ def _run_generate(job_id,d):
         of=f"out_{uuid.uuid4().hex[:8]}.png"; oi.save(os.path.join(OUTPUTS,of))
         torch.cuda.empty_cache(); gc.collect()
         log(f"Done {el:.1f}s — {oi.size[0]}x{oi.size[1]}","success")
-        _jobs[job_id]={"status":"done","result":{
+        result={
             "url":f"/api/outputs/{of}","w":oi.size[0],"h":oi.size[1],
-            "prompt":prompt,"seed":seed,"elapsed":round(el,1),"mode":mode}}
+            "prompt":prompt,"seed":seed,"elapsed":round(el,1),"mode":mode}
+        with _jobs_lock:
+            _jobs[job_id]={"status":"done","result":result,"finished_at":time.time()}
+        _save_jobs()
     except Exception as e:
         log(f"Generate failed: {e}","error"); traceback.print_exc()
-        _jobs[job_id]={"status":"error","error":str(e)}
+        with _jobs_lock:
+            _jobs[job_id]={"status":"error","error":str(e),"finished_at":time.time()}
+        _save_jobs()
     finally:
         _generating=False; _progress["active"]=False; _progress["step"]=0
 
 @app.route("/api/job/<job_id>")
 def get_job(job_id):
-    j=_jobs.get(job_id)
+    with _jobs_lock:
+        j=_jobs.get(job_id)
     if not j: return jsonify({"error":"Job not found"}),404
     if j["status"]=="done":
-        # Mark when it was first read, keep for 5 min so refreshed pages can get it
         if "read_at" not in j: j["read_at"]=time.time()
         return jsonify({"status":"done","result":j["result"]})
     elif j["status"]=="error":
@@ -273,11 +402,19 @@ def get_job(job_id):
         return jsonify({"status":"error","error":j["error"]})
     return jsonify({"status":"running","progress":_progress})
 
-def _cleanup_jobs():
-    """Remove completed jobs older than 5 minutes."""
-    now=time.time()
-    expired=[k for k,v in _jobs.items() if v.get("read_at") and now-v["read_at"]>300]
-    for k in expired: _jobs.pop(k,None)
+@app.route("/api/jobs",methods=["GET"])
+def list_jobs():
+    """List all known jobs (for recovery after reconnect)."""
+    with _jobs_lock:
+        summary={}
+        for k,v in _jobs.items():
+            summary[k]={"status":v.get("status"),"started_at":v.get("started_at"),
+                        "finished_at":v.get("finished_at")}
+            if v.get("status")=="done":
+                summary[k]["result"]=v.get("result")
+            elif v.get("status")=="error":
+                summary[k]["error"]=v.get("error")
+    return jsonify({"jobs":summary,"generating":_generating})
 
 @app.route("/api/use_output",methods=["POST"])
 def use_output():

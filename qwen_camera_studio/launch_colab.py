@@ -1,4 +1,4 @@
-# launch_colab.py — MissingLink Qwen Studio
+# launch_colab.py — MissingLink Qwen Studio (hardened)
 import os,time,threading,traceback,sys
 import socket as _socket
 import requests as _requests
@@ -22,6 +22,22 @@ if 'app' not in dir():
     os.chdir(_pd); print(f"[launch] project: {_pd}")
     from backend import *
 
+# ── Detect restart ─────────────────────────────────────────────
+_state_dir=os.path.join(PROJECT_DIR,".state")
+_restart_marker=os.path.join(_state_dir,"last_launch")
+_is_restart=os.path.isfile(_restart_marker)
+if _is_restart:
+    _last=0
+    try:
+        with open(_restart_marker) as f: _last=float(f.read().strip())
+        elapsed=time.time()-_last
+        print(f"\n  ♻️  Restart detected (last launch was {elapsed:.0f}s ago)")
+        print(f"  📂 Preserved state in .state/, uploads/, outputs/")
+    except: pass
+# Write current launch marker
+os.makedirs(_state_dir,exist_ok=True)
+with open(_restart_marker,"w") as f: f.write(str(time.time()))
+
 # ── Pre-download models ────────────────────────────────────────
 VARIANT=os.environ.get("GGUF_VARIANT","Q4_K_M")
 print("\n"+"="*60)
@@ -35,7 +51,6 @@ hf_hub_download(repo_id="unsloth/Qwen-Image-Edit-2511-GGUF",filename=f"qwen-imag
 print("  ✓ cached")
 
 print("[2/4] Base pipeline (text encoder + VAE)...")
-# Download the full repo with allow_patterns to get only what we need
 from huggingface_hub import snapshot_download
 snapshot_download("Qwen/Qwen-Image-Edit-2511",
     allow_patterns=["model_index.json","scheduler/*","vae/*","tokenizer/*","processor/*",
@@ -90,28 +105,33 @@ if IN_COLAB:
             if c and _requests.get(c.rstrip("/")+"/api/keepalive",timeout=4).status_code==200: url=c; break
         except: pass
         time.sleep(.5)
+
+    _restart_msg=' <span style="color:#22C55E;font-size:11px">♻️ Session restored</span>' if _is_restart else ''
     if url:
         display(_H(f'''<div style="margin:12px 0;padding:14px 20px;background:#111113;border:1px solid #E8A917;border-radius:8px;font-family:monospace">
             <span style="color:#71717A;font-size:12px">🎬 Qwen Studio live:</span>
-            <a href="{url}" target="_blank" style="color:#E8A917;font-size:16px;font-weight:bold;margin-left:8px">{url}</a></div>'''))
+            <a href="{url}" target="_blank" style="color:#E8A917;font-size:16px;font-weight:bold;margin-left:8px">{url}</a>{_restart_msg}</div>'''))
     else:
         try:
             from google.colab import output as _co
             _co.serve_kernel_port_as_iframe(PORT,height='850')
         except: pass
         display(_H(f'''<div style="margin:8px 0;padding:10px 16px;background:#111113;border:1px solid #E8A917;border-radius:8px;font-family:monospace;display:flex;align-items:center;gap:8px">
-            <span style="color:#E8A917;font-weight:bold">🎬 Qwen Studio</span><span style="color:#71717A;font-size:12px">embedded above ↑</span>
+            <span style="color:#E8A917;font-weight:bold">🎬 Qwen Studio</span><span style="color:#71717A;font-size:12px">embedded above ↑</span>{_restart_msg}
             <button onclick="(async()=>{{const u=await google.colab.kernel.proxyPort({PORT},{{cache:false}});window.open(u.startsWith('http')?u:'https://'+u,'_blank')}})()"
                 style="margin-left:auto;padding:5px 12px;background:#E8A917;color:#000;border:none;border-radius:5px;font-family:monospace;font-size:11px;font-weight:bold;cursor:pointer">↗ New Tab</button></div>'''))
 else:
     print(f"\n🎬 Qwen Studio: http://localhost:{PORT}\n")
 
 print("\n"+"="*60)
-print("  ✅ Server running. Auto-loading model...")
+if _is_restart:
+    print("  ♻️  RESTARTED — previous session state preserved")
+    print("  📂 Uploads, outputs, and UI state restored from disk")
+else:
+    print("  ✅ Fresh start")
+print("  ⏳ Auto-loading model...")
 print("="*60)
 
-# Verify gguf is importable before trying to load
-# Verify gguf is importable before trying to load
 try:
     import gguf as _gguf_check
     print(f"  ✓ gguf package installed")
@@ -120,7 +140,6 @@ except ImportError:
     print("  Run this in a cell and restart runtime:")
     print('    !pip install "gguf>=0.10.0"')
 
-# Auto-load the pipeline in background
 import threading as _thr
 _thr.Thread(target=load_pipeline, args=(VARIANT,), daemon=True).start()
 print(f"  ⏳ Model loading in background (GGUF {VARIANT})...")
