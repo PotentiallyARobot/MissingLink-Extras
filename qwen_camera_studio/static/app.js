@@ -1,51 +1,177 @@
-// app.js — Qwen Studio client
+// app.js — Qwen Studio client (hardened)
 const $=id=>document.getElementById(id);
 
 let imageId=null,imageUrl=null,ready=false,consoleOpen=false,hwOpen=false;
 window._promptLocked=false;
 let lastLogT=0;
 let currentMode='camera';
-let activeJobId=null; // currently polling job
+let activeJobId=null;
 
 // Edit mode: 3 image slots
 let slots=[null,null,null];
+let lastResult=null;
+let lastOutputFilename=null;
 
-// ── Session persistence ───────────────────────────
+// Debounce timer for saving state
+let _saveTimer=null;
+
+// ── Session persistence (dual: server + localStorage) ───
 function saveSession(){
-    try{
-        const s={
-            mode:currentMode,
-            imageId, imageUrl,
-            slots,
-            activeJobId,
-            lastOutputFilename,
-            promptInput:$('promptInput')?$('promptInput').value:'',
-            customPrompt:$('customPrompt')?$('customPrompt').value:'',
-            seed:$('rngSeed')?$('rngSeed').value:'42',
-            cfg:$('rngCfg')?$('rngCfg').value:'1',
-            steps:$('rngSteps')?$('rngSteps').value:'4',
-            lora:$('rngLora')?$('rngLora').value:'0.9',
-            width:$('inpWidth')?$('inpWidth').value:'',
-            height:$('inpHeight')?$('inpHeight').value:'',
-            chkRand:$('chkRand')?$('chkRand').checked:true,
-            lastResult:lastResult,
-        };
-        sessionStorage.setItem('qwen_studio',JSON.stringify(s));
-    }catch(e){}
+    // Debounce: wait 300ms of inactivity before actually saving
+    if(_saveTimer) clearTimeout(_saveTimer);
+    _saveTimer=setTimeout(_doSaveSession,300);
 }
 
-let lastResult=null; // last successful result data
+function _doSaveSession(){
+    const s=_gatherState();
+    // Save to localStorage (survives tab close, fast)
+    try{ localStorage.setItem('qwen_studio',JSON.stringify(s)); }catch(e){}
+    // Save to server (survives full Colab restart, async fire-and-forget)
+    _saveToServer(s);
+}
 
-function restoreSession(){
+function _gatherState(){
+    return {
+        mode:currentMode,
+        imageId, imageUrl,
+        slots,
+        activeJobId,
+        lastOutputFilename,
+        promptInput:$('promptInput')?$('promptInput').value:'',
+        customPrompt:$('customPrompt')?$('customPrompt').value:'',
+        seed:$('rngSeed')?$('rngSeed').value:'42',
+        cfg:$('rngCfg')?$('rngCfg').value:'1',
+        steps:$('rngSteps')?$('rngSteps').value:'4',
+        lora:$('rngLora')?$('rngLora').value:'0.9',
+        width:$('inpWidth')?$('inpWidth').value:'',
+        height:$('inpHeight')?$('inpHeight').value:'',
+        chkRand:$('chkRand')?$('chkRand').checked:true,
+        lastResult:lastResult,
+        promptLocked:window._promptLocked,
+    };
+}
+
+async function _saveToServer(s){
     try{
-        const raw=sessionStorage.getItem('qwen_studio');
-        if(!raw) return;
-        const s=JSON.parse(raw);
+        await fetch('/api/state',{
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify(s)
+        });
+    }catch(e){/* network blip, ignore */}
+}
 
-        // Restore mode
+async function restoreSession(){
+    // Strategy: try server state first (survives Colab restart),
+    // fall back to localStorage (survives page refresh with same origin)
+    let s=null;
+    try{
+        const r=await fetch('/api/state');
+        if(r.ok){
+            const serverState=await r.json();
+            // Server state has _uploads, _outputs, _completed_jobs metadata
+            // plus the UI state fields if previously saved
+            if(serverState.mode){
+                s=serverState;
+                s._fromServer=true;
+            }
+        }
+    }catch(e){}
+
+    if(!s){
+        try{
+            const raw=localStorage.getItem('qwen_studio');
+            if(raw) s=JSON.parse(raw);
+        }catch(e){}
+    }
+
+    if(!s) return;
+
+    // If restoring from server, validate that referenced files still exist
+    if(s._fromServer){
+        const uploadIds=new Set((s._uploads||[]).map(u=>u.id));
+        const outputFiles=new Set((s._outputs||[]).map(o=>o.filename));
+
+        // Validate camera input
+        if(s.imageId && !uploadIds.has(s.imageId)){
+            s.imageId=null; s.imageUrl=null;
+        }
+
+        // Validate edit slots
+        if(s.slots){
+            for(let i=0;i<s.slots.length;i++){
+                if(s.slots[i] && !uploadIds.has(s.slots[i].id)){
+                    s.slots[i]=null;
+                }
+            }
+        }
+
+        // Validate last result
+        if(s.lastResult && s.lastResult.url){
+            const fn=s.lastResult.url.split('/').pop();
+            if(!outputFiles.has(fn)){
+                s.lastResult=null;
+                s.lastOutputFilename=null;
+            }
+        }
+
+        // Check for completed jobs we might have missed
+        const completedJobs=s._completed_jobs||{};
+        if(s.activeJobId && completedJobs[s.activeJobId]){
+            const job=completedJobs[s.activeJobId];
+            if(job.status==='done' && job.result){
+                s.lastResult=job.result;
+                s.lastOutputFilename=(job.result.url||'').split('/').pop();
+                s.activeJobId=null;
+            } else if(job.status==='error'){
+                s.activeJobId=null;
+            }
+        }
+    } else {
+        // localStorage restore: validate against server
+        try{
+            const refs={image_ids:[],output_files:[]};
+            if(s.imageId) refs.image_ids.push(s.imageId);
+            if(s.slots){
+                s.slots.forEach(sl=>{if(sl&&sl.id) refs.image_ids.push(sl.id);});
+            }
+            if(s.lastOutputFilename) refs.output_files.push(s.lastOutputFilename);
+
+            if(refs.image_ids.length||refs.output_files.length){
+                const vr=await fetch('/api/validate_refs',{
+                    method:'POST',
+                    headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify(refs)
+                });
+                if(vr.ok){
+                    const v=await vr.json();
+                    if(s.imageId && !v.valid_images[s.imageId]){
+                        s.imageId=null; s.imageUrl=null;
+                    }
+                    if(s.slots){
+                        for(let i=0;i<s.slots.length;i++){
+                            if(s.slots[i] && !v.valid_images[s.slots[i].id]){
+                                s.slots[i]=null;
+                            }
+                        }
+                    }
+                    if(s.lastOutputFilename && !v.valid_outputs[s.lastOutputFilename]){
+                        s.lastResult=null; s.lastOutputFilename=null;
+                    }
+                }
+            }
+        }catch(e){/* validation failed, proceed with what we have */}
+    }
+
+    // Apply state to UI
+    _applyState(s);
+}
+
+function _applyState(s){
+    try{
         if(s.mode && s.mode!==currentMode) setMode(s.mode);
 
-        // Restore camera input
+        // Camera input
         if(s.imageId && s.imageUrl){
             imageId=s.imageId; imageUrl=s.imageUrl;
             $('dropzone').style.display='none';
@@ -54,7 +180,7 @@ function restoreSession(){
             setViewportImage(s.imageUrl);
         }
 
-        // Restore edit slots
+        // Edit slots
         if(s.slots){
             for(let i=0;i<3;i++){
                 slots[i]=s.slots[i]||null;
@@ -62,7 +188,7 @@ function restoreSession(){
             }
         }
 
-        // Restore settings
+        // Settings
         if(s.promptInput && $('promptInput')) $('promptInput').value=s.promptInput;
         if(s.customPrompt && $('customPrompt')) $('customPrompt').value=s.customPrompt;
         if(s.seed){ $('rngSeed').value=s.seed; $('vSeed').textContent=s.seed; }
@@ -72,6 +198,11 @@ function restoreSession(){
         if(s.width) $('inpWidth').value=s.width;
         if(s.height) $('inpHeight').value=s.height;
         if(s.chkRand!==undefined) $('chkRand').checked=s.chkRand;
+        if(s.promptLocked){
+            window._promptLocked=true;
+            $('promptLock').classList.add('locked');
+            $('promptLock').textContent='🔒';
+        }
 
         lastOutputFilename=s.lastOutputFilename||null;
 
@@ -95,7 +226,20 @@ function restoreSession(){
 document.addEventListener('DOMContentLoaded',()=>{
     initViewport();initDrop();initSlots();pollStatus();pollLogs();
     setInterval(pollStatus,2500);setInterval(pollLogs,1500);
+    // Periodic state save as safety net (every 30s)
+    setInterval(()=>_saveToServer(_gatherState()),30000);
     restoreSession();
+});
+
+// Save state before user leaves
+window.addEventListener('beforeunload',()=>{
+    const s=_gatherState();
+    try{ localStorage.setItem('qwen_studio',JSON.stringify(s)); }catch(e){}
+    // Use sendBeacon for reliable save on close
+    try{
+        navigator.sendBeacon('/api/state',
+            new Blob([JSON.stringify(s)],{type:'application/json'}));
+    }catch(e){}
 });
 
 // ── Mode switching (instant, UI only) ─────────────
@@ -164,7 +308,13 @@ async function pollStatus(){
             $('genFill').style.width=pct+'%';
             $('genText').textContent=`Step ${d.progress.step}/${d.progress.total}`;
         }
-    }catch(e){}
+    }catch(e){
+        // Server unreachable — show disconnected state
+        const dot=$('connDot'),lbl=$('connLabel');
+        dot.className='dot'; dot.style.background='var(--red)';
+        lbl.textContent='Disconnected';
+        ready=false; $('btnGen').disabled=true;
+    }
 }
 
 // ── Logs ──────────────────────────────────────────
@@ -326,8 +476,6 @@ function closeModal(){
 document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeModal(); });
 
 // ── Use output as input ───────────────────────────
-let lastOutputFilename = null;
-
 async function useAsInput(){
     if(!lastOutputFilename) return;
     try{
@@ -354,6 +502,7 @@ function toggleLock(){
     window._promptLocked=!window._promptLocked;
     $('promptLock').classList.toggle('locked',window._promptLocked);
     $('promptLock').textContent=window._promptLocked?'🔒':'🔓';
+    saveSession();
 }
 
 // ══════════════════════════════════════════════════
@@ -409,7 +558,7 @@ async function submitAndPoll(payload){
     try{
         const r=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
         const start=await r.json();
-        if(start.error){$('genText').textContent=start.error;return;}
+        if(start.error){$('genText').textContent=start.error;finishJob();return;}
         activeJobId=start.job_id;
         saveSession();
         await pollJob(activeJobId);
@@ -419,11 +568,56 @@ async function submitAndPoll(payload){
     }
 }
 
-// Resume polling for a job (e.g. after page refresh)
+// Resume polling for a job (e.g. after page refresh or reconnect)
 async function resumePolling(jobId){
     $('btnGen').disabled=true; $('btnGen').textContent='⏳ GENERATING...';
     $('genOverlay').classList.add('active');
     $('genText').textContent='Resuming...';
+
+    // First check if the job already completed while we were away
+    try{
+        const r=await fetch(`/api/job/${jobId}`);
+        if(r.ok){
+            const j=await r.json();
+            if(j.status==='done'){
+                lastResult=j.result;
+                showResult(j.result);
+                finishJob();
+                return;
+            } else if(j.status==='error'){
+                $('genText').textContent=j.error||'Generation failed';
+                finishJob();
+                return;
+            }
+        } else if(r.status===404){
+            // Job is gone — check if server is still generating
+            const sr=await fetch('/api/status');
+            if(sr.ok){
+                const st=await sr.json();
+                if(!st.generating){
+                    // Not generating and job gone — check completed jobs list
+                    try{
+                        const jr=await fetch('/api/jobs');
+                        if(jr.ok){
+                            const jd=await jr.json();
+                            // Look for any recent completed job
+                            const recent=Object.entries(jd.jobs||{})
+                                .filter(([,v])=>v.status==='done')
+                                .sort(([,a],[,b])=>(b.finished_at||0)-(a.finished_at||0));
+                            if(recent.length && recent[0][1].result){
+                                lastResult=recent[0][1].result;
+                                showResult(recent[0][1].result);
+                            }
+                        }
+                    }catch(e){}
+                    $('genText').textContent='Job completed or expired';
+                    finishJob();
+                    return;
+                }
+            }
+        }
+    }catch(e){/* network issue, fall through to polling */}
+
     try{
         await pollJob(jobId);
     }catch(e){$('genText').textContent='Poll failed: '+e.message;}
@@ -433,20 +627,17 @@ async function resumePolling(jobId){
 }
 
 async function pollJob(jobId){
-    // Poll with max 600 attempts (~15 min at 1.5s intervals)
+    let consecutiveErrors=0;
     for(let attempt=0;attempt<600;attempt++){
         await new Promise(ok=>setTimeout(ok,1500));
         try{
             const pr=await fetch(`/api/job/${jobId}`);
+            consecutiveErrors=0; // reset on any successful fetch
             if(pr.status===404){
-                // Job gone — was already consumed or server restarted
-                // Check if backend is still generating
                 try{
                     const sr=await fetch('/api/status');
                     const st=await sr.json();
                     if(st.generating){
-                        // Still generating but job ID lost (server restart?)
-                        // Just keep waiting and show progress from status
                         if(st.progress && st.progress.total){
                             const pct=Math.round(st.progress.step/st.progress.total*100);
                             $('genFill').style.width=pct+'%';
@@ -455,7 +646,22 @@ async function pollJob(jobId){
                         continue;
                     }
                 }catch(e){}
-                // Not generating and job 404 — it's truly gone
+                // Check /api/jobs for any recently finished job
+                try{
+                    const jr=await fetch('/api/jobs');
+                    if(jr.ok){
+                        const jd=await jr.json();
+                        const recent=Object.entries(jd.jobs||{})
+                            .filter(([,v])=>v.status==='done')
+                            .sort(([,a],[,b])=>(b.finished_at||0)-(a.finished_at||0));
+                        if(recent.length && recent[0][1].result){
+                            lastResult=recent[0][1].result;
+                            showResult(recent[0][1].result);
+                            saveSession();
+                            return;
+                        }
+                    }
+                }catch(e){}
                 $('genText').textContent='Job completed or expired';
                 return;
             }
@@ -469,14 +675,20 @@ async function pollJob(jobId){
                 $('genText').textContent=j.error||'Generation failed';
                 return;
             }
-            // Still running
             if(j.progress && j.progress.total){
                 const pct=Math.round(j.progress.step/j.progress.total*100);
                 $('genFill').style.width=pct+'%';
                 $('genText').textContent=`Step ${j.progress.step}/${j.progress.total}`;
             }
         }catch(e){
-            // Network blip — just retry
+            consecutiveErrors++;
+            // After 20 consecutive network failures (~30s), show disconnected
+            if(consecutiveErrors>20){
+                $('genText').textContent='Lost connection to server — will resume when reconnected';
+            } else {
+                $('genText').textContent='Reconnecting...';
+            }
+            // Don't give up — keep polling (server might come back)
         }
     }
     $('genText').textContent='Timed out waiting for result';
@@ -492,6 +704,7 @@ function finishJob(){
 
 function showResult(d){
     $('outImg').src=d.url; $('outImg').style.display='';
+    $('outPh').style.display='none';
     $('rngSeed').value=d.seed; $('vSeed').textContent=d.seed;
     $('resultBar').style.display='flex';
     const tag=d.mode==='camera'?'':'✏️ ';
