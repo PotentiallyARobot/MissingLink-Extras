@@ -18,9 +18,27 @@ print(f"[backend] project={PROJECT_DIR}")
 JOBS_FILE=os.path.join(STATE_DIR,"jobs.json")
 UI_STATE_FILE=os.path.join(STATE_DIR,"ui_state.json")
 
-from flask import Flask,request,jsonify,send_from_directory
+from flask import Flask,request,jsonify,send_from_directory,make_response
 app=Flask(__name__,static_folder=STATIC,static_url_path="/static")
 app.config["MAX_CONTENT_LENGTH"]=50*1024*1024
+
+# ── CORS: allow Colab proxy origins ────────────────
+@app.after_request
+def _cors(resp):
+    origin=request.headers.get("Origin","")
+    # Allow Colab proxy origins and localhost
+    if origin and ("colab.dev" in origin or "colab.google" in origin
+                    or "localhost" in origin or "127.0.0.1" in origin
+                    or "googleusercontent.com" in origin):
+        resp.headers["Access-Control-Allow-Origin"]=origin
+        resp.headers["Access-Control-Allow-Headers"]="Content-Type"
+        resp.headers["Access-Control-Allow-Methods"]="GET,POST,OPTIONS"
+    return resp
+
+@app.route("/api/<path:p>",methods=["OPTIONS"])
+def _preflight(p):
+    r=make_response("",204)
+    return r
 
 torch=None; Image=None
 def _t():
@@ -106,6 +124,30 @@ def _load_ui_state():
     except Exception as e:
         print(f"[warn] Failed to load UI state: {e}")
     return None
+
+# ── Cached psutil values (non-blocking) ────────────
+_hw_cache={"cpu_pct":0,"ram":0,"ram_total":0,"disk":0,"disk_total":0,"_t":0}
+_hw_lock=threading.Lock()
+
+def _update_hw():
+    """Update hardware stats in background — never blocks a request."""
+    while True:
+        try:
+            import psutil
+            cpu=round(psutil.cpu_percent(interval=1))
+            mem=psutil.virtual_memory()
+            dk=psutil.disk_usage('/')
+            with _hw_lock:
+                _hw_cache["cpu_pct"]=cpu
+                _hw_cache["ram"]=round(mem.used/1e6)
+                _hw_cache["ram_total"]=round(mem.total/1e6)
+                _hw_cache["disk"]=round(dk.used/1e9,1)
+                _hw_cache["disk_total"]=round(dk.total/1e9,1)
+                _hw_cache["_t"]=time.time()
+        except: pass
+        time.sleep(2)
+
+threading.Thread(target=_update_hw,daemon=True).start()
 
 
 def resize_for_qwen(img,mx=1024,mul=8):
@@ -205,15 +247,21 @@ def _set_lora_scales(scales):
                 if name in module.scaling:
                     module.scaling[name] = weight
 
+
+# ══════════════════════════════════════════════════
+#  ROUTES
+# ══════════════════════════════════════════════════
+
 @app.route("/")
 def index(): return send_from_directory(STATIC,"index.html")
+
 @app.route("/api/keepalive")
-def keepalive(): return jsonify({"status":"ok"})
+def keepalive(): return jsonify({"status":"ok","t":time.time()})
 
 @app.route("/api/status")
 def status():
     _cleanup_jobs()
-    gpu=None;vram=0;vt=0;cpu_pct=0;ram=0;ram_total=0;disk=0;disk_total=0
+    gpu=None;vram=0;vt=0
     try:
         _t()
         if torch.cuda.is_available():
@@ -221,19 +269,14 @@ def status():
             vram=round(torch.cuda.memory_allocated()/1e6)
             vt=round(torch.cuda.get_device_properties(0).total_memory/1e6)
     except: pass
-    try:
-        import psutil
-        cpu_pct=round(psutil.cpu_percent(interval=0))
-        mem=psutil.virtual_memory()
-        ram=round(mem.used/1e6);ram_total=round(mem.total/1e6)
-        dk=psutil.disk_usage('/')
-        disk=round(dk.used/1e9,1);disk_total=round(dk.total/1e9,1)
-    except: pass
+    # Use cached psutil values (never blocks)
+    with _hw_lock:
+        hw=dict(_hw_cache)
     return jsonify({"ready":pipeline is not None,"loading":_loading,"error":_error,
         "generating":_generating,"progress":_progress,
         "gpu":gpu,"vram":vram,"vram_total":vt,
-        "cpu_pct":cpu_pct,"ram":ram,"ram_total":ram_total,
-        "disk":disk,"disk_total":disk_total})
+        "cpu_pct":hw["cpu_pct"],"ram":hw["ram"],"ram_total":hw["ram_total"],
+        "disk":hw["disk"],"disk_total":hw["disk_total"]})
 
 @app.route("/api/logs")
 def get_logs():
@@ -265,7 +308,6 @@ def srv_out(fn): return send_from_directory(OUTPUTS,fn)
 # ── Persistent UI state endpoints ──────────────────
 @app.route("/api/state",methods=["GET"])
 def get_state():
-    """Return saved UI state + inventory of available files."""
     state=_load_ui_state() or {}
     uploads=[]
     for fn in sorted(os.listdir(UPLOADS)):
@@ -283,7 +325,6 @@ def get_state():
 
 @app.route("/api/state",methods=["POST"])
 def save_state():
-    """Save UI state from the client."""
     d=request.get_json(silent=True) or {}
     d.pop("_uploads",None)
     d.pop("_outputs",None)
@@ -293,7 +334,6 @@ def save_state():
 
 @app.route("/api/validate_refs",methods=["POST"])
 def validate_refs():
-    """Client sends image IDs; backend confirms which still exist on disk."""
     d=request.get_json(silent=True) or {}
     image_ids=d.get("image_ids",[])
     output_files=d.get("output_files",[])
@@ -404,7 +444,6 @@ def get_job(job_id):
 
 @app.route("/api/jobs",methods=["GET"])
 def list_jobs():
-    """List all known jobs (for recovery after reconnect)."""
     with _jobs_lock:
         summary={}
         for k,v in _jobs.items():

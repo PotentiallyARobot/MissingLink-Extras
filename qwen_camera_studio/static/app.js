@@ -12,21 +12,32 @@ let slots=[null,null,null];
 let lastResult=null;
 let lastOutputFilename=null;
 
+// Connection tracking
+let _connOk=false;       // last poll succeeded
+let _connFailCount=0;    // consecutive failures
+
 // Debounce timer for saving state
 let _saveTimer=null;
 
+// ── Fetch with timeout (critical for Colab proxy) ───
+function fetchT(url,opts,ms){
+    ms=ms||8000;
+    const c=new AbortController();
+    const t=setTimeout(()=>c.abort(),ms);
+    opts=opts||{};
+    opts.signal=c.signal;
+    return fetch(url,opts).finally(()=>clearTimeout(t));
+}
+
 // ── Session persistence (dual: server + localStorage) ───
 function saveSession(){
-    // Debounce: wait 300ms of inactivity before actually saving
     if(_saveTimer) clearTimeout(_saveTimer);
     _saveTimer=setTimeout(_doSaveSession,300);
 }
 
 function _doSaveSession(){
     const s=_gatherState();
-    // Save to localStorage (survives tab close, fast)
     try{ localStorage.setItem('qwen_studio',JSON.stringify(s)); }catch(e){}
-    // Save to server (survives full Colab restart, async fire-and-forget)
     _saveToServer(s);
 }
 
@@ -53,24 +64,22 @@ function _gatherState(){
 
 async function _saveToServer(s){
     try{
-        await fetch('/api/state',{
+        await fetchT('/api/state',{
             method:'POST',
             headers:{'Content-Type':'application/json'},
             body:JSON.stringify(s)
-        });
-    }catch(e){/* network blip, ignore */}
+        },5000);
+    }catch(e){}
 }
 
 async function restoreSession(){
-    // Strategy: try server state first (survives Colab restart),
-    // fall back to localStorage (survives page refresh with same origin)
     let s=null;
+
+    // Strategy: try server state first (survives Colab restarts)
     try{
-        const r=await fetch('/api/state');
+        const r=await fetchT('/api/state',null,5000);
         if(r.ok){
             const serverState=await r.json();
-            // Server state has _uploads, _outputs, _completed_jobs metadata
-            // plus the UI state fields if previously saved
             if(serverState.mode){
                 s=serverState;
                 s._fromServer=true;
@@ -78,6 +87,7 @@ async function restoreSession(){
         }
     }catch(e){}
 
+    // Fall back to localStorage
     if(!s){
         try{
             const raw=localStorage.getItem('qwen_studio');
@@ -87,35 +97,24 @@ async function restoreSession(){
 
     if(!s) return;
 
-    // If restoring from server, validate that referenced files still exist
+    // Validate file references against server
     if(s._fromServer){
         const uploadIds=new Set((s._uploads||[]).map(u=>u.id));
         const outputFiles=new Set((s._outputs||[]).map(o=>o.filename));
 
-        // Validate camera input
         if(s.imageId && !uploadIds.has(s.imageId)){
             s.imageId=null; s.imageUrl=null;
         }
-
-        // Validate edit slots
         if(s.slots){
             for(let i=0;i<s.slots.length;i++){
-                if(s.slots[i] && !uploadIds.has(s.slots[i].id)){
-                    s.slots[i]=null;
-                }
+                if(s.slots[i] && !uploadIds.has(s.slots[i].id)) s.slots[i]=null;
             }
         }
-
-        // Validate last result
         if(s.lastResult && s.lastResult.url){
             const fn=s.lastResult.url.split('/').pop();
-            if(!outputFiles.has(fn)){
-                s.lastResult=null;
-                s.lastOutputFilename=null;
-            }
+            if(!outputFiles.has(fn)){ s.lastResult=null; s.lastOutputFilename=null; }
         }
-
-        // Check for completed jobs we might have missed
+        // Check completed jobs we missed
         const completedJobs=s._completed_jobs||{};
         if(s.activeJobId && completedJobs[s.activeJobId]){
             const job=completedJobs[s.activeJobId];
@@ -128,31 +127,25 @@ async function restoreSession(){
             }
         }
     } else {
-        // localStorage restore: validate against server
+        // localStorage: validate via backend
         try{
             const refs={image_ids:[],output_files:[]};
             if(s.imageId) refs.image_ids.push(s.imageId);
-            if(s.slots){
-                s.slots.forEach(sl=>{if(sl&&sl.id) refs.image_ids.push(sl.id);});
-            }
+            if(s.slots) s.slots.forEach(sl=>{if(sl&&sl.id) refs.image_ids.push(sl.id);});
             if(s.lastOutputFilename) refs.output_files.push(s.lastOutputFilename);
 
             if(refs.image_ids.length||refs.output_files.length){
-                const vr=await fetch('/api/validate_refs',{
+                const vr=await fetchT('/api/validate_refs',{
                     method:'POST',
                     headers:{'Content-Type':'application/json'},
                     body:JSON.stringify(refs)
-                });
+                },5000);
                 if(vr.ok){
                     const v=await vr.json();
-                    if(s.imageId && !v.valid_images[s.imageId]){
-                        s.imageId=null; s.imageUrl=null;
-                    }
+                    if(s.imageId && !v.valid_images[s.imageId]){ s.imageId=null; s.imageUrl=null; }
                     if(s.slots){
                         for(let i=0;i<s.slots.length;i++){
-                            if(s.slots[i] && !v.valid_images[s.slots[i].id]){
-                                s.slots[i]=null;
-                            }
+                            if(s.slots[i] && !v.valid_images[s.slots[i].id]) s.slots[i]=null;
                         }
                     }
                     if(s.lastOutputFilename && !v.valid_outputs[s.lastOutputFilename]){
@@ -160,10 +153,9 @@ async function restoreSession(){
                     }
                 }
             }
-        }catch(e){/* validation failed, proceed with what we have */}
+        }catch(e){}
     }
 
-    // Apply state to UI
     _applyState(s);
 }
 
@@ -171,7 +163,6 @@ function _applyState(s){
     try{
         if(s.mode && s.mode!==currentMode) setMode(s.mode);
 
-        // Camera input
         if(s.imageId && s.imageUrl){
             imageId=s.imageId; imageUrl=s.imageUrl;
             $('dropzone').style.display='none';
@@ -180,7 +171,6 @@ function _applyState(s){
             setViewportImage(s.imageUrl);
         }
 
-        // Edit slots
         if(s.slots){
             for(let i=0;i<3;i++){
                 slots[i]=s.slots[i]||null;
@@ -188,7 +178,6 @@ function _applyState(s){
             }
         }
 
-        // Settings
         if(s.promptInput && $('promptInput')) $('promptInput').value=s.promptInput;
         if(s.customPrompt && $('customPrompt')) $('customPrompt').value=s.customPrompt;
         if(s.seed){ $('rngSeed').value=s.seed; $('vSeed').textContent=s.seed; }
@@ -206,13 +195,11 @@ function _applyState(s){
 
         lastOutputFilename=s.lastOutputFilename||null;
 
-        // Restore last result image
         if(s.lastResult){
             lastResult=s.lastResult;
             showResult(s.lastResult);
         }
 
-        // Resume polling if a job was active
         if(s.activeJobId){
             activeJobId=s.activeJobId;
             resumePolling(s.activeJobId);
@@ -226,23 +213,20 @@ function _applyState(s){
 document.addEventListener('DOMContentLoaded',()=>{
     initViewport();initDrop();initSlots();pollStatus();pollLogs();
     setInterval(pollStatus,2500);setInterval(pollLogs,1500);
-    // Periodic state save as safety net (every 30s)
     setInterval(()=>_saveToServer(_gatherState()),30000);
     restoreSession();
 });
 
-// Save state before user leaves
 window.addEventListener('beforeunload',()=>{
     const s=_gatherState();
     try{ localStorage.setItem('qwen_studio',JSON.stringify(s)); }catch(e){}
-    // Use sendBeacon for reliable save on close
     try{
         navigator.sendBeacon('/api/state',
             new Blob([JSON.stringify(s)],{type:'application/json'}));
     }catch(e){}
 });
 
-// ── Mode switching (instant, UI only) ─────────────
+// ── Mode switching ────────────────────────────────
 function setMode(mode){
     currentMode=mode;
     const isCam=mode==='camera';
@@ -268,11 +252,17 @@ function updateGenButton(){
     }
 }
 
-// ── Status ────────────────────────────────────────
+// ── Status polling (with timeout + reconnection) ──
 async function pollStatus(){
     try{
-        const r=await fetch('/api/status'),d=await r.json();
+        const r=await fetchT('/api/status',null,6000);
+        const d=await r.json();
         const dot=$('connDot'),lbl=$('connLabel');
+
+        // Track connection recovery
+        const wasDisconnected=!_connOk;
+        _connOk=true; _connFailCount=0;
+
         if(d.ready){
             dot.className='dot on'; lbl.textContent='Connected'; ready=true;
             updateGenButton();
@@ -309,18 +299,22 @@ async function pollStatus(){
             $('genText').textContent=`Step ${d.progress.step}/${d.progress.total}`;
         }
     }catch(e){
-        // Server unreachable — show disconnected state
+        _connOk=false; _connFailCount++;
         const dot=$('connDot'),lbl=$('connLabel');
-        dot.className='dot'; dot.style.background='var(--red)';
-        lbl.textContent='Disconnected';
-        ready=false; $('btnGen').disabled=true;
+        // Only show disconnected after 2+ consecutive failures (avoid single-blip noise)
+        if(_connFailCount>=2){
+            dot.className='dot'; dot.style.background='var(--red)';
+            lbl.textContent='Disconnected';
+            ready=false; $('btnGen').disabled=true;
+        }
     }
 }
 
 // ── Logs ──────────────────────────────────────────
 async function pollLogs(){
     try{
-        const r=await fetch(`/api/logs?since=${lastLogT}`),d=await r.json();
+        const r=await fetchT(`/api/logs?since=${lastLogT}`,null,5000);
+        const d=await r.json();
         const body=$('consoleBody');
         d.logs.forEach(l=>{
             const div=document.createElement('div');
@@ -350,8 +344,8 @@ function toggleHW(){
 
 async function loadModel(){
     $('btnLoad').disabled=true; $('btnLoad').textContent='⏳ STARTING...';
-    try{await fetch('/api/load',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({variant:$('selVariant').value})});}catch(e){}
+    try{await fetchT('/api/load',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({variant:$('selVariant').value})},5000);}catch(e){}
 }
 
 // ══════════════════════════════════════════════════
@@ -384,10 +378,11 @@ function setDimensions(w, h){
 async function uploadFile(file){
     const fd=new FormData();fd.append('image',file);
     try{
-        const r=await fetch('/api/upload',{method:'POST',body:fd}),d=await r.json();
+        const r=await fetchT('/api/upload',{method:'POST',body:fd},15000);
+        const d=await r.json();
         if(d.error){alert(d.error);return;}
         setInputImage(d.id, d.url, d.w, d.h);
-    }catch(e){alert('Upload failed');}
+    }catch(e){alert('Upload failed — server may be busy. Try again.');}
 }
 
 function clearInput(){
@@ -430,14 +425,15 @@ function slotFileChange(i){
 async function uploadToSlot(i,file){
     const fd=new FormData();fd.append('image',file);
     try{
-        const r=await fetch('/api/upload',{method:'POST',body:fd}),d=await r.json();
+        const r=await fetchT('/api/upload',{method:'POST',body:fd},15000);
+        const d=await r.json();
         if(d.error){alert(d.error);return;}
         slots[i]={id:d.id, url:d.url, filename:d.filename, w:d.w, h:d.h};
         setDimensions(d.w, d.h);
         renderSlot(i);
         updateGenButton();
         saveSession();
-    }catch(e){alert('Upload failed');}
+    }catch(e){alert('Upload failed — server may be busy. Try again.');}
 }
 
 function removeSlot(i){
@@ -479,8 +475,8 @@ document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeModal(); });
 async function useAsInput(){
     if(!lastOutputFilename) return;
     try{
-        const r=await fetch('/api/use_output',{method:'POST',headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({filename:lastOutputFilename})});
+        const r=await fetchT('/api/use_output',{method:'POST',headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({filename:lastOutputFilename})},10000);
         const d=await r.json();
         if(d.error){alert(d.error);return;}
         if(currentMode==='camera'){
@@ -494,7 +490,7 @@ async function useAsInput(){
             updateGenButton();
             saveSession();
         }
-    }catch(e){alert('Failed');}
+    }catch(e){alert('Failed — try again.');}
 }
 
 // ── Prompt lock ───────────────────────────────────
@@ -556,7 +552,7 @@ async function submitAndPoll(payload){
     $('genText').textContent='Starting...';
 
     try{
-        const r=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+        const r=await fetchT('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)},10000);
         const start=await r.json();
         if(start.error){$('genText').textContent=start.error;finishJob();return;}
         activeJobId=start.job_id;
@@ -568,39 +564,30 @@ async function submitAndPoll(payload){
     }
 }
 
-// Resume polling for a job (e.g. after page refresh or reconnect)
 async function resumePolling(jobId){
     $('btnGen').disabled=true; $('btnGen').textContent='⏳ GENERATING...';
     $('genOverlay').classList.add('active');
     $('genText').textContent='Resuming...';
 
-    // First check if the job already completed while we were away
+    // Check if already done
     try{
-        const r=await fetch(`/api/job/${jobId}`);
+        const r=await fetchT(`/api/job/${jobId}`,null,5000);
         if(r.ok){
             const j=await r.json();
             if(j.status==='done'){
-                lastResult=j.result;
-                showResult(j.result);
-                finishJob();
-                return;
+                lastResult=j.result; showResult(j.result); finishJob(); return;
             } else if(j.status==='error'){
-                $('genText').textContent=j.error||'Generation failed';
-                finishJob();
-                return;
+                $('genText').textContent=j.error||'Generation failed'; finishJob(); return;
             }
         } else if(r.status===404){
-            // Job is gone — check if server is still generating
-            const sr=await fetch('/api/status');
+            const sr=await fetchT('/api/status',null,5000);
             if(sr.ok){
                 const st=await sr.json();
                 if(!st.generating){
-                    // Not generating and job gone — check completed jobs list
                     try{
-                        const jr=await fetch('/api/jobs');
+                        const jr=await fetchT('/api/jobs',null,5000);
                         if(jr.ok){
                             const jd=await jr.json();
-                            // Look for any recent completed job
                             const recent=Object.entries(jd.jobs||{})
                                 .filter(([,v])=>v.status==='done')
                                 .sort(([,a],[,b])=>(b.finished_at||0)-(a.finished_at||0));
@@ -611,12 +598,11 @@ async function resumePolling(jobId){
                         }
                     }catch(e){}
                     $('genText').textContent='Job completed or expired';
-                    finishJob();
-                    return;
+                    finishJob(); return;
                 }
             }
         }
-    }catch(e){/* network issue, fall through to polling */}
+    }catch(e){}
 
     try{
         await pollJob(jobId);
@@ -631,11 +617,11 @@ async function pollJob(jobId){
     for(let attempt=0;attempt<600;attempt++){
         await new Promise(ok=>setTimeout(ok,1500));
         try{
-            const pr=await fetch(`/api/job/${jobId}`);
-            consecutiveErrors=0; // reset on any successful fetch
+            const pr=await fetchT(`/api/job/${jobId}`,null,6000);
+            consecutiveErrors=0;
             if(pr.status===404){
                 try{
-                    const sr=await fetch('/api/status');
+                    const sr=await fetchT('/api/status',null,5000);
                     const st=await sr.json();
                     if(st.generating){
                         if(st.progress && st.progress.total){
@@ -646,9 +632,9 @@ async function pollJob(jobId){
                         continue;
                     }
                 }catch(e){}
-                // Check /api/jobs for any recently finished job
+                // Check jobs list for recently finished work
                 try{
-                    const jr=await fetch('/api/jobs');
+                    const jr=await fetchT('/api/jobs',null,5000);
                     if(jr.ok){
                         const jd=await jr.json();
                         const recent=Object.entries(jd.jobs||{})
@@ -682,13 +668,11 @@ async function pollJob(jobId){
             }
         }catch(e){
             consecutiveErrors++;
-            // After 20 consecutive network failures (~30s), show disconnected
             if(consecutiveErrors>20){
-                $('genText').textContent='Lost connection to server — will resume when reconnected';
-            } else {
+                $('genText').textContent='Lost connection — will resume when server returns';
+            } else if(consecutiveErrors>2){
                 $('genText').textContent='Reconnecting...';
             }
-            // Don't give up — keep polling (server might come back)
         }
     }
     $('genText').textContent='Timed out waiting for result';
