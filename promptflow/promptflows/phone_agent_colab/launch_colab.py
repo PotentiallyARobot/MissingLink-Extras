@@ -1,18 +1,18 @@
 import json
-import os
-from pathlib import Path
+import time
 
 import gradio as gr
 import requests
 
 from deploy_twilio_from_colab import DEPLOY_INFO_PATH, DeployError, deploy
 
-ROOT = Path(__file__).resolve().parent
-
 
 def _load_deploy_info():
     if DEPLOY_INFO_PATH.exists():
-        return json.loads(DEPLOY_INFO_PATH.read_text(encoding="utf-8"))
+        try:
+            return json.loads(DEPLOY_INFO_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
     return {
         "base_url": "",
         "admin_key": "",
@@ -21,33 +21,133 @@ def _load_deploy_info():
     }
 
 
-def deploy_backend():
+def _ensure_backend():
+    info = _load_deploy_info()
+    base_url = (info.get("base_url") or "").strip().rstrip("/")
+    admin_key = (info.get("admin_key") or "").strip()
+
+    if base_url and admin_key:
+        return info, "Backend ready."
+
+    info = deploy()
+    return info, "Backend deployed automatically."
+
+
+def _safe_json(resp):
     try:
-        info = deploy()
-        msg = (
-            f"Backend deployed.\n\n"
-            f"Base URL: {info['base_url']}\n"
-            f"Admin key saved locally in deployment.json\n"
-            f"Sync service: {info['sync_service_sid']}"
-        )
-        return info["base_url"], info["admin_key"], msg
-    except DeployError as e:
-        return gr.update(), gr.update(), f"Deploy failed:\n\n{e}"
-    except Exception as e:
-        return gr.update(), gr.update(), f"Deploy failed with an unexpected error:\n\n{e}"
+        return resp.json()
+    except Exception:
+        text = getattr(resp, "text", "")
+        return {"ok": False, "error": f"Non-JSON response: {text[:1000]}"}
 
 
-def start_call(base_url, admin_key, to_number, objective, contact_name, max_turns):
-    base_url = (base_url or "").strip().rstrip("/")
-    admin_key = (admin_key or "").strip()
+def _turn_text(turn):
+    return (
+        turn.get("text")
+        or turn.get("content")
+        or turn.get("message")
+        or turn.get("utterance")
+        or ""
+    ).strip()
+
+
+def _turn_role(turn):
+    return (
+        turn.get("role")
+        or turn.get("speaker")
+        or turn.get("from")
+        or "unknown"
+    ).strip().upper()
+
+
+def _turn_time(turn):
+    return (
+        turn.get("at")
+        or turn.get("timestamp")
+        or turn.get("time")
+        or ""
+    ).strip()
+
+
+def _format_transcript(turns):
+    if not turns:
+        return "Waiting for transcript..."
+    parts = []
+    for turn in turns:
+        ts = _turn_time(turn)
+        role = _turn_role(turn)
+        text = _turn_text(turn)
+        prefix = f"[{ts}] " if ts else ""
+        parts.append(f"{prefix}{role}: {text}")
+    return "\n\n".join(parts)
+
+
+def _format_status(data):
+    status = data.get("status", "unknown")
+    turn_count = data.get("turn_count", len(data.get("turns", []) or []))
+    max_turns = data.get("max_turns", "")
+    call_sid = data.get("call_sid", "")
+    confidence = data.get("confidence", "")
+    error = data.get("error", "")
+
+    lines = [f"Status: {status}"]
+
+    if max_turns != "":
+        lines.append(f"Turns: {turn_count}/{max_turns}")
+    else:
+        lines.append(f"Turns: {turn_count}")
+
+    if confidence:
+        lines.append(f"Confidence: {confidence}")
+    if call_sid:
+        lines.append(f"Call SID: {call_sid}")
+    if error:
+        lines.append(f"Error: {error}")
+
+    return "\n".join(lines)
+
+
+def _extract_final_answer(data):
+    for key in ["result", "final_answer", "answer", "summary", "final_result"]:
+        value = (data.get(key) or "").strip() if isinstance(data.get(key), str) else data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def start_agent_call(to_number, objective, contact_name, max_turns):
     to_number = (to_number or "").strip()
     objective = (objective or "").strip()
     contact_name = (contact_name or "").strip()
+    max_turns = int(max_turns or 6)
+
+    if not to_number:
+        yield "Enter a phone number.", "", "", ""
+        return
+
+    if not objective:
+        yield "Enter instructions for the agent.", "", "", ""
+        return
+
+    yield "Preparing backend...", "", "", ""
+
+    try:
+        info, prep_msg = _ensure_backend()
+    except DeployError as e:
+        yield f"Backend deployment failed:\n\n{e}", "", "", ""
+        return
+    except Exception as e:
+        yield f"Backend deployment failed unexpectedly:\n\n{e}", "", "", ""
+        return
+
+    base_url = (info.get("base_url") or "").strip().rstrip("/")
+    admin_key = (info.get("admin_key") or "").strip()
 
     if not base_url or not admin_key:
-        return "", "", "Please deploy the backend first or paste the base URL and admin key."
-    if not to_number or not objective:
-        return "", "", "Please enter both a destination number and an objective."
+        yield "Backend setup did not produce a usable base URL/admin key.", "", "", ""
+        return
+
+    yield prep_msg + "\n\nStarting call...", "", "", ""
 
     try:
         resp = requests.post(
@@ -57,90 +157,122 @@ def start_call(base_url, admin_key, to_number, objective, contact_name, max_turn
                 "to": to_number,
                 "objective": objective,
                 "contact_name": contact_name,
-                "max_turns": str(int(max_turns or 6)),
+                "max_turns": str(max_turns),
             },
-            timeout=45,
+            timeout=60,
         )
-        data = resp.json()
+        data = _safe_json(resp)
     except Exception as e:
-        return "", "", f"Call start failed: {e}"
+        yield f"Call start failed:\n\n{e}", "", "", ""
+        return
 
     if not resp.ok or not data.get("ok"):
-        return "", "", json.dumps(data, indent=2)
+        yield "Call start failed:\n\n" + json.dumps(data, indent=2), "", "", ""
+        return
 
     job_id = data["job_id"]
-    token = data["admin_token"]
-    pretty = json.dumps(data, indent=2)
-    return job_id, token, pretty
+    admin_token = data["admin_token"]
 
+    yield f"Call started.\nJob ID: {job_id}\nConnecting...", "", "", job_id
 
-def refresh_job(base_url, job_id, token):
-    base_url = (base_url or "").strip().rstrip("/")
-    job_id = (job_id or "").strip()
-    token = (token or "").strip()
-    if not base_url or not job_id or not token:
-        return "Paste or create a job first."
+    last_transcript = ""
+    last_result = ""
 
-    try:
-        resp = requests.get(
-            f"{base_url}/status",
-            params={"job_id": job_id, "admin_token": token},
-            timeout=30,
-        )
-        data = resp.json()
-    except Exception as e:
-        return f"Refresh failed: {e}"
+    for _ in range(240):  # about 8 minutes at 2s polling
+        try:
+            resp = requests.get(
+                f"{base_url}/status",
+                params={"job_id": job_id, "admin_token": admin_token},
+                timeout=30,
+            )
+            data = _safe_json(resp)
+        except Exception as e:
+            yield f"Refresh failed: {e}", last_transcript, last_result, job_id
+            time.sleep(2)
+            continue
 
-    return json.dumps(data, indent=2)
+        if not resp.ok or not data.get("ok"):
+            yield "Status error:\n\n" + json.dumps(data, indent=2), last_transcript, last_result, job_id
+            time.sleep(2)
+            continue
+
+        transcript = _format_transcript(data.get("turns", []) or [])
+        result = _extract_final_answer(data)
+        status_text = _format_status(data)
+
+        last_transcript = transcript
+        last_result = result
+
+        yield status_text, transcript, result, job_id
+
+        if str(data.get("status", "")).lower() in {"done", "completed", "complete", "failed", "error"}:
+            return
+
+        time.sleep(2)
+
+    yield "Timed out waiting for completion.", last_transcript, last_result, job_id
 
 
 def build_ui():
-    info = _load_deploy_info()
-
-    with gr.Blocks(title="Colab Phone Agent") as demo:
-        gr.Markdown("# Colab Phone Agent")
+    with gr.Blocks(title="Phone Agent") as demo:
+        gr.Markdown("# Phone Agent")
         gr.Markdown(
-            "Deploy the Twilio Functions backend once, then enter a phone number and a goal. "
-            "The agent will place the call, pursue the objective, and store the final extracted answer."
+            "Enter a phone number and the agent's goal. "
+            "The backend will be deployed automatically from your Colab secrets if needed."
         )
 
-        with gr.Tab("1. Deploy backend"):
-            deploy_btn = gr.Button("Deploy / refresh backend", variant="primary")
-            base_url = gr.Textbox(label="Twilio Functions base URL", value=info.get("base_url", ""))
-            admin_key = gr.Textbox(label="Admin key", value=info.get("admin_key", ""), type="password")
-            deploy_log = gr.Textbox(label="Deploy log", lines=10)
-            deploy_btn.click(deploy_backend, outputs=[base_url, admin_key, deploy_log])
-
-        with gr.Tab("2. Start call"):
-            to_number = gr.Textbox(label="Destination number (E.164)", placeholder="+12025550123")
-            contact_name = gr.Textbox(label="Optional contact name", placeholder="Tyler")
-            objective = gr.Textbox(
-                label="Objective",
-                lines=5,
-                placeholder=(
-                    "Call Tyler and find out where he put his coat. "
-                    "When you have the information, say thank you, goodbye, and hang up."
-                ),
+        with gr.Row():
+            to_number = gr.Textbox(
+                label="Phone number",
+                placeholder="+12025550123",
+                scale=1,
             )
-            max_turns = gr.Slider(label="Max turns", minimum=2, maximum=12, step=1, value=6)
-            start_btn = gr.Button("Start call", variant="primary")
-            job_id = gr.Textbox(label="Job ID")
-            job_token = gr.Textbox(label="Job token", type="password")
-            start_result = gr.Textbox(label="Start result", lines=12)
-            start_btn.click(
-                start_call,
-                inputs=[base_url, admin_key, to_number, objective, contact_name, max_turns],
-                outputs=[job_id, job_token, start_result],
+            contact_name = gr.Textbox(
+                label="Contact name (optional)",
+                placeholder="Tyler",
+                scale=1,
             )
 
-        with gr.Tab("3. Monitor result"):
-            refresh_btn = gr.Button("Refresh job")
-            status_json = gr.Textbox(label="Current job status", lines=18)
-            refresh_btn.click(refresh_job, inputs=[base_url, job_id, job_token], outputs=[status_json])
+        objective = gr.Textbox(
+            label="Instructions for the agent",
+            lines=6,
+            placeholder=(
+                "Call Tyler and find out where he put his coat. "
+                "When you have the information, say thank you, goodbye, and hang up."
+            ),
+        )
+
+        with gr.Accordion("Advanced", open=False):
+            max_turns = gr.Slider(
+                label="Max turns",
+                minimum=2,
+                maximum=12,
+                step=1,
+                value=6,
+            )
+
+        start_btn = gr.Button("Start agent call", variant="primary")
+
+        status_box = gr.Textbox(label="Status", lines=6)
+        transcript_box = gr.Textbox(label="Live transcript", lines=18)
+        final_answer_box = gr.Textbox(label="Final answer", lines=4)
+        job_id_box = gr.Textbox(label="Job ID", visible=False)
+
+        start_btn.click(
+            start_agent_call,
+            inputs=[to_number, objective, contact_name, max_turns],
+            outputs=[status_box, transcript_box, final_answer_box, job_id_box],
+        )
 
     return demo
 
 
 if __name__ == "__main__":
     demo = build_ui()
-    demo.launch(share=False, inline=True, debug=True, server_name='0.0.0.0', server_port=7860)
+    demo.launch(
+        share=False,
+        inline=True,
+        debug=True,
+        server_name="0.0.0.0",
+        server_port=7860,
+    )
