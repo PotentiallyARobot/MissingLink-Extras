@@ -1,0 +1,16 @@
+{
+  "name": "colab-phone-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Twilio Functions backend for a simple outbound phone agent",
+  "dependencies": {
+    "openai": "^6.0.0",
+    "twilio": "^5.0.0"
+  },
+  "devDependencies": {
+    "twilio-run": "^4.0.0"
+  },
+  "scripts": {
+    "deploy": "twilio-run deploy --env .env.generated --environment dev"
+  }
+}
