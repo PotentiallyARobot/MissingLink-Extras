@@ -12,11 +12,12 @@ if not os.path.isdir(os.path.join(_D,"static")):
 PROJECT_DIR=_D; STATIC=os.path.join(_D,"static"); UPLOADS=os.path.join(_D,"uploads"); OUTPUTS=os.path.join(_D,"outputs")
 STATE_DIR=os.path.join(_D,".state")
 VAE_CACHE_DIR=os.path.join(_D,".vae_cache")
-COMPILE_CACHE_DIR=os.path.join(_D,".compile_cache")
-for d in [UPLOADS,OUTPUTS,STATIC,STATE_DIR,VAE_CACHE_DIR,COMPILE_CACHE_DIR]: os.makedirs(d,exist_ok=True)
+for d in [UPLOADS,OUTPUTS,STATIC,STATE_DIR,VAE_CACHE_DIR]: os.makedirs(d,exist_ok=True)
 
 # ── torch.compile cache: must be set BEFORE torch is imported ──
-# Saves compiled inductor graphs to disk so restarts skip recompilation
+# Use /tmp/torchinductor_root — matches where caches are built and uploaded from
+COMPILE_CACHE_DIR="/tmp/torchinductor_root"
+os.makedirs(COMPILE_CACHE_DIR,exist_ok=True)
 os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"]="1"
 os.environ["TORCHINDUCTOR_CACHE_DIR"]=COMPILE_CACHE_DIR
 print(f"[backend] project={PROJECT_DIR}")
@@ -34,7 +35,7 @@ def _download_compile_cache():
         tag=f"{gpu}_sm{cap[0]}{cap[1]}_torch{torch.__version__.split('+')[0]}_cu{torch.version.cuda.replace('.','')}"
 
         # Skip if cache already has files (local build or previous download)
-        existing=sum(1 for _,_,fs in os.walk(COMPILE_CACHE_DIR) for f in fs if f.endswith(('.cubin','.json','.py')))
+        existing=sum(1 for _,_,fs in os.walk(COMPILE_CACHE_DIR) for f in fs)
         if existing>100:
             print(f"[compile] Cache already populated ({existing} files), skipping download")
             return
@@ -42,42 +43,36 @@ def _download_compile_cache():
         cache_path=f"compile_cache/{tag}"
         print(f"[compile] Looking for pre-built cache: {_COMPILE_CACHE_REPO}/{cache_path}")
 
-        from huggingface_hub import snapshot_download,list_repo_tree
-        # Check if this GPU tag exists in the repo
+        from huggingface_hub import snapshot_download
+        # Download to a temp location, then move files to cache root
+        import tempfile, shutil
+        tmp_dl=tempfile.mkdtemp(prefix="compile_dl_")
         try:
-            files=list(list_repo_tree(_COMPILE_CACHE_REPO,path_in_repo=cache_path,repo_type="model"))
-            if not files:
-                print(f"[compile] No pre-built cache for {tag}")
-                return
-        except Exception:
-            print(f"[compile] No pre-built cache for {tag}")
-            return
-
-        print(f"[compile] Downloading pre-built kernels for {gpu}...")
-        snapshot_download(
-            repo_id=_COMPILE_CACHE_REPO,
-            repo_type="model",
-            allow_patterns=f"{cache_path}/*",
-            local_dir=COMPILE_CACHE_DIR,
-        )
-        # Move files from nested path to cache root
-        downloaded=os.path.join(COMPILE_CACHE_DIR,cache_path)
-        if os.path.isdir(downloaded):
-            import shutil
-            for item in os.listdir(downloaded):
-                src=os.path.join(downloaded,item)
-                dst=os.path.join(COMPILE_CACHE_DIR,item)
-                if os.path.isdir(src):
-                    if os.path.exists(dst): shutil.rmtree(dst)
-                    shutil.move(src,dst)
-                else:
-                    shutil.move(src,dst)
-            # Clean up nested dirs
-            try: shutil.rmtree(os.path.join(COMPILE_CACHE_DIR,"compile_cache"))
-            except: pass
-
-        n=sum(1 for _,_,fs in os.walk(COMPILE_CACHE_DIR) for f in fs)
-        print(f"[compile] Downloaded {n} cached kernel files for {gpu}")
+            snapshot_download(
+                repo_id=_COMPILE_CACHE_REPO,
+                repo_type="model",
+                allow_patterns=f"{cache_path}/*",
+                local_dir=tmp_dl,
+            )
+            # Files are at tmp_dl/compile_cache/{tag}/...
+            src=os.path.join(tmp_dl,cache_path)
+            if os.path.isdir(src):
+                n=0
+                for item in os.listdir(src):
+                    s=os.path.join(src,item)
+                    d=os.path.join(COMPILE_CACHE_DIR,item)
+                    if os.path.isdir(s):
+                        if os.path.exists(d): shutil.rmtree(d)
+                        shutil.copytree(s,d)
+                    else:
+                        shutil.copy2(s,d)
+                    n+=1
+                total=sum(1 for _,_,fs in os.walk(COMPILE_CACHE_DIR) for f in fs)
+                print(f"[compile] Downloaded {total} cached kernel files for {gpu}")
+            else:
+                print(f"[compile] No cache found for tag: {tag}")
+        finally:
+            shutil.rmtree(tmp_dl,ignore_errors=True)
     except Exception as e:
         print(f"[compile] Cache download failed (non-fatal): {e}")
 
@@ -401,8 +396,11 @@ def load_pipeline(variant="Q4_K_M"):
         # seconds on restart with cache hit). If warmup fails, restore
         # uncompiled transformer so pipeline still works.
         try:
-            if _compiled_ok:
-                log("Running warmup (triggers torch.compile — first time takes ~13min, cached restarts are fast)...")
+            _cache_files=sum(1 for _,_,fs in os.walk(COMPILE_CACHE_DIR) for f in fs)
+            if _compiled_ok and _cache_files>100:
+                log(f"Running warmup (compile cache loaded: {_cache_files} files — should be fast)...")
+            elif _compiled_ok:
+                log("Running warmup (NO cache found — first compile takes ~13min)...")
             else:
                 log("Running warmup pass (priming CUDA kernels)...")
             _qem.VAE_IMAGE_SIZE=64*64
