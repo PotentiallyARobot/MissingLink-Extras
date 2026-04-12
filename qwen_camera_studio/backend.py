@@ -1,5 +1,5 @@
 # backend.py — MissingLink Qwen Studio (hardened)
-import os,sys,math,gc,io,time,base64,uuid,json,traceback,threading
+import os,sys,math,gc,io,time,base64,uuid,json,traceback,threading,hashlib
 IN_COLAB="google.colab" in sys.modules
 if IN_COLAB:
     from google.colab import output as colab_output
@@ -11,7 +11,8 @@ if not os.path.isdir(os.path.join(_D,"static")):
         if os.path.isdir(os.path.join(_c,"static")): _D=_c; break
 PROJECT_DIR=_D; STATIC=os.path.join(_D,"static"); UPLOADS=os.path.join(_D,"uploads"); OUTPUTS=os.path.join(_D,"outputs")
 STATE_DIR=os.path.join(_D,".state")
-for d in [UPLOADS,OUTPUTS,STATIC,STATE_DIR]: os.makedirs(d,exist_ok=True)
+VAE_CACHE_DIR=os.path.join(_D,".vae_cache")
+for d in [UPLOADS,OUTPUTS,STATIC,STATE_DIR,VAE_CACHE_DIR]: os.makedirs(d,exist_ok=True)
 print(f"[backend] project={PROJECT_DIR}")
 
 # ── Persistent state files ─────────────────────────
@@ -56,6 +57,26 @@ def log(msg,level="info"):
 
 pipeline=None; _qem=None; _loading=False; _error=None; _generating=False
 _progress={"step":0,"total":0,"active":False}
+
+# ── Caches for speed ─────────────────────────────
+# File lookup cache: image_id -> filepath (invalidated on upload)
+_upload_cache={}
+_upload_cache_lock=threading.Lock()
+
+# Resized PIL image cache: (filepath, max_size, mul) -> PIL.Image
+_resized_cache={}
+_MAX_RESIZED_CACHE=20
+
+# Text encoder prompt cache: (prompt, device) -> (prompt_embeds, pooled_prompt_embeds, negative_prompt_embeds, negative_pooled_prompt_embeds)
+_prompt_cache={}
+_MAX_PROMPT_CACHE=32
+
+# LoRA scaling modules cache: list of modules with scaling dicts (avoid full tree walk)
+_lora_modules=None
+
+# VAE latent cache: hash(image_bytes + dims) -> path to .pt file on disk
+_VAE_CACHE_MAX_ENTRIES=200
+_VAE_CACHE_MAX_GB=10.0
 
 # ── Persistent jobs store ──────────────────────────
 _jobs={}
@@ -172,6 +193,21 @@ def load_pipeline(variant="Q4_K_M"):
                 "gguf package not installed! Run: pip install 'gguf>=0.10.0' and restart runtime"
             )
 
+        # ── 1. TF32 + cuDNN: free speed on Ampere+ ──
+        try:
+            torch.backends.cuda.matmul.allow_tf32=True
+            torch.backends.cudnn.allow_tf32=True
+            torch.set_float32_matmul_precision("high")
+            log("TF32 matmul + cuDNN enabled")
+        except Exception as e:
+            log(f"TF32 setup skipped: {e}","warn")
+
+        # ── 2. cuDNN benchmark: auto-tune conv kernels ──
+        try:
+            torch.backends.cudnn.benchmark=True
+            log("cuDNN benchmark mode enabled")
+        except: pass
+
         from diffusers import (QwenImageEditPlusPipeline,QwenImageTransformer2DModel,
             FlowMatchEulerDiscreteScheduler,GGUFQuantizationConfig)
         from huggingface_hub import hf_hub_download
@@ -193,7 +229,8 @@ def load_pipeline(variant="Q4_K_M"):
         log("GGUF loaded, building pipeline...")
         p=QwenImageEditPlusPipeline.from_pretrained("Qwen/Qwen-Image-Edit-2511",transformer=tr,torch_dtype=torch.bfloat16)
         p.scheduler=FlowMatchEulerDiscreteScheduler.from_config(sc)
-        p.enable_model_cpu_offload(); p.set_progress_bar_config(disable=None)
+
+        # Load LoRAs first (before offload decisions)
         log("Loading Lightning LoRA...")
         p.load_lora_weights("lightx2v/Qwen-Image-Edit-2511-Lightning",
             weight_name="Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors",adapter_name="lightning")
@@ -201,8 +238,85 @@ def load_pipeline(variant="Q4_K_M"):
         p.load_lora_weights("fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA",
             weight_name="qwen-image-edit-2511-multiple-angles-lora.safetensors",adapter_name="angles")
         p.set_adapters(["lightning","angles"],adapter_weights=[1.0,0.9])
+
+        # ── 3. Fuse lightning LoRA into base weights ──
+        # Lightning is always at scale=1.0, so bake it in to eliminate
+        # per-layer LoRA overhead on every forward pass (~5-10% speedup)
+        try:
+            p.fuse_lora(adapter_names=["lightning"],lora_scale=1.0)
+            p.unload_lora_weights()  # unload all LoRA state
+            # Reload ONLY the angles LoRA (lightning is now baked in)
+            p.load_lora_weights("fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA",
+                weight_name="qwen-image-edit-2511-multiple-angles-lora.safetensors",adapter_name="angles")
+            p.set_adapters(["angles"],adapter_weights=[0.9])
+            log("Lightning LoRA fused into base weights","success")
+        except Exception as e:
+            log(f"LoRA fuse failed (using unfused — still works): {e}","warn")
+            # Restore original dual-adapter setup
+            try:
+                p.set_adapters(["lightning","angles"],adapter_weights=[1.0,0.9])
+            except: pass
+
+        # ── 4. Smart offload: GPU-only if VRAM allows ──
+        _used_full_gpu=False
+        if torch.cuda.is_available():
+            vram_total=torch.cuda.get_device_properties(0).total_memory/1e9
+            log(f"GPU VRAM: {vram_total:.1f} GB")
+            # GGUF Q4_K_M ~4GB transformer + ~0.3GB VAE + ~2GB text encoder ≈ 7GB
+            # Keep 3GB headroom for activations/latents
+            if vram_total>=12:
+                try:
+                    p.to("cuda")
+                    _used_full_gpu=True
+                    log(f"Full GPU mode (no CPU offload) — {vram_total:.0f}GB VRAM","success")
+                except Exception as e:
+                    log(f"Full GPU failed, falling back to CPU offload: {e}","warn")
+                    p.enable_model_cpu_offload()
+            else:
+                p.enable_model_cpu_offload()
+                log(f"CPU offload mode — {vram_total:.0f}GB VRAM (need ≥12GB for full GPU)")
+        else:
+            p.enable_model_cpu_offload()
+
+        p.set_progress_bar_config(disable=None)
+
+        # ── 5. VAE tiling: faster encode/decode for large images ──
+        try:
+            p.enable_vae_tiling()
+            log("VAE tiling enabled")
+        except Exception as e:
+            log(f"VAE tiling not available: {e}","warn")
+
+        # ── 6. SDPA attention processor ──
+        try:
+            from diffusers.models.attention_processor import AttnProcessor2_0
+            p.transformer.set_attn_processor(AttnProcessor2_0())
+            log("SDPA attention (AttnProcessor2_0) enabled","success")
+        except Exception as e:
+            log(f"SDPA processor not set (may already be default): {e}","warn")
+
+        # ── 7. torch.compile on transformer (skip for GGUF if incompatible) ──
+        try:
+            if hasattr(torch,'compile') and _used_full_gpu:
+                p.transformer=torch.compile(p.transformer,mode="reduce-overhead",fullgraph=False)
+                log("torch.compile on transformer (reduce-overhead)","success")
+            elif hasattr(torch,'compile'):
+                log("torch.compile skipped (CPU offload mode — not compatible)")
+        except Exception as e:
+            log(f"torch.compile failed (non-fatal): {e}","warn")
+
         global _qem; _qem=_qem_ref; pipeline=p
         log("Pipeline ready!","success")
+
+        # Log final optimization summary
+        _opts=[]
+        if _used_full_gpu: _opts.append("full-GPU")
+        else: _opts.append("CPU-offload")
+        _opts.append("TF32")
+        _opts.append("VAE-tiling")
+        _opts.append("VAE-cache")
+        log(f"Active optimizations: {', '.join(_opts)}","success")
+
     except Exception as e:
         import traceback as tb
         full_tb = tb.format_exc()
@@ -213,17 +327,99 @@ def load_pipeline(variant="Q4_K_M"):
     finally: _loading=False
 
 def _find_upload(iid):
+    with _upload_cache_lock:
+        if iid in _upload_cache:
+            p=_upload_cache[iid]
+            if os.path.isfile(p): return p
+            del _upload_cache[iid]
     ms=[f for f in os.listdir(UPLOADS) if f.startswith(iid)]
-    return os.path.join(UPLOADS,ms[0]) if ms else None
+    if ms:
+        p=os.path.join(UPLOADS,ms[0])
+        with _upload_cache_lock:
+            _upload_cache[iid]=p
+        return p
+    return None
+
+def _invalidate_upload_cache(iid=None):
+    with _upload_cache_lock:
+        if iid: _upload_cache.pop(iid,None)
+        else: _upload_cache.clear()
 
 def _load_images(image_ids):
     _t(); imgs=[]
     for iid in image_ids:
         fp=_find_upload(iid)
         if fp:
-            img=Image.open(fp).convert("RGB")
-            imgs.append(resize_for_qwen(img))
+            cache_key=(fp,os.path.getmtime(fp))
+            if cache_key in _resized_cache:
+                imgs.append(_resized_cache[cache_key])
+            else:
+                img=Image.open(fp).convert("RGB")
+                resized=resize_for_qwen(img)
+                if len(_resized_cache)>=_MAX_RESIZED_CACHE:
+                    oldest=next(iter(_resized_cache))
+                    del _resized_cache[oldest]
+                _resized_cache[cache_key]=resized
+                imgs.append(resized)
     return imgs
+
+# ── VAE latent caching ────────────────────────────
+def _vae_cache_key(img, width, height):
+    """Hash PIL image content + target dims to create a stable cache key."""
+    buf=io.BytesIO()
+    img.save(buf,format="PNG",compress_level=1)
+    h=hashlib.md5(buf.getvalue())
+    h.update(f"{width}x{height}".encode())
+    return h.hexdigest()
+
+def _vae_cache_path(key):
+    return os.path.join(VAE_CACHE_DIR,f"{key}.pt")
+
+def _vae_cache_get(key):
+    """Load cached VAE latents from disk. Returns tensor or None."""
+    p=_vae_cache_path(key)
+    if os.path.isfile(p):
+        try:
+            _t()
+            data=torch.load(p,map_location="cpu",weights_only=True)
+            os.utime(p)  # touch for LRU
+            log(f"VAE cache HIT: {key[:12]}...")
+            return data
+        except Exception as e:
+            log(f"VAE cache load error: {e}","warn")
+            try: os.remove(p)
+            except: pass
+    return None
+
+def _vae_cache_put(key, tensor):
+    """Save VAE latents to disk cache."""
+    try:
+        _vae_cache_evict()
+        p=_vae_cache_path(key)
+        torch.save(tensor.cpu(),p)
+        log(f"VAE cache STORE: {key[:12]}...")
+    except Exception as e:
+        log(f"VAE cache save error: {e}","warn")
+
+def _vae_cache_evict():
+    """Evict oldest entries if cache exceeds limits."""
+    try:
+        entries=[]
+        total_bytes=0
+        for fn in os.listdir(VAE_CACHE_DIR):
+            if not fn.endswith(".pt"): continue
+            fp=os.path.join(VAE_CACHE_DIR,fn)
+            st=os.stat(fp)
+            entries.append((fp,st.st_mtime,st.st_size))
+            total_bytes+=st.st_size
+        entries.sort(key=lambda x:x[1])  # oldest first
+        while len(entries)>_VAE_CACHE_MAX_ENTRIES or total_bytes>_VAE_CACHE_MAX_GB*1e9:
+            if not entries: break
+            fp,_,sz=entries.pop(0)
+            try: os.remove(fp)
+            except: pass
+            total_bytes-=sz
+    except: pass
 
 def _snap_dim(v,mul=8):
     return max(mul,round(v/mul)*mul)
@@ -240,12 +436,15 @@ def _cap_resolution(w,h):
     return w,h
 
 def _set_lora_scales(scales):
-    transformer = pipeline.transformer
-    for module in transformer.modules():
-        if hasattr(module, 'scaling') and isinstance(module.scaling, dict):
-            for name, weight in scales.items():
-                if name in module.scaling:
-                    module.scaling[name] = weight
+    global _lora_modules
+    if _lora_modules is None:
+        _lora_modules=[m for m in pipeline.transformer.modules()
+                       if hasattr(m,'scaling') and isinstance(m.scaling,dict)]
+        log(f"Cached {len(_lora_modules)} LoRA scaling modules")
+    for module in _lora_modules:
+        for name, weight in scales.items():
+            if name in module.scaling:
+                module.scaling[name]=weight
 
 
 # ══════════════════════════════════════════════════
@@ -272,11 +471,20 @@ def status():
     # Use cached psutil values (never blocks)
     with _hw_lock:
         hw=dict(_hw_cache)
+    # VAE cache stats
+    vae_count=0;vae_mb=0
+    try:
+        for fn in os.listdir(VAE_CACHE_DIR):
+            if fn.endswith(".pt"):
+                vae_count+=1; vae_mb+=os.path.getsize(os.path.join(VAE_CACHE_DIR,fn))
+        vae_mb=round(vae_mb/1e6,1)
+    except: pass
     return jsonify({"ready":pipeline is not None,"loading":_loading,"error":_error,
         "generating":_generating,"progress":_progress,
         "gpu":gpu,"vram":vram,"vram_total":vt,
         "cpu_pct":hw["cpu_pct"],"ram":hw["ram"],"ram_total":hw["ram_total"],
-        "disk":hw["disk"],"disk_total":hw["disk_total"]})
+        "disk":hw["disk"],"disk_total":hw["disk_total"],
+        "vae_cache":{"count":vae_count,"size_mb":vae_mb}})
 
 @app.route("/api/logs")
 def get_logs():
@@ -297,6 +505,7 @@ def upload():
     if "image" not in request.files: return jsonify({"error":"No image"}),400
     f=request.files["image"]; ext=os.path.splitext(f.filename)[1].lower() or ".png"
     uid=uuid.uuid4().hex[:8]; fn=f"{uid}{ext}"; f.save(os.path.join(UPLOADS,fn))
+    _invalidate_upload_cache()  # new file added, clear lookup cache
     _t(); img=Image.open(os.path.join(UPLOADS,fn)).convert("RGB")
     return jsonify({"id":uid,"filename":fn,"w":img.size[0],"h":img.size[1],"url":f"/api/uploads/{fn}"})
 
@@ -406,21 +615,130 @@ def _run_generate(job_id,d):
 
         _set_lora_scales({"lightning":1.0,"angles":angles_w})
 
+        # ── Text encoder prompt caching ───────────────
+        # The text encoder (T5) is slow. Cache its output so repeated
+        # prompts skip the full forward pass entirely.
+        _orig_encode_prompt=None
+        _neg_prompt=" "  # always the same
+        _prompt_key=(prompt,_neg_prompt)
+        if hasattr(pipeline,'encode_prompt') and _prompt_key in _prompt_cache:
+            cached_enc=_prompt_cache[_prompt_key]
+            _orig_encode_prompt=pipeline.encode_prompt
+            def _cached_encode_prompt(*args,**kwargs):
+                log("Text encoder skipped (cached)")
+                return cached_enc
+            pipeline.encode_prompt=_cached_encode_prompt
+        elif hasattr(pipeline,'encode_prompt'):
+            _orig_encode_prompt=pipeline.encode_prompt
+            def _capturing_encode_prompt(*args,**kwargs):
+                result=_orig_encode_prompt(*args,**kwargs)
+                try:
+                    # Cache the result (detach tensors to avoid graph retention)
+                    if isinstance(result,tuple):
+                        cached=tuple(r.detach() if hasattr(r,'detach') else r for r in result)
+                    else:
+                        cached=result.detach() if hasattr(result,'detach') else result
+                    if len(_prompt_cache)>=_MAX_PROMPT_CACHE:
+                        _prompt_cache.pop(next(iter(_prompt_cache)))
+                    _prompt_cache[_prompt_key]=cached
+                    log(f"Text encoder output cached (prompt len={len(prompt)})")
+                except Exception as e:
+                    log(f"Prompt cache capture failed: {e}","warn")
+                return result
+            pipeline.encode_prompt=_capturing_encode_prompt
+
+        # ── VAE encode caching ────────────────────
+        # Compute cache key for the primary input image (first image)
+        primary_img=imgs[0]
+        vae_key=_vae_cache_key(primary_img,ow,oh)
+        cached_latents=_vae_cache_get(vae_key)
+
+        # Monkey-patch VAE encode if we have a cache hit
+        _orig_vae_encode=None
+        _first_encode_call=[True]
+        if cached_latents is not None:
+            _orig_vae_encode=pipeline.vae.encode
+            cached_on_device=[None]
+            def _cached_encode(x,*args,**kwargs):
+                # Only intercept the first encode call (the input image)
+                # subsequent calls (if any) go through normally
+                if _first_encode_call[0]:
+                    _first_encode_call[0]=False
+                    device=x.device
+                    if cached_on_device[0] is None:
+                        cached_on_device[0]=cached_latents.to(device)
+                    log(f"VAE encode skipped (cached)")
+                    class _FakeOutput:
+                        def __init__(self,lt): self.latent_dist=self; self.sample_=lt
+                        def sample(self): return self.sample_
+                        @property
+                        def latent(self): return self.sample_
+                    return _FakeOutput(cached_on_device[0])
+                return _orig_vae_encode(x,*args,**kwargs)
+            pipeline.vae.encode=_cached_encode
+        else:
+            # Wrap VAE encode to capture and cache the first result
+            _orig_vae_encode=pipeline.vae.encode
+            def _caching_encode(x,*args,**kwargs):
+                result=_orig_vae_encode(x,*args,**kwargs)
+                if _first_encode_call[0]:
+                    _first_encode_call[0]=False
+                    try:
+                        sample=result.latent_dist.sample() if hasattr(result,'latent_dist') else result
+                        _vae_cache_put(vae_key,sample.detach())
+                    except Exception as e:
+                        log(f"VAE cache capture failed: {e}","warn")
+                return result
+            pipeline.vae.encode=_caching_encode
+
         t0=time.time()
-        with torch.inference_mode():
-            out=pipeline(image=img_input,prompt=prompt,generator=torch.manual_seed(seed),
-                num_inference_steps=steps,guidance_scale=1.0,true_cfg_scale=cfg,
-                negative_prompt=" ",height=oh,width=ow,callback_on_step_end=_prog_cb)
+        # Use CUDA generator to avoid CPU↔GPU sync on random number generation
+        try:
+            gen=torch.Generator(device="cuda").manual_seed(seed)
+        except:
+            gen=torch.manual_seed(seed)
+        try:
+            with torch.inference_mode():
+                out=pipeline(image=img_input,prompt=prompt,generator=gen,
+                    num_inference_steps=steps,guidance_scale=1.0,true_cfg_scale=cfg,
+                    negative_prompt=" ",height=oh,width=ow,callback_on_step_end=_prog_cb)
+        finally:
+            # Always restore monkey-patched methods
+            if _orig_vae_encode is not None:
+                pipeline.vae.encode=_orig_vae_encode
+            if _orig_encode_prompt is not None:
+                pipeline.encode_prompt=_orig_encode_prompt
+
         el=time.time()-t0; oi=out.images[0]
         of=f"out_{uuid.uuid4().hex[:8]}.png"; oi.save(os.path.join(OUTPUTS,of))
-        torch.cuda.empty_cache(); gc.collect()
-        log(f"Done {el:.1f}s — {oi.size[0]}x{oi.size[1]}","success")
+
+        # Smart VRAM management: only flush if >80% utilized
+        try:
+            if torch.cuda.is_available():
+                vram_used=torch.cuda.memory_allocated()
+                vram_total=torch.cuda.get_device_properties(0).total_memory
+                if vram_used/vram_total>0.8:
+                    torch.cuda.empty_cache(); gc.collect()
+        except:
+            torch.cuda.empty_cache(); gc.collect()
+
+        log(f"Done {el:.1f}s — {oi.size[0]}x{oi.size[1]} (vae_cached={'HIT' if cached_latents is not None else 'MISS'})","success")
         result={
             "url":f"/api/outputs/{of}","w":oi.size[0],"h":oi.size[1],
             "prompt":prompt,"seed":seed,"elapsed":round(el,1),"mode":mode}
         with _jobs_lock:
             _jobs[job_id]={"status":"done","result":result,"finished_at":time.time()}
         _save_jobs()
+
+        # ── Pre-cache output image for "Use as Input" ──
+        # The user's most common next action is clicking "Use as Input"
+        # then generating again at the same output dims. Pre-encode the
+        # output through VAE now so that next run is an instant cache hit.
+        try:
+            _precache_output_vae(oi,ow,oh)
+        except Exception as e:
+            log(f"Pre-cache output failed (non-fatal): {e}","warn")
+
     except Exception as e:
         log(f"Generate failed: {e}","error"); traceback.print_exc()
         with _jobs_lock:
@@ -428,6 +746,35 @@ def _run_generate(job_id,d):
         _save_jobs()
     finally:
         _generating=False; _progress["active"]=False; _progress["step"]=0
+
+def _precache_output_vae(output_img,ow,oh):
+    """Pre-encode the output image through VAE and cache it.
+    When the user clicks 'Use as Input', this image gets loaded,
+    resized by resize_for_qwen(), then VAE-encoded. We do that
+    encoding now so the next generate is a cache hit."""
+    _t()
+    resized=resize_for_qwen(output_img)
+    key=_vae_cache_key(resized,ow,oh)
+    # Skip if already cached (shouldn't happen, but be safe)
+    if os.path.isfile(_vae_cache_path(key)):
+        return
+    # Run the actual VAE encode
+    import numpy as np
+    img_np=np.array(resized).astype(np.float32)/255.0
+    img_tensor=torch.from_numpy(img_np).permute(2,0,1).unsqueeze(0)
+    img_tensor=img_tensor.to(dtype=pipeline.vae.dtype,device=pipeline.vae.device)
+    # Normalize to [-1,1] as VAE expects
+    img_tensor=2.0*img_tensor-1.0
+    with torch.inference_mode():
+        enc=pipeline.vae.encode(img_tensor)
+        if hasattr(enc,'latent_dist'):
+            latent=enc.latent_dist.mode()
+        elif hasattr(enc,'latents'):
+            latent=enc.latents
+        else:
+            latent=enc
+        _vae_cache_put(key,latent.detach())
+    log(f"Pre-cached output VAE encoding ({resized.size[0]}x{resized.size[1]} → {ow}x{oh})")
 
 @app.route("/api/job/<job_id>")
 def get_job(job_id):
@@ -463,6 +810,39 @@ def use_output():
     if not os.path.isfile(src_path): return jsonify({"error":"Output not found"}),404
     uid=uuid.uuid4().hex[:8]; fn=f"{uid}.png"
     import shutil; shutil.copy2(src_path,os.path.join(UPLOADS,fn))
+    _invalidate_upload_cache()
     img=Image.open(os.path.join(UPLOADS,fn)).convert("RGB")
     log(f"Output → Input: {fn} ({img.size[0]}x{img.size[1]})")
     return jsonify({"id":uid,"filename":fn,"w":img.size[0],"h":img.size[1],"url":f"/api/uploads/{fn}"})
+
+@app.route("/api/vae_cache",methods=["GET"])
+def vae_cache_info():
+    """Return VAE cache stats."""
+    try:
+        entries=[]
+        total=0
+        for fn in os.listdir(VAE_CACHE_DIR):
+            if fn.endswith(".pt"):
+                fp=os.path.join(VAE_CACHE_DIR,fn)
+                sz=os.path.getsize(fp)
+                entries.append(fn)
+                total+=sz
+        return jsonify({"count":len(entries),"size_mb":round(total/1e6,1)})
+    except:
+        return jsonify({"count":0,"size_mb":0})
+
+@app.route("/api/vae_cache",methods=["DELETE"])
+def vae_cache_clear():
+    """Clear the VAE latent cache."""
+    cleared=0
+    try:
+        for fn in os.listdir(VAE_CACHE_DIR):
+            if fn.endswith(".pt"):
+                os.remove(os.path.join(VAE_CACHE_DIR,fn))
+                cleared+=1
+        _resized_cache.clear()
+        _prompt_cache.clear()
+        log(f"Cleared VAE cache ({cleared} entries)","info")
+    except Exception as e:
+        log(f"Cache clear error: {e}","warn")
+    return jsonify({"status":"ok","cleared":cleared})
