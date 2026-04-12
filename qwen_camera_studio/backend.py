@@ -244,24 +244,55 @@ def load_pipeline(variant="Q4_K_M"):
         # with GGUF quantized models. The _set_lora_scales runtime approach
         # is safer and the overhead is small (840 modules, <1ms per call).
 
-        # ── 4. Smart offload: GPU-only if VRAM allows ──
+        # ── 4. Smart offload: try best option, fall back on OOM ──
         _used_full_gpu=False
+        _used_hybrid=False
         if torch.cuda.is_available():
             vram_total=torch.cuda.get_device_properties(0).total_memory/1e9
             log(f"GPU VRAM: {vram_total:.1f} GB")
-            # GGUF Q4_K_M ~4GB transformer + ~0.3GB VAE + ~2GB text encoder ≈ 7GB
-            # Keep 3GB headroom for activations/latents
-            if vram_total>=12:
+
+            # Try 1: everything on GPU
+            try:
+                p.to("cuda")
+                _used_full_gpu=True
+                log(f"Full GPU mode — {vram_total:.0f}GB VRAM","success")
+            except Exception as e:
+                log(f"Full GPU failed ({e}), trying hybrid...","warn")
+                torch.cuda.empty_cache(); gc.collect()
+
+                # Try 2: transformer+VAE on GPU, text encoder CPU-offloaded
                 try:
-                    p.to("cuda")
-                    _used_full_gpu=True
-                    log(f"Full GPU mode (no CPU offload) — {vram_total:.0f}GB VRAM","success")
-                except Exception as e:
-                    log(f"Full GPU failed, falling back to CPU offload: {e}","warn")
+                    p.to("cpu")
                     p.enable_model_cpu_offload()
-            else:
-                p.enable_model_cpu_offload()
-                log(f"CPU offload mode — {vram_total:.0f}GB VRAM (need ≥12GB for full GPU)")
+                    from accelerate.hooks import remove_hook_from_module
+                    remove_hook_from_module(p.transformer, recurse=True)
+                    p.transformer.to("cuda")
+                    remove_hook_from_module(p.vae, recurse=True)
+                    p.vae.to("cuda")
+                    _used_hybrid=True
+                    log(f"Hybrid GPU mode — transformer+VAE on GPU, text encoder offloaded","success")
+                    log(f"  VRAM: {torch.cuda.memory_allocated()/1e9:.1f}GB of {vram_total:.0f}GB")
+                except Exception as e:
+                    log(f"Hybrid failed ({e}), trying transformer-only...","warn")
+                    torch.cuda.empty_cache(); gc.collect()
+
+                    # Try 3: transformer-only on GPU, VAE+text encoder offloaded (T4 16GB)
+                    try:
+                        p.to("cpu")
+                        p.enable_model_cpu_offload()
+                        from accelerate.hooks import remove_hook_from_module
+                        remove_hook_from_module(p.transformer, recurse=True)
+                        p.transformer.to("cuda")
+                        _used_hybrid=True
+                        log(f"Transformer-only GPU mode — VAE+text encoder offloaded","success")
+                        log(f"  VRAM: {torch.cuda.memory_allocated()/1e9:.1f}GB of {vram_total:.0f}GB")
+                    except Exception as e:
+                        log(f"Transformer-only failed ({e}), full CPU offload","warn")
+                        torch.cuda.empty_cache(); gc.collect()
+                        try: p.to("cpu")
+                        except: pass
+                        p.enable_model_cpu_offload()
+                        log(f"CPU offload mode — {vram_total:.0f}GB VRAM")
         else:
             p.enable_model_cpu_offload()
 
@@ -293,7 +324,7 @@ def load_pipeline(variant="Q4_K_M"):
             _qem.VAE_IMAGE_SIZE=64*64
             dummy_img=Image.new("RGB",(64,64),(128,128,128))
             with torch.inference_mode():
-                _warmup_dev="cuda" if _used_full_gpu else "cpu"
+                _warmup_dev="cuda" if (_used_full_gpu or _used_hybrid) else "cpu"
                 _=p(image=dummy_img,prompt="warmup",
                     generator=torch.Generator(device=_warmup_dev).manual_seed(0),
                     num_inference_steps=1,guidance_scale=1.0,
@@ -307,6 +338,7 @@ def load_pipeline(variant="Q4_K_M"):
         # Log final optimization summary
         _opts=[]
         if _used_full_gpu: _opts.append("full-GPU")
+        elif _used_hybrid: _opts.append("hybrid-GPU(transformer+VAE)")
         else: _opts.append("CPU-offload")
         _opts.append("TF32")
         _opts.append("VAE-cache")
@@ -647,51 +679,54 @@ def _run_generate(job_id,d):
             pipeline.encode_prompt=_capturing_encode_prompt
 
         # ── VAE encode caching ────────────────────
-        # Compute cache key for the primary input image (first image)
-        primary_img=imgs[0]
-        vae_key=_vae_cache_key(primary_img,ow,oh)
-        cached_latents=_vae_cache_get(vae_key)
-
-        # Monkey-patch VAE encode if we have a cache hit
+        # Only cache in camera mode (single image). In edit mode the pipeline
+        # batches multiple images into one vae.encode() call — intercepting
+        # that with a single-image cache would return wrong-shaped latents.
         _orig_vae_encode=None
-        _first_encode_call=[True]
-        if cached_latents is not None:
-            _orig_vae_encode=pipeline.vae.encode
-            cached_on_device=[None]
-            def _cached_encode(x,*args,**kwargs):
-                # Only intercept the first encode call (the input image)
-                # subsequent calls (if any) go through normally
-                if _first_encode_call[0]:
-                    _first_encode_call[0]=False
-                    device=x.device
-                    if cached_on_device[0] is None:
-                        cached_on_device[0]=cached_latents.to(device)
-                    log(f"VAE encode skipped (cached)")
-                    class _FakeOutput:
-                        def __init__(self,lt): self.latent_dist=self; self.sample_=lt
-                        def sample(self): return self.sample_
-                        def mode(self): return self.sample_
-                        @property
-                        def latent(self): return self.sample_
-                        @property
-                        def mean(self): return self.sample_
-                    return _FakeOutput(cached_on_device[0])
-                return _orig_vae_encode(x,*args,**kwargs)
-            pipeline.vae.encode=_cached_encode
+        _use_vae_cache = (mode == 'camera' and len(imgs) == 1)
+
+        if _use_vae_cache:
+            primary_img=imgs[0]
+            vae_key=_vae_cache_key(primary_img,ow,oh)
+            cached_latents=_vae_cache_get(vae_key)
+            _first_encode_call=[True]
+
+            if cached_latents is not None:
+                _orig_vae_encode=pipeline.vae.encode
+                cached_on_device=[None]
+                def _cached_encode(x,*args,**kwargs):
+                    if _first_encode_call[0]:
+                        _first_encode_call[0]=False
+                        device=x.device
+                        if cached_on_device[0] is None:
+                            cached_on_device[0]=cached_latents.to(device)
+                        log(f"VAE encode skipped (cached)")
+                        class _FakeOutput:
+                            def __init__(self,lt): self.latent_dist=self; self.sample_=lt
+                            def sample(self): return self.sample_
+                            def mode(self): return self.sample_
+                            @property
+                            def latent(self): return self.sample_
+                            @property
+                            def mean(self): return self.sample_
+                        return _FakeOutput(cached_on_device[0])
+                    return _orig_vae_encode(x,*args,**kwargs)
+                pipeline.vae.encode=_cached_encode
+            else:
+                _orig_vae_encode=pipeline.vae.encode
+                def _caching_encode(x,*args,**kwargs):
+                    result=_orig_vae_encode(x,*args,**kwargs)
+                    if _first_encode_call[0]:
+                        _first_encode_call[0]=False
+                        try:
+                            sample=result.latent_dist.mode() if hasattr(result,'latent_dist') else result
+                            _vae_cache_put(vae_key,sample.detach())
+                        except Exception as e:
+                            log(f"VAE cache capture failed: {e}","warn")
+                    return result
+                pipeline.vae.encode=_caching_encode
         else:
-            # Wrap VAE encode to capture and cache the first result
-            _orig_vae_encode=pipeline.vae.encode
-            def _caching_encode(x,*args,**kwargs):
-                result=_orig_vae_encode(x,*args,**kwargs)
-                if _first_encode_call[0]:
-                    _first_encode_call[0]=False
-                    try:
-                        sample=result.latent_dist.sample() if hasattr(result,'latent_dist') else result
-                        _vae_cache_put(vae_key,sample.detach())
-                    except Exception as e:
-                        log(f"VAE cache capture failed: {e}","warn")
-                return result
-            pipeline.vae.encode=_caching_encode
+            log(f"VAE cache skipped (edit mode, {len(imgs)} images)")
 
         t0=time.time()
         # Use CUDA generator only in full-GPU mode; CPU offload needs CPU generator
@@ -730,7 +765,8 @@ def _run_generate(job_id,d):
         except:
             torch.cuda.empty_cache(); gc.collect()
 
-        log(f"Done {el:.1f}s — {oi.size[0]}x{oi.size[1]} (vae_cached={'HIT' if cached_latents is not None else 'MISS'})","success")
+        _cache_status = "HIT" if (_use_vae_cache and cached_latents is not None) else "MISS" if _use_vae_cache else "N/A"
+        log(f"Done {el:.1f}s — {oi.size[0]}x{oi.size[1]} (vae_cache={_cache_status})","success")
         result={
             "url":f"/api/outputs/{of}","w":oi.size[0],"h":oi.size[1],
             "prompt":prompt,"seed":seed,"elapsed":round(el,1),"mode":mode}
@@ -738,18 +774,16 @@ def _run_generate(job_id,d):
             _jobs[job_id]={"status":"done","result":result,"finished_at":time.time()}
         _save_jobs()
 
-        # ── Pre-cache output in background thread ──
-        # Don't block _generating — fire and forget so user can start
-        # a new generation immediately after seeing the result.
-        _oi_copy=oi.copy()  # copy so thread owns the PIL image
-        def _bg_precache():
-            try:
-                # Bail if a new generation started before we could pre-cache
-                if _generating: return
-                _precache_output_vae(_oi_copy,ow,oh)
-            except Exception as e:
-                log(f"Pre-cache output failed (non-fatal): {e}","warn")
-        threading.Thread(target=_bg_precache,daemon=True).start()
+        # ── Pre-cache output in background thread (camera mode only) ──
+        if mode == 'camera':
+            _oi_copy=oi.copy()
+            def _bg_precache():
+                try:
+                    if _generating: return
+                    _precache_output_vae(_oi_copy,ow,oh)
+                except Exception as e:
+                    log(f"Pre-cache output failed (non-fatal): {e}","warn")
+            threading.Thread(target=_bg_precache,daemon=True).start()
 
     except Exception as e:
         log(f"Generate failed: {e}","error"); traceback.print_exc()
