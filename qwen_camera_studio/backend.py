@@ -280,23 +280,16 @@ def load_pipeline(variant="Q4_K_M"):
         except Exception as e:
             log(f"SDPA processor not set (may already be default): {e}","warn")
 
-        # ── 8. torch.compile on transformer (skip for GGUF if incompatible) ──
-        try:
-            if hasattr(torch,'compile') and _used_full_gpu:
-                p.transformer=torch.compile(p.transformer,mode="reduce-overhead",fullgraph=False)
-                log("torch.compile on transformer (reduce-overhead)","success")
-            elif hasattr(torch,'compile'):
-                log("torch.compile skipped (CPU offload mode — not compatible)")
-        except Exception as e:
-            log(f"torch.compile failed (non-fatal): {e}","warn")
+        # ── torch.compile ──
+        # DISABLED: Qwen transformer uses dual-output attention unpacking
+        # (img_attn_output, txt_attn_output = attn_output) which torch.dynamo
+        # cannot trace. Use the standalone optimize_compile.py cell to test
+        # future compatibility.
 
         global _qem; _qem=_qem_ref; pipeline=p
         log("Pipeline ready!","success")
 
-        # ── 9. Warmup run: prime CUDA kernels + cuDNN autotuner ──
-        # First real generation is always slow because CUDA compiles
-        # kernels, cuDNN benchmarks convolutions, and torch.compile
-        # traces the graph. A tiny dummy run hides this latency.
+        # ── Warmup run: prime CUDA kernels + cuDNN autotuner ──
         try:
             log("Running warmup pass (priming CUDA kernels)...")
             _qem.VAE_IMAGE_SIZE=64*64
