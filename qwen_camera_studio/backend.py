@@ -272,13 +272,11 @@ def load_pipeline(variant="Q4_K_M"):
         # internal return structures causing "not enough values to unpack"
         # during decode. Safe to re-enable if future diffusers versions fix this.
 
-        # ── 6. SDPA attention processor ──
-        try:
-            from diffusers.models.attention_processor import AttnProcessor2_0
-            p.transformer.set_attn_processor(AttnProcessor2_0())
-            log("SDPA attention (AttnProcessor2_0) enabled","success")
-        except Exception as e:
-            log(f"SDPA processor not set (may already be default): {e}","warn")
+        # ── SDPA attention ──
+        # DISABLED: Qwen transformer uses a custom attention processor that
+        # returns (img_attn, txt_attn) as a tuple. AttnProcessor2_0 returns
+        # a single tensor, breaking the unpacking at line 709.
+        # The default Qwen processor already uses SDPA internally.
 
         # ── torch.compile ──
         # DISABLED: Qwen transformer uses dual-output attention unpacking
