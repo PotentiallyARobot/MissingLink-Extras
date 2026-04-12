@@ -239,23 +239,10 @@ def load_pipeline(variant="Q4_K_M"):
             weight_name="qwen-image-edit-2511-multiple-angles-lora.safetensors",adapter_name="angles")
         p.set_adapters(["lightning","angles"],adapter_weights=[1.0,0.9])
 
-        # ── 3. Fuse lightning LoRA into base weights ──
-        # Lightning is always at scale=1.0, so bake it in to eliminate
-        # per-layer LoRA overhead on every forward pass (~5-10% speedup)
-        try:
-            p.fuse_lora(adapter_names=["lightning"],lora_scale=1.0)
-            p.unload_lora_weights()  # unload all LoRA state
-            # Reload ONLY the angles LoRA (lightning is now baked in)
-            p.load_lora_weights("fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA",
-                weight_name="qwen-image-edit-2511-multiple-angles-lora.safetensors",adapter_name="angles")
-            p.set_adapters(["angles"],adapter_weights=[0.9])
-            log("Lightning LoRA fused into base weights","success")
-        except Exception as e:
-            log(f"LoRA fuse failed (using unfused — still works): {e}","warn")
-            # Restore original dual-adapter setup
-            try:
-                p.set_adapters(["lightning","angles"],adapter_weights=[1.0,0.9])
-            except: pass
+        # ── 3. LoRA fusing ──
+        # NOTE: disabled — fuse_lora + unload_lora_weights is destructive
+        # with GGUF quantized models. The _set_lora_scales runtime approach
+        # is safer and the overhead is small (840 modules, <1ms per call).
 
         # ── 4. Smart offload: GPU-only if VRAM allows ──
         _used_full_gpu=False
@@ -280,12 +267,10 @@ def load_pipeline(variant="Q4_K_M"):
 
         p.set_progress_bar_config(disable=None)
 
-        # ── 5. VAE tiling: faster encode/decode for large images ──
-        try:
-            p.enable_vae_tiling()
-            log("VAE tiling enabled")
-        except Exception as e:
-            log(f"VAE tiling not available: {e}","warn")
+        # ── 5. VAE tiling/slicing/channels_last ──
+        # NOTE: disabled for Qwen pipeline — enable_vae_tiling() changes
+        # internal return structures causing "not enough values to unpack"
+        # during decode. Safe to re-enable if future diffusers versions fix this.
 
         # ── 6. SDPA attention processor ──
         try:
@@ -295,7 +280,7 @@ def load_pipeline(variant="Q4_K_M"):
         except Exception as e:
             log(f"SDPA processor not set (may already be default): {e}","warn")
 
-        # ── 7. torch.compile on transformer (skip for GGUF if incompatible) ──
+        # ── 8. torch.compile on transformer (skip for GGUF if incompatible) ──
         try:
             if hasattr(torch,'compile') and _used_full_gpu:
                 p.transformer=torch.compile(p.transformer,mode="reduce-overhead",fullgraph=False)
@@ -308,13 +293,35 @@ def load_pipeline(variant="Q4_K_M"):
         global _qem; _qem=_qem_ref; pipeline=p
         log("Pipeline ready!","success")
 
+        # ── 9. Warmup run: prime CUDA kernels + cuDNN autotuner ──
+        # First real generation is always slow because CUDA compiles
+        # kernels, cuDNN benchmarks convolutions, and torch.compile
+        # traces the graph. A tiny dummy run hides this latency.
+        try:
+            log("Running warmup pass (priming CUDA kernels)...")
+            _qem.VAE_IMAGE_SIZE=64*64
+            dummy_img=Image.new("RGB",(64,64),(128,128,128))
+            with torch.inference_mode():
+                _warmup_dev="cuda" if _used_full_gpu else "cpu"
+                _=p(image=dummy_img,prompt="warmup",
+                    generator=torch.Generator(device=_warmup_dev).manual_seed(0),
+                    num_inference_steps=1,guidance_scale=1.0,
+                    height=64,width=64)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            log("Warmup complete — CUDA kernels primed","success")
+        except Exception as e:
+            log(f"Warmup failed (non-fatal, first generation may be slower): {e}","warn")
+
         # Log final optimization summary
         _opts=[]
         if _used_full_gpu: _opts.append("full-GPU")
         else: _opts.append("CPU-offload")
         _opts.append("TF32")
-        _opts.append("VAE-tiling")
         _opts.append("VAE-cache")
+        _opts.append("prompt-cache")
+        _opts.append("CUDA-gen")
+        _opts.append("warmup")
         log(f"Active optimizations: {', '.join(_opts)}","success")
 
     except Exception as e:
@@ -365,11 +372,10 @@ def _load_images(image_ids):
 
 # ── VAE latent caching ────────────────────────────
 def _vae_cache_key(img, width, height):
-    """Hash PIL image content + target dims to create a stable cache key."""
-    buf=io.BytesIO()
-    img.save(buf,format="PNG",compress_level=1)
-    h=hashlib.md5(buf.getvalue())
-    h.update(f"{width}x{height}".encode())
+    """Hash PIL image content + target dims to create a stable cache key.
+    Uses raw pixel bytes (fast) instead of PNG encoding (slow)."""
+    h=hashlib.md5(img.tobytes())
+    h.update(f"{img.size[0]}x{img.size[1]}_{width}x{height}".encode())
     return h.hexdigest()
 
 def _vae_cache_path(key):
@@ -381,7 +387,9 @@ def _vae_cache_get(key):
     if os.path.isfile(p):
         try:
             _t()
-            data=torch.load(p,map_location="cpu",weights_only=True)
+            # Load directly to GPU if available to avoid CPU→GPU copy later
+            dev="cuda" if torch.cuda.is_available() else "cpu"
+            data=torch.load(p,map_location=dev,weights_only=True)
             os.utime(p)  # touch for LRU
             log(f"VAE cache HIT: {key[:12]}...")
             return data
@@ -692,11 +700,15 @@ def _run_generate(job_id,d):
             pipeline.vae.encode=_caching_encode
 
         t0=time.time()
-        # Use CUDA generator to avoid CPU↔GPU sync on random number generation
+        # Use CUDA generator only in full-GPU mode; CPU offload needs CPU generator
         try:
-            gen=torch.Generator(device="cuda").manual_seed(seed)
+            _on_gpu = hasattr(pipeline,'_offload_gpu_id') is False and next(pipeline.transformer.parameters()).is_cuda
         except:
-            gen=torch.manual_seed(seed)
+            _on_gpu = False
+        if _on_gpu:
+            gen=torch.Generator(device="cuda").manual_seed(seed)
+        else:
+            gen=torch.Generator(device="cpu").manual_seed(seed)
         try:
             with torch.inference_mode():
                 out=pipeline(image=img_input,prompt=prompt,generator=gen,
@@ -710,7 +722,9 @@ def _run_generate(job_id,d):
                 pipeline.encode_prompt=_orig_encode_prompt
 
         el=time.time()-t0; oi=out.images[0]
-        of=f"out_{uuid.uuid4().hex[:8]}.png"; oi.save(os.path.join(OUTPUTS,of))
+        of=f"out_{uuid.uuid4().hex[:8]}.png"
+        # Save with minimal PNG compression (default level 6 is slow)
+        oi.save(os.path.join(OUTPUTS,of),compress_level=1)
 
         # Smart VRAM management: only flush if >80% utilized
         try:
@@ -730,14 +744,18 @@ def _run_generate(job_id,d):
             _jobs[job_id]={"status":"done","result":result,"finished_at":time.time()}
         _save_jobs()
 
-        # ── Pre-cache output image for "Use as Input" ──
-        # The user's most common next action is clicking "Use as Input"
-        # then generating again at the same output dims. Pre-encode the
-        # output through VAE now so that next run is an instant cache hit.
-        try:
-            _precache_output_vae(oi,ow,oh)
-        except Exception as e:
-            log(f"Pre-cache output failed (non-fatal): {e}","warn")
+        # ── Pre-cache output in background thread ──
+        # Don't block _generating — fire and forget so user can start
+        # a new generation immediately after seeing the result.
+        _oi_copy=oi.copy()  # copy so thread owns the PIL image
+        def _bg_precache():
+            try:
+                # Bail if a new generation started before we could pre-cache
+                if _generating: return
+                _precache_output_vae(_oi_copy,ow,oh)
+            except Exception as e:
+                log(f"Pre-cache output failed (non-fatal): {e}","warn")
+        threading.Thread(target=_bg_precache,daemon=True).start()
 
     except Exception as e:
         log(f"Generate failed: {e}","error"); traceback.print_exc()
