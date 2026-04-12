@@ -670,8 +670,11 @@ def _run_generate(job_id,d):
                     class _FakeOutput:
                         def __init__(self,lt): self.latent_dist=self; self.sample_=lt
                         def sample(self): return self.sample_
+                        def mode(self): return self.sample_
                         @property
                         def latent(self): return self.sample_
+                        @property
+                        def mean(self): return self.sample_
                     return _FakeOutput(cached_on_device[0])
                 return _orig_vae_encode(x,*args,**kwargs)
             pipeline.vae.encode=_cached_encode
