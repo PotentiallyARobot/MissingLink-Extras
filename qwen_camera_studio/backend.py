@@ -12,8 +12,74 @@ if not os.path.isdir(os.path.join(_D,"static")):
 PROJECT_DIR=_D; STATIC=os.path.join(_D,"static"); UPLOADS=os.path.join(_D,"uploads"); OUTPUTS=os.path.join(_D,"outputs")
 STATE_DIR=os.path.join(_D,".state")
 VAE_CACHE_DIR=os.path.join(_D,".vae_cache")
-for d in [UPLOADS,OUTPUTS,STATIC,STATE_DIR,VAE_CACHE_DIR]: os.makedirs(d,exist_ok=True)
+COMPILE_CACHE_DIR=os.path.join(_D,".compile_cache")
+for d in [UPLOADS,OUTPUTS,STATIC,STATE_DIR,VAE_CACHE_DIR,COMPILE_CACHE_DIR]: os.makedirs(d,exist_ok=True)
+
+# ── torch.compile cache: must be set BEFORE torch is imported ──
+# Saves compiled inductor graphs to disk so restarts skip recompilation
+os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"]="1"
+os.environ["TORCHINDUCTOR_CACHE_DIR"]=COMPILE_CACHE_DIR
 print(f"[backend] project={PROJECT_DIR}")
+print(f"[backend] compile cache={COMPILE_CACHE_DIR}")
+
+# ── Pre-built compile cache from HuggingFace ──────
+_COMPILE_CACHE_REPO="TylerF/MissingLinkModelCache"
+def _download_compile_cache():
+    """Download pre-compiled inductor kernels for this GPU if available."""
+    try:
+        import torch
+        if not torch.cuda.is_available(): return
+        gpu=torch.cuda.get_device_name(0).replace(" ","-").replace("/","-")
+        cap=torch.cuda.get_device_capability(0)
+        tag=f"{gpu}_sm{cap[0]}{cap[1]}_torch{torch.__version__.split('+')[0]}_cu{torch.version.cuda.replace('.','')}"
+
+        # Skip if cache already has files (local build or previous download)
+        existing=sum(1 for _,_,fs in os.walk(COMPILE_CACHE_DIR) for f in fs if f.endswith(('.cubin','.json','.py')))
+        if existing>100:
+            print(f"[compile] Cache already populated ({existing} files), skipping download")
+            return
+
+        cache_path=f"compile_cache/{tag}"
+        print(f"[compile] Looking for pre-built cache: {_COMPILE_CACHE_REPO}/{cache_path}")
+
+        from huggingface_hub import snapshot_download,list_repo_tree
+        # Check if this GPU tag exists in the repo
+        try:
+            files=list(list_repo_tree(_COMPILE_CACHE_REPO,path_in_repo=cache_path,repo_type="model"))
+            if not files:
+                print(f"[compile] No pre-built cache for {tag}")
+                return
+        except Exception:
+            print(f"[compile] No pre-built cache for {tag}")
+            return
+
+        print(f"[compile] Downloading pre-built kernels for {gpu}...")
+        snapshot_download(
+            repo_id=_COMPILE_CACHE_REPO,
+            repo_type="model",
+            allow_patterns=f"{cache_path}/*",
+            local_dir=COMPILE_CACHE_DIR,
+        )
+        # Move files from nested path to cache root
+        downloaded=os.path.join(COMPILE_CACHE_DIR,cache_path)
+        if os.path.isdir(downloaded):
+            import shutil
+            for item in os.listdir(downloaded):
+                src=os.path.join(downloaded,item)
+                dst=os.path.join(COMPILE_CACHE_DIR,item)
+                if os.path.isdir(src):
+                    if os.path.exists(dst): shutil.rmtree(dst)
+                    shutil.move(src,dst)
+                else:
+                    shutil.move(src,dst)
+            # Clean up nested dirs
+            try: shutil.rmtree(os.path.join(COMPILE_CACHE_DIR,"compile_cache"))
+            except: pass
+
+        n=sum(1 for _,_,fs in os.walk(COMPILE_CACHE_DIR) for f in fs)
+        print(f"[compile] Downloaded {n} cached kernel files for {gpu}")
+    except Exception as e:
+        print(f"[compile] Cache download failed (non-fatal): {e}")
 
 # ── Persistent state files ─────────────────────────
 JOBS_FILE=os.path.join(STATE_DIR,"jobs.json")
@@ -185,6 +251,9 @@ def load_pipeline(variant="Q4_K_M"):
     if pipeline: return
     _loading=True; _error=None
     try:
+        # Download pre-built compile cache for this GPU (if available)
+        _download_compile_cache()
+
         try:
             import gguf
             log(f"gguf package: installed")
@@ -304,23 +373,38 @@ def load_pipeline(variant="Q4_K_M"):
         # during decode. Safe to re-enable if future diffusers versions fix this.
 
         # ── SDPA attention ──
-        # DISABLED: Qwen transformer uses a custom attention processor that
-        # returns (img_attn, txt_attn) as a tuple. AttnProcessor2_0 returns
-        # a single tensor, breaking the unpacking at line 709.
-        # The default Qwen processor already uses SDPA internally.
+        # DISABLED: Qwen uses custom dual-output attention processor.
+        # AttnProcessor2_0 returns single tensor, breaks unpacking.
 
-        # ── torch.compile ──
-        # DISABLED: Qwen transformer uses dual-output attention unpacking
-        # (img_attn_output, txt_attn_output = attn_output) which torch.dynamo
-        # cannot trace. Use the standalone optimize_compile.py cell to test
-        # future compatibility.
+        # ── torch.compile (reduce-overhead) ──
+        # 4x faster denoising after compilation. Compiled graphs are cached
+        # to .compile_cache/ so restarts skip the ~13min compile step.
+        _original_transformer=p.transformer
+        _compiled_ok=False
+        if hasattr(torch,'compile') and (_used_full_gpu or _used_hybrid):
+            try:
+                log("Applying torch.compile (reduce-overhead)...")
+                p.transformer=torch.compile(p.transformer,mode="reduce-overhead",fullgraph=False)
+                log("torch.compile wrapper applied — will compile on first run","success")
+                _compiled_ok=True
+            except Exception as e:
+                log(f"torch.compile failed: {e}","warn")
+                p.transformer=_original_transformer
+        elif hasattr(torch,'compile'):
+            log("torch.compile skipped (CPU offload mode)")
 
         global _qem; _qem=_qem_ref; pipeline=p
         log("Pipeline ready!","success")
 
-        # ── Warmup run: prime CUDA kernels + cuDNN autotuner ──
+        # ── Warmup run: triggers compilation + primes CUDA kernels ──
+        # If compiled, first run compiles inductor graphs (~13min first time,
+        # seconds on restart with cache hit). If warmup fails, restore
+        # uncompiled transformer so pipeline still works.
         try:
-            log("Running warmup pass (priming CUDA kernels)...")
+            if _compiled_ok:
+                log("Running warmup (triggers torch.compile — first time takes ~13min, cached restarts are fast)...")
+            else:
+                log("Running warmup pass (priming CUDA kernels)...")
             _qem.VAE_IMAGE_SIZE=64*64
             dummy_img=Image.new("RGB",(64,64),(128,128,128))
             with torch.inference_mode():
@@ -333,7 +417,24 @@ def load_pipeline(variant="Q4_K_M"):
                 torch.cuda.empty_cache()
             log("Warmup complete — CUDA kernels primed","success")
         except Exception as e:
-            log(f"Warmup failed (non-fatal, first generation may be slower): {e}","warn")
+            if _compiled_ok:
+                log(f"Compiled warmup failed: {e}","warn")
+                log("Restoring uncompiled transformer — pipeline still works","warn")
+                p.transformer=_original_transformer
+                pipeline=p
+                _compiled_ok=False
+                # Try warmup again without compile
+                try:
+                    _qem.VAE_IMAGE_SIZE=64*64
+                    with torch.inference_mode():
+                        _=p(image=dummy_img,prompt="warmup",
+                            generator=torch.Generator(device=_warmup_dev).manual_seed(0),
+                            num_inference_steps=1,guidance_scale=1.0,
+                            height=64,width=64)
+                    log("Uncompiled warmup succeeded","success")
+                except: pass
+            else:
+                log(f"Warmup failed (non-fatal): {e}","warn")
 
         # Log final optimization summary
         _opts=[]
@@ -344,7 +445,7 @@ def load_pipeline(variant="Q4_K_M"):
         _opts.append("VAE-cache")
         _opts.append("prompt-cache")
         _opts.append("CUDA-gen")
-        _opts.append("warmup")
+        if _compiled_ok: _opts.append("torch.compile(reduce-overhead)")
         log(f"Active optimizations: {', '.join(_opts)}","success")
 
     except Exception as e:
