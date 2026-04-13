@@ -26,7 +26,7 @@ print(f"[backend] compile cache={COMPILE_CACHE_DIR}")
 # ── Pre-built compile cache from HuggingFace ──────
 _COMPILE_CACHE_REPO="TylerF/MissingLinkModelCache"
 def _download_compile_cache():
-    """Download pre-compiled inductor kernels for this GPU if available."""
+    """Download pre-compiled inductor kernels (as zip) for this GPU."""
     try:
         import torch
         if not torch.cuda.is_available(): return
@@ -34,45 +34,44 @@ def _download_compile_cache():
         cap=torch.cuda.get_device_capability(0)
         tag=f"{gpu}_sm{cap[0]}{cap[1]}_torch{torch.__version__.split('+')[0]}_cu{torch.version.cuda.replace('.','')}"
 
-        # Skip if cache already has files (local build or previous download)
+        # Skip if cache already populated
         existing=sum(1 for _,_,fs in os.walk(COMPILE_CACHE_DIR) for f in fs)
         if existing>100:
             print(f"[compile] Cache already populated ({existing} files), skipping download")
             return
 
-        cache_path=f"compile_cache/{tag}"
-        print(f"[compile] Looking for pre-built cache: {_COMPILE_CACHE_REPO}/{cache_path}")
+        # Auth for private repo
+        _hf_token=os.environ.get("HF_TOKEN")
+        if not _hf_token and IN_COLAB:
+            try:
+                from google.colab import userdata
+                _hf_token=userdata.get("HF_TOKEN")
+            except: pass
+        if _hf_token:
+            from huggingface_hub import login
+            login(token=_hf_token,add_to_git_credential=False)
 
-        from huggingface_hub import snapshot_download
-        # Download to a temp location, then move files to cache root
-        import tempfile, shutil
-        tmp_dl=tempfile.mkdtemp(prefix="compile_dl_")
+        zip_name=f"compile_cache/{tag}.zip"
+        print(f"[compile] Downloading: {_COMPILE_CACHE_REPO}/{zip_name}")
+
+        from huggingface_hub import hf_hub_download
+        import zipfile
         try:
-            snapshot_download(
+            zip_path=hf_hub_download(
                 repo_id=_COMPILE_CACHE_REPO,
+                filename=zip_name,
                 repo_type="model",
-                allow_patterns=f"{cache_path}/*",
-                local_dir=tmp_dl,
             )
-            # Files are at tmp_dl/compile_cache/{tag}/...
-            src=os.path.join(tmp_dl,cache_path)
-            if os.path.isdir(src):
-                n=0
-                for item in os.listdir(src):
-                    s=os.path.join(src,item)
-                    d=os.path.join(COMPILE_CACHE_DIR,item)
-                    if os.path.isdir(s):
-                        if os.path.exists(d): shutil.rmtree(d)
-                        shutil.copytree(s,d)
-                    else:
-                        shutil.copy2(s,d)
-                    n+=1
-                total=sum(1 for _,_,fs in os.walk(COMPILE_CACHE_DIR) for f in fs)
-                print(f"[compile] Downloaded {total} cached kernel files for {gpu}")
-            else:
-                print(f"[compile] No cache found for tag: {tag}")
-        finally:
-            shutil.rmtree(tmp_dl,ignore_errors=True)
+        except Exception as e:
+            print(f"[compile] No pre-built cache for {tag}: {e}")
+            return
+
+        print(f"[compile] Extracting to {COMPILE_CACHE_DIR}...")
+        with zipfile.ZipFile(zip_path,"r") as zf:
+            zf.extractall(COMPILE_CACHE_DIR)
+
+        total=sum(1 for _,_,fs in os.walk(COMPILE_CACHE_DIR) for f in fs)
+        print(f"[compile] Loaded {total} cached kernel files for {gpu}")
     except Exception as e:
         print(f"[compile] Cache download failed (non-fatal): {e}")
 
@@ -257,6 +256,15 @@ def load_pipeline(variant="Q4_K_M"):
                 "gguf package not installed! Run: pip install 'gguf>=0.10.0' and restart runtime"
             )
 
+        # bitsandbytes needed for 4-bit text encoder on L4
+        try:
+            import bitsandbytes
+        except ImportError:
+            log("Installing bitsandbytes for 4-bit quantization...")
+            import subprocess
+            subprocess.check_call([sys.executable,"-m","pip","install",
+                "bitsandbytes","-q","--break-system-packages"])
+
         # ── 1. TF32 + cuDNN: free speed on Ampere+ ──
         try:
             torch.backends.cuda.matmul.allow_tf32=True
@@ -291,7 +299,38 @@ def load_pipeline(variant="Q4_K_M"):
             quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
             torch_dtype=torch.bfloat16,config="Qwen/Qwen-Image-Edit-2511",subfolder="transformer")
         log("GGUF loaded, building pipeline...")
-        p=QwenImageEditPlusPipeline.from_pretrained("Qwen/Qwen-Image-Edit-2511",transformer=tr,torch_dtype=torch.bfloat16)
+
+        # ── Detect GPU tier and load text encoder accordingly ──
+        # A100 (80GB): bf16 text encoder, full GPU, compile reduce-overhead
+        # L4 (24GB): 4-bit text encoder, full GPU, compile default
+        # T4 (16GB): bf16 text encoder, hybrid offload, no compile
+        _use_4bit_text_encoder=False
+        _text_encoder=None
+        vram_total=0
+        if torch.cuda.is_available():
+            vram_total=torch.cuda.get_device_properties(0).total_memory/1e9
+            if 16<vram_total<40:
+                # L4 tier: 4-bit text encoder to fit everything on GPU
+                try:
+                    from transformers import Qwen2_5_VLForConditionalGeneration,BitsAndBytesConfig
+                    log(f"L4 detected ({vram_total:.0f}GB) — loading 4-bit text encoder...")
+                    _text_encoder=Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                        "Qwen/Qwen-Image-Edit-2511",subfolder="text_encoder",
+                        quantization_config=BitsAndBytesConfig(
+                            load_in_4bit=True,bnb_4bit_compute_dtype=torch.bfloat16,
+                            bnb_4bit_quant_type="nf4"),
+                        torch_dtype=torch.bfloat16)
+                    _use_4bit_text_encoder=True
+                    log(f"4-bit text encoder loaded — {torch.cuda.memory_allocated()/1e9:.1f}GB VRAM","success")
+                except Exception as e:
+                    log(f"4-bit text encoder failed ({e}), using bf16","warn")
+
+        if _text_encoder:
+            p=QwenImageEditPlusPipeline.from_pretrained("Qwen/Qwen-Image-Edit-2511",
+                transformer=tr,text_encoder=_text_encoder,torch_dtype=torch.bfloat16)
+        else:
+            p=QwenImageEditPlusPipeline.from_pretrained("Qwen/Qwen-Image-Edit-2511",
+                transformer=tr,torch_dtype=torch.bfloat16)
         p.scheduler=FlowMatchEulerDiscreteScheduler.from_config(sc)
 
         # Load LoRAs first (before offload decisions)
@@ -371,16 +410,20 @@ def load_pipeline(variant="Q4_K_M"):
         # DISABLED: Qwen uses custom dual-output attention processor.
         # AttnProcessor2_0 returns single tensor, breaks unpacking.
 
-        # ── torch.compile (reduce-overhead) ──
-        # 4x faster denoising after compilation. Compiled graphs are cached
-        # to .compile_cache/ so restarts skip the ~13min compile step.
+        # ── torch.compile ──
+        # A100 (80GB): reduce-overhead — 4x faster, CUDA graphs fit
+        # L4 (24GB): default — 2x faster, no CUDA graphs (too tight).
+        #   Pre-built cache from HF avoids the compilation step that eats
+        #   extra VRAM. If warmup OOMs, restore uncompiled (still 21s).
+        # T4/offload: skip — compile incompatible with offload hooks
         _original_transformer=p.transformer
         _compiled_ok=False
         if hasattr(torch,'compile') and (_used_full_gpu or _used_hybrid):
+            _compile_mode="default" if _use_4bit_text_encoder else "reduce-overhead"
             try:
-                log("Applying torch.compile (reduce-overhead)...")
-                p.transformer=torch.compile(p.transformer,mode="reduce-overhead",fullgraph=False)
-                log("torch.compile wrapper applied — will compile on first run","success")
+                log(f"Applying torch.compile (mode={_compile_mode})...")
+                p.transformer=torch.compile(p.transformer,mode=_compile_mode,fullgraph=False)
+                log(f"torch.compile wrapper applied — will compile on first run","success")
                 _compiled_ok=True
             except Exception as e:
                 log(f"torch.compile failed: {e}","warn")
@@ -439,11 +482,12 @@ def load_pipeline(variant="Q4_K_M"):
         if _used_full_gpu: _opts.append("full-GPU")
         elif _used_hybrid: _opts.append("hybrid-GPU(transformer+VAE)")
         else: _opts.append("CPU-offload")
+        if _use_4bit_text_encoder: _opts.append("4bit-text-encoder")
         _opts.append("TF32")
         _opts.append("VAE-cache")
         _opts.append("prompt-cache")
         _opts.append("CUDA-gen")
-        if _compiled_ok: _opts.append("torch.compile(reduce-overhead)")
+        if _compiled_ok: _opts.append(f"torch.compile({_compile_mode})")
         log(f"Active optimizations: {', '.join(_opts)}","success")
 
     except Exception as e:
