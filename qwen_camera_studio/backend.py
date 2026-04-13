@@ -26,10 +26,14 @@ print(f"[backend] compile cache={COMPILE_CACHE_DIR}")
 # ── Pre-built compile cache from HuggingFace ──────
 _COMPILE_CACHE_REPO="TylerF/MissingLinkModelCache"
 def _download_compile_cache():
-    """Download pre-compiled inductor kernels (as zip) for this GPU."""
+    """Download pre-compiled inductor kernels (as zip) for this GPU. A100 only."""
     try:
         import torch
         if not torch.cuda.is_available(): return
+        vram=torch.cuda.get_device_properties(0).total_memory/1e9
+        if vram<40:
+            print(f"[compile] Skipping cache download ({vram:.0f}GB VRAM — compile is A100-only)")
+            return
         gpu=torch.cuda.get_device_name(0).replace(" ","-").replace("/","-")
         cap=torch.cuda.get_device_capability(0)
         tag=f"{gpu}_sm{cap[0]}{cap[1]}_torch{torch.__version__.split('+')[0]}_cu{torch.version.cuda.replace('.','')}"
@@ -411,15 +415,15 @@ def load_pipeline(variant="Q4_K_M"):
         # AttnProcessor2_0 returns single tensor, breaks unpacking.
 
         # ── torch.compile ──
-        # A100 (80GB): reduce-overhead — 4x faster, CUDA graphs fit
-        # L4 (24GB): default — 2x faster, no CUDA graphs (too tight).
-        #   Pre-built cache from HF avoids the compilation step that eats
-        #   extra VRAM. If warmup OOMs, restore uncompiled (still 21s).
-        # T4/offload: skip — compile incompatible with offload hooks
+        # A100 (80GB): reduce-overhead — 4x faster, plenty of VRAM
+        # L4 (24GB): SKIP — 4-bit text encoder + full GPU gives 21s (vs 47s
+        #   offload). Compile caches are graph-specific and don't transfer
+        #   between test cells and the actual backend pipeline.
+        # T4/offload: SKIP — incompatible with offload hooks
         _original_transformer=p.transformer
         _compiled_ok=False
-        if hasattr(torch,'compile') and (_used_full_gpu or _used_hybrid):
-            _compile_mode="default" if _use_4bit_text_encoder else "reduce-overhead"
+        if hasattr(torch,'compile') and _used_full_gpu and not _use_4bit_text_encoder:
+            _compile_mode="reduce-overhead"
             try:
                 log(f"Applying torch.compile (mode={_compile_mode})...")
                 p.transformer=torch.compile(p.transformer,mode=_compile_mode,fullgraph=False)
@@ -428,6 +432,8 @@ def load_pipeline(variant="Q4_K_M"):
             except Exception as e:
                 log(f"torch.compile failed: {e}","warn")
                 p.transformer=_original_transformer
+        elif _use_4bit_text_encoder:
+            log("4-bit text encoder mode — torch.compile skipped (VRAM headroom needed for generation)")
         elif hasattr(torch,'compile'):
             log("torch.compile skipped (CPU offload mode)")
 
