@@ -50,6 +50,7 @@ function _gatherState(){
         lastOutputFilename,
         promptInput:$('promptInput')?$('promptInput').value:'',
         customPrompt:$('customPrompt')?$('customPrompt').value:'',
+        negPrompt:$('negPrompt')?$('negPrompt').value:'',
         seed:$('rngSeed')?$('rngSeed').value:'42',
         cfg:$('rngCfg')?$('rngCfg').value:'1',
         steps:$('rngSteps')?$('rngSteps').value:'4',
@@ -180,6 +181,7 @@ function _applyState(s){
 
         if(s.promptInput && $('promptInput')) $('promptInput').value=s.promptInput;
         if(s.customPrompt && $('customPrompt')) $('customPrompt').value=s.customPrompt;
+        if(s.negPrompt && $('negPrompt')) $('negPrompt').value=s.negPrompt;
         if(s.seed){ $('rngSeed').value=s.seed; $('vSeed').textContent=s.seed; }
         if(s.cfg){ $('rngCfg').value=s.cfg; $('vCfg').textContent=s.cfg; }
         if(s.steps){ $('rngSteps').value=s.steps; $('vSteps').textContent=s.steps; }
@@ -515,6 +517,7 @@ async function doGenerateCamera(){
         mode:'camera',
         image_ids:[imageId],
         prompt:$('promptInput').value,
+        negative_prompt:$('negPrompt')?$('negPrompt').value.trim():'',
         seed:parseInt($('rngSeed').value),
         randomize_seed:$('chkRand').checked,
         guidance_scale:parseFloat($('rngCfg').value),
@@ -535,6 +538,7 @@ async function doGenerateEdit(){
         mode:'edit',
         image_ids:filled.map(s=>s.id),
         prompt:prompt,
+        negative_prompt:$('negPrompt')?$('negPrompt').value.trim():'',
         seed:parseInt($('rngSeed').value),
         randomize_seed:$('chkRand').checked,
         guidance_scale:parseFloat($('rngCfg').value),

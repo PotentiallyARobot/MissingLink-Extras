@@ -128,6 +128,9 @@
     <!-- ═══ SHARED SETTINGS ═══ -->
     <div class="sec">
         <div class="sec-label"><span class="icon">⚙️</span> SETTINGS</div>
+        <div class="field"><label>Negative Prompt</label>
+            <textarea class="custom-prompt" id="negPrompt" placeholder="What to avoid...&#10;e.g. &quot;blurry, distorted, low quality&quot;" rows="2" style="font-size:11px"></textarea>
+        </div>
         <div class="dim-row">
             <div class="dim-field"><label>Width</label><input type="number" id="inpWidth" min="8" max="2048" step="8" placeholder="auto"></div>
             <span class="dim-x">×</span>
@@ -136,7 +139,7 @@
         </div>
         <div class="slider-row"><span class="sl">Seed</span><input type="range" id="rngSeed" min="0" max="2147483647" value="42" oninput="$('vSeed').textContent=this.value"><span class="sv" id="vSeed">42</span></div>
         <label class="check-row"><input type="checkbox" id="chkRand" checked> Randomize Seed</label>
-        <div class="slider-row"><span class="sl">CFG</span><input type="range" id="rngCfg" min="1" max="10" value="1" step="0.5" oninput="$('vCfg').textContent=this.value"><span class="sv" id="vCfg">1</span></div>
+        <div class="slider-row"><span class="sl">CFG</span><input type="range" id="rngCfg" min="1" max="10" value="2" step="0.5" oninput="$('vCfg').textContent=this.value"><span class="sv" id="vCfg">2</span></div>
         <div class="slider-row"><span class="sl">Steps</span><input type="range" id="rngSteps" min="1" max="20" value="4" oninput="$('vSteps').textContent=this.value"><span class="sv" id="vSteps">4</span></div>
         <div class="slider-row camera-only"><span class="sl">LoRA</span><input type="range" id="rngLora" min="0" max="1.5" value="0.9" step="0.05" oninput="$('vLora').textContent=this.value"><span class="sv" id="vLora">0.9</span></div>
     </div>
