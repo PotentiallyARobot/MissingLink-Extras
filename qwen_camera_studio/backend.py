@@ -1,5 +1,10 @@
 # backend.py — MissingLink Qwen Studio (hardened)
 import os,sys,math,gc,io,time,base64,uuid,json,traceback,threading,hashlib
+import warnings
+warnings.filterwarnings("ignore",message=".*Flax classes are deprecated.*")
+warnings.filterwarnings("ignore",message=".*true_cfg_scale is passed.*")
+warnings.filterwarnings("ignore",message=".*guidance_scale is passed.*")
+warnings.filterwarnings("ignore",message=".*Already found a.*peft_config.*")
 IN_COLAB="google.colab" in sys.modules
 if IN_COLAB:
     from google.colab import output as colab_output
@@ -340,12 +345,6 @@ def load_pipeline(variant="Q4_K_M"):
             log("   Without it, compile cache cannot be downloaded and startup will be much slower.","error")
             log("   Get your token at https://missinglink.build","error")
 
-        # Suppress Flax deprecation warnings from diffusers
-        import warnings
-        warnings.filterwarnings("ignore",message=".*Flax classes are deprecated.*")
-        warnings.filterwarnings("ignore",message=".*true_cfg_scale is passed.*")
-        warnings.filterwarnings("ignore",message=".*guidance_scale is passed.*")
-
         # Download pre-built compile cache for this GPU (if available)
         _download_compile_cache()
 
@@ -578,7 +577,10 @@ def load_pipeline(variant="Q4_K_M"):
                 _qem.VAE_IMAGE_SIZE=_warmup_sz*_warmup_sz
                 dummy_img=Image.new("RGB",(_warmup_sz,_warmup_sz),(128,128,128))
                 with torch.inference_mode():
-                    _=p(image=dummy_img,prompt="warmup",
+                    # Must match real generation params: true_cfg_scale + negative_prompt
+                    # triggers a different code path that also needs compilation
+                    _=p(image=dummy_img,prompt="<sks> front view eye-level shot",
+                        negative_prompt=" ",true_cfg_scale=4.0,
                         generator=torch.Generator(device=_warmup_dev).manual_seed(0),
                         num_inference_steps=4,guidance_scale=1.0,
                         height=_warmup_sz,width=_warmup_sz)
