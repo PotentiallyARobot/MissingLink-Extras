@@ -536,8 +536,9 @@ def load_pipeline(variant="Q4_K_M"):
         elif hasattr(torch,'compile'):
             log("torch.compile skipped (CPU offload mode)")
 
-        global _qem; _qem=_qem_ref; pipeline=p
-        log("Pipeline ready!","success")
+        global _qem; _qem=_qem_ref
+        # NOTE: pipeline is NOT set yet — warmup must finish before requests can run
+        log("Pipeline ready — running warmup...")
 
         # ── Warmup ──
         # Regional compile + mega-cache: ~27s warmup (cache pre-populated)
@@ -624,6 +625,8 @@ def load_pipeline(variant="Q4_K_M"):
                 log(f"Warmup failed (non-fatal): {e}","warn")
 
         # Log final optimization summary
+        pipeline=p  # NOW requests can flow — warmup is done
+        log("Pipeline ready!","success")
         _opts=[]
         if _used_full_gpu: _opts.append("full-GPU")
         elif _used_hybrid: _opts.append("hybrid-GPU(transformer+VAE)")
@@ -1184,3 +1187,14 @@ def vae_cache_clear():
     except Exception as e:
         log(f"Cache clear error: {e}","warn")
     return jsonify({"status":"ok","cleared":cleared})
+
+# ── Auto-load pipeline on import ──────────────────────
+# Pipeline loads and warms up before the Flask server starts,
+# so the UI is immediately ready when it opens.
+if IN_COLAB:
+    log("Auto-loading pipeline...")
+    load_pipeline()
+    if pipeline:
+        log("Pipeline ready — launching UI","success")
+    else:
+        log("Pipeline failed to load — UI will show error","error")
