@@ -1,10 +1,5 @@
 # backend.py — MissingLink Qwen Studio (hardened)
 import os,sys,math,gc,io,time,base64,uuid,json,traceback,threading,hashlib
-import warnings
-warnings.filterwarnings("ignore",message=".*Flax classes are deprecated.*")
-warnings.filterwarnings("ignore",message=".*true_cfg_scale is passed.*")
-warnings.filterwarnings("ignore",message=".*guidance_scale is passed.*")
-warnings.filterwarnings("ignore",message=".*Already found a.*peft_config.*")
 IN_COLAB="google.colab" in sys.modules
 if IN_COLAB:
     from google.colab import output as colab_output
@@ -333,18 +328,6 @@ def load_pipeline(variant="Q4_K_M"):
     if pipeline: return
     _loading=True; _error=None
     try:
-        # ── Check for MISSING_LINK_TOKEN ──
-        _ml_token=os.environ.get("MISSING_LINK_TOKEN") or os.environ.get("ML_TOKEN")
-        if not _ml_token and IN_COLAB:
-            try:
-                from google.colab import userdata
-                _ml_token=userdata.get("MISSING_LINK_TOKEN")
-            except: pass
-        if not _ml_token:
-            log("⚠️  MISSING_LINK_TOKEN not found! Set it in Colab Secrets (🔑 icon in sidebar).","error")
-            log("   Without it, compile cache cannot be downloaded and startup will be much slower.","error")
-            log("   Get your token at https://missinglink.build","error")
-
         # Download pre-built compile cache for this GPU (if available)
         _download_compile_cache()
 
@@ -501,15 +484,10 @@ def load_pipeline(variant="Q4_K_M"):
 
         p.set_progress_bar_config(disable=None)
 
-        # ── 5. VAE tiling/slicing ──
-        # Enables chunked VAE decode so higher resolutions don't OOM.
-        if hasattr(p,"vae") and p.vae is not None:
-            if hasattr(p.vae,"enable_tiling"):
-                p.vae.enable_tiling()
-                log("VAE tiling enabled","success")
-            if hasattr(p.vae,"enable_slicing"):
-                p.vae.enable_slicing()
-                log("VAE slicing enabled","success")
+        # ── 5. VAE tiling/slicing/channels_last ──
+        # NOTE: disabled for Qwen pipeline — enable_vae_tiling() changes
+        # internal return structures causing "not enough values to unpack"
+        # during decode. Safe to re-enable if future diffusers versions fix this.
 
         # ── SDPA attention ──
         # DISABLED: Qwen uses custom dual-output attention processor.
@@ -582,10 +560,7 @@ def load_pipeline(variant="Q4_K_M"):
                 _qem.VAE_IMAGE_SIZE=_warmup_sz*_warmup_sz
                 dummy_img=Image.new("RGB",(_warmup_sz,_warmup_sz),(128,128,128))
                 with torch.inference_mode():
-                    # Must match real generation params: true_cfg_scale + negative_prompt
-                    # triggers a different code path that also needs compilation
-                    _=p(image=dummy_img,prompt="<sks> front view eye-level shot",
-                        negative_prompt=" ",true_cfg_scale=4.0,
+                    _=p(image=dummy_img,prompt="warmup",
                         generator=torch.Generator(device=_warmup_dev).manual_seed(0),
                         num_inference_steps=4,guidance_scale=1.0,
                         height=_warmup_sz,width=_warmup_sz)
@@ -658,8 +633,6 @@ def load_pipeline(variant="Q4_K_M"):
         else: _opts.append("CPU-offload")
         if _use_4bit_text_encoder: _opts.append("4bit-text-encoder")
         _opts.append("TF32")
-        _opts.append("VAE-tiling")
-        _opts.append("VAE-slicing")
         _opts.append("VAE-cache")
         _opts.append("prompt-cache")
         _opts.append("CUDA-gen")
@@ -943,7 +916,6 @@ def _run_generate(job_id,d):
         cfg=float(d.get("guidance_scale",1.0))
         steps=int(d.get("inference_steps",4))
         lora_scale=float(d.get("lora_scale",0.9))
-        neg_prompt=d.get("negative_prompt"," ").strip() or " "
 
         imgs=_load_images(image_ids)
         if not imgs:
@@ -970,43 +942,36 @@ def _run_generate(job_id,d):
         _set_lora_scales({"lightning":1.0,"angles":angles_w})
 
         # ── Text encoder prompt caching ───────────────
-        # The text encoder is slow. Cache its output so repeated prompts
-        # skip the full forward pass entirely.
-        # IMPORTANT: when true_cfg_scale > 1, the pipeline calls encode_prompt
-        # twice (positive + negative). A blanket cache would return the positive
-        # result for the negative call too, zeroing out the CFG effect.
-        # So we only cache when cfg <= 1 (no CFG = single encode_prompt call).
+        # The text encoder (T5) is slow. Cache its output so repeated
+        # prompts skip the full forward pass entirely.
         _orig_encode_prompt=None
-        _use_prompt_cache = (cfg <= 1.0)
-
-        if _use_prompt_cache:
-            _prompt_key=(prompt,neg_prompt)
-            if hasattr(pipeline,'encode_prompt') and _prompt_key in _prompt_cache:
-                cached_enc=_prompt_cache[_prompt_key]
-                _orig_encode_prompt=pipeline.encode_prompt
-                def _cached_encode_prompt(*args,**kwargs):
-                    log("Text encoder skipped (cached)")
-                    return cached_enc
-                pipeline.encode_prompt=_cached_encode_prompt
-            elif hasattr(pipeline,'encode_prompt'):
-                _orig_encode_prompt=pipeline.encode_prompt
-                def _capturing_encode_prompt(*args,**kwargs):
-                    result=_orig_encode_prompt(*args,**kwargs)
-                    try:
-                        if isinstance(result,tuple):
-                            cached=tuple(r.detach() if hasattr(r,'detach') else r for r in result)
-                        else:
-                            cached=result.detach() if hasattr(result,'detach') else result
-                        if len(_prompt_cache)>=_MAX_PROMPT_CACHE:
-                            _prompt_cache.pop(next(iter(_prompt_cache)))
-                        _prompt_cache[_prompt_key]=cached
-                        log(f"Text encoder output cached (prompt len={len(prompt)})")
-                    except Exception as e:
-                        log(f"Prompt cache capture failed: {e}","warn")
-                    return result
-                pipeline.encode_prompt=_capturing_encode_prompt
-        else:
-            log(f"Prompt cache skipped (true_cfg_scale={cfg} > 1, needs separate pos/neg encoding)")
+        _neg_prompt=" "  # always the same
+        _prompt_key=(prompt,_neg_prompt)
+        if hasattr(pipeline,'encode_prompt') and _prompt_key in _prompt_cache:
+            cached_enc=_prompt_cache[_prompt_key]
+            _orig_encode_prompt=pipeline.encode_prompt
+            def _cached_encode_prompt(*args,**kwargs):
+                log("Text encoder skipped (cached)")
+                return cached_enc
+            pipeline.encode_prompt=_cached_encode_prompt
+        elif hasattr(pipeline,'encode_prompt'):
+            _orig_encode_prompt=pipeline.encode_prompt
+            def _capturing_encode_prompt(*args,**kwargs):
+                result=_orig_encode_prompt(*args,**kwargs)
+                try:
+                    # Cache the result (detach tensors to avoid graph retention)
+                    if isinstance(result,tuple):
+                        cached=tuple(r.detach() if hasattr(r,'detach') else r for r in result)
+                    else:
+                        cached=result.detach() if hasattr(result,'detach') else result
+                    if len(_prompt_cache)>=_MAX_PROMPT_CACHE:
+                        _prompt_cache.pop(next(iter(_prompt_cache)))
+                    _prompt_cache[_prompt_key]=cached
+                    log(f"Text encoder output cached (prompt len={len(prompt)})")
+                except Exception as e:
+                    log(f"Prompt cache capture failed: {e}","warn")
+                return result
+            pipeline.encode_prompt=_capturing_encode_prompt
 
         # ── VAE encode caching ────────────────────
         # Only cache in camera mode (single image). In edit mode the pipeline
@@ -1072,7 +1037,7 @@ def _run_generate(job_id,d):
             with torch.inference_mode():
                 out=pipeline(image=img_input,prompt=prompt,generator=gen,
                     num_inference_steps=steps,guidance_scale=1.0,true_cfg_scale=cfg,
-                    negative_prompt=neg_prompt,height=oh,width=ow,callback_on_step_end=_prog_cb)
+                    negative_prompt=" ",height=oh,width=ow,callback_on_step_end=_prog_cb)
         finally:
             # Always restore monkey-patched methods
             if _orig_vae_encode is not None:
