@@ -328,6 +328,24 @@ def load_pipeline(variant="Q4_K_M"):
     if pipeline: return
     _loading=True; _error=None
     try:
+        # ── Check for MISSING_LINK_TOKEN ──
+        _ml_token=os.environ.get("MISSING_LINK_TOKEN") or os.environ.get("ML_TOKEN")
+        if not _ml_token and IN_COLAB:
+            try:
+                from google.colab import userdata
+                _ml_token=userdata.get("MISSING_LINK_TOKEN")
+            except: pass
+        if not _ml_token:
+            log("⚠️  MISSING_LINK_TOKEN not found! Set it in Colab Secrets (🔑 icon in sidebar).","error")
+            log("   Without it, compile cache cannot be downloaded and startup will be much slower.","error")
+            log("   Get your token at https://missinglink.build","error")
+
+        # Suppress Flax deprecation warnings from diffusers
+        import warnings
+        warnings.filterwarnings("ignore",message=".*Flax classes are deprecated.*")
+        warnings.filterwarnings("ignore",message=".*true_cfg_scale is passed.*")
+        warnings.filterwarnings("ignore",message=".*guidance_scale is passed.*")
+
         # Download pre-built compile cache for this GPU (if available)
         _download_compile_cache()
 
