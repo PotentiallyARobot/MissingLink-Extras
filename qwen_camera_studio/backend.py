@@ -31,12 +31,14 @@ _CACHE_TOKEN_URL="https://missinglink.build/api/cache-token"
 def _get_cache_token():
     """Get HF token for compile cache access. Tries API endpoint first, falls back to env vars."""
     # 1. Try fetching from API using user's ML token
-    _ml_token=os.environ.get("ML_TOKEN")
+    _ml_token=os.environ.get("MISSING_LINK_TOKEN") or os.environ.get("ML_TOKEN")
     if not _ml_token and IN_COLAB:
         try:
             from google.colab import userdata
-            _ml_token=userdata.get("ML_TOKEN")
-        except: pass
+            _ml_token=userdata.get("MISSING_LINK_TOKEN")
+        except:
+            try: _ml_token=userdata.get("ML_TOKEN")
+            except: pass
     if _ml_token:
         try:
             import urllib.request,json as _j
