@@ -15,67 +15,144 @@ VAE_CACHE_DIR=os.path.join(_D,".vae_cache")
 for d in [UPLOADS,OUTPUTS,STATIC,STATE_DIR,VAE_CACHE_DIR]: os.makedirs(d,exist_ok=True)
 
 # ── torch.compile cache: must be set BEFORE torch is imported ──
-# Use /tmp/torchinductor_root — matches where caches are built and uploaded from
 COMPILE_CACHE_DIR="/tmp/torchinductor_root"
 os.makedirs(COMPILE_CACHE_DIR,exist_ok=True)
 os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"]="1"
+os.environ["TORCHINDUCTOR_AUTOGRAD_CACHE"]="1"
 os.environ["TORCHINDUCTOR_CACHE_DIR"]=COMPILE_CACHE_DIR
+os.environ["PYTORCH_CUDA_ALLOC_CONF"]="expandable_segments:True"
 print(f"[backend] project={PROJECT_DIR}")
 print(f"[backend] compile cache={COMPILE_CACHE_DIR}")
 
 # ── Pre-built compile cache from HuggingFace ──────
 _COMPILE_CACHE_REPO="TylerF/MissingLinkModelCache"
+_CACHE_TOKEN_URL="https://missinglink.build/api/cache-token"
+
+def _get_cache_token():
+    """Get HF token for compile cache access. Tries API endpoint first, falls back to env vars."""
+    # 1. Try fetching from API using user's ML token
+    _ml_token=os.environ.get("ML_TOKEN")
+    if not _ml_token and IN_COLAB:
+        try:
+            from google.colab import userdata
+            _ml_token=userdata.get("ML_TOKEN")
+        except: pass
+    if _ml_token:
+        try:
+            import urllib.request,json as _j
+            req=urllib.request.Request(_CACHE_TOKEN_URL,headers={"x-api-key":_ml_token})
+            with urllib.request.urlopen(req,timeout=10) as resp:
+                data=_j.loads(resp.read())
+                if data.get("ok") and data.get("hf_token"):
+                    return data["hf_token"]
+        except Exception as e:
+            print(f"[compile] Cache token API failed: {e}")
+
+    # 2. Fall back to HF_TOKEN env var
+    t=os.environ.get("HF_TOKEN")
+    if t: return t
+    if IN_COLAB:
+        try:
+            from google.colab import userdata
+            return userdata.get("HF_TOKEN")
+        except: pass
+    return None
+
+def _get_gpu_tag():
+    """Get GPU-specific tag for cache lookup."""
+    import torch
+    if not torch.cuda.is_available(): return None
+    gpu=torch.cuda.get_device_name(0).replace(" ","-").replace("/","-")
+    cap=torch.cuda.get_device_capability(0)
+    return f"{gpu}_sm{cap[0]}{cap[1]}_torch{torch.__version__.split('+')[0]}_cu{torch.version.cuda.replace('.','')}"
+
+def _inject_torch_key():
+    """Pin torch_key so inductor cache lookups match the compile session."""
+    try:
+        import torch._inductor.codecache as cc
+        import base64 as b64
+        SAVED_KEY=b64.b64decode("1LeYUP9UUZwkIc+iw44562F1M8GQzyicOOnfGjDIF1E=")
+        cc.torch_key=lambda: SAVED_KEY
+        print("[compile] torch_key pinned for cache portability")
+    except Exception as e:
+        print(f"[compile] torch_key injection failed (non-fatal): {e}")
+
+def _enable_inductor_config():
+    """Enable inductor cache configs after torch is imported."""
+    try:
+        import torch._inductor.config as ic
+        ic.fx_graph_cache=True
+        ic.bundle_triton_into_fx_graph_cache=True
+    except Exception as e:
+        print(f"[compile] Inductor config setup failed (non-fatal): {e}")
+
 def _download_compile_cache():
-    """Download pre-compiled inductor kernels (as zip) for this GPU. A100 only."""
+    """Download pre-compiled cache artifacts for this GPU.
+    
+    Downloads two things:
+    1. Inductor cache zip (triton kernels + autotuning configs)
+    2. Mega-cache binary (portable bundled fxgraph + aotautograd + triton)
+    """
     try:
         import torch
         if not torch.cuda.is_available(): return
-        vram=torch.cuda.get_device_properties(0).total_memory/1e9
-        if vram<40:
-            print(f"[compile] Skipping cache download ({vram:.0f}GB VRAM — compile is A100-only)")
-            return
-        gpu=torch.cuda.get_device_name(0).replace(" ","-").replace("/","-")
-        cap=torch.cuda.get_device_capability(0)
-        tag=f"{gpu}_sm{cap[0]}{cap[1]}_torch{torch.__version__.split('+')[0]}_cu{torch.version.cuda.replace('.','')}"
+
+        # Inject torch_key and enable configs first
+        _inject_torch_key()
+        _enable_inductor_config()
+
+        tag=_get_gpu_tag()
+        if not tag: return
 
         # Skip if cache already populated
         existing=sum(1 for _,_,fs in os.walk(COMPILE_CACHE_DIR) for f in fs)
         if existing>100:
-            print(f"[compile] Cache already populated ({existing} files), skipping download")
-            return
+            print(f"[compile] Cache already populated ({existing} files), loading mega-cache only")
+        else:
+            # 1. Download and extract inductor cache zip (triton kernels + autotuning)
+            from huggingface_hub import hf_hub_download
+            import zipfile, shutil
 
-        # Auth for private repo
-        _hf_token=os.environ.get("HF_TOKEN")
-        if not _hf_token and IN_COLAB:
-            try:
-                from google.colab import userdata
-                _hf_token=userdata.get("HF_TOKEN")
-            except: pass
-        if _hf_token:
-            from huggingface_hub import login
-            login(token=_hf_token,add_to_git_credential=False)
+            # Try regional cache first (smaller, faster), fall back to full cache
+            for zip_name in [f"compile_cache/{tag}_regional.zip", f"compile_cache/{tag}.zip"]:
+                try:
+                    print(f"[compile] Downloading: {_COMPILE_CACHE_REPO}/{zip_name}")
+                    zip_path=hf_hub_download(
+                        repo_id=_COMPILE_CACHE_REPO, filename=zip_name,
+                        repo_type="model", token=_get_cache_token())
+                    if os.path.exists(COMPILE_CACHE_DIR):
+                        shutil.rmtree(COMPILE_CACHE_DIR)
+                    os.makedirs(COMPILE_CACHE_DIR, exist_ok=True)
+                    with zipfile.ZipFile(zip_path,"r") as zf:
+                        zf.extractall(COMPILE_CACHE_DIR)
+                    total=sum(1 for _,_,fs in os.walk(COMPILE_CACHE_DIR) for f in fs)
+                    print(f"[compile] Extracted {total} cached files")
+                    break
+                except Exception as e:
+                    print(f"[compile] {zip_name} not found: {e}")
 
-        zip_name=f"compile_cache/{tag}.zip"
-        print(f"[compile] Downloading: {_COMPILE_CACHE_REPO}/{zip_name}")
-
-        from huggingface_hub import hf_hub_download
-        import zipfile
+        # 2. Download and load mega-cache (portable bundled artifacts)
         try:
-            zip_path=hf_hub_download(
-                repo_id=_COMPILE_CACHE_REPO,
-                filename=zip_name,
-                repo_type="model",
-            )
+            from huggingface_hub import hf_hub_download
+            for mc_name in [f"compile_cache/{tag}_megacache_regional.bin",
+                           f"compile_cache/{tag}_megacache.bin"]:
+                try:
+                    print(f"[compile] Downloading mega-cache: {mc_name}")
+                    mc_path=hf_hub_download(
+                        repo_id=_COMPILE_CACHE_REPO, filename=mc_name,
+                        repo_type="model", token=_get_cache_token())
+                    with open(mc_path,"rb") as f:
+                        artifact_bytes=f.read()
+                    print(f"[compile] Loading {len(artifact_bytes)/1e6:.0f}MB mega-cache...")
+                    torch.compiler.load_cache_artifacts(artifact_bytes)
+                    del artifact_bytes
+                    print("[compile] Mega-cache loaded successfully")
+                    break
+                except Exception as e:
+                    print(f"[compile] {mc_name} not found: {e}")
         except Exception as e:
-            print(f"[compile] No pre-built cache for {tag}: {e}")
-            return
+            print(f"[compile] Mega-cache load failed (non-fatal): {e}")
 
-        print(f"[compile] Extracting to {COMPILE_CACHE_DIR}...")
-        with zipfile.ZipFile(zip_path,"r") as zf:
-            zf.extractall(COMPILE_CACHE_DIR)
-
-        total=sum(1 for _,_,fs in os.walk(COMPILE_CACHE_DIR) for f in fs)
-        print(f"[compile] Loaded {total} cached kernel files for {gpu}")
     except Exception as e:
         print(f"[compile] Cache download failed (non-fatal): {e}")
 
@@ -415,64 +492,125 @@ def load_pipeline(variant="Q4_K_M"):
         # AttnProcessor2_0 returns single tensor, breaks unpacking.
 
         # ── torch.compile ──
-        # A100 (80GB): reduce-overhead — 4x faster, plenty of VRAM
-        # L4 (24GB): SKIP — 4-bit text encoder + full GPU gives 21s (vs 47s
-        #   offload). Compile caches are graph-specific and don't transfer
-        #   between test cells and the actual backend pipeline.
-        # T4/offload: SKIP — incompatible with offload hooks
+        # A100 (80GB): reduce-overhead on full transformer — 4x faster
+        # L4 (24GB): regional compilation (per-block) — 2x faster, portable cache
+        # T4/offload: skip — incompatible with offload hooks
         _original_transformer=p.transformer
         _compiled_ok=False
-        if hasattr(torch,'compile') and _used_full_gpu and not _use_4bit_text_encoder:
-            _compile_mode="reduce-overhead"
-            try:
-                log(f"Applying torch.compile (mode={_compile_mode})...")
-                p.transformer=torch.compile(p.transformer,mode=_compile_mode,fullgraph=False)
-                log(f"torch.compile wrapper applied — will compile on first run","success")
-                _compiled_ok=True
-            except Exception as e:
-                log(f"torch.compile failed: {e}","warn")
-                p.transformer=_original_transformer
-        elif _use_4bit_text_encoder:
-            log("4-bit text encoder mode — torch.compile skipped (VRAM headroom needed for generation)")
+        _compile_mode=None
+        _regional_compile=False
+
+        if hasattr(torch,'compile') and _used_full_gpu:
+            if _use_4bit_text_encoder:
+                # L4 path: regional compilation — compile individual transformer blocks
+                # Much faster first-run (52s vs 674s) and cache is portable via mega-cache
+                _compile_mode="default"
+                try:
+                    log(f"Applying regional torch.compile (mode={_compile_mode}) to {len(p.transformer.transformer_blocks)} blocks...")
+                    torch._dynamo.reset()
+                    for i,block in enumerate(p.transformer.transformer_blocks):
+                        p.transformer.transformer_blocks[i]=torch.compile(block,mode=_compile_mode,fullgraph=False)
+                    log(f"Regional torch.compile applied to {len(p.transformer.transformer_blocks)} blocks","success")
+                    _compiled_ok=True
+                    _regional_compile=True
+                except Exception as e:
+                    log(f"Regional torch.compile failed: {e}","warn")
+                    # Restore original blocks
+                    try:
+                        for i,block in enumerate(_original_transformer.transformer_blocks):
+                            p.transformer.transformer_blocks[i]=block
+                    except: pass
+            else:
+                # A100 path: full transformer compile with reduce-overhead
+                _compile_mode="reduce-overhead"
+                try:
+                    log(f"Applying torch.compile (mode={_compile_mode})...")
+                    p.transformer=torch.compile(p.transformer,mode=_compile_mode,fullgraph=False)
+                    log(f"torch.compile wrapper applied","success")
+                    _compiled_ok=True
+                except Exception as e:
+                    log(f"torch.compile failed: {e}","warn")
+                    p.transformer=_original_transformer
         elif hasattr(torch,'compile'):
             log("torch.compile skipped (CPU offload mode)")
 
         global _qem; _qem=_qem_ref; pipeline=p
         log("Pipeline ready!","success")
 
-        # ── Warmup run: triggers compilation + primes CUDA kernels ──
-        # If compiled, first run compiles inductor graphs (~13min first time,
-        # seconds on restart with cache hit). If warmup fails, restore
-        # uncompiled transformer so pipeline still works.
+        # ── Warmup ──
+        # Regional compile + mega-cache: ~27s warmup (cache pre-populated)
+        # Regional compile, no cache: ~52s warmup
+        # A100 full compile: uses CUDA graphs warmup
+        # No compile: just prime CUDA kernels
         try:
             _cache_files=sum(1 for _,_,fs in os.walk(COMPILE_CACHE_DIR) for f in fs)
-            if _compiled_ok and _cache_files>100:
-                log(f"Running warmup (compile cache loaded: {_cache_files} files — should be fast)...")
-            elif _compiled_ok:
-                log("Running warmup (NO cache found — first compile takes ~13min)...")
-            else:
-                log("Running warmup pass (priming CUDA kernels)...")
-            _qem.VAE_IMAGE_SIZE=64*64
-            dummy_img=Image.new("RGB",(64,64),(128,128,128))
-            with torch.inference_mode():
-                _warmup_dev="cuda" if (_used_full_gpu or _used_hybrid) else "cpu"
-                _=p(image=dummy_img,prompt="warmup",
-                    generator=torch.Generator(device=_warmup_dev).manual_seed(0),
-                    num_inference_steps=1,guidance_scale=1.0,
-                    height=64,width=64)
-            if torch.cuda.is_available():
+            _warmup_dev="cuda" if (_used_full_gpu or _used_hybrid) else "cpu"
+
+            if _compiled_ok and _regional_compile:
+                # L4 regional compilation path — warmup runs full pipeline
+                # Cache makes this ~27s, uncached ~52s
+                if _cache_files>100:
+                    log(f"Running regional compile warmup (cache: {_cache_files} files — should be ~27s)...")
+                else:
+                    log("Running regional compile warmup (no cache — ~52s first time)...")
+                _warmup_sz=768
+                _qem.VAE_IMAGE_SIZE=_warmup_sz*_warmup_sz
+                dummy_img=Image.new("RGB",(_warmup_sz,_warmup_sz),(128,128,128))
+                with torch.inference_mode():
+                    _=p(image=dummy_img,prompt="warmup",
+                        generator=torch.Generator(device=_warmup_dev).manual_seed(0),
+                        num_inference_steps=4,guidance_scale=1.0,
+                        height=_warmup_sz,width=_warmup_sz)
                 torch.cuda.empty_cache()
-            log("Warmup complete — CUDA kernels primed","success")
+                log("Regional compile warmup complete","success")
+
+            elif _compiled_ok:
+                # A100 path: full compile warmup
+                if _cache_files>100:
+                    log(f"Running warmup (compile cache: {_cache_files} files — should be fast)...")
+                else:
+                    log("Running warmup (NO cache — first compile takes ~13min)...")
+                _qem.VAE_IMAGE_SIZE=64*64
+                dummy_img=Image.new("RGB",(64,64),(128,128,128))
+                with torch.inference_mode():
+                    _=p(image=dummy_img,prompt="warmup",
+                        generator=torch.Generator(device=_warmup_dev).manual_seed(0),
+                        num_inference_steps=1,guidance_scale=1.0,
+                        height=64,width=64)
+                torch.cuda.empty_cache()
+                log("Warmup complete","success")
+
+            else:
+                # No compile — just prime CUDA kernels
+                log("Running warmup pass (priming CUDA kernels)...")
+                _qem.VAE_IMAGE_SIZE=64*64
+                dummy_img=Image.new("RGB",(64,64),(128,128,128))
+                with torch.inference_mode():
+                    _=p(image=dummy_img,prompt="warmup",
+                        generator=torch.Generator(device=_warmup_dev).manual_seed(0),
+                        num_inference_steps=1,guidance_scale=1.0,
+                        height=64,width=64)
+                torch.cuda.empty_cache()
+                log("Warmup complete","success")
         except Exception as e:
             if _compiled_ok:
                 log(f"Compiled warmup failed: {e}","warn")
                 log("Restoring uncompiled transformer — pipeline still works","warn")
-                p.transformer=_original_transformer
+                if _regional_compile:
+                    # Restore original blocks
+                    try:
+                        for i,block in enumerate(_original_transformer.transformer_blocks):
+                            p.transformer.transformer_blocks[i]=block
+                    except: pass
+                else:
+                    p.transformer=_original_transformer
                 pipeline=p
                 _compiled_ok=False
+                torch.cuda.empty_cache(); gc.collect()
                 # Try warmup again without compile
                 try:
                     _qem.VAE_IMAGE_SIZE=64*64
+                    dummy_img=Image.new("RGB",(64,64),(128,128,128))
                     with torch.inference_mode():
                         _=p(image=dummy_img,prompt="warmup",
                             generator=torch.Generator(device=_warmup_dev).manual_seed(0),
@@ -493,7 +631,10 @@ def load_pipeline(variant="Q4_K_M"):
         _opts.append("VAE-cache")
         _opts.append("prompt-cache")
         _opts.append("CUDA-gen")
-        if _compiled_ok: _opts.append(f"torch.compile({_compile_mode})")
+        if _compiled_ok and _regional_compile:
+            _opts.append(f"torch.compile-regional({_compile_mode})")
+        elif _compiled_ok:
+            _opts.append(f"torch.compile({_compile_mode})")
         log(f"Active optimizations: {', '.join(_opts)}","success")
 
     except Exception as e:
