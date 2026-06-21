@@ -50,8 +50,15 @@ class TeeWriter:
         return getattr(self._original, name)
 
 console_lines = collections.deque(maxlen=800)
-sys.stdout = TeeWriter(sys.__stdout__, console_lines)
-sys.stderr = TeeWriter(sys.__stderr__, console_lines)
+# Wrap the LIVE stream (sys.stdout), not the raw boot fd (sys.__stdout__).
+# In Colab/Jupyter the notebook routes cell output through ipykernel's
+# sys.stdout; sys.__stdout__ is the original fd the frontend does NOT display.
+# Wrapping __stdout__ silently swallowed all output. The isinstance guard
+# prevents stacking Tees if backend is imported more than once in a session.
+if not isinstance(sys.stdout, TeeWriter):
+    sys.stdout = TeeWriter(sys.stdout, console_lines)
+if not isinstance(sys.stderr, TeeWriter):
+    sys.stderr = TeeWriter(sys.stderr, console_lines)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -91,10 +98,10 @@ def copy_weights(src, dst, label=""):
             shutil.copy2(str(item), str(target))
             copied += item.stat().st_size
             pct = int(copied / total * 100) if total else 100
-            sys.__stdout__.write(f"\r  {pct}% ({copied / 1e9:.1f} / {total / 1e9:.1f} GB)   ")
-            sys.__stdout__.flush()
-    sys.__stdout__.write("\n")
-    sys.__stdout__.flush()
+            sys.stdout.write(f"\r  {pct}% ({copied / 1e9:.1f} / {total / 1e9:.1f} GB)   ")
+            sys.stdout.flush()
+    sys.stdout.write("\n")
+    sys.stdout.flush()
     print(f"  ✅ Copy complete.")
 
 
