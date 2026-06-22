@@ -489,8 +489,9 @@ function poll(jobId, type, cfg) {
             // ── Job log ──
             if (d.log) {
                 const jl = $('consoleJob');
+                const atBottom = jl.scrollHeight - jl.scrollTop - jl.clientHeight < 40;
                 jl.textContent = d.log.join('\n');
-                jl.scrollTop = jl.scrollHeight;
+                if (atBottom) jl.scrollTop = jl.scrollHeight;
             }
 
             // ── System console ──
@@ -498,22 +499,20 @@ function poll(jobId, type, cfg) {
                 const cr = await fetch('/api/console');
                 const cd = await cr.json();
                 const sc = $('consoleSystem');
-                sc.textContent = cd.lines.join('\n');
-                sc.scrollTop = sc.scrollHeight;
+                const atBottom = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 40;
+                if (!sc.dataset.cleared) {
+                    sc.textContent = cd.lines.join('\n');
+                    if (atBottom) sc.scrollTop = sc.scrollHeight;
+                }
             } catch (e) {}
 
             // ── Done ──
-            if (d.status === 'done') {
+            if (d.status === 'done' || d.status === 'cancelled') {
                 clearInterval(timers[type]);
                 timers[type] = null;
                 delete localStart[type];
 
                 if (type === 'generate') {
-                    $('canvasProgress').classList.remove('active');
-                    $('genBtn3d').disabled = false;
-                    $('genBtn3d').textContent = 'Generate →';
-                    stopHwPolling();
-
                     // Store HW log path for download
                     if (d.hw_log) {
                         lastHwLogPath = d.hw_log;
@@ -530,6 +529,15 @@ function poll(jobId, type, cfg) {
                             selectModel(0);
                         }
                     }
+
+                    // Remove this job from the active list.
+                    if (window._genJobIds) {
+                        window._genJobIds = window._genJobIds.filter(id => id !== jobId);
+                    }
+
+                    // If more jobs are queued/running, advance to the next one;
+                    // otherwise tear down the generate UI.
+                    advanceQueueOrFinish();
                 }
 
                 if (type === 'rmbg') {
@@ -547,6 +555,167 @@ function poll(jobId, type, cfg) {
 // ══════════════════════════════════════════════════════════════
 // GENERATE 3D
 // ══════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════
+// CONSOLE: COPY / CLEAR
+// ══════════════════════════════════════════════════════════════
+
+function _activeConsoleEl() {
+    // Whichever console tab is currently visible.
+    const job = $('consoleJob');
+    if (job && job.style.display !== 'none') return job;
+    return $('consoleSystem');
+}
+
+async function copyConsole() {
+    const el = _activeConsoleEl();
+    const text = el ? el.textContent : '';
+    const btn = $('consoleCopyBtn');
+    try {
+        await navigator.clipboard.writeText(text);
+        if (btn) { const o = btn.textContent; btn.textContent = '✓ Copied'; setTimeout(() => btn.textContent = o, 1200); }
+    } catch (e) {
+        // Fallback for non-secure contexts / older browsers
+        const ta = document.createElement('textarea');
+        ta.value = text; document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); } catch (_) {}
+        document.body.removeChild(ta);
+        if (btn) { const o = btn.textContent; btn.textContent = '✓ Copied'; setTimeout(() => btn.textContent = o, 1200); }
+    }
+}
+
+function clearConsole() {
+    const sys = $('consoleSystem');
+    const job = $('consoleJob');
+    if (sys && sys.style.display !== 'none') {
+        sys.textContent = '';
+        // Stop the poller from immediately re-filling it from /api/console
+        // until new content arrives (cleared flag is reset on next gen).
+        sys.dataset.cleared = '1';
+    }
+    if (job && job.style.display !== 'none') {
+        job.textContent = '';
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// QUEUE + CANCEL
+// ══════════════════════════════════════════════════════════════
+
+let activeGenJobId = null;
+let queueTimer = null;
+
+function startQueuePolling() {
+    if (queueTimer) return;
+    $('queuePanel').style.display = '';
+    queueTimer = setInterval(refreshQueue, 1200);
+    refreshQueue();
+}
+
+function stopQueuePolling() {
+    if (queueTimer) { clearInterval(queueTimer); queueTimer = null; }
+}
+
+async function refreshQueue() {
+    try {
+        const r = await fetch('/api/queue');
+        const q = await r.json();
+        const list = $('queueList');
+        const rows = [];
+
+        if (q.active) {
+            const p = q.active.progress || {};
+            rows.push(`<div class="queue-row active">
+                <span class="q-dot running"></span>
+                <span class="q-name">${escapeHtml(q.active.name)}</span>
+                <span class="q-status">${Math.round(p.pct || 0)}%</span>
+            </div>`);
+        }
+        q.queued.forEach((j, i) => {
+            rows.push(`<div class="queue-row">
+                <span class="q-dot pending"></span>
+                <span class="q-name">${escapeHtml(j.name)}</span>
+                <span class="q-status">#${i + 1} waiting</span>
+                <button class="q-cancel" onclick="cancelJob('${j.job_id}')" title="Remove from queue">✕</button>
+            </div>`);
+        });
+        (q.recent || []).forEach(j => {
+            const icon = j.status === 'cancelled' ? '⏹' : '✓';
+            rows.push(`<div class="queue-row done">
+                <span class="q-dot ${j.status}"></span>
+                <span class="q-name">${escapeHtml(j.name)}</span>
+                <span class="q-status">${icon} ${j.status}</span>
+            </div>`);
+        });
+
+        list.innerHTML = rows.join('') || '<div class="queue-empty">Queue is empty</div>';
+    } catch (e) { /* transient */ }
+}
+
+async function cancelJob(jobId) {
+    try {
+        await fetch('/api/cancel/' + jobId, { method: 'POST' });
+        refreshQueue();
+    } catch (e) { alert('Cancel failed: ' + e.message); }
+}
+
+function cancelActiveGen() {
+    if (!activeGenJobId) return;
+    const btn = $('cancelGenBtn');
+    btn.textContent = '⏹ Cancelling…';
+    btn.disabled = true;
+    cancelJob(activeGenJobId).then(() => {
+        setTimeout(() => { btn.disabled = false; btn.textContent = '⏹ Cancel'; }, 1500);
+    });
+}
+
+function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// Called when a generate job finishes: advance to the next queued/running job,
+// or if none remain, tear down the generate UI.
+function advanceQueueOrFinish() {
+    const remaining = (window._genJobIds || []);
+    if (remaining.length > 0) {
+        // Poll the next still-active job.
+        activeGenJobId = remaining[0];
+        localStart['generate'] = Date.now();
+        poll(activeGenJobId, 'generate', {});
+        return;
+    }
+    // Nothing left — but the worker may still have queued jobs submitted from
+    // elsewhere; check the queue once before tearing down.
+    fetch('/api/queue').then(r => r.json()).then(q => {
+        if (q.active || (q.queued && q.queued.length)) {
+            const next = q.active ? q.active.job_id : q.queued[0].job_id;
+            activeGenJobId = next;
+            if (!window._genJobIds.includes(next)) window._genJobIds.push(next);
+            localStart['generate'] = Date.now();
+            poll(next, 'generate', {});
+        } else {
+            // Truly done.
+            activeGenJobId = null;
+            $('canvasProgress').classList.remove('active');
+            $('genBtn3d').disabled = false;
+            $('genBtn3d').textContent = 'Generate →';
+            $('addQueueBtn').style.display = 'none';
+            $('cancelGenBtn').style.display = 'none';
+            stopHwPolling();
+            stopQueuePolling();
+            $('queuePanel').style.display = 'none';
+        }
+    }).catch(() => {
+        activeGenJobId = null;
+        $('genBtn3d').disabled = false;
+        $('genBtn3d').textContent = 'Generate →';
+        $('addQueueBtn').style.display = 'none';
+        $('cancelGenBtn').style.display = 'none';
+        stopHwPolling();
+        stopQueuePolling();
+    });
+}
 
 async function startGen() {
     if (!files3d.length) return;
@@ -581,24 +750,40 @@ async function startGen() {
         const d = await r.json();
         if (!d.job_id) throw new Error(d.error || 'Failed');
 
+        // Track the most-recently-submitted job and remember all active ones.
+        activeGenJobId = d.job_id;
+        if (!window._genJobIds) window._genJobIds = [];
+        window._genJobIds.push(d.job_id);
+
+        // Clear the file picker so the next "Add to Queue" starts fresh.
+        files3d.length = 0;
+        renderThumbs(files3d, 'thumbs3d', 'browse3d');
+
         btn.textContent = 'Generating…';
+        // Once a job is in flight, the primary button becomes "Add to Queue"
+        // and a Cancel button appears.
+        $('addQueueBtn').style.display = '';
+        $('cancelGenBtn').style.display = '';
 
         // Show progress overlay
         $('canvasEmpty').style.display = 'none';
         $('canvasProgress').classList.add('active');
         $('cpFill').style.width = '0%';
         $('cpPct').textContent = '0%';
-        $('cpPhase').textContent = 'Starting…';
+        $('cpPhase').textContent = d.position > 1 ? `Queued (#${d.position})…` : 'Starting…';
         $('cpDetail').textContent = '';
 
         // Open console automatically
         if (!consoleOpen) toggleConsole();
+        // Resume console updates if it was previously cleared
+        delete $('consoleSystem').dataset.cleared;
 
         // Start HW monitoring during generation
         ensureHwPolling();
 
         localStart['generate'] = Date.now();
         poll(d.job_id, 'generate', {});
+        startQueuePolling();
     } catch (e) {
         alert('Error: ' + e.message);
         btn.disabled = false;
@@ -1120,9 +1305,14 @@ async function tryReconnect() {
             $('canvasProgress').classList.add('active');
             $('genBtn3d').disabled = true;
             $('genBtn3d').textContent = 'Generating…';
+            $('addQueueBtn').style.display = '';
+            $('cancelGenBtn').style.display = '';
             if (!consoleOpen) toggleConsole();
+            activeGenJobId = d.generate;
+            window._genJobIds = [d.generate];
             localStart['generate'] = Date.now();
             poll(d.generate, 'generate', {});
+            startQueuePolling();
         }
 
         if (d.rmbg) {

@@ -165,6 +165,13 @@
 
       <div class="sidebar-section">
         <button class="gen-btn" id="genBtn3d" onclick="startGen()" disabled>Generate →</button>
+        <button class="gen-btn secondary" id="addQueueBtn" onclick="startGen()" style="display:none">+ Add to Queue</button>
+        <button class="gen-btn danger" id="cancelGenBtn" onclick="cancelActiveGen()" style="display:none">⏹ Cancel</button>
+
+        <div class="queue-panel" id="queuePanel" style="display:none">
+          <div class="queue-panel-title">Queue</div>
+          <div class="queue-list" id="queueList"></div>
+        </div>
       </div>
     </div>
 
@@ -414,6 +421,10 @@
       <div class="console-tab-btns">
         <button class="console-tab-btn active" data-target="consoleSystem" onclick="switchConsoleTab(this)">System</button>
         <button class="console-tab-btn" data-target="consoleJob" onclick="switchConsoleTab(this)">Job Log</button>
+      </div>
+      <div class="console-actions">
+        <button class="console-action-btn" id="consoleCopyBtn" onclick="copyConsole()" title="Copy visible console to clipboard">📋 Copy</button>
+        <button class="console-action-btn" id="consoleClearBtn" onclick="clearConsole()" title="Clear the visible console">🗑 Clear</button>
       </div>
     </div>
     <div class="console-content" id="consoleSystem"></div>
