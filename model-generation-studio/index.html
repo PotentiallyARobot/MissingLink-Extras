@@ -166,7 +166,6 @@
       <div class="sidebar-section">
         <button class="gen-btn" id="genBtn3d" onclick="startGen()" disabled>Generate →</button>
         <button class="gen-btn secondary" id="addQueueBtn" onclick="startGen()" style="display:none">+ Add to Queue</button>
-        <button class="gen-btn danger" id="cancelGenBtn" onclick="cancelActiveGen()" style="display:none">⏹ Cancel</button>
       </div>
     </div>
 
@@ -402,6 +401,18 @@
           <button class="qf-hide" id="queueHideBtn" onclick="toggleQueuePanel()">▾ Hide</button>
         </div>
         <div class="queue-list" id="queueList"></div>
+      </div>
+
+      <!-- Floating history overlay -->
+      <div class="history-float collapsed" id="historyPanel">
+        <div class="history-float-header">
+          <span class="hf-title">🕘 History <span class="hf-count" id="historyCount"></span></span>
+          <div class="hf-actions">
+            <button class="hf-btn" id="historyRefreshBtn" onclick="refreshHistory()" title="Rescan output folder">⟳</button>
+            <button class="hf-btn" id="historyHideBtn" onclick="toggleHistoryPanel()">▴ Show</button>
+          </div>
+        </div>
+        <div class="history-grid" id="historyGrid"></div>
       </div>
     </div>
 

@@ -631,14 +631,18 @@ async function refreshQueue() {
         if (q.active) {
             const p = q.active.progress || {};
             const pct = Math.round(p.pct || 0);
+            const imgInfo = (p.image_num && p.total) ? `${p.image_num}/${p.total}` : '';
+            const elapsed = p.elapsed ? fmtTime(p.elapsed) : '';
+            const meta = [imgInfo, elapsed].filter(Boolean).join(' · ');
             rows.push(`<div class="queue-row active">
                 <span class="q-thumb">⚡</span>
                 <div class="q-body">
                     <span class="q-name">${escapeHtml(q.active.name)}</span>
-                    <span class="q-status">${escapeHtml(p.phase || 'Generating')}</span>
+                    <span class="q-status">${escapeHtml(p.phase || 'Generating')}${meta ? ' — ' + meta : ''}</span>
+                    <div class="q-row-bar"><div class="q-row-bar-fill" style="width:${pct}%"></div></div>
                 </div>
-                <span class="q-status">${pct}%</span>
-                <div class="q-row-bar"><div class="q-row-bar-fill" style="width:${pct}%"></div></div>
+                <span class="q-pct">${pct}%</span>
+                <button class="q-cancel" onclick="cancelJob('${q.active.job_id}')" title="Cancel this job">✕</button>
             </div>`);
         }
         (q.queued || []).forEach((j, i) => {
@@ -669,6 +673,66 @@ function toggleQueuePanel() {
     if (btn) btn.textContent = panel.classList.contains('collapsed') ? '▴ Show' : '▾ Hide';
 }
 
+// ══════════════════════════════════════════════════════════════
+// HISTORY (persistent — scans the output dir)
+// ══════════════════════════════════════════════════════════════
+
+let historyModels = [];
+
+function toggleHistoryPanel() {
+    const panel = $('historyPanel');
+    const btn = $('historyHideBtn');
+    panel.classList.toggle('collapsed');
+    const collapsed = panel.classList.contains('collapsed');
+    if (btn) btn.textContent = collapsed ? '▴ Show' : '▾ Hide';
+    if (!collapsed) refreshHistory();   // load when opened
+}
+
+async function refreshHistory() {
+    const grid = $('historyGrid');
+    grid.innerHTML = '<div class="history-empty">Scanning…</div>';
+    try {
+        const dir = $('sOutDir') ? $('sOutDir').value : '';
+        const url = '/api/history' + (dir ? '?dir=' + encodeURIComponent(dir) : '');
+        const r = await fetch(url);
+        const d = await r.json();
+        historyModels = d.models || [];
+        const cnt = $('historyCount');
+        if (cnt) cnt.textContent = historyModels.length ? `(${historyModels.length})` : '';
+
+        if (!historyModels.length) {
+            grid.innerHTML = '<div class="history-empty">No past generations found</div>';
+            return;
+        }
+        grid.innerHTML = historyModels.map((m, i) => {
+            // thumbnail: preview image or sprite sheet if available, else a cube glyph
+            const thumb = (m.media && (m.media_type === 'image' || m.media_type === 'rts_sprite' || m.media_type === 'doom_sprite'))
+                ? `<img src="/api/file?p=${enc(m.media)}" loading="lazy" alt="">`
+                : `<span class="hg-glyph">🧊</span>`;
+            return `<div class="history-card" onclick="openHistory(${i})" title="${escapeHtml(m.name)}">
+                <div class="hg-thumb">${thumb}</div>
+                <div class="hg-name">${escapeHtml(m.name)}</div>
+            </div>`;
+        }).join('');
+    } catch (e) {
+        grid.innerHTML = '<div class="history-empty">Failed to load history</div>';
+    }
+}
+
+function openHistory(idx) {
+    const m = historyModels[idx];
+    if (!m) return;
+    // Reuse the model pipeline: if it's not already in completedModels, add it,
+    // then select it so it loads into the stage (canvas + edit panel).
+    let pos = completedModels.findIndex(c => c.name === m.name && c.glb === m.glb);
+    if (pos < 0) {
+        completedModels.push(m);
+        pos = completedModels.length - 1;
+        rebuildModelTabs();
+    }
+    selectModel(pos);
+}
+
 async function cancelJob(jobId) {
     try {
         await fetch('/api/cancel/' + jobId, { method: 'POST' });
@@ -676,15 +740,8 @@ async function cancelJob(jobId) {
     } catch (e) { alert('Cancel failed: ' + e.message); }
 }
 
-function cancelActiveGen() {
-    if (!activeGenJobId) return;
-    const btn = $('cancelGenBtn');
-    btn.textContent = '⏹ Cancelling…';
-    btn.disabled = true;
-    cancelJob(activeGenJobId).then(() => {
-        setTimeout(() => { btn.disabled = false; btn.textContent = '⏹ Cancel'; }, 1500);
-    });
-}
+// (cancelActiveGen removed — cancel is now per-entry via the ✕ on the queue card,
+//  which calls cancelJob(job_id) directly.)
 
 function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, c =>
@@ -718,7 +775,6 @@ function advanceQueueOrFinish() {
             $('genBtn3d').disabled = false;
             $('genBtn3d').textContent = 'Generate →';
             $('addQueueBtn').style.display = 'none';
-            $('cancelGenBtn').style.display = 'none';
             stopHwPolling();
             stopQueuePolling();
             $('queuePanel').style.display = 'none';
@@ -728,7 +784,6 @@ function advanceQueueOrFinish() {
         $('genBtn3d').disabled = false;
         $('genBtn3d').textContent = 'Generate →';
         $('addQueueBtn').style.display = 'none';
-        $('cancelGenBtn').style.display = 'none';
         stopHwPolling();
         stopQueuePolling();
     });
@@ -780,7 +835,6 @@ async function startGen() {
         // Once a job is in flight, the primary button becomes "Add to Queue"
         // and a Cancel button appears.
         $('addQueueBtn').style.display = '';
-        $('cancelGenBtn').style.display = '';
 
         // Show progress overlay
         $('canvasEmpty').style.display = 'none';
@@ -1323,7 +1377,6 @@ async function tryReconnect() {
             $('genBtn3d').disabled = true;
             $('genBtn3d').textContent = 'Generating…';
             $('addQueueBtn').style.display = '';
-            $('cancelGenBtn').style.display = '';
             if (!consoleOpen) toggleConsole();
             activeGenJobId = d.generate;
             window._genJobIds = [d.generate];
