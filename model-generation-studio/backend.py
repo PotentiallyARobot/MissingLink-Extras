@@ -925,6 +925,56 @@ STEPS = [
 
 MAX_RETRIES = 3
 
+# Map the three samplers to sub-fractions of the reconstruction step (step 1).
+# trellis_pipe.run() runs sparse-structure → shape SLAT → tex SLAT in sequence;
+# each is ~1/3 of the reconstruction phase. We parse their tqdm lines from the
+# captured console to drive the progress bar smoothly during this long call.
+_SAMPLER_ORDER = [
+    ("sampling sparse structure", 0.00, 0.33),
+    ("sampling shape slat",       0.33, 0.66),
+    ("sampling tex slat",         0.66, 1.00),
+]
+_TQDM_PCT_RE = re.compile(r"(\d+)%\|")
+
+
+def _parse_recon_subprogress():
+    """Read the most recent sampler line from console_lines and return a 0..1
+    fraction of the whole reconstruction step, or None if no sampler line yet."""
+    # Scan a generous window newest-first; tqdm emits many lines fast.
+    for raw in reversed(list(console_lines)[-120:]):
+        line = raw.lstrip("\r").strip()
+        low = line.lower()
+        for key, lo, hi in _SAMPLER_ORDER:
+            if key in low:
+                m = _TQDM_PCT_RE.search(line)
+                if m:
+                    frac = max(0, min(100, int(m.group(1)))) / 100.0
+                    return lo + (hi - lo) * frac
+                return lo
+    return None
+
+
+def _recon_progress_thread(job, idx, total, t0_all, stop_evt):
+    """While reconstruction runs, interpolate the bar inside step 1's weight band
+    using parsed sampler progress, so the bar moves instead of jumping at the end."""
+    step1_start = sum(w for _, w in STEPS[:1])      # cumulative weight before recon (0.01)
+    step1_weight = STEPS[1][1]                       # 0.30
+    logged = [False]
+    while not stop_evt.wait(0.4):
+        sub = _parse_recon_subprogress()
+        if sub is None:
+            continue
+        if not logged[0]:
+            job["log"].append("  📊 progress tracking active (reconstruction)")
+            logged[0] = True
+        cum = step1_start + sub * step1_weight
+        pct = (idx + cum) / total * 100.0
+        p = dict(job.get("progress", {}))   # copy so we don't lose a concurrent set_phase
+        if pct > p.get("pct", 0):
+            p["pct"] = round(pct, 1)
+            p["elapsed"] = round(time.perf_counter() - t0_all, 1)
+            job["progress"] = p
+
 
 def run_generate_job(job_id):
     job = jobs[job_id]
@@ -1018,13 +1068,25 @@ def run_generate_job(job_id):
                     stage_cache_dir = out_path / f"{base}_stages"
                     stage_cache_dir.mkdir(parents=True, exist_ok=True)
 
-                    out = trellis_pipe.run(
-                        [image], image_weights=[1.0],
-                        sparse_structure_sampler_params={"steps": 12},
-                        shape_slat_sampler_params={"steps": 12},
-                        tex_slat_sampler_params={"steps": 12},
-                        cache_stages=str(stage_cache_dir),
-                    )
+                    # Start a thread that parses sampler tqdm output and advances
+                    # the progress bar during this long call (otherwise it sits
+                    # at the step-start pct and only jumps when run() returns).
+                    _recon_stop = threading.Event()
+                    _recon_thr = threading.Thread(
+                        target=_recon_progress_thread,
+                        args=(job, idx, total, t0_all, _recon_stop),
+                        daemon=True, name="recon-progress")
+                    _recon_thr.start()
+                    try:
+                        out = trellis_pipe.run(
+                            [image], image_weights=[1.0],
+                            sparse_structure_sampler_params={"steps": 12},
+                            shape_slat_sampler_params={"steps": 12},
+                            tex_slat_sampler_params={"steps": 12},
+                            cache_stages=str(stage_cache_dir),
+                        )
+                    finally:
+                        _recon_stop.set()
                     if not out:
                         raise RuntimeError("Empty pipeline result")
                     mesh = out[0]
@@ -1439,7 +1501,27 @@ def api_history():
         entries.append(entry)
 
     entries.sort(key=lambda e: e["mtime"], reverse=True)
-    return jsonify({"models": entries, "dir": real, "count": len(entries)})
+
+    # Pagination: default first 20, newest-first. Frontend pages on scroll.
+    try:
+        limit = max(1, min(100, int(request.args.get("limit", 20))))
+    except (TypeError, ValueError):
+        limit = 20
+    try:
+        offset = max(0, int(request.args.get("offset", 0)))
+    except (TypeError, ValueError):
+        offset = 0
+
+    total = len(entries)
+    page = entries[offset:offset + limit]
+    return jsonify({
+        "models": page,
+        "dir": real,
+        "count": total,
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + limit < total,
+    })
 
 
 @app.route("/api/rmbg", methods=["POST"])
@@ -2083,6 +2165,19 @@ def api_file():
                 break
         except (ValueError, TypeError):
             continue
+
+    # Also permit files under the same safe output bases that /api/history and
+    # /api/generate validate against. Without this, thumbnails for generations
+    # from PREVIOUS sessions (not in this session's jobs dict) get a 403, which
+    # is why the history panel showed blank cards. This does not widen access
+    # beyond what the history/generate endpoints already allow.
+    if not in_allowed:
+        SAFE_FILE_BASES = ["/content/drive/MyDrive", "/content/"]
+        for base in SAFE_FILE_BASES:
+            rb = os.path.realpath(base)
+            if real == rb or real.startswith(rb + os.sep):
+                in_allowed = True
+                break
 
     if not in_allowed:
         return "Access denied", 403
