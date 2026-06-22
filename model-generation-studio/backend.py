@@ -395,6 +395,78 @@ jobs = {}
 active_jobs = {}
 _gpu_lock = threading.Lock()
 
+# ── Job queue ──────────────────────────────────────────────────────────────
+# /api/generate enqueues a job (status "queued") instead of spawning a thread.
+# A single persistent worker drains the queue serially — correct, since the GPU
+# can only run one job at a time anyway (everything goes through _gpu_lock).
+# Adding more jobs while one runs just appends more to the queue.
+_generate_queue = collections.deque()      # job_ids waiting to run
+_queue_cv = threading.Condition()          # signals the worker when work arrives
+_queue_order = []                          # all generate job_ids in submit order (for UI)
+_worker_started = [False]
+
+
+def _enqueue_generate(job_id):
+    with _queue_cv:
+        _generate_queue.append(job_id)
+        _queue_order.append(job_id)
+        jobs[job_id]["status"] = "queued"
+        _queue_cv.notify()
+
+
+def _generate_worker():
+    while True:
+        with _queue_cv:
+            while not _generate_queue:
+                _queue_cv.wait()
+            job_id = _generate_queue.popleft()
+        # Skip jobs cancelled while still queued
+        job = jobs.get(job_id)
+        if not job or job.get("cancel"):
+            if job:
+                job["status"] = "cancelled"
+                job["progress"] = {"pct": 0, "image_num": 0, "total": 0,
+                                   "name": "Cancelled", "phase": "Cancelled before start",
+                                   "elapsed": 0}
+            continue
+        try:
+            run_generate_job(job_id)
+        except Exception as e:
+            job["status"] = "done"
+            job["log"].append(f"  ❌ worker error: {e}")
+            traceback.print_exc()
+
+
+def _ensure_worker():
+    if not _worker_started[0]:
+        _worker_started[0] = True
+        threading.Thread(target=_generate_worker, daemon=True, name="generate-worker").start()
+
+
+def queue_snapshot():
+    """Return queue state for the UI: queued / active / recent done."""
+    with _queue_cv:
+        queued_ids = list(_generate_queue)
+    out = {"queued": [], "active": None, "recent": []}
+    active_id = active_jobs.get("generate")
+    for jid in queued_ids:
+        j = jobs.get(jid, {})
+        out["queued"].append({"job_id": jid, "name": j.get("name", jid),
+                              "total": j.get("progress", {}).get("total", 0)})
+    if active_id and active_id in jobs and jobs[active_id]["status"] == "running":
+        j = jobs[active_id]
+        out["active"] = {"job_id": active_id, "name": j.get("name", active_id),
+                         "progress": j.get("progress", {})}
+    # recent finished generate jobs, newest first
+    for jid in reversed(_queue_order[-20:]):
+        j = jobs.get(jid)
+        if j and j["status"] in ("done", "cancelled") and jid != active_id:
+            out["recent"].append({"job_id": jid, "name": j.get("name", jid),
+                                  "status": j["status"]})
+        if len(out["recent"]) >= 8:
+            break
+    return out
+
 
 # ══════════════════════════════════════════════════════════════
 # HW USAGE LOGGER — samples GPU/CPU every second, tagged by phase
@@ -869,8 +941,15 @@ def run_generate_job(job_id):
     _hw_logger.start()
     _hw_logger.set_phase("job_init")
 
+    job["status"] = "running"
+
     with _gpu_lock:
         for idx, (orig_name, file_path) in enumerate(files):
+            # ── Cancel check (between images) ──
+            if job.get("cancel"):
+                job["log"].append("  ⏹ Cancelled by user.")
+                break
+
             base = safe_stem(orig_name)
             glb_out = out_path / f"{base}.glb"
 
@@ -912,6 +991,12 @@ def run_generate_job(job_id):
             error = None
             for attempt in range(MAX_RETRIES):
                 try:
+                    # ── Cancel check (before heavy recon) ──
+                    if job.get("cancel"):
+                        job["log"].append("  ⏹ Cancelled by user.")
+                        error = None
+                        break
+
                     gc.collect()
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
@@ -1130,7 +1215,8 @@ def run_generate_job(job_id):
                 safe_reload_models()
 
         dt_total = time.perf_counter() - t0_all
-        job["log"].append(f"\nDone — {done}/{total} in {dt_total:.1f}s")
+        _was_cancelled = bool(job.get("cancel"))
+        job["log"].append(f"\n{'Cancelled' if _was_cancelled else 'Done'} — {done}/{total} in {dt_total:.1f}s")
 
         # ── Stop HW logger and save CSV to output directory ──
         _hw_logger.set_phase("complete")
@@ -1143,10 +1229,12 @@ def run_generate_job(job_id):
         except Exception as e:
             job["log"].append(f"  ⚠ Failed to save HW log: {e}")
 
-        job["status"] = "done"
+        job["status"] = "cancelled" if _was_cancelled else "done"
         job["progress"] = {
-            "pct": 100, "image_num": total, "total": total,
-            "name": "Complete", "phase": "All done!",
+            "pct": 100 if not _was_cancelled else job.get("progress", {}).get("pct", 0),
+            "image_num": done, "total": total,
+            "name": "Cancelled" if _was_cancelled else "Complete",
+            "phase": "Cancelled by user" if _was_cancelled else "All done!",
             "elapsed": round(dt_total, 1),
         }
 
@@ -1252,13 +1340,50 @@ def api_generate():
         f.save(str(dest))
         saved.append((f.filename, str(dest)))
     jobs[job_id] = {
-        "status": "running",
+        "status": "queued",
         "progress": {"pct": 0, "image_num": 0, "total": len(saved),
-                     "name": "Starting...", "phase": "Preparing...", "elapsed": 0},
+                     "name": "Queued...", "phase": "Waiting in queue...", "elapsed": 0},
         "log": [], "results": [], "files": saved, "settings": settings,
+        "cancel": False,
+        "name": (saved[0][0] if len(saved) == 1 else f"{len(saved)} images"),
     }
-    threading.Thread(target=run_generate_job, args=(job_id,), daemon=True).start()
-    return jsonify({"job_id": job_id})
+    _ensure_worker()
+    _enqueue_generate(job_id)
+    # position in queue (1 = next, accounting for any currently-running job)
+    with _queue_cv:
+        pos = len(_generate_queue)
+    return jsonify({"job_id": job_id, "queued": True, "position": pos})
+
+
+@app.route("/api/cancel/<job_id>", methods=["POST"])
+def api_cancel(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    # If it's still waiting in the queue, remove it outright.
+    with _queue_cv:
+        if job_id in _generate_queue:
+            try:
+                _generate_queue.remove(job_id)
+            except ValueError:
+                pass
+            job["status"] = "cancelled"
+            job["progress"] = {"pct": 0, "image_num": 0,
+                               "total": job.get("progress", {}).get("total", 0),
+                               "name": "Cancelled", "phase": "Removed from queue",
+                               "elapsed": 0}
+            job["log"].append("  ⏹ Removed from queue before starting.")
+            return jsonify({"ok": True, "where": "queue"})
+    # Otherwise it's running: set the flag; the job loop checks it at step
+    # boundaries and stops as soon as the current step finishes.
+    job["cancel"] = True
+    job["log"].append("  ⏹ Cancel requested — stopping after current step…")
+    return jsonify({"ok": True, "where": "running"})
+
+
+@app.route("/api/queue")
+def api_queue():
+    return jsonify(queue_snapshot())
 
 
 @app.route("/api/rmbg", methods=["POST"])
