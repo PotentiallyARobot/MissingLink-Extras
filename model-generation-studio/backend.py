@@ -1386,6 +1386,62 @@ def api_queue():
     return jsonify(queue_snapshot())
 
 
+@app.route("/api/history")
+def api_history():
+    """Scan an output directory and reconstruct past generations from files on
+    disk, so history survives page reloads and new sessions. Each .glb becomes
+    an entry, with its companion render-mesh / stage-cache / media filled in if
+    present. Sorted newest-first by the GLB's modification time."""
+    out_dir = request.args.get("dir", "/content/drive/MyDrive/trellis_models_out")
+    # Validate against the same safe bases used elsewhere
+    SAFE_OUTPUT_BASES = ["/content/drive/MyDrive", "/content/"]
+    real = os.path.realpath(out_dir)
+    if not any(real == os.path.realpath(b) or real.startswith(os.path.realpath(b) + os.sep)
+               for b in SAFE_OUTPUT_BASES):
+        return jsonify({"error": "Directory not allowed"}), 400
+    base = pathlib.Path(real)
+    if not base.is_dir():
+        return jsonify({"models": []})
+
+    entries = []
+    for glb in base.glob("*.glb"):
+        name = glb.stem
+        entry = {"name": name, "glb": str(glb), "mtime": glb.stat().st_mtime}
+
+        rm = base / f"{name}_render_mesh.pt"
+        if rm.is_file():
+            entry["render_mesh"] = str(rm)
+        sc = base / f"{name}_stages"
+        if sc.is_dir():
+            entry["stage_cache"] = str(sc)
+
+        # Media: prefer video, then preview image, then sprite sheets
+        for cand, mtype in [(f"{name}.mp4", "video"),
+                            (f"{name}_perspective.mp4", "video"),
+                            (f"{name}_preview.png", "image"),
+                            (f"{name}_spritesheet.png", "rts_sprite"),
+                            (f"{name}_doom_sheet.png", "doom_sprite")]:
+            mp = base / cand
+            if mp.is_file():
+                entry["media"] = str(mp)
+                entry["media_type"] = mtype
+                break
+
+        # Sprite frames if present
+        for sdir, key in [(f"{name}_sprites", "rts"), (f"{name}_doom_sprites", "doom")]:
+            sp = base / sdir
+            if sp.is_dir():
+                frames = sorted(str(f) for f in sp.glob("*.png"))
+                if frames:
+                    entry["sprite_frames"] = frames
+                break
+
+        entries.append(entry)
+
+    entries.sort(key=lambda e: e["mtime"], reverse=True)
+    return jsonify({"models": entries, "dir": real, "count": len(entries)})
+
+
 @app.route("/api/rmbg", methods=["POST"])
 def api_rmbg():
     files = request.files.getlist("images")
