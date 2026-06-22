@@ -21,6 +21,39 @@ import time, threading, traceback, sys
 import socket as _socket
 import requests as _requests
 
+# ══════════════════════════════════════════════════════════════
+# 0) STARTUP VISIBILITY — unbuffered output + background heartbeat
+# ══════════════════════════════════════════════════════════════
+# Colab can show a blank cell for long stretches while the main thread is
+# blocked in CUDA/C++ work (pipeline load, kernel compiles), because output
+# stays buffered until Python regains control. We (a) force line-buffered,
+# write-through streams, and (b) run a heartbeat on a SEPARATE thread that
+# prints a timestamped "still working" line every few seconds — so the cell
+# never goes fully blank even while the main thread is frozen. The heartbeat
+# is stopped once the server is confirmed healthy (see _stop_heartbeat()).
+try:
+    sys.stdout.reconfigure(line_buffering=True, write_through=True)
+    sys.stderr.reconfigure(line_buffering=True, write_through=True)
+except Exception:
+    pass
+
+_hb_stop = threading.Event()
+_hb_t0 = time.time()
+
+def _heartbeat_loop():
+    while not _hb_stop.wait(10):   # tick every 10s until stopped
+        elapsed = time.time() - _hb_t0
+        print(f"   ⏱  starting up… ({elapsed/60:.1f} min elapsed)", flush=True)
+
+_hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True, name="startup-heartbeat")
+_hb_thread.start()
+
+def _stop_heartbeat():
+    if not _hb_stop.is_set():
+        _hb_stop.set()
+
+print("⏳ TRELLIS.2 launch starting — booting Flask server…", flush=True)
+
 # ── These come from backend.py (already imported via `from backend import *`) ──
 # app, IN_COLAB, eval_js, jobs, console_lines
 
@@ -44,8 +77,10 @@ def _run_server():
         app.run(host="0.0.0.0", port=PORT, threaded=True, use_reloader=False)
     except Exception as exc:
         _server_error[0] = exc
-        sys.__stderr__.write(f"\n❌ Flask server crashed: {exc}\n")
-        traceback.print_exc(file=sys.__stderr__)
+        _stop_heartbeat()
+        # write to the rendered stream (sys.stderr), not the raw fd Colab ignores
+        print(f"\n❌ Flask server crashed: {exc}", flush=True)
+        traceback.print_exc()
 
 
 server_thread = threading.Thread(target=_run_server, daemon=True, name='flask-server')
@@ -70,12 +105,14 @@ for _attempt in range(80):
     time.sleep(0.5)
 
 if not _local_ready:
+    _stop_heartbeat()
     raise RuntimeError(
         f"Flask server never became reachable on localhost:{PORT}.\n"
         f"  Server-thread error : {_server_error[0]}\n"
         f"  Last health-check error: {_last_local_err}\n"
     )
 
+_stop_heartbeat()
 print(f"✅ Flask server healthy on localhost:{PORT}")
 
 # ══════════════════════════════════════════════════════════════
