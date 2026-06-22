@@ -557,6 +557,59 @@ function poll(jobId, type, cfg) {
 // ══════════════════════════════════════════════════════════════
 
 // ══════════════════════════════════════════════════════════════
+// DRAGGABLE FLOATING PANELS (queue + history)
+// ══════════════════════════════════════════════════════════════
+
+function makeDraggable(panelId, handleSelector) {
+    const panel = $(panelId);
+    if (!panel) return;
+    const handle = panel.querySelector(handleSelector);
+    if (!handle) return;
+
+    let startX, startY, startLeft, startTop, dragging = false;
+
+    handle.style.cursor = 'move';
+
+    handle.addEventListener('mousedown', (e) => {
+        // Don't start a drag when clicking a button inside the header.
+        if (e.target.closest('button')) return;
+        dragging = true;
+        const rect = panel.getBoundingClientRect();
+        const parent = panel.offsetParent.getBoundingClientRect();
+        // Switch to explicit left/top positioning (panels default to right/top).
+        startLeft = rect.left - parent.left;
+        startTop = rect.top - parent.top;
+        startX = e.clientX;
+        startY = e.clientY;
+        panel.style.left = startLeft + 'px';
+        panel.style.top = startTop + 'px';
+        panel.style.right = 'auto';
+        panel.style.bottom = 'auto';
+        panel.classList.add('dragging');
+        e.preventDefault();
+    });
+
+    window.addEventListener('mousemove', (e) => {
+        if (!dragging) return;
+        const parent = panel.offsetParent.getBoundingClientRect();
+        let nl = startLeft + (e.clientX - startX);
+        let nt = startTop + (e.clientY - startY);
+        // Keep within the parent bounds.
+        nl = Math.max(0, Math.min(nl, parent.width - panel.offsetWidth));
+        nt = Math.max(0, Math.min(nt, parent.height - panel.offsetHeight));
+        panel.style.left = nl + 'px';
+        panel.style.top = nt + 'px';
+    });
+
+    window.addEventListener('mouseup', () => {
+        if (dragging) { dragging = false; panel.classList.remove('dragging'); }
+    });
+}
+
+makeDraggable('queuePanel', '.queue-float-header');
+makeDraggable('historyPanel', '.history-float-header');
+
+// ══════════════════════════════════════════════════════════════
 // CONSOLE: COPY / CLEAR
 // ══════════════════════════════════════════════════════════════
 
@@ -678,6 +731,10 @@ function toggleQueuePanel() {
 // ══════════════════════════════════════════════════════════════
 
 let historyModels = [];
+let historyOffset = 0;
+let historyHasMore = false;
+let historyLoading = false;
+const HISTORY_PAGE = 20;
 
 function toggleHistoryPanel() {
     const panel = $('historyPanel');
@@ -688,42 +745,80 @@ function toggleHistoryPanel() {
     if (!collapsed) refreshHistory();   // load when opened
 }
 
+function _historyCardHTML(m, i) {
+    const thumb = (m.media && (m.media_type === 'image' || m.media_type === 'rts_sprite' || m.media_type === 'doom_sprite'))
+        ? `<img src="/api/file?p=${enc(m.media)}" loading="lazy" alt="">`
+        : `<span class="hg-glyph">🧊</span>`;
+    return `<div class="history-card" onclick="openHistory(${i})" title="${escapeHtml(m.name)}">
+        <div class="hg-thumb">${thumb}</div>
+        <div class="hg-name">${escapeHtml(m.name)}</div>
+    </div>`;
+}
+
+// Fresh load (first page) — resets the grid.
 async function refreshHistory() {
-    const grid = $('historyGrid');
-    grid.innerHTML = '<div class="history-empty">Scanning…</div>';
+    historyModels = [];
+    historyOffset = 0;
+    historyHasMore = false;
+    $('historyGrid').innerHTML = '<div class="history-empty">Scanning…</div>';
+    await loadMoreHistory(true);
+}
+
+// Append the next page (or first page when reset=true).
+async function loadMoreHistory(reset = false) {
+    if (historyLoading) return;
+    if (!reset && !historyHasMore) return;
+    historyLoading = true;
     try {
         const dir = $('sOutDir') ? $('sOutDir').value : '';
-        const url = '/api/history' + (dir ? '?dir=' + encodeURIComponent(dir) : '');
-        const r = await fetch(url);
+        const params = new URLSearchParams({ limit: HISTORY_PAGE, offset: historyOffset });
+        if (dir) params.set('dir', dir);
+        const r = await fetch('/api/history?' + params.toString());
         const d = await r.json();
-        historyModels = d.models || [];
-        const cnt = $('historyCount');
-        if (cnt) cnt.textContent = historyModels.length ? `(${historyModels.length})` : '';
 
-        if (!historyModels.length) {
+        const cnt = $('historyCount');
+        if (cnt) cnt.textContent = d.count ? `(${d.count})` : '';
+
+        const grid = $('historyGrid');
+        if (reset) grid.innerHTML = '';
+
+        const newModels = d.models || [];
+        if (reset && newModels.length === 0) {
             grid.innerHTML = '<div class="history-empty">No past generations found</div>';
+            historyHasMore = false;
             return;
         }
-        grid.innerHTML = historyModels.map((m, i) => {
-            // thumbnail: preview image or sprite sheet if available, else a cube glyph
-            const thumb = (m.media && (m.media_type === 'image' || m.media_type === 'rts_sprite' || m.media_type === 'doom_sprite'))
-                ? `<img src="/api/file?p=${enc(m.media)}" loading="lazy" alt="">`
-                : `<span class="hg-glyph">🧊</span>`;
-            return `<div class="history-card" onclick="openHistory(${i})" title="${escapeHtml(m.name)}">
-                <div class="hg-thumb">${thumb}</div>
-                <div class="hg-name">${escapeHtml(m.name)}</div>
-            </div>`;
-        }).join('');
+
+        // Append cards with correct global indices into historyModels.
+        const startIdx = historyModels.length;
+        historyModels = historyModels.concat(newModels);
+        const html = newModels.map((m, j) => _historyCardHTML(m, startIdx + j)).join('');
+        grid.insertAdjacentHTML('beforeend', html);
+
+        historyOffset += newModels.length;
+        historyHasMore = !!d.has_more;
     } catch (e) {
-        grid.innerHTML = '<div class="history-empty">Failed to load history</div>';
+        if (reset) $('historyGrid').innerHTML = '<div class="history-empty">Failed to load history</div>';
+    } finally {
+        historyLoading = false;
     }
 }
+
+// Infinite scroll: when the grid is scrolled near the bottom, fetch next page.
+function _initHistoryScroll() {
+    const grid = $('historyGrid');
+    if (!grid) return;
+    grid.addEventListener('scroll', () => {
+        if (grid.scrollHeight - grid.scrollTop - grid.clientHeight < 120) {
+            loadMoreHistory(false);
+        }
+    });
+}
+_initHistoryScroll();
 
 function openHistory(idx) {
     const m = historyModels[idx];
     if (!m) return;
-    // Reuse the model pipeline: if it's not already in completedModels, add it,
-    // then select it so it loads into the stage (canvas + edit panel).
     let pos = completedModels.findIndex(c => c.name === m.name && c.glb === m.glb);
     if (pos < 0) {
         completedModels.push(m);
