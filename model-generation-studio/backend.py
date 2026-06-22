@@ -176,6 +176,24 @@ if str(REPO_DIR) not in sys.path:
 if "/content" not in sys.path:
     sys.path.insert(0, "/content")
 
+# transformers 5.x compatibility for tied-weights is handled at the source in
+# trellis2/_colab_compat.py (patch_transformers_missing_all_tied_weights_keys),
+# which trellis2/__init__ applies on import. We deliberately do NOT re-patch it
+# here: doing so would capture our function as the "original" and prevent the
+# real method from running when it should.
+
+# ── staged-load logging ────────────────────────────────────────────────────
+# from_pretrained / .cuda() / HDRI load are the slow, silent part of startup.
+# These helpers stream a labelled, timed line per stage so a stall is legible
+# instead of a blank cell. flush=True is essential — without it the TeeWriter
+# can buffer and the output won't appear until the whole block finishes.
+def _stage(msg):
+    print(f"⏳ {msg}...", flush=True)
+    return time.perf_counter()
+
+def _stage_done(t0, msg):
+    print(f"✓ {msg} ({time.perf_counter() - t0:.1f}s)", flush=True)
+
 from trellis2.pipelines import Trellis2ImageTo3DPipeline
 from trellis2.utils import render_utils
 from trellis2.renderers import EnvMap
@@ -191,10 +209,19 @@ RENDER_MAX_FACES = 16_000_000
 
 print(f"GPU: {GPU_NAME} | VRAM: {TOTAL_VRAM:.1f} GB")
 print("Loading TRELLIS.2 pipeline...")
+
+_t = _stage("Resolving weights (download/copy if needed)")
 weights_path = resolve_weights()
 downloaded_from_hf = (weights_path == HF_MODEL_ID)
+_stage_done(_t, f"Weights ready at {weights_path}")
+
+_t = _stage("Building pipeline — image-cond model (DINOv3), VAEs, samplers")
 trellis_pipe = Trellis2ImageTo3DPipeline.from_pretrained(weights_path)
+_stage_done(_t, "Pipeline built")
+
+_t = _stage("Moving pipeline to GPU")
 trellis_pipe.cuda()
+_stage_done(_t, "Pipeline on GPU")
 
 if downloaded_from_hf:
     try:
@@ -207,12 +234,14 @@ if downloaded_from_hf:
         print(f"  ⚠ Could not copy HF cache: {e}")
     threading.Thread(target=cache_weights_to_drive, daemon=True).start()
 
+_t = _stage("Loading HDRI envmap (forest.exr)")
 hdri = REPO_DIR / "assets" / "hdri" / "forest.exr"
 envmap = EnvMap(torch.tensor(
     cv2.cvtColor(cv2.imread(str(hdri), cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB),
     dtype=torch.float32, device="cuda",
 ))
-print("✅ TRELLIS.2 pipeline loaded")
+_stage_done(_t, "Envmap loaded")
+print("✅ TRELLIS.2 pipeline loaded — ready to serve")
 
 
 # ══════════════════════════════════════════════════════════════
