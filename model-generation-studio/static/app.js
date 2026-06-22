@@ -623,19 +623,29 @@ async function refreshQueue() {
         const list = $('queueList');
         const rows = [];
 
+        const queuedCount = (q.queued || []).length;
+        const activeCount = q.active ? 1 : 0;
+        const cnt = $('queueCount');
+        if (cnt) cnt.textContent = (activeCount + queuedCount) ? `${activeCount}/${activeCount + queuedCount}` : '';
+
         if (q.active) {
             const p = q.active.progress || {};
+            const pct = Math.round(p.pct || 0);
             rows.push(`<div class="queue-row active">
-                <span class="q-dot running"></span>
-                <span class="q-name">${escapeHtml(q.active.name)}</span>
-                <span class="q-status">${Math.round(p.pct || 0)}%</span>
+                <span class="q-thumb">⚡</span>
+                <div class="q-body">
+                    <span class="q-name">${escapeHtml(q.active.name)}</span>
+                    <span class="q-status">${escapeHtml(p.phase || 'Generating')}</span>
+                </div>
+                <span class="q-status">${pct}%</span>
+                <div class="q-row-bar"><div class="q-row-bar-fill" style="width:${pct}%"></div></div>
             </div>`);
         }
-        q.queued.forEach((j, i) => {
+        (q.queued || []).forEach((j, i) => {
             rows.push(`<div class="queue-row">
                 <span class="q-dot pending"></span>
-                <span class="q-name">${escapeHtml(j.name)}</span>
-                <span class="q-status">#${i + 1} waiting</span>
+                <div class="q-body"><span class="q-name">${escapeHtml(j.name)}</span>
+                    <span class="q-status">#${i + 1} waiting</span></div>
                 <button class="q-cancel" onclick="cancelJob('${j.job_id}')" title="Remove from queue">✕</button>
             </div>`);
         });
@@ -643,13 +653,20 @@ async function refreshQueue() {
             const icon = j.status === 'cancelled' ? '⏹' : '✓';
             rows.push(`<div class="queue-row done">
                 <span class="q-dot ${j.status}"></span>
-                <span class="q-name">${escapeHtml(j.name)}</span>
-                <span class="q-status">${icon} ${j.status}</span>
+                <div class="q-body"><span class="q-name">${escapeHtml(j.name)}</span>
+                    <span class="q-status">${icon} ${j.status}</span></div>
             </div>`);
         });
 
         list.innerHTML = rows.join('') || '<div class="queue-empty">Queue is empty</div>';
     } catch (e) { /* transient */ }
+}
+
+function toggleQueuePanel() {
+    const panel = $('queuePanel');
+    const btn = $('queueHideBtn');
+    panel.classList.toggle('collapsed');
+    if (btn) btn.textContent = panel.classList.contains('collapsed') ? '▴ Show' : '▾ Hide';
 }
 
 async function cancelJob(jobId) {

@@ -167,11 +167,6 @@
         <button class="gen-btn" id="genBtn3d" onclick="startGen()" disabled>Generate →</button>
         <button class="gen-btn secondary" id="addQueueBtn" onclick="startGen()" style="display:none">+ Add to Queue</button>
         <button class="gen-btn danger" id="cancelGenBtn" onclick="cancelActiveGen()" style="display:none">⏹ Cancel</button>
-
-        <div class="queue-panel" id="queuePanel" style="display:none">
-          <div class="queue-panel-title">Queue</div>
-          <div class="queue-list" id="queueList"></div>
-        </div>
       </div>
     </div>
 
@@ -398,6 +393,15 @@
         <div class="cp-detail" id="cpDetail"></div>
         <div class="cp-bar"><div class="cp-bar-fill" id="cpFill"></div></div>
         <div class="cp-pct" id="cpPct">0%</div>
+      </div>
+
+      <!-- Floating queue overlay -->
+      <div class="queue-float" id="queuePanel" style="display:none">
+        <div class="queue-float-header">
+          <span class="qf-title">⚡ Queue <span class="qf-count" id="queueCount"></span></span>
+          <button class="qf-hide" id="queueHideBtn" onclick="toggleQueuePanel()">▾ Hide</button>
+        </div>
+        <div class="queue-list" id="queueList"></div>
       </div>
     </div>
 
