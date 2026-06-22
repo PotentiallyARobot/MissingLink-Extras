@@ -306,16 +306,32 @@ rmbg_load_error = [None]
 
 
 def _ensure_monkey_patch():
-    """Apply the all_tied_weights_keys monkey patch for RMBG-1.4 compatibility."""
-    if not hasattr(torch.nn.Module, "_patched_all_tied_weights_keys"):
-        torch.nn.Module._patched_all_tied_weights_keys = True
+    """Apply the all_tied_weights_keys shim for RMBG-1.4 on OLD transformers only.
 
-        @property
-        def _atwk(self):
-            return {}
+    On transformers >=5, PreTrainedModel defines all_tied_weights_keys itself and
+    post_init() ASSIGNS to it. A read-only property here breaks every model init
+    with 'property has no setter'. So: (a) skip entirely if transformers already
+    provides the attribute, and (b) if we do install it, give it a setter."""
+    if hasattr(torch.nn.Module, "_patched_all_tied_weights_keys"):
+        return
+    # If transformers (or torch) already exposes the attribute, do nothing —
+    # patching would shadow it and break 5.x's assignment in post_init.
+    try:
+        from transformers.modeling_utils import PreTrainedModel as _PTM
+        if hasattr(_PTM, "all_tied_weights_keys"):
+            torch.nn.Module._patched_all_tied_weights_keys = True
+            return
+    except Exception:
+        pass
+    torch.nn.Module._patched_all_tied_weights_keys = True
 
-        setattr(torch.nn.Module, "all_tied_weights_keys", _atwk)
-        print("  🔧 Applied all_tied_weights_keys monkey patch for RMBG-1.4")
+    # Read/write property so any later assignment (e.g. post_init) succeeds.
+    def _atwk_get(self):
+        return getattr(self, "_atwk_value", {})
+    def _atwk_set(self, value):
+        self._atwk_value = value
+    setattr(torch.nn.Module, "all_tied_weights_keys", property(_atwk_get, _atwk_set))
+    print("  🔧 Applied all_tied_weights_keys shim for RMBG-1.4 (old transformers)")
 
 
 def get_rmbg():
