@@ -757,7 +757,7 @@ async function startGen() {
 
         // Clear the file picker so the next "Add to Queue" starts fresh.
         files3d.length = 0;
-        renderThumbs(files3d, 'thumbs3d', 'browse3d');
+        renderThumbs(files3d, 'thumbs3d', 'genBtn3d');
 
         btn.textContent = 'Generating…';
         // Once a job is in flight, the primary button becomes "Add to Queue"
