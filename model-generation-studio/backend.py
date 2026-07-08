@@ -120,6 +120,35 @@ def resolve_weights():
     return HF_MODEL_ID
 
 
+def patch_image_cond_repo(weights_dir):
+    """Rewrite the stale DINOv3 repo id baked into the pipeline configs.
+
+    The upstream configs point image_cond_model at
+    'kiennt120/dinov3-vitl16-pretrain-lvd1689m', which now 404s. 'camenduru/…'
+    is a live mirror of the same facebook/dinov3-vitl16 weights, so we swap the
+    id in place before Trellis2ImageTo3DPipeline.from_pretrained() reads it.
+
+    This replaces the manual `sed` cell — it runs automatically at load and is
+    idempotent (a no-op once patched, or if the id is already correct).
+    """
+    OLD = "kiennt120/dinov3-vitl16-pretrain-lvd1689m"
+    NEW = "camenduru/dinov3-vitl16-pretrain-lvd1689m"
+    wd = pathlib.Path(weights_dir)
+    if not wd.is_dir():
+        return
+    for cfg in ("pipeline.json", "texturing_pipeline.json"):
+        fp = wd / cfg
+        if not fp.is_file():
+            continue
+        try:
+            txt = fp.read_text()
+            if OLD in txt:
+                fp.write_text(txt.replace(OLD, NEW))
+                print(f"  🔧 Patched DINOv3 repo id in {cfg} ({OLD} → {NEW})")
+        except Exception as e:
+            print(f"  ⚠ Could not patch {cfg}: {e}")
+
+
 def cache_weights_to_drive():
     if DRIVE_WEIGHTS.exists() and any(DRIVE_WEIGHTS.iterdir()):
         return
@@ -213,6 +242,10 @@ print("Loading TRELLIS.2 pipeline...")
 _t = _stage("Resolving weights (download/copy if needed)")
 weights_path = resolve_weights()
 downloaded_from_hf = (weights_path == HF_MODEL_ID)
+# Fix the dead DINOv3 repo id in the local configs before from_pretrained reads
+# them. Only applies to a local weights dir (not the HF-id download path).
+if not downloaded_from_hf:
+    patch_image_cond_repo(weights_path)
 _stage_done(_t, f"Weights ready at {weights_path}")
 
 _t = _stage("Building pipeline — image-cond model (DINOv3), VAEs, samplers")
@@ -222,6 +255,30 @@ _stage_done(_t, "Pipeline built")
 _t = _stage("Moving pipeline to GPU")
 trellis_pipe.cuda()
 _stage_done(_t, "Pipeline on GPU")
+
+# ── Optional bf16 inference (opt-in, OFF by default) ──────────────────────────
+# Set env TRELLIS2_BF16=1 before importing backend to run the flow-matching
+# transformers under bf16 autocast. On an A100 this is the real speed/VRAM lever
+# (bf16 tensor cores) now that GGUF isn't available for this PyTorch pipeline.
+# It's OFF by default so behaviour is identical to before unless you opt in.
+# NOTE: this has NOT been validated on-device here — bf16 can shift numerics on
+# sparse-voxel / flow-matching ops, so verify output quality on a test image and
+# just unset the env var to revert if you see artifacts or CUDA errors.
+TRELLIS2_BF16 = os.getenv("TRELLIS2_BF16", "0").lower() in ("1", "true", "yes")
+if TRELLIS2_BF16:
+    import functools as _functools
+
+    def _bf16_autocast(fn):
+        @_functools.wraps(fn)
+        def _inner(*a, **k):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                return fn(*a, **k)
+        return _inner
+
+    trellis_pipe.run = _bf16_autocast(trellis_pipe.run)
+    if hasattr(trellis_pipe, "decode_latent"):
+        trellis_pipe.decode_latent = _bf16_autocast(trellis_pipe.decode_latent)
+    print("⚡ TRELLIS2_BF16=1 → bf16 autocast enabled for inference")
 
 if downloaded_from_hf:
     try:
