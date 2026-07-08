@@ -261,9 +261,9 @@ _stage_done(_t, "Pipeline on GPU")
 # transformers under bf16 autocast. On an A100 this is the real speed/VRAM lever
 # (bf16 tensor cores) now that GGUF isn't available for this PyTorch pipeline.
 # It's OFF by default so behaviour is identical to before unless you opt in.
-# NOTE: this has NOT been validated on-device here — bf16 can shift numerics on
-# sparse-voxel / flow-matching ops, so verify output quality on a test image and
-# just unset the env var to revert if you see artifacts or CUDA errors.
+# NOTE: bf16 can shift numerics on sparse-voxel / flow-matching ops, so verify
+# output quality on a test image and just unset the env var to revert if you see
+# artifacts or CUDA errors.
 TRELLIS2_BF16 = os.getenv("TRELLIS2_BF16", "0").lower() in ("1", "true", "yes")
 if TRELLIS2_BF16:
     import functools as _functools
