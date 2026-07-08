@@ -40,22 +40,53 @@ function switchSidebarTab(btn) {
 // ══════════════════════════════════════════════════════════════
 
 let consoleOpen = false;
+let consoleMinimized = false;
+const CONSOLE_OPEN_H = '200px';
 
 function toggleConsole() {
     consoleOpen = !consoleOpen;
     const drawer = $('consoleDrawer');
     const btn = $('consoleToggle');
     if (consoleOpen) {
-        document.documentElement.style.setProperty('--console-h', '200px');
+        // Always open to the full height; clear any prior minimized state.
+        consoleMinimized = false;
+        drawer.classList.remove('minimized');
+        document.documentElement.style.setProperty('--console-h', CONSOLE_OPEN_H);
         drawer.classList.add('open');
         btn.classList.add('active');
         btn.textContent = '▾ Console';
+        syncMinBtn();
     } else {
         document.documentElement.style.setProperty('--console-h', '0px');
-        drawer.classList.remove('open');
+        drawer.classList.remove('open', 'minimized');
         btn.classList.remove('active');
         btn.textContent = '▸ Console';
     }
+}
+
+// Collapse the drawer to just its header bar (content hidden, tabs/actions
+// stay reachable), or restore it to full height. Only meaningful while open;
+// if the drawer is closed, this opens it first.
+function minimizeConsole() {
+    if (!consoleOpen) { toggleConsole(); return; }
+    consoleMinimized = !consoleMinimized;
+    const drawer = $('consoleDrawer');
+    if (consoleMinimized) {
+        drawer.classList.add('minimized');
+        // 'auto' lets the grid row shrink to the header's natural height.
+        document.documentElement.style.setProperty('--console-h', 'auto');
+    } else {
+        drawer.classList.remove('minimized');
+        document.documentElement.style.setProperty('--console-h', CONSOLE_OPEN_H);
+    }
+    syncMinBtn();
+}
+
+function syncMinBtn() {
+    const b = $('consoleMinBtn');
+    if (!b) return;
+    b.textContent = consoleMinimized ? '▢' : '▁';
+    b.title = consoleMinimized ? 'Restore console' : 'Minimize console';
 }
 
 function switchConsoleTab(btn) {

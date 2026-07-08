@@ -181,6 +181,9 @@ body{background:var(--black);color:var(--text);font-family:var(--font-body);font
 /* ═══ CONSOLE DRAWER ═══ */
 .console-drawer{grid-area:console;background:#08080A;border-top:1px solid var(--border);display:none;flex-direction:column;overflow:hidden}
 .console-drawer.open{display:flex}
+/* Minimized: collapse to just the header bar; content hidden, tabs+actions stay reachable */
+.console-drawer.minimized .console-content{display:none}
+.console-drawer.minimized .console-drawer-header{border-bottom:none}
 .console-drawer-header{display:flex;align-items:center;padding:6px 16px;gap:10px;border-bottom:1px solid var(--border);flex-shrink:0}
 .cdh-label{font-family:var(--font-mono);font-size:10px;color:var(--text-muted);font-weight:600;letter-spacing:.5px;text-transform:uppercase}
 .console-tab-btns{display:flex;gap:2px;margin-left:8px}
@@ -521,6 +524,7 @@ body{background:var(--black);color:var(--text);font-family:var(--font-body);font
 .console-actions{margin-left:auto;display:flex;gap:6px}
 .console-action-btn{font-family:var(--font-mono);font-size:9px;padding:3px 9px;border-radius:3px;background:var(--surface-3);border:1px solid var(--border);color:var(--text-dim);cursor:pointer;transition:all .1s}
 .console-action-btn:hover{color:var(--gold);border-color:var(--gold-dark)}
+.console-min-btn{font-size:12px;line-height:1;padding:2px 9px 4px}
 
 .queue-float{position:absolute;bottom:80px;right:20px;width:300px;z-index:50;background:rgba(17,17,19,.92);backdrop-filter:blur(8px);border:1px solid var(--border-light);border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.5);overflow:hidden}
 .queue-float-header{display:flex;align-items:center;justify-content:space-between;padding:9px 14px;border-bottom:1px solid var(--border)}
