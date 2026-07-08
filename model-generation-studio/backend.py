@@ -256,15 +256,14 @@ _t = _stage("Moving pipeline to GPU")
 trellis_pipe.cuda()
 _stage_done(_t, "Pipeline on GPU")
 
-# ── Optional bf16 inference (opt-in, OFF by default) ──────────────────────────
-# Set env TRELLIS2_BF16=1 before importing backend to run the flow-matching
-# transformers under bf16 autocast. On an A100 this is the real speed/VRAM lever
-# (bf16 tensor cores) now that GGUF isn't available for this PyTorch pipeline.
-# It's OFF by default so behaviour is identical to before unless you opt in.
-# NOTE: bf16 can shift numerics on sparse-voxel / flow-matching ops, so verify
-# output quality on a test image and just unset the env var to revert if you see
-# artifacts or CUDA errors.
-TRELLIS2_BF16 = os.getenv("TRELLIS2_BF16", "0").lower() in ("1", "true", "yes")
+# ── bf16 inference (ON by default) ────────────────────────────────────────────
+# Runs the flow-matching transformers under bf16 autocast. On an A100 this uses
+# bf16 tensor cores and halves activation bandwidth for the sampling stages.
+# (TF32 is already enabled above, and the mesh/UV/bake stages are unaffected, so
+# the end-to-end speedup is real but partial.) Disable with TRELLIS2_BF16=0 if
+# you see artifacts or CUDA/NaN errors — bf16 can shift numerics on sparse-voxel
+# / flow-matching ops. Not validated on-device here, so sanity-check one image.
+TRELLIS2_BF16 = os.getenv("TRELLIS2_BF16", "1").lower() not in ("0", "false", "no", "off")
 if TRELLIS2_BF16:
     import functools as _functools
 
@@ -278,7 +277,9 @@ if TRELLIS2_BF16:
     trellis_pipe.run = _bf16_autocast(trellis_pipe.run)
     if hasattr(trellis_pipe, "decode_latent"):
         trellis_pipe.decode_latent = _bf16_autocast(trellis_pipe.decode_latent)
-    print("⚡ TRELLIS2_BF16=1 → bf16 autocast enabled for inference")
+    print("⚡ bf16 autocast enabled for inference (set TRELLIS2_BF16=0 to disable)")
+else:
+    print("bf16 disabled (TRELLIS2_BF16=0) — running default precision")
 
 if downloaded_from_hf:
     try:
