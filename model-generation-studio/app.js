@@ -776,41 +776,13 @@ function toggleHistoryPanel() {
     if (!collapsed) refreshHistory();   // load when opened
 }
 
-// Format a unix mtime (seconds) as a short created-date for the card.
-function _fmtHistoryDate(mtime) {
-    if (!mtime) return '';
-    try {
-        return new Date(mtime * 1000).toLocaleDateString(undefined,
-            { month: 'short', day: 'numeric', year: 'numeric' });
-    } catch (e) { return ''; }
-}
-
-// If an older model's preview file is gone/broken, swap the img for the glyph
-// placeholder instead of showing a broken-image icon.
-function histThumbError(img) {
-    const t = img.closest('.hg-thumb');
-    if (t) { t.classList.add('hg-thumb-fallback'); t.innerHTML = '<span class="hg-glyph">🧊</span>'; }
-}
-
 function _historyCardHTML(m, i) {
-    const hasImg = m.media && (m.media_type === 'image' || m.media_type === 'rts_sprite' || m.media_type === 'doom_sprite');
-    const thumb = hasImg
-        ? `<img src="/api/file?p=${enc(m.media)}" loading="lazy" alt="" onerror="histThumbError(this)">`
+    const thumb = (m.media && (m.media_type === 'image' || m.media_type === 'rts_sprite' || m.media_type === 'doom_sprite'))
+        ? `<img src="/api/file?p=${enc(m.media)}" loading="lazy" alt="">`
         : `<span class="hg-glyph">🧊</span>`;
-    // Older models built by earlier versions may lack a render mesh / stage cache
-    // (needed for re-render / edit). Flag them so the card still reads clearly
-    // and the user knows some actions may be unavailable — never render blank.
-    const missing = !m.render_mesh && !m.stage_cache;
-    const legacyTag = missing
-        ? `<span class="hg-tag" title="Older model — render mesh / stage cache missing, so Edit / Re-render may be unavailable">legacy</span>`
-        : '';
-    const date = _fmtHistoryDate(m.mtime);
-    const metaBits = [date, legacyTag].filter(Boolean).join('');
-    const meta = metaBits ? `<div class="hg-meta">${metaBits}</div>` : '';
-    return `<div class="history-card${missing ? ' legacy' : ''}" onclick="openHistory(${i})" title="${escapeHtml(m.name)}">
-        <div class="hg-thumb${hasImg ? '' : ' hg-thumb-fallback'}">${thumb}</div>
-        <div class="hg-name">${escapeHtml(m.name || 'untitled')}</div>
-        ${meta}
+    return `<div class="history-card" onclick="openHistory(${i})" title="${escapeHtml(m.name)}">
+        <div class="hg-thumb">${thumb}</div>
+        <div class="hg-name">${escapeHtml(m.name)}</div>
     </div>`;
 }
 
@@ -828,15 +800,6 @@ async function loadMoreHistory(reset = false) {
     if (historyLoading) return;
     if (!reset && !historyHasMore) return;
     historyLoading = true;
-    const grid = $('historyGrid');
-    // Visible feedback while the next page of 20 streams in (infinite scroll).
-    let loadingRow = null;
-    if (!reset && grid) {
-        loadingRow = document.createElement('div');
-        loadingRow.className = 'history-empty';
-        loadingRow.textContent = 'Loading more…';
-        grid.appendChild(loadingRow);
-    }
     try {
         const dir = $('sOutDir') ? $('sOutDir').value : '';
         const params = new URLSearchParams({ limit: HISTORY_PAGE, offset: historyOffset });
@@ -847,7 +810,7 @@ async function loadMoreHistory(reset = false) {
         const cnt = $('historyCount');
         if (cnt) cnt.textContent = d.count ? `(${d.count})` : '';
 
-        if (loadingRow) { loadingRow.remove(); loadingRow = null; }
+        const grid = $('historyGrid');
         if (reset) grid.innerHTML = '';
 
         const newModels = d.models || [];
@@ -868,7 +831,6 @@ async function loadMoreHistory(reset = false) {
     } catch (e) {
         if (reset) $('historyGrid').innerHTML = '<div class="history-empty">Failed to load history</div>';
     } finally {
-        if (loadingRow) loadingRow.remove();
         historyLoading = false;
     }
 }

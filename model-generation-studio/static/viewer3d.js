@@ -24,6 +24,18 @@ let frameCount = 0, fpsTime = 0, currentFps = 0;
 let animFrameId = null;
 let isActive = false;
 
+// ── Render-performance state ──────────────────────────────────────────────────
+// needsRender drives on-demand rendering: we only draw a frame when something
+// actually changed (camera motion, interaction, paint, load, resize) instead of
+// burning the GPU on a static model. fullDpr/interactDpr drive adaptive
+// resolution: we render at a lower pixel ratio while the user is rotating/
+// panning/zooming (fewer fragments = faster), then restore crisp full-res once
+// the view settles.
+let needsRender = true;
+let fullDpr = 1, interactDpr = 1;
+const INTERACT_DPR_SCALE = 0.65;   // fraction of full resolution used while interacting
+function invalidate() { needsRender = true; }
+
 // ── Paint mask state ──
 let paintMode = false;
 let isPainting = false;
@@ -96,6 +108,9 @@ function init() {
 
     controls.addEventListener('start', onInteractionStart);
     controls.addEventListener('end', onInteractionEnd);
+    // Any camera change (drag, zoom, pan, damping tail, programmatic update)
+    // requests a redraw. This is the authoritative trigger for on-demand render.
+    controls.addEventListener('change', invalidate);
 
     setupLights();
     clock = new THREE.Clock();
@@ -153,6 +168,7 @@ function clearMask() {
     if (!maskCtx) return;
     maskCtx.clearRect(0, 0, MASK_RESOLUTION, MASK_RESOLUTION);
     if (maskTexture) maskTexture.needsUpdate = true;
+    invalidate();
     lastPaintUV = null;
     window.dispatchEvent(new CustomEvent('maskChanged', { detail: { hasContent: false } }));
 }
@@ -171,6 +187,7 @@ function loadMaskFromImage(img) {
     maskCtx.clearRect(0, 0, MASK_RESOLUTION, MASK_RESOLUTION);
     maskCtx.drawImage(img, 0, 0, MASK_RESOLUTION, MASK_RESOLUTION);
     if (maskTexture) maskTexture.needsUpdate = true;
+    invalidate();
     window.dispatchEvent(new CustomEvent('maskChanged', { detail: { hasContent: true } }));
 }
 
@@ -253,6 +270,7 @@ function removeMaskOverlay() {
         maskOverlayMesh.traverse((obj) => { if (obj.isMesh) obj.material?.dispose?.(); });
         scene.remove(maskOverlayMesh);
         maskOverlayMesh = null;
+        invalidate();
     }
 }
 
@@ -433,6 +451,7 @@ function paintAtScreen(clientX, clientY) {
     }
 
     if (maskTexture) maskTexture.needsUpdate = true;
+    invalidate();
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -448,6 +467,7 @@ function onKeyUp(e) { keysDown.delete(e.key.toLowerCase()); }
 
 function processKeyboardInput() {
     if (keysDown.size === 0 || !controls) return;
+    invalidate();   // keyboard moves the camera directly; request a redraw
     const right = new THREE.Vector3();
     const up = new THREE.Vector3(0, 1, 0);
     const forward = new THREE.Vector3();
@@ -504,19 +524,30 @@ function zoomOut() {
 function onInteractionStart() {
     if (paintMode) return;
     if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
-    if (!isInteracting) { isInteracting = true; if (!forcedWireframe) switchToFastMode(); }
+    if (!isInteracting) {
+        isInteracting = true;
+        if (renderer) renderer.setPixelRatio(interactDpr);   // lower res while moving
+        if (!forcedWireframe) switchToFastMode();
+    }
+    invalidate();
 }
 
 function onInteractionEnd() {
     if (paintMode) return;
     if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => { isInteracting = false; if (!forcedWireframe) switchToShadedMode(); }, IDLE_DELAY);
+    idleTimer = setTimeout(() => {
+        isInteracting = false;
+        if (renderer) renderer.setPixelRatio(fullDpr);       // restore crisp full res
+        if (!forcedWireframe) switchToShadedMode();
+        invalidate();
+    }, IDLE_DELAY);
 }
 
 function switchToFastMode() {
     if (!currentModel || paintMode) return;
     currentModel.traverse((obj) => { if (obj.isMesh) { const u = unlitMaterials.get(obj); if (u) obj.material = u; } });
     if (!paintMode) { hudMode.textContent = 'FAST'; hudMode.className = 'hud-mode fast'; }
+    invalidate();
 }
 
 function switchToShadedMode() {
@@ -527,6 +558,7 @@ function switchToShadedMode() {
         if (orig) { obj.material = orig; if (Array.isArray(orig)) orig.forEach(m => { m.wireframe = false; }); else orig.wireframe = false; }
     });
     hudMode.textContent = 'SHADED'; hudMode.className = 'hud-mode shaded';
+    invalidate();
 }
 
 function toggleWireframe() {
@@ -538,6 +570,7 @@ function toggleWireframe() {
         currentModel.traverse((obj) => { if (!obj.isMesh) return; const orig = originalMaterials.get(obj); if (orig) { obj.material = orig; if (Array.isArray(orig)) orig.forEach(m => { m.wireframe = true; }); else orig.wireframe = true; } });
         hudMode.textContent = 'WIREFRAME'; hudMode.className = 'hud-mode wire';
     } else { if (isInteracting) switchToFastMode(); else switchToShadedMode(); }
+    invalidate();
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -651,11 +684,17 @@ function animate() {
     animFrameId = requestAnimationFrame(animate);
     if (!isActive) return;
     processKeyboardInput();
-    controls.update();
-    renderer.render(scene, camera);
-    frameCount++;
-    const elapsed = clock.getElapsedTime();
-    if (elapsed - fpsTime >= 0.5) { currentFps = Math.round(frameCount / (elapsed - fpsTime)); hudFps.textContent = currentFps + ' fps'; frameCount = 0; fpsTime = elapsed; }
+    controls.update();   // applies damping; fires 'change' -> invalidate() when the camera moves
+    // On-demand: only draw when something changed. While interacting or painting
+    // we draw every frame; otherwise we wait for an invalidate(). This frees the
+    // GPU on a static model so rotation has full headroom the moment it starts.
+    if (needsRender || isInteracting || paintMode) {
+        renderer.render(scene, camera);
+        if (!isInteracting && !paintMode) needsRender = false;
+        frameCount++;
+        const elapsed = clock.getElapsedTime();
+        if (elapsed - fpsTime >= 0.5) { currentFps = Math.round(frameCount / (elapsed - fpsTime)); hudFps.textContent = currentFps + ' fps'; frameCount = 0; fpsTime = elapsed; }
+    }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -679,9 +718,12 @@ function hide() { isActive = false; container.classList.remove('active'); if (pa
 function onResize() {
     if (!renderer || !container) return;
     const w = container.clientWidth || 1, h = container.clientHeight || 1;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    renderer.setPixelRatio(dpr); renderer.setSize(w, h, false);
+    fullDpr = Math.min(window.devicePixelRatio || 1, 2);
+    interactDpr = Math.max(0.5, fullDpr * INTERACT_DPR_SCALE);
+    renderer.setPixelRatio(isInteracting ? interactDpr : fullDpr);
+    renderer.setSize(w, h, false);
     camera.aspect = w / h; camera.updateProjectionMatrix();
+    invalidate();
 }
 
 // ══════════════════════════════════════════════════════════════
