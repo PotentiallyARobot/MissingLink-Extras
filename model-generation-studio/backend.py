@@ -223,9 +223,19 @@ def _stage(msg):
 def _stage_done(t0, msg):
     print(f"✓ {msg} ({time.perf_counter() - t0:.1f}s)", flush=True)
 
-from trellis2.pipelines import Trellis2ImageTo3DPipeline
-from trellis2.utils import render_utils
-from trellis2.renderers import EnvMap
+# ── GGUF mode: set TRELLIS2_GGUF=1 before import to run the Q4 GGUF engine ────
+# (pure-Python Aero-Ex fork, no ComfyUI; ~4.4GB VRAM). Stage-cache features
+# (Edit / Re-render / Re-texture) are unavailable in GGUF mode.
+GGUF_MODE = os.getenv("TRELLIS2_GGUF", "0").lower() in ("1", "true", "yes")
+if GGUF_MODE:
+    import gguf_engine
+    gguf_engine.prepare()                              # shims + vendor + patches + sys.path
+    from trellis2_gguf.utils import render_utils
+    from trellis2_gguf.renderers.pbr_mesh_renderer import EnvMap
+else:
+    from trellis2.pipelines import Trellis2ImageTo3DPipeline
+    from trellis2.utils import render_utils
+    from trellis2.renderers import EnvMap
 import o_voxel
 import missinglink.postprocess_parallel as pp
 
@@ -239,22 +249,33 @@ RENDER_MAX_FACES = 16_000_000
 print(f"GPU: {GPU_NAME} | VRAM: {TOTAL_VRAM:.1f} GB")
 print("Loading TRELLIS.2 pipeline...")
 
-_t = _stage("Resolving weights (download/copy if needed)")
-weights_path = resolve_weights()
-downloaded_from_hf = (weights_path == HF_MODEL_ID)
-# Fix the dead DINOv3 repo id in the local configs before from_pretrained reads
-# them. Only applies to a local weights dir (not the HF-id download path).
-if not downloaded_from_hf:
-    patch_image_cond_repo(weights_path)
-_stage_done(_t, f"Weights ready at {weights_path}")
+if GGUF_MODE:
+    _t = _stage(f"Loading Q4 GGUF pipeline ({os.getenv('TRELLIS2_GGUF_QUANT', 'Q4_K_M')})")
+    trellis_pipe = gguf_engine.load_pipeline(log=print)
+    _stage_done(_t, "GGUF pipeline built (studio run() adapter installed)")
+else:
+    _t = _stage("Resolving weights (download/copy if needed)")
+    weights_path = resolve_weights()
+    downloaded_from_hf = (weights_path == HF_MODEL_ID)
+    # Fix the dead DINOv3 repo id in the local configs before from_pretrained reads
+    # them. Only applies to a local weights dir (not the HF-id download path).
+    if not downloaded_from_hf:
+        patch_image_cond_repo(weights_path)
+    _stage_done(_t, f"Weights ready at {weights_path}")
 
-_t = _stage("Building pipeline — image-cond model (DINOv3), VAEs, samplers")
-trellis_pipe = Trellis2ImageTo3DPipeline.from_pretrained(weights_path)
-_stage_done(_t, "Pipeline built")
+    _t = _stage("Building pipeline — image-cond model (DINOv3), VAEs, samplers")
+    trellis_pipe = Trellis2ImageTo3DPipeline.from_pretrained(weights_path)
+    _stage_done(_t, "Pipeline built")
 
-_t = _stage("Moving pipeline to GPU")
-trellis_pipe.cuda()
-_stage_done(_t, "Pipeline on GPU")
+if not GGUF_MODE:
+    _t = _stage("Moving pipeline to GPU")
+    trellis_pipe.cuda()
+    _stage_done(_t, "Pipeline on GPU")
+
+# ── bf16 inference (ON by default; stock mode only) ───────────────────────────
+# GGUF mode skips this: weights are Q4-packed and the engine's dequant path
+# manages precision itself — wrapping it in autocast is untested and unnecessary.
+TRELLIS2_BF16 = (not GGUF_MODE) and os.getenv("TRELLIS2_BF16", "1").lower() not in ("0", "false", "no", "off")
 
 # ── bf16 inference (ON by default) ────────────────────────────────────────────
 # Runs the flow-matching transformers under bf16 autocast. On an A100 this uses
@@ -263,7 +284,6 @@ _stage_done(_t, "Pipeline on GPU")
 # the end-to-end speedup is real but partial.) Disable with TRELLIS2_BF16=0 if
 # you see artifacts or CUDA/NaN errors — bf16 can shift numerics on sparse-voxel
 # / flow-matching ops. Not validated on-device here, so sanity-check one image.
-TRELLIS2_BF16 = os.getenv("TRELLIS2_BF16", "1").lower() not in ("0", "false", "no", "off")
 if TRELLIS2_BF16:
     import functools as _functools
 
@@ -294,6 +314,16 @@ if downloaded_from_hf:
 
 _t = _stage("Loading HDRI envmap (forest.exr)")
 hdri = REPO_DIR / "assets" / "hdri" / "forest.exr"
+if not hdri.exists():
+    # GGUF-only runtimes may not have the TRELLIS.2 repo checked out; fetch the
+    # stock HDRI so the PBR renderer has identical lighting either way.
+    hdri = pathlib.Path("/content/forest.exr")
+    if not hdri.exists():
+        import requests as _rq
+        _r = _rq.get("https://raw.githubusercontent.com/microsoft/TRELLIS.2/main/assets/hdri/forest.exr", timeout=60)
+        _r.raise_for_status()
+        hdri.write_bytes(_r.content)
+        print(f"  ⬇ downloaded stock forest.exr -> {hdri}")
 envmap = EnvMap(torch.tensor(
     cv2.cvtColor(cv2.imread(str(hdri), cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB),
     dtype=torch.float32, device="cuda",
@@ -1406,6 +1436,12 @@ import logging
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
 
+@app.route("/api/mode")
+def api_mode():
+    return jsonify({"gguf": GGUF_MODE,
+                    "quant": os.getenv("TRELLIS2_GGUF_QUANT", "Q4_K_M") if GGUF_MODE else None})
+
+
 @app.route("/api/keepalive")
 def api_keepalive():
     return jsonify({"ok": True})
@@ -1608,6 +1644,8 @@ def api_rmbg():
 
 @app.route("/api/rerender", methods=["POST"])
 def api_rerender():
+    if GGUF_MODE:
+        return jsonify({"error": "Not available in GGUF mode — stage caches are unsupported by the Q4 engine. Restart without TRELLIS2_GGUF=1 for Edit/Re-render/Re-texture."}), 400
     """
     Re-render a previously generated model with a different render mode.
     Expects JSON: { render_mesh, name, mode, output_dir, ... render settings }
@@ -1786,6 +1824,8 @@ def api_stages():
 
 @app.route("/api/retexture", methods=["POST"])
 def api_retexture():
+    if GGUF_MODE:
+        return jsonify({"error": "Not available in GGUF mode — stage caches are unsupported by the Q4 engine. Restart without TRELLIS2_GGUF=1 for Edit/Re-render/Re-texture."}), 400
     """
     Retexture a model with masked latent blending.
 

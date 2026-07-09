@@ -885,6 +885,25 @@ function _initHistoryScroll() {
 }
 _initHistoryScroll();
 
+// ── GGUF mode detection: badge + hide stage-cache features ──────────────────
+(async () => {
+    try {
+        const r = await fetch('/api/mode');
+        const m = await r.json();
+        if (m && m.gguf) {
+            document.body.classList.add('gguf-mode');
+            const hl = document.querySelector('.app-header-left');
+            if (hl) {
+                const b = document.createElement('span');
+                b.className = 'gguf-badge';
+                b.textContent = `GGUF ${m.quant || 'Q4'}`;
+                b.title = 'Running the Q4 GGUF engine (~4.4GB VRAM). Edit / Re-render / Re-texture are unavailable in this mode.';
+                hl.appendChild(b);
+            }
+        }
+    } catch (e) { /* stock mode or endpoint absent — no-op */ }
+})();
+
 function openHistory(idx) {
     const m = historyModels[idx];
     if (!m) return;
