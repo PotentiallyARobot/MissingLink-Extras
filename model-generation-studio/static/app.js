@@ -718,8 +718,11 @@ async function refreshQueue() {
             const imgInfo = (p.image_num && p.total) ? `${p.image_num}/${p.total}` : '';
             const elapsed = p.elapsed ? fmtTime(p.elapsed) : '';
             const meta = [imgInfo, elapsed].filter(Boolean).join(' · ');
+            const aThumb = q.active.thumb
+                ? `<span class="q-thumb"><img src="/api/file?p=${enc(q.active.thumb)}" alt="" onerror="this.parentNode.textContent='⚡'"></span>`
+                : `<span class="q-thumb">⚡</span>`;
             rows.push(`<div class="queue-row active">
-                <span class="q-thumb">⚡</span>
+                ${aThumb}
                 <div class="q-body">
                     <span class="q-name">${escapeHtml(q.active.name)}</span>
                     <span class="q-status">${escapeHtml(p.phase || 'Generating')}${meta ? ' — ' + meta : ''}</span>
@@ -730,8 +733,11 @@ async function refreshQueue() {
             </div>`);
         }
         (q.queued || []).forEach((j, i) => {
+            const qThumb = j.thumb
+                ? `<span class="q-thumb q-thumb-sm"><img src="/api/file?p=${enc(j.thumb)}" alt="" onerror="this.parentNode.outerHTML='<span class=&quot;q-dot pending&quot;></span>'"></span>`
+                : `<span class="q-dot pending"></span>`;
             rows.push(`<div class="queue-row">
-                <span class="q-dot pending"></span>
+                ${qThumb}
                 <div class="q-body"><span class="q-name">${escapeHtml(j.name)}</span>
                     <span class="q-status">#${i + 1} waiting</span></div>
                 <button class="q-cancel" onclick="cancelJob('${j.job_id}')" title="Remove from queue">✕</button>
@@ -862,6 +868,7 @@ async function loadMoreHistory(reset = false) {
         historyModels = historyModels.concat(newModels);
         const html = newModels.map((m, j) => _historyCardHTML(m, startIdx + j)).join('');
         grid.insertAdjacentHTML('beforeend', html);
+        _healHistoryThumbs(grid);
 
         historyOffset += newModels.length;
         historyHasMore = !!d.has_more;
@@ -874,6 +881,41 @@ async function loadMoreHistory(reset = false) {
 }
 
 // Infinite scroll: when the grid is scrolled near the bottom, fetch next page.
+// Self-heal: some environment is collapsing .hg-thumb despite aspect-ratio +
+// min-height in CSS. Enforce square thumbs via inline styles (immune to any
+// stylesheet issue), and report once, visibly, what was measured so the root
+// cause is identifiable from a screenshot.
+function _healHistoryThumbs(grid) {
+    try {
+        const thumbs = grid.querySelectorAll('.hg-thumb:not([data-healed])');
+        let collapsed = 0, firstH = null;
+        thumbs.forEach(t => {
+            t.setAttribute('data-healed', '1');
+            const h = t.clientHeight;
+            if (firstH === null) firstH = h;
+            if (h < 40) {
+                collapsed++;
+                const w = t.clientWidth || 120;
+                t.style.height = w + 'px';
+                t.style.minHeight = '72px';
+            }
+        });
+        if (collapsed > 0 && !grid.querySelector('.history-diag')) {
+            let ruleFound = 'unknown';
+            try {
+                ruleFound = [...document.styleSheets].some(s => {
+                    try { return [...s.cssRules].some(r => r.selectorText === '.hg-thumb'); }
+                    catch (e) { return false; }
+                }) ? 'yes' : 'NO';
+            } catch (e) {}
+            const d = document.createElement('div');
+            d.className = 'history-empty history-diag';
+            d.textContent = `diag[${UI_BUILD}]: ${collapsed} thumbs collapsed (h=${firstH}px), .hg-thumb rule in CSSOM: ${ruleFound} — inline-fixed`;
+            grid.appendChild(d);
+        }
+    } catch (e) { console.error('thumb heal error', e); }
+}
+
 function _initHistoryScroll() {
     const grid = $('historyGrid');
     if (!grid) return;
@@ -886,7 +928,7 @@ function _initHistoryScroll() {
 _initHistoryScroll();
 
 // UI build stamp — shows in the History header so screenshots identify the build.
-const UI_BUILD = 'r7-gguf';
+const UI_BUILD = 'r8-gguf';
 (() => {
     const hdr = document.querySelector('.history-float-header .hf-title');
     if (hdr) {
