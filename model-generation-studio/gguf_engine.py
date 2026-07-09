@@ -303,7 +303,7 @@ def load_pipeline(log=print):
                 need_pre = False
         except Exception:
             pass
-        return fork_run(
+        out = fork_run(
             image,
             sparse_structure_sampler_params=sparse_structure_sampler_params or {"steps": 12},
             shape_slat_sampler_params=shape_slat_sampler_params or {"steps": 12},
@@ -312,6 +312,14 @@ def load_pipeline(log=print):
             pipeline_type=None, use_tiled=False,
             generate_texture_slat=True, verbose=True,
         )
+        # API bridge: the fork's MeshWithVoxel renamed stock simplify() to
+        # simplify_with_cumesh() (same cumesh mechanics). Alias it so the
+        # studio's mesh.simplify(target) call sites work unchanged.
+        for m in (out if isinstance(out, (list, tuple)) else [out]):
+            if m is not None and not hasattr(m, "simplify") and hasattr(m, "simplify_with_cumesh"):
+                m.simplify = (lambda target=1000000, verbose=False, options=None, _m=m:
+                              _m.simplify_with_cumesh(target, verbose=verbose, options=options or {}))
+        return out
 
     pipe.run = studio_run
     log(f"[gguf] pipeline ready ({QUANT}, adapter installed)")
