@@ -252,6 +252,23 @@ def load_pipeline(log=print):
             low_vram = free_gb < 16
         pipe.low_vram = low_vram
         log(f"[gguf] low_vram={low_vram} — models {'offloaded per stage' if low_vram else 'stay resident on GPU'}")
+        # Preload every lazily-loaded sub-model NOW (SLat encoder, both flow
+        # cascades, decoders, DINOv3) so nothing loads mid-generation. Uses the
+        # fork's own load_* methods so GGUF quant flags stay correct. Only when
+        # keeping models resident — on low-VRAM cards lazy loading is the point.
+        if not low_vram:
+            for meth in ("load_sparse_structure_model", "load_image_cond_model",
+                         "load_shape_slat_flow_model_512", "load_shape_slat_flow_model_1024",
+                         "load_tex_slat_flow_model_512", "load_tex_slat_flow_model_1024",
+                         "load_shape_slat_decoder", "load_tex_slat_decoder",
+                         "load_shape_slat_encoder"):
+                try:
+                    getattr(pipe, meth)()
+                except Exception as pe:
+                    log(f"[gguf] preload {meth} skipped: {pe}")
+            loaded = sum(1 for m in pipe.models.values() if m is not None)
+            free_gb = torch.cuda.mem_get_info()[0] / 1e9 if torch.cuda.is_available() else 0
+            log(f"[gguf] preloaded {loaded}/{len(pipe.models)} sub-models to GPU ({free_gb:.1f}GB VRAM still free)")
     except Exception as e:
         log(f"[gguf] low_vram config note: {e}")
 

@@ -372,6 +372,8 @@ def safe_offload_models():
         pass  # fall through to offload if the check itself fails
     freed_before = torch.cuda.memory_allocated() / 1e9
     for name, model in trellis_pipe.models.items():
+        if model is None:
+            continue  # lazily-unloaded entry (GGUF fork) — nothing to move
         try:
             model.to("cpu")
         except Exception as e:
@@ -552,14 +554,26 @@ def queue_snapshot():
         queued_ids = list(_generate_queue)
     out = {"queued": [], "active": None, "recent": []}
     active_id = active_jobs.get("generate")
+    def _thumb(j):
+        # First uploaded image for this job (saved under UPLOAD_DIR/<job_id>/) —
+        # served to the UI via /api/file, which already allows UPLOAD_DIR.
+        files = j.get("files") or []
+        if files:
+            p = files[0][1] if isinstance(files[0], (list, tuple)) else files[0]
+            if p and os.path.isfile(p):
+                return p
+        return None
+
     for jid in queued_ids:
         j = jobs.get(jid, {})
         out["queued"].append({"job_id": jid, "name": j.get("name", jid),
-                              "total": j.get("progress", {}).get("total", 0)})
+                              "total": j.get("progress", {}).get("total", 0),
+                              "thumb": _thumb(j)})
     if active_id and active_id in jobs and jobs[active_id]["status"] == "running":
         j = jobs[active_id]
         out["active"] = {"job_id": active_id, "name": j.get("name", active_id),
-                         "progress": j.get("progress", {})}
+                         "progress": j.get("progress", {}),
+                         "thumb": _thumb(j)}
     # recent finished generate jobs, newest first
     for jid in reversed(_queue_order[-20:]):
         j = jobs.get(jid)
