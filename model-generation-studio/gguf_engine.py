@@ -237,6 +237,24 @@ def load_pipeline(log=print):
         _install_dequant_cache()
         log("[gguf] dequant cache ON (fp16 cached after first use; faster, more VRAM)")
 
+    # Keep models resident on the GPU when there's room. The fork defaults
+    # low_vram=True, which offloads every stage's model to CPU after use and
+    # chunks linear ops — pure overhead on a big card. Auto: disable low_vram
+    # when free VRAM > 16GB. Override with TRELLIS2_GGUF_LOW_VRAM=0/1.
+    try:
+        lv_env = os.getenv("TRELLIS2_GGUF_LOW_VRAM", "").strip().lower()
+        if lv_env in ("0", "false", "no"):
+            low_vram = False
+        elif lv_env in ("1", "true", "yes"):
+            low_vram = True
+        else:
+            free_gb = torch.cuda.mem_get_info()[0] / 1e9 if torch.cuda.is_available() else 0
+            low_vram = free_gb < 16
+        pipe.low_vram = low_vram
+        log(f"[gguf] low_vram={low_vram} — models {'offloaded per stage' if low_vram else 'stay resident on GPU'}")
+    except Exception as e:
+        log(f"[gguf] low_vram config note: {e}")
+
     # run() adapter: accept the studio's stock call signature.
     fork_run = pipe.run
 
