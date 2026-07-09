@@ -1344,6 +1344,8 @@ def run_generate_job(job_id):
                     break
 
                 except Exception as e:
+                    error_tb = traceback.format_exc()   # capture NOW, while active
+                    print(error_tb)                     # full traceback to server stdout
                     err = str(e).lower()
                     retryable = ("storage" in err or "out of memory" in err
                                  or "illegal memory" in err or "cuda error" in err
@@ -1386,7 +1388,11 @@ def run_generate_job(job_id):
 
             if error:
                 job["log"].append(f"  ❌ {orig_name}: {error}")
-                traceback.print_exc()
+                # print_exc() here ran outside the except block ("NoneType: None"),
+                # hiding the real failure. Use the traceback captured at catch time.
+                tb = locals().get("error_tb")
+                if tb:
+                    job["log"].append("  ── traceback ──\n" + tb)
 
             safe_offload_models()
 
