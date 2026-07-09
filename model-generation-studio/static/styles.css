@@ -540,7 +540,9 @@ body{background:var(--black);color:var(--text);font-family:var(--font-body);font
 .queue-row.active{background:var(--surface-3);border:1px solid var(--gold);align-items:flex-start}
 .q-pct{font-family:var(--font-mono);font-size:11px;font-weight:700;color:var(--gold);flex-shrink:0}
 .queue-row.done{opacity:.45}
-.q-thumb{width:38px;height:38px;border-radius:6px;background:var(--black);flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:16px}
+.q-thumb{width:38px;height:38px;border-radius:6px;background:var(--black);flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:16px;overflow:hidden}
+.q-thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.q-thumb-sm{width:26px;height:26px;border-radius:4px}
 .q-body{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
 .q-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text);font-weight:600}
 .q-status{font-size:9px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.4px}

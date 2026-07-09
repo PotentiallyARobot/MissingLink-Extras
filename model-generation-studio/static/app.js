@@ -719,7 +719,7 @@ async function refreshQueue() {
             const elapsed = p.elapsed ? fmtTime(p.elapsed) : '';
             const meta = [imgInfo, elapsed].filter(Boolean).join(' · ');
             const aThumb = q.active.thumb
-                ? `<span class="q-thumb"><img src="/api/file?p=${enc(q.active.thumb)}" alt="" onerror="this.parentNode.textContent='⚡'"></span>`
+                ? `<span class="q-thumb" style="width:38px;height:38px;overflow:hidden;flex-shrink:0;border-radius:6px"><img src="/api/file?p=${enc(q.active.thumb)}" alt="" style="width:38px;height:38px;object-fit:cover;display:block" onerror="this.parentNode.textContent='⚡'"></span>`
                 : `<span class="q-thumb">⚡</span>`;
             rows.push(`<div class="queue-row active">
                 ${aThumb}
@@ -734,7 +734,7 @@ async function refreshQueue() {
         }
         (q.queued || []).forEach((j, i) => {
             const qThumb = j.thumb
-                ? `<span class="q-thumb q-thumb-sm"><img src="/api/file?p=${enc(j.thumb)}" alt="" onerror="this.parentNode.outerHTML='<span class=&quot;q-dot pending&quot;></span>'"></span>`
+                ? `<span class="q-thumb q-thumb-sm" style="width:26px;height:26px;overflow:hidden;flex-shrink:0;border-radius:4px"><img src="/api/file?p=${enc(j.thumb)}" alt="" style="width:26px;height:26px;object-fit:cover;display:block" onerror="this.parentNode.outerHTML='<span class=&quot;q-dot pending&quot;></span>'"></span>`
                 : `<span class="q-dot pending"></span>`;
             rows.push(`<div class="queue-row">
                 ${qThumb}
@@ -928,7 +928,7 @@ function _initHistoryScroll() {
 _initHistoryScroll();
 
 // UI build stamp — shows in the History header so screenshots identify the build.
-const UI_BUILD = 'r8-gguf';
+const UI_BUILD = 'r9-gguf';
 (() => {
     const hdr = document.querySelector('.history-float-header .hf-title');
     if (hdr) {
