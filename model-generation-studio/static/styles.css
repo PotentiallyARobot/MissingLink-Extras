@@ -583,3 +583,6 @@ body{background:var(--black);color:var(--text);font-family:var(--font-body);font
 /* ── Draggable floating panels ── */
 .queue-float.dragging,.history-float.dragging{opacity:.92;box-shadow:0 12px 40px rgba(0,0,0,.7);z-index:60}
 .queue-float-header,.history-float-header{user-select:none}
+/* ── GGUF mode ── */
+.gguf-badge{font-family:var(--font-mono);font-size:9px;text-transform:uppercase;letter-spacing:.05em;color:var(--gold);border:1px solid var(--gold-dark);border-radius:3px;padding:2px 7px;margin-left:10px;vertical-align:middle}
+.gguf-mode .sidebar-tab[data-panel="panelEdit"]{display:none}
