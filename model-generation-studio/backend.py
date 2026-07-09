@@ -253,6 +253,9 @@ if GGUF_MODE:
     _t = _stage(f"Loading Q4 GGUF pipeline ({os.getenv('TRELLIS2_GGUF_QUANT', 'Q4_K_M')})")
     trellis_pipe = gguf_engine.load_pipeline(log=print)
     _stage_done(_t, "GGUF pipeline built (studio run() adapter installed)")
+    # GGUF weights are managed by gguf_engine/model_manager, not the stock HF
+    # cache, so the Drive weight-caching block below must not run.
+    downloaded_from_hf = False
 else:
     _t = _stage("Resolving weights (download/copy if needed)")
     weights_path = resolve_weights()
