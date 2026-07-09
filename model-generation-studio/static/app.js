@@ -885,6 +885,18 @@ function _initHistoryScroll() {
 }
 _initHistoryScroll();
 
+// UI build stamp — shows in the History header so screenshots identify the build.
+const UI_BUILD = 'r7-gguf';
+(() => {
+    const hdr = document.querySelector('.history-float-header .hf-title');
+    if (hdr) {
+        const s = document.createElement('span');
+        s.className = 'ui-build-tag';
+        s.textContent = UI_BUILD;
+        hdr.appendChild(s);
+    }
+})();
+
 // ── GGUF mode detection: badge + hide stage-cache features ──────────────────
 (async () => {
     try {
