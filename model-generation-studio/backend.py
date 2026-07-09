@@ -357,7 +357,19 @@ def safe_cleanup():
 
 
 def safe_offload_models():
-    """Offload ALL pipeline models to CPU. Logs any failures."""
+    """Offload ALL pipeline models to CPU. Logs any failures.
+
+    VRAM-aware: when there is plenty of free VRAM, offloading is pure overhead
+    (models get moved back moments later), so we skip it. Threshold in GB via
+    TRELLIS2_OFFLOAD_MIN_FREE (default 12); set to 0 to always offload."""
+    try:
+        min_free = float(os.getenv("TRELLIS2_OFFLOAD_MIN_FREE", "12"))
+        free_gb = torch.cuda.mem_get_info()[0] / 1e9
+        if min_free > 0 and free_gb > min_free:
+            print(f"    ↷ skip offload — {free_gb:.1f}GB VRAM free (> {min_free:.0f}GB threshold)")
+            return
+    except Exception:
+        pass  # fall through to offload if the check itself fails
     freed_before = torch.cuda.memory_allocated() / 1e9
     for name, model in trellis_pipe.models.items():
         try:
