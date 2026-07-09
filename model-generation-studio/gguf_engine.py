@@ -252,6 +252,16 @@ def load_pipeline(log=print):
             low_vram = free_gb < 16
         pipe.low_vram = low_vram
         log(f"[gguf] low_vram={low_vram} — models {'offloaded per stage' if low_vram else 'stay resident on GPU'}")
+        if not low_vram:
+            # decode_tex_slat() unconditionally calls move_all_to_cpu() to free
+            # VRAM for the decoder, then load_tex_slat_decoder() — which is a
+            # no-op when the decoder is already loaded, leaving it stranded on
+            # CPU ("mat1 is on cuda:0, different from other tensors on cpu").
+            # With models resident and plenty of VRAM the offload is pointless,
+            # so neutralize it. Original kept at pipe._orig_move_all_to_cpu.
+            pipe._orig_move_all_to_cpu = pipe.move_all_to_cpu
+            pipe.move_all_to_cpu = lambda: print(
+                "[gguf] move_all_to_cpu skipped (models resident; low_vram off)")
         # Preload every lazily-loaded sub-model NOW (SLat encoder, both flow
         # cascades, decoders, DINOv3) so nothing loads mid-generation. Uses the
         # fork's own load_* methods so GGUF quant flags stay correct. Only when
