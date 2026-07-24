@@ -383,6 +383,20 @@ def download_safetensors(url, dest_name, out_dir, min_bytes=4096,
     os.replace(tmp_path, path)   # atomic move into final location
     return path
 
+_HF_ALLOW = ["model_index.json", "*.json", "*/*"]
+_HF_IGNORE = ["assets/*", "asset/*", "examples/*", "images/*", "teaser/*",
+              "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.mp4",
+              "*.md", "*.pdf", ".gitattributes",
+              "*.pt", "*.pth", "*.onnx", "*.msgpack", "*.h5", "*.gguf"]
+
+def _hf_wanted(path):
+    """Mirror of the allow/ignore patterns for size accounting."""
+    from fnmatch import fnmatch
+    p = path or ""
+    if any(fnmatch(p, pat) for pat in _HF_IGNORE):
+        return False
+    return any(fnmatch(p, pat) for pat in _HF_ALLOW)
+
 def _hf_predownload(repo_id, token=None):
     """Download an HF repo's files into the hub cache BEFORE from_pretrained,
     with live progress to the console and the swap status line. In Colab,
@@ -406,7 +420,15 @@ def _hf_predownload(repo_id, token=None):
             from huggingface_hub import HfApi
             info = HfApi().model_info(repo_id, files_metadata=True,
                                       token=token)
-            total = sum((f.size or 0) for f in (info.siblings or [])) or None
+            sibs = info.siblings or []
+            full = sum((f.size or 0) for f in sibs)
+            total = sum((f.size or 0) for f in sibs
+                        if _hf_wanted(f.rfilename)) or None
+            if total and full - total > 1e9:
+                _log(f"  [hf] {repo_id}: skipping "
+                     f"{_fmt_bytes(full - total)} of repo files the "
+                     "pipeline never loads (single-file duplicates, "
+                     "assets...).")
         except Exception:
             pass
         blob_dir = os.path.join(_cache,
@@ -455,7 +477,9 @@ def _hf_predownload(repo_id, token=None):
         th = threading.Thread(target=_watch, daemon=True)
         th.start()
         try:
-            snapshot_download(repo_id, token=token)
+            snapshot_download(repo_id, token=token,
+                              allow_patterns=_HF_ALLOW,
+                              ignore_patterns=_HF_IGNORE)
         finally:
             done_evt.set()
             th.join(timeout=1)
