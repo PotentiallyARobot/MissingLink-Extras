@@ -1,6 +1,6 @@
 # ============================================================
 #  DiT STUDIO  —  single-cell Colab launcher
-#  Qwen-Image 2512 (default)  •  FLUX.1-dev  •  Z-Image Turbo
+#  Z-Image Turbo (default — fast boot)  •  Qwen-Image 2512  •  FLUX.1-dev
 #  text-to-image + image-to-image, runtime LoRA support
 #  (add from URL or the Civitai browser, control strengths live)
 #
@@ -180,15 +180,17 @@ MODEL_REGISTRY = {
                                        "off; negative prompt does little).")},
     },
 }
-DEFAULT_MODEL_KEY = "qwen"            # Qwen-Image 2512 loads by default
+DEFAULT_MODEL_KEY = "zimage"          # Z-Image Turbo boots by default (~20 GB; Qwen/Flux load on demand)
 BASE_MODEL = MODEL_REGISTRY[DEFAULT_MODEL_KEY]["repo"]
 DTYPE = torch.bfloat16                # all three recommend bf16; A100-native
 
 # LoRAs to download + attach automatically at startup. Each entry is either a
 # plain download-URL string, or a dict {"url", "name", "scale", "triggers"}.
 # The Civitai API is queried for each (name, base model, trigger words), and
-# the FIRST entry's base-model family decides which base model boots — so a
-# Qwen LoRA here makes the studio start on the matching Qwen pipeline.
+# Startup LoRAs that don't match DEFAULT_MODEL_KEY's family are skipped at
+# boot (they can still be attached after swapping to their model later) —
+# they do NOT change which base model boots, so the fast Z-Image default
+# is never silently replaced by a 47 GB Qwen download.
 # civitai.red mirror URLs work; the CIVITAI_API_KEY is attached either way.
 STARTUP_LORAS = [
     "https://civitai.red/api/download/models/2328988?fileId=2219270",
@@ -4046,7 +4048,7 @@ a.login-gift:hover{background:var(--gold-dim)}
     </div>
     <div class="hdr-right">
       <div class="hdr-badge" id="acctBadge" style="display:none" title="Signed in with MissingLink — click to sign out" onclick="mlLogout()"><span>&#128100;</span><span id="acctPill"></span></div>
-      <div class="hdr-badge" id="modelBadge" title="Active base model"><span>&#9638;</span><span id="modelPill">Qwen-Image 2512</span></div>
+      <div class="hdr-badge" id="modelBadge" title="Active base model"><span>&#9638;</span><span id="modelPill">Z-Image Turbo</span></div>
       <div class="hdr-badge" title="VRAM"><span>&#9635;</span><span id="vramPill">&ndash; / &ndash; GB</span></div>
       <div class="hdr-badge" id="connBadge" title="GPU state"><div class="dot cold" id="connDot"></div><span id="connLabel">Connecting</span></div>
     </div>
@@ -4065,7 +4067,7 @@ a.login-gift:hover{background:var(--gold-dim)}
 
       <div class="sec" id="modelSec">
         <div class="sec-label"><span class="icon">&#9638;</span> Base model
-          <span class="c" id="modelNow">Qwen-Image 2512</span></div>
+          <span class="c" id="modelNow">Z-Image Turbo</span></div>
         <div class="model-btn-row" style="margin-bottom:6px">
           <button class="gen-btn gen-btn-secondary" id="presetQwen"
             onclick="_startSwap('qwen','')">Qwen 2512</button>
@@ -4085,7 +4087,7 @@ a.login-gift:hover{background:var(--gold-dim)}
           <button class="gen-btn gen-btn-secondary" id="swapBtn"
             onclick="swapModel()">&#8635; Load model</button>
           <button class="gen-btn gen-btn-secondary" id="resetBtn"
-            onclick="resetModel()">Reset to Qwen</button>
+            onclick="resetModel()">Reset to Z-Image</button>
         </div>
         <div class="hintline">One model lives in VRAM at a time (full A100 residency, bf16). FLUX.1-dev is a <b>gated</b> HF repo &mdash; accept its license and add HF_TOKEN in Colab Secrets. Civitai checkpoints load as transformer grafts onto the matching family.</div>
       </div>
@@ -5370,7 +5372,7 @@ async function refreshModelVid(){
 }
 let _lbActiveTag="";              // currently selected quick-pick tag
 let _lbTagsLoaded=false;
-let _activeArch="qwen";        // family of the resident model (qwen|flux|zimage)
+let _activeArch="zimage";      // family of the resident model (qwen|flux|zimage)
 function _familyOf(base){
   // Map a Civitai base-model string ("Qwen", "Flux.1 D", "ZImageTurbo"...)
   // to a supported family key. Flux.2 is a different architecture -> null.
@@ -6469,7 +6471,7 @@ setTimeout(_restoreCombo,2500);
 
 # ---- launch ------------------------------------------------------------
 print("=" * 60)
-print("  Preparing DiT Studio (default: Qwen-Image 2512).")
+print("  Preparing Z-Image Studio (default: Z-Image Turbo \u2014 fast boot, ~20 GB).")
 print("=" * 60)
 if torch.cuda.is_available():
     _free, _total = torch.cuda.mem_get_info()
@@ -6508,10 +6510,6 @@ for _entry in STARTUP_LORAS:
     _startup.append((_u, _nm, float(_entry.get("scale", 1.0)), _trg, _fam))
 
 _boot_key = DEFAULT_MODEL_KEY
-for _u, _nm, _sc, _trg, _fam in _startup:
-    if _fam in MODEL_REGISTRY:
-        _boot_key = _fam
-        break
 _boot = MODEL_REGISTRY[_boot_key]
 print(f"Loading {_boot['label']} (first run downloads the weights — "
       "this takes a while)...")
