@@ -40,6 +40,65 @@
 import os, sys, subprocess
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+# ── Early launch fetch of the LTX-2.3 weights ────────────────────────────
+# The big model downloads start HERE — before the ~3 min of pip installs
+# below — so the checkpoint is pulling from second zero. aria2c opens 16
+# parallel connections (single-stream HTTP tops out far below what the
+# runtime's NIC can do; this is usually a 3-8x speedup). _ltx_download()
+# later waits on these processes, verifies sizes, and resumes anything
+# unfinished, so this is purely a head start — never a second copy.
+# NOTE: keep the paths/URLs in sync with the LTX section further down.
+LTX_EARLY_FETCH = {}
+try:
+    import shutil as _esh
+    import urllib.request as _eurl
+    from pathlib import Path as _EPath
+    _e_models = "/content/ltx/models"
+    _e_files = [
+        ("https://huggingface.co/Lightricks/LTX-2.3-fp8/resolve/"
+         "main/ltx-2.3-22b-distilled-fp8.safetensors",
+         f"{_e_models}/ltx-2.3-22b-distilled-fp8.safetensors"),
+        ("https://huggingface.co/Lightricks/LTX-2.3/resolve/"
+         "main/ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+         f"{_e_models}/ltx-2.3-spatial-upscaler-x2-1.1.safetensors"),
+    ]
+    if _esh.which("aria2c") is None:
+        subprocess.run(["apt-get", "install", "-y", "-qq", "aria2"],
+                       capture_output=True)
+    if _esh.which("aria2c"):
+        _EPath(_e_models).mkdir(parents=True, exist_ok=True)
+        _etok = os.environ.get("HF_TOKEN", "").strip()
+        for _u, _d in _e_files:
+            _dp = _EPath(_d)
+            _have = _dp.stat().st_size if _dp.exists() else 0
+            _tot = 0
+            try:
+                _rq = _eurl.Request(_u, method="HEAD")
+                if _etok:
+                    _rq.add_header("Authorization", f"Bearer {_etok}")
+                with _eurl.urlopen(_rq, timeout=20) as _rr:
+                    _tot = int(_rr.headers.get("Content-Length") or 0)
+            except Exception:
+                pass
+            if _have and _tot and _have >= _tot:
+                continue   # finished on a previous run
+            _cmd = ["aria2c", "-c", "-x16", "-s16", "-k1M",
+                    "--file-allocation=none", "--console-log-level=warn",
+                    "--summary-interval=0", "-d", _e_models,
+                    "-o", _dp.name]
+            if _etok:
+                _cmd += ["--header", f"Authorization: Bearer {_etok}"]
+            LTX_EARLY_FETCH[_d] = subprocess.Popen(
+                _cmd + [_u],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if LTX_EARLY_FETCH:
+            print(f"LTX-2.3 weights: {len(LTX_EARLY_FETCH)} download(s) "
+                  "running in the background (aria2c, 16 parallel "
+                  "connections) while dependencies install...")
+except Exception as _efe:
+    print(f"  (early LTX fetch skipped: {_efe} — the normal preload "
+          "will download instead.)")
+
 print("Installing dependencies (~3 min first run)...")
 # Support libraries first. Wan needs ftfy (text cleanup) and the UMT5
 # text encoder + CLIP vision encoder from transformers. "gguf" is the
@@ -1072,8 +1131,41 @@ def _ltx_paths():
         "gemma": f"{LTX_MODELS}/gemma",
     }
 
+def _dl_progress(dest_p, total, label, job, p0, p1, extra=""):
+    done = dest_p.stat().st_size if dest_p.exists() else 0
+    if total:
+        msg = (f"downloading {label}: "
+               f"{done/1e9:.1f}/{total/1e9:.1f} GB{extra}")
+        if job is not None:
+            job.update(stage=msg, progress=int(
+                p0 + done / total * (p1 - p0)))
+        _log("  [ltx] " + msg)
+
+def _aria2_wait(proc, dest_p, total, label, job, p0, p1):
+    """Poll an aria2c child, streaming progress into the job/log."""
+    last = 0.0
+    while proc.poll() is None:
+        if job is not None and job.get("cancel"):
+            try: proc.terminate()
+            except Exception: pass
+            raise _JobCancelled()
+        time.sleep(1)
+        if time.time() - last > 4:
+            last = time.time()
+            _dl_progress(dest_p, total, label, job, p0, p1,
+                         " (16 parallel connections)")
+    return proc.returncode
+
 def _ltx_download(url, dest, label, job=None, p0=10, p1=60):
-    """Stream a big file with resume support + progress into the job."""
+    """Fetch a big file as fast as the pipe allows.
+
+    Order of preference:
+      1. an aria2c process already started by the launch-time early
+         fetch (LTX_EARLY_FETCH) — just wait on it;
+      2. a fresh aria2c with 16 parallel connections (resumes partials,
+         including ones left by the old single-stream downloader);
+      3. the original single-stream requests download (fallback)."""
+    import shutil as _sh
     dest_p = Path(dest)
     dest_p.parent.mkdir(parents=True, exist_ok=True)
     headers = {}
@@ -1086,10 +1178,51 @@ def _ltx_download(url, dest, label, job=None, p0=10, p1=60):
         total = int(head.headers.get("content-length") or 0)
     except Exception:
         pass
+
+    # 1) the launch-time early fetch may already be pulling this file
+    early = None
+    try:
+        early = LTX_EARLY_FETCH.pop(str(dest_p), None)
+    except Exception:
+        early = None
+    if early is not None and early.poll() is None:
+        _log(f"  [ltx] {label}: launch-time download already in flight — "
+             "waiting for it to finish...")
+        _aria2_wait(early, dest_p, total, label, job, p0, p1)
     have = dest_p.stat().st_size if dest_p.exists() else 0
-    if total and have == total:
+    if total and have >= total:
         _log(f"  [ltx] {label}: already downloaded.")
         return
+
+    # 2) fast path: aria2c, 16 connections, resume (-c) any partial
+    if _sh.which("aria2c") is None:
+        subprocess.run(["apt-get", "install", "-y", "-qq", "aria2"],
+                       capture_output=True)
+    if _sh.which("aria2c"):
+        if have:
+            _log(f"  [ltx] {label}: resuming at {have/1e9:.1f} GB "
+                 "(aria2c, 16 parallel connections).")
+        else:
+            _log(f"  [ltx] downloading {label} "
+                 "(aria2c, 16 parallel connections)...")
+        cmd = ["aria2c", "-c", "-x16", "-s16", "-k1M",
+               "--file-allocation=none", "--console-log-level=warn",
+               "--summary-interval=0", "-d", str(dest_p.parent),
+               "-o", dest_p.name]
+        if HF_TOKEN:
+            cmd += ["--header", f"Authorization: Bearer {HF_TOKEN}"]
+        proc = subprocess.Popen(cmd + [url], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        rc = _aria2_wait(proc, dest_p, total, label, job, p0, p1)
+        have = dest_p.stat().st_size if dest_p.exists() else 0
+        if rc == 0 and (not total or have >= total):
+            _log(f"  [ltx] {label}: download complete.")
+            return
+        _log(f"  [ltx] {label}: aria2c exited {rc} "
+             f"({have/1e9:.1f}/{total/1e9:.1f} GB) — falling back to "
+             "single-stream download for the remainder.")
+
+    # 3) fallback: original single-stream resume download
     mode = "wb"
     if 0 < have < (total or 0):
         headers["Range"] = f"bytes={have}-"
@@ -1117,7 +1250,6 @@ def _ltx_download(url, dest, label, job=None, p0=10, p1=60):
                             job.update(stage=msg, progress=int(
                                 p0 + done / total * (p1 - p0)))
                         _log("  [ltx] " + msg)
-
 def _ensure_ltx_ready(job=None):
     """One-time lazy setup: install the official ltx-pipelines package
     into the MAIN Colab environment (same interpreter that runs Wan —
@@ -1166,7 +1298,7 @@ def _ensure_ltx_ready(job=None):
                   f"{LTX_DIR}/repo/packages/ltx-pipelines"],
                  "ltx-pipelines install")
             _run([sys.executable, "-m", "pip", "install", "-q",
-                  "av", "tqdm", "pillow", "openimageio"],
+                  "av", "tqdm", "pillow", "openimageio", "hf_transfer"],
                  "ltx deps install")
             (Path(LTX_DIR) / ".pkgs").touch()
         _ltx_download(LTX_CKPT_URL, p["ckpt"],
@@ -1176,9 +1308,16 @@ def _ensure_ltx_ready(job=None):
         if not Path(p["gemma"], "config.json").exists():
             st("LTX setup: downloading Gemma-3 12B text encoder "
                "(~24 GB, ungated Lightricks mirror)", 58)
+            # hf_transfer = Rust multi-stream downloader; big speedup
+            try:
+                import hf_transfer  # noqa: F401
+            except Exception:
+                subprocess.run([sys.executable, "-m", "pip", "install",
+                                "-q", "hf_transfer"], capture_output=True)
+            os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
             from huggingface_hub import snapshot_download
             snapshot_download(LTX_GEMMA_REPO, local_dir=p["gemma"],
-                              token=HF_TOKEN or None)
+                              max_workers=8, token=HF_TOKEN or None)
         (Path(LTX_DIR) / ".ready").touch()
         st("LTX engine ready.", 12)
         return p
@@ -1751,6 +1890,46 @@ def _ltx_worker_stop():
     w["proc"] = None
     w["cfg_key"] = None
 
+
+# ── LTX-2.3 launch-time preload ──────────────────────────────────────────
+# Kicked off in a background thread when the UI starts, so the ~55 GB
+# one-time download AND the model load both happen while the user is
+# still setting up their shot. By the time they click Generate, the
+# resident worker is (usually) already warm and the clip starts at once.
+LTX_PRELOAD = {"state": "idle", "detail": "", "started": None, "done": None}
+
+def _ltx_background_preload():
+    """Download + load the LTX-2.3 engine at UI launch (background).
+
+    Safe to race with a real render:
+      * _ensure_ltx_ready() is serialized by LTX_SETUP_LOCK — a render
+        arriving mid-download just waits on the same lock, then finds
+        the .ready marker and proceeds (no duplicate downloads).
+      * the worker start is serialized by LTX_WORKER["lock"], and
+        _ltx_worker_start() reuses the already-warm process when the
+        config key matches, so the render and the preload can never
+        spawn two workers."""
+    try:
+        LTX_PRELOAD.update(state="downloading", started=time.time(),
+                           detail="fetching LTX-2.3 models (~55 GB "
+                                  "one-time; instant if already on disk)")
+        _log("  [ltx] launch preload: ensuring models are on disk...")
+        p = _ensure_ltx_ready()          # no-op after the first run
+        LTX_PRELOAD.update(state="loading",
+                           detail="loading the model into memory")
+        vg = (torch.cuda.mem_get_info()[1] / 1e9
+              if torch.cuda.is_available() else 0)
+        off = "none" if (vg and vg >= LTX_GPU_RESIDENT_MIN_GB) else "cpu"
+        with LTX_WORKER["lock"]:
+            _ltx_worker_start(p, off)
+        LTX_PRELOAD.update(state="ready", detail="model resident",
+                           done=time.time())
+        _log("  [ltx] launch preload complete — LTX-2.3 is resident; "
+             "Generate starts rendering immediately.")
+    except Exception as e:
+        LTX_PRELOAD.update(state="error", detail=str(e)[:300])
+        _log(f"  [ltx] launch preload failed ({e}) — falling back to "
+             "lazy setup on the first render.")
 
 # ── IC-LoRA video-to-video one-shot worker ───────────────────────────────
 # ICLoraPipeline uses a DIFFERENT model config than the persistent
@@ -3212,6 +3391,12 @@ def _index():
 @app.route("/api/keepalive")
 def _keepalive():
     return jsonify(ok=True, t=time.time())
+
+@app.route("/api/preload")
+def _preload_status():
+    """Launch-time LTX-2.3 preload progress (idle/downloading/loading/
+    ready/error) so the UI can show readiness before Generate."""
+    return jsonify(**LTX_PRELOAD)
 
 @app.route("/api/loras", methods=["GET"])
 def _list_loras():
@@ -10415,44 +10600,27 @@ except Exception as _e:
     print(f"  (pipeline class check skipped: {_e})")
 
 if _ml_unlocked():
-    # LTX-2.3 is the default engine. If its ~55 GB of models are already
-    # on disk from a previous run, pre-warm the resident worker now so the
-    # first clip renders without a load wait. If not, defer — we don't
-    # trigger the big one-time download until the user actually generates.
-    # (Wan is built lazily when you switch to it.)
-    try:
-        _ltx_ready = (Path(LTX_DIR) / ".ready").exists()
-    except Exception:
-        _ltx_ready = False
-    if _ltx_ready:
-        try:
-            _vg = (torch.cuda.mem_get_info()[1] / 1e9
-                   if torch.cuda.is_available() else 0)
-            _off = "none" if (_vg and _vg >= LTX_GPU_RESIDENT_MIN_GB) else "cpu"
-            print("LTX-2.3 models already present — pre-warming the "
-                  "resident worker so the first clip is instant...")
-            _ltx_worker_start(_ltx_paths(), _off)
-            print("LTX-2.3 model resident and ready.")
-        except Exception as _e:
-            print(f"  (LTX pre-warm skipped: {_e} — it will load on the "
-                  "first render.)")
-    else:
-        print("LTX-2.3 is the default engine. Its models (~55 GB) download "
-              "once on your first render, then the model stays resident.")
     if not ML.get("member"):
         print(f"  Free trial: {ML.get('remaining', 0)} of "
               f"{ML.get('free_limit', FREE_RENDERS_HINT)} renders left.")
 else:
     print("=" * 60)
     print("  LOCKED — sign in with Google to use the studio.")
-    print("  Model preload is deferred; open the studio link below and")
-    print("  sign in. New users get "
+    print("  Open the studio link below and sign in. New users get "
           f"{FREE_RENDERS_HINT} free video renders.")
     print(f"  Members: unlimited. Sign up: {MISSINGLINK_SIGNUP_URL}")
     print("=" * 60)
-print("LTX-2.3 engine: available in the UI under 'Base model' — set up "
-      "lazily on the first LTX job (~55 GB one-time download, installed "
-      "into the main environment alongside Wan).")
+
+# LTX-2.3 is the default engine. Kick off its download + model load NOW,
+# in a background thread, so it is already resident when the user clicks
+# Generate. The UI comes up immediately; a render submitted while the
+# preload is still in flight simply waits on the same locks and then
+# reuses the warm worker. (Wan is still built lazily when switched to.)
+print("LTX-2.3 engine: preloading in the background now (models download "
+      "once, ~55 GB; the model then loads and stays resident so Generate "
+      "starts instantly — progress at /api/preload and in the console).")
+threading.Thread(target=_ltx_background_preload, daemon=True,
+                 name="ltx-preload").start()
 
 # Auto-load preset LoRAs so they appear in the UI menu on first load.
 # Done before the server starts so /api/loras already has them.
