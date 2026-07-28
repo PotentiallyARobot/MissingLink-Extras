@@ -241,6 +241,68 @@ OPENAI_TEXT_MODEL = "gpt-5.6-sol"
 if OPENAI_API_KEY:
     print(f"  Auto Prompt / auto-write will run on YOUR key with "
           f"{OPENAI_TEXT_MODEL}.")
+# Fallbacks tried in order after OPENAI_TEXT_MODEL — covers accounts
+# without flagship access, per-model rate limits, and reasoning replies
+# that come back empty.
+OPENAI_FALLBACK_MODELS = ["gpt-5.6-terra", "gpt-5.6-luna", "gpt-4o"]
+
+def _openai_chat_json(content, max_tokens, label="auto"):
+    """POST one vision+text user message to chat/completions and parse a
+    JSON object out of the reply. Tries OPENAI_TEXT_MODEL first, then
+    the fallbacks. Big max_tokens matters: GPT-5.6 spends part of the
+    budget on internal reasoning BEFORE the visible reply, so a small
+    cap can yield an empty message. Returns (dict, None) on success or
+    (None, error_string) after all models fail."""
+    last_err = ""
+    for m in [OPENAI_TEXT_MODEL] + [x for x in OPENAI_FALLBACK_MODELS
+                                    if x != OPENAI_TEXT_MODEL]:
+        try:
+            rr = _requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
+                         "Content-Type": "application/json"},
+                json={"model": m,
+                      "messages": [{"role": "user", "content": content}],
+                      "response_format": {"type": "json_object"},
+                      "max_completion_tokens": max_tokens},
+                timeout=240)
+        except Exception as e:
+            last_err = f"request failed — {e}"
+            continue
+        if rr.status_code >= 400:
+            try:
+                msg = (rr.json().get("error") or {}).get("message") or ""
+            except Exception:
+                msg = rr.text or ""
+            last_err = f"OpenAI {rr.status_code} on {m}: {msg[:300]}"
+            _log(f"  [{label}] {last_err}")
+            if rr.status_code == 401:
+                return None, last_err + " (check OPENAI_API_KEY)"
+            continue   # model access / params / rate limit -> next model
+        try:
+            ch = (rr.json().get("choices") or [{}])[0]
+            txt = ((ch.get("message") or {}).get("content") or "").strip()
+        except Exception as e:
+            last_err = f"{m}: bad response — {e}"
+            continue
+        if not txt:
+            last_err = (f"{m}: empty reply (finish_reason="
+                        f"{ch.get('finish_reason')}) — likely the "
+                        "reasoning budget ate the output")
+            _log(f"  [{label}] {last_err}")
+            continue
+        s, e2 = txt.find("{"), txt.rfind("}")
+        if s < 0 or e2 <= s:
+            last_err = f"{m}: no JSON object in reply"
+            continue
+        try:
+            jj = json.loads(txt[s:e2 + 1])
+        except Exception as e:
+            last_err = f"{m}: JSON parse failed — {e}"
+            continue
+        _log(f"  [{label}] {m} (your key) responded.")
+        return jj, None
+    return None, last_err or "OpenAI call failed"
 
 # Live auth/session state. The token comes from signing in with Google
 # on missinglink.build (the login screen opens it in a new tab and gives
@@ -1271,10 +1333,48 @@ def _ensure_ltx_ready(job=None):
             job.update(stage=msg,
                        progress=(pct if pct is not None
                                  else job.get("progress", 5)))
+    # If the launch preload (or another job) is holding the setup lock,
+    # a render used to sit frozen at "preparing LTX engine" for the
+    # whole 24 GB Gemma download. Make the wait visible instead: poll
+    # the lock and stream download progress into the job while blocked.
+    if not LTX_SETUP_LOCK.acquire(blocking=False):
+        st("launch preload is still fetching models — waiting for it "
+           "to finish (live progress below)", 3)
+        while not LTX_SETUP_LOCK.acquire(timeout=5):
+            if job is not None and job.get("cancel"):
+                raise _JobCancelled()
+            try:
+                g = sum(f.stat().st_size for f in
+                        Path(_ltx_paths()["gemma"]).rglob("*")
+                        if f.is_file())
+                if g:
+                    st("waiting on the launch preload — Gemma text "
+                       f"encoder {g/1e9:.1f}/~24 GB so far", 3)
+            except Exception:
+                pass
+    LTX_SETUP_LOCK.release()   # the with-block below re-acquires it
     with LTX_SETUP_LOCK:
         p = _ltx_paths()
+
+        def _gemma_ok():
+            # config.json downloads FIRST during a snapshot, so its
+            # presence alone proves nothing — an interrupted download
+            # leaves config.json with no model shards. Require at least
+            # one model*.safetensors before calling Gemma complete.
+            g = Path(p["gemma"])
+            return ((g / "config.json").exists()
+                    and any(g.rglob("model*.safetensors")))
+
         if (Path(LTX_DIR) / ".ready").exists():
-            return p
+            if _gemma_ok():
+                return p
+            # A previous run wrote .ready around an incomplete Gemma
+            # download (interrupted mid-snapshot). Heal: drop the marker
+            # and fall through so the download resumes.
+            _log("  [ltx] .ready marker found but the Gemma text encoder "
+                 "is incomplete (no model*.safetensors) — resuming the "
+                 "download to repair it.")
+            (Path(LTX_DIR) / ".ready").unlink(missing_ok=True)
         Path(LTX_MODELS).mkdir(parents=True, exist_ok=True)
 
         def _run(cmd, label):
@@ -1314,7 +1414,7 @@ def _ensure_ltx_ready(job=None):
                       "LTX-2.3 distilled fp8 checkpoint", job, 10, 55)
         _ltx_download(LTX_UPSCALER_URL, p["upscaler"],
                       "spatial upscaler", job, 55, 57)
-        if not Path(p["gemma"], "config.json").exists():
+        if not _gemma_ok():
             st("LTX setup: downloading Gemma-3 12B text encoder "
                "(~24 GB, ungated Lightricks mirror)", 58)
             # hf_transfer = Rust multi-stream downloader; big speedup
@@ -1325,8 +1425,50 @@ def _ensure_ltx_ready(job=None):
                                 "-q", "hf_transfer"], capture_output=True)
             os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
             from huggingface_hub import snapshot_download
-            snapshot_download(LTX_GEMMA_REPO, local_dir=p["gemma"],
-                              max_workers=8, token=HF_TOKEN or None)
+            # snapshot_download prints nothing — watch the folder size in
+            # a side thread so the console and the job progress bar both
+            # show the ~24 GB coming in instead of a frozen stage.
+            _gstop = {"done": False}
+            def _gwatch():
+                while not _gstop["done"]:
+                    time.sleep(5)
+                    try:
+                        g = sum(f.stat().st_size for f in
+                                Path(p["gemma"]).rglob("*")
+                                if f.is_file())
+                        st(f"Gemma text encoder: {g/1e9:.1f}/~24 GB",
+                           58 + min(9, int(g / 24e9 * 9)))
+                    except Exception:
+                        pass
+            threading.Thread(target=_gwatch, daemon=True,
+                             name="gemma-progress").start()
+            try:
+                try:
+                    snapshot_download(LTX_GEMMA_REPO, local_dir=p["gemma"],
+                                      max_workers=8,
+                                      token=HF_TOKEN or None)
+                except Exception as e:
+                    # hf_transfer is fast but brittle on flaky links (it
+                    # can't resume partial files). Fall back to the
+                    # standard downloader, which resumes from disk.
+                    _log(f"  [ltx] fast Gemma download failed "
+                         f"({str(e)[:200]}) — retrying with the standard "
+                         "resumable downloader...")
+                    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+                    try:
+                        snapshot_download(LTX_GEMMA_REPO,
+                                          local_dir=p["gemma"],
+                                          max_workers=8,
+                                          token=HF_TOKEN or None)
+                    finally:
+                        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+            finally:
+                _gstop["done"] = True
+            if not _gemma_ok():
+                raise RuntimeError(
+                    "Gemma text encoder download finished but no "
+                    "model*.safetensors shards are present under "
+                    f"{p['gemma']} — delete that folder and rerun.")
         (Path(LTX_DIR) / ".ready").touch()
         st("LTX engine ready.", 12)
         return p
@@ -4087,32 +4229,20 @@ def _autoprompt():
         if end_uri:
             content.append({"type": "image_url",
                             "image_url": {"url": end_uri}})
-        try:
-            rr = _requests.post("https://api.openai.com/v1/chat/completions",
-                                headers={"Authorization":
-                                         f"Bearer {OPENAI_API_KEY}",
-                                         "Content-Type": "application/json"},
-                                json={"model": OPENAI_TEXT_MODEL,
-                                      "messages": [{"role": "user",
-                                                    "content": content}],
-                                      "response_format":
-                                          {"type": "json_object"},
-                                      "max_completion_tokens": 4000},
-                                timeout=180)
-            if rr.status_code >= 400:
-                return jsonify(ok=False, error=f"OpenAI {rr.status_code}: "
-                               f"{(rr.text or '')[:200]}"), 502
-            jj = json.loads(rr.json()["choices"][0]["message"]["content"])
-            _log(f"  [auto] {OPENAI_TEXT_MODEL} (your key) wrote a "
+        # Big token budget: GPT-5.6 reasons internally before replying,
+        # so a small cap returns an EMPTY message and broke this feature.
+        jj, err = _openai_chat_json(content, 16000, "auto")
+        if jj is not None:
+            _log("  [auto] wrote a "
                  f"{'scene + dialogue' if engine == 'ltx' else 'scene'} "
-                 "prompt.")
+                 "prompt on your key.")
             return jsonify(ok=True,
                            scene=jj.get("scene", ""),
                            camera=jj.get("camera", ""),
                            speakers=jj.get("speakers") or [],
                            lines=jj.get("lines") or [])
-        except Exception as e:
-            return jsonify(ok=False, error=f"auto prompt failed — {e}"), 502
+        _log(f"  [auto] direct OpenAI path failed ({err}) — falling back "
+             "to the MissingLink server.")
     # ── Server path: MissingLink's key ──
     try:
         r = _requests.post(f"{MISSINGLINK_API}/api/notebook/autoprompt",
@@ -4184,25 +4314,11 @@ def _autoline():
         if payload.get("image"):
             content.append({"type": "image_url",
                             "image_url": {"url": payload["image"]}})
-        try:
-            rr = _requests.post("https://api.openai.com/v1/chat/completions",
-                                headers={"Authorization":
-                                         f"Bearer {OPENAI_API_KEY}",
-                                         "Content-Type": "application/json"},
-                                json={"model": OPENAI_TEXT_MODEL,
-                                      "messages": [{"role": "user",
-                                                    "content": content}],
-                                      "response_format":
-                                          {"type": "json_object"},
-                                      "max_completion_tokens": 1500},
-                                timeout=120)
-            if rr.status_code >= 400:
-                return jsonify(ok=False, error=f"OpenAI {rr.status_code}: "
-                               f"{(rr.text or '')[:200]}"), 502
-            jj = json.loads(rr.json()["choices"][0]["message"]["content"])
-            return jsonify(ok=True, line=(jj.get("line") or "").strip())
-        except Exception as e:
-            return jsonify(ok=False, error=f"autoline failed — {e}"), 502
+        jj, err = _openai_chat_json(content, 8000, "line")
+        if jj is not None and (jj.get("line") or "").strip():
+            return jsonify(ok=True, line=jj["line"].strip())
+        _log(f"  [line] direct OpenAI path failed ({err}) — falling back "
+             "to the MissingLink server.")
     # ── Server path: MissingLink's key ──
     try:
         r = _requests.post(f"{MISSINGLINK_API}/api/notebook/autoline",
