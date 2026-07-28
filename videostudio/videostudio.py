@@ -232,6 +232,15 @@ OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY")
 if OPENAI_API_KEY:
     print(f"  OPENAI_API_KEY: found ({len(OPENAI_API_KEY)} chars) — image "
           "generation will use YOUR key directly (no MissingLink tokens).")
+# Text/vision model for Auto Prompt, Auto-write line, and next-scene
+# proposals when running on the user's own key. gpt-5.6-sol is OpenAI's
+# flagship (GPT-5.6 family, GA July 2026) — strongest writing + vision.
+# Swap to "gpt-5.6-terra" (balanced) or "gpt-5.6-luna" (cheapest) to
+# trade quality for cost.
+OPENAI_TEXT_MODEL = "gpt-5.6-sol"
+if OPENAI_API_KEY:
+    print(f"  Auto Prompt / auto-write will run on YOUR key with "
+          f"{OPENAI_TEXT_MODEL}.")
 
 # Live auth/session state. The token comes from signing in with Google
 # on missinglink.build (the login screen opens it in a new tab and gives
@@ -4008,6 +4017,103 @@ def _autoprompt():
             end_uri = _ai_image(d["end_image"])
         except Exception:
             end_uri = None
+    # ── Direct path: the user's own OpenAI key (OPENAI_TEXT_MODEL) ──
+    if OPENAI_API_KEY:
+        engine = d.get("engine", "wan")
+        ctx = (d.get("context") or "")[:4000].strip()
+        instr = (d.get("instructions") or "")[:2000].strip()
+        if engine == "ltx":
+            text = (
+                "You are the head writer and cinematographer for an AI film "
+                "studio. The attached image is the STARTING FRAME of a clip "
+                "rendered by LTX-2.3, a video model that generates ONE "
+                "CONTINUOUS SHOT with fully synchronized audio and spoken "
+                "dialogue. Write the strongest possible ~20-second clip.\n\n"
+                "SCENE: one flowing present-tense paragraph describing what "
+                "visibly happens across the whole clip — the subject's "
+                "appearance and wardrobe exactly as in the image, specific "
+                "physical actions and how they evolve over the clip, "
+                "expressions and body language while speaking, the "
+                "environment, lighting and mood, and ambient sound cues "
+                "(LTX renders the audio too). ONE continuous shot only: "
+                "never write cuts, 'then we see', montages, or a second "
+                "camera setup. Keep motion continuous, physical and "
+                "grounded.\n\n"
+                "CAMERA: one short sentence — framing, lens feel, and a "
+                "single continuous camera move (e.g. 'slow dolly-in from a "
+                "waist-up medium shot, 35mm, shallow depth of field').\n\n"
+                "DIALOGUE — this sets the clip length: the studio computes "
+                "duration from the dialogue word count at ~2.3 spoken words "
+                "per second, so write about 40-46 TOTAL words of dialogue "
+                "split across 3-6 alternating lines to fill ~20 seconds. "
+                "Make it genuinely good drama or comedy: distinct voices, "
+                "subtext, tension or humor, and forward momentum — every "
+                "line changes something; no filler greetings, no "
+                "exposition dumps. If the frame is clearly a no-dialogue "
+                "moment (empty landscape, no plausible speaker), return "
+                "empty speakers/lines and spend the words on a richer "
+                "SCENE with ambient audio instead.\n\n"
+                "SPEAKERS: for each speaker, a short UPPERCASE name and a "
+                "voice description LTX can synthesize — age, gender, pitch, "
+                "accent, pace, emotion (e.g. 'a low gravelly male voice, "
+                "50s, weary, slow deliberate pace').\n"
+                + ("\nAn END FRAME is also attached — write the scene and "
+                   "motion so the shot plausibly LANDS on it by the final "
+                   "second." if end_uri else "")
+                + (f"\nStory context (continue it, keep characters and "
+                   f"voices consistent, never repeat old lines): {ctx}"
+                   if ctx else "")
+                + (f"\nUser instructions (follow these): {instr}"
+                   if instr else "")
+                + '\nRespond ONLY as JSON: {"scene": "...", "camera": '
+                '"...", "speakers": [{"name": "...", "voice": "..."}], '
+                '"lines": [{"speaker": "NAME", "text": "...", "clip": 1}]}'
+            )
+        else:
+            text = (
+                "You are a prompt writer for the Wan 2.x image-to-video "
+                "model. The attached image is the starting frame. Write "
+                "one vivid present-tense prompt (2-4 sentences) describing "
+                "the MOTION that unfolds from this exact frame: what the "
+                "subject does, how the environment moves, lighting and "
+                "atmosphere, plus one continuous camera move. Stay true "
+                "to what is in the image; no cuts, no dialogue.\n"
+                + (f"\nStory context: {ctx}" if ctx else "")
+                + (f"\nUser instructions: {instr}" if instr else "")
+                + '\nRespond ONLY as JSON: {"scene": "the prompt"}'
+            )
+        content = [{"type": "text", "text": text},
+                   {"type": "image_url", "image_url": {"url": img_uri}}]
+        if end_uri:
+            content.append({"type": "image_url",
+                            "image_url": {"url": end_uri}})
+        try:
+            rr = _requests.post("https://api.openai.com/v1/chat/completions",
+                                headers={"Authorization":
+                                         f"Bearer {OPENAI_API_KEY}",
+                                         "Content-Type": "application/json"},
+                                json={"model": OPENAI_TEXT_MODEL,
+                                      "messages": [{"role": "user",
+                                                    "content": content}],
+                                      "response_format":
+                                          {"type": "json_object"},
+                                      "max_completion_tokens": 4000},
+                                timeout=180)
+            if rr.status_code >= 400:
+                return jsonify(ok=False, error=f"OpenAI {rr.status_code}: "
+                               f"{(rr.text or '')[:200]}"), 502
+            jj = json.loads(rr.json()["choices"][0]["message"]["content"])
+            _log(f"  [auto] {OPENAI_TEXT_MODEL} (your key) wrote a "
+                 f"{'scene + dialogue' if engine == 'ltx' else 'scene'} "
+                 "prompt.")
+            return jsonify(ok=True,
+                           scene=jj.get("scene", ""),
+                           camera=jj.get("camera", ""),
+                           speakers=jj.get("speakers") or [],
+                           lines=jj.get("lines") or [])
+        except Exception as e:
+            return jsonify(ok=False, error=f"auto prompt failed — {e}"), 502
+    # ── Server path: MissingLink's key ──
     try:
         r = _requests.post(f"{MISSINGLINK_API}/api/notebook/autoprompt",
                            headers={"Authorization": f"Bearer {ML.get('key') or ''}"},
@@ -4052,6 +4158,52 @@ def _autoline():
             payload["image"] = _ai_image(d["image"])
         except Exception:
             pass
+    # ── Direct path: the user's own OpenAI key (OPENAI_TEXT_MODEL) ──
+    if OPENAI_API_KEY:
+        text = (
+            f"Write ONE line of spoken dialogue for {payload['speaker']} "
+            "in an AI-generated film clip (LTX-2.3 renders the voice and "
+            "lip-sync from this text). Continue the scene naturally and "
+            "make the line count: in character, distinct voice, subtext "
+            "over exposition, and it must move the moment forward. "
+            "10-18 words, natural speech only — no stage directions, no "
+            "quotation marks, no character name prefix.\n"
+            + (f"\nScene: {payload['scene']}" if payload["scene"] else "")
+            + (f"\nDialogue already in this clip (do not repeat, respond "
+               f"to it): {payload['lines_here']}"
+               if payload["lines_here"] else "")
+            + (f"\nStory so far: {payload['story']}"
+               if payload["story"] else "")
+            + (f"\nContext: {payload['context']}"
+               if payload["context"] else "")
+            + (f"\nUser instructions: {payload['instructions']}"
+               if payload["instructions"] else "")
+            + '\nRespond ONLY as JSON: {"line": "the line"}'
+        )
+        content = [{"type": "text", "text": text}]
+        if payload.get("image"):
+            content.append({"type": "image_url",
+                            "image_url": {"url": payload["image"]}})
+        try:
+            rr = _requests.post("https://api.openai.com/v1/chat/completions",
+                                headers={"Authorization":
+                                         f"Bearer {OPENAI_API_KEY}",
+                                         "Content-Type": "application/json"},
+                                json={"model": OPENAI_TEXT_MODEL,
+                                      "messages": [{"role": "user",
+                                                    "content": content}],
+                                      "response_format":
+                                          {"type": "json_object"},
+                                      "max_completion_tokens": 1500},
+                                timeout=120)
+            if rr.status_code >= 400:
+                return jsonify(ok=False, error=f"OpenAI {rr.status_code}: "
+                               f"{(rr.text or '')[:200]}"), 502
+            jj = json.loads(rr.json()["choices"][0]["message"]["content"])
+            return jsonify(ok=True, line=(jj.get("line") or "").strip())
+        except Exception as e:
+            return jsonify(ok=False, error=f"autoline failed — {e}"), 502
+    # ── Server path: MissingLink's key ──
     try:
         r = _requests.post(f"{MISSINGLINK_API}/api/notebook/autoline",
                            headers={"Authorization": f"Bearer {ML.get('key') or ''}"},
@@ -4238,7 +4390,7 @@ def _nextscene_propose():
             rr = _requests.post("https://api.openai.com/v1/chat/completions",
                                 headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
                                          "Content-Type": "application/json"},
-                                json={"model": "gpt-4o-mini",
+                                json={"model": OPENAI_TEXT_MODEL,
                                       "messages": [{"role": "user", "content": [
                                           {"type": "text", "text": text},
                                           {"type": "image_url",
@@ -4336,7 +4488,7 @@ def _openai_generate_direct(d):
     try:
         vr = _requests.post(f"{OA}/chat/completions",
                             headers={**hdr, "Content-Type": "application/json"},
-                            json={"model": "gpt-4o-mini",
+                            json={"model": OPENAI_TEXT_MODEL,
                                   "messages": [{"role": "user", "content": [
                                       {"type": "text", "text":
                                        f'This is the proposed next shot. Intended: "{intent}". '
@@ -6039,7 +6191,7 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
         <span class="stage-tab-icon">&#127916;</span> Editor</button>
     </div>
     <div class="hdr-right">
-      <div class="hdr-badge" id="mlBadge" style="cursor:pointer" onclick="showGateIfLocked()" title="MissingLink membership"><span style="color:var(--gold)">&#9670;</span><span id="mlBadgeTxt">Sign in</span></div>
+      <div class="hdr-badge" id="mlBadge" style="cursor:pointer" onclick="mlBadgeClick()" title="MissingLink membership — click for pricing"><span style="color:var(--gold)">&#9670;</span><span id="mlBadgeTxt">Sign in</span></div>
       <div class="hdr-badge" title="VRAM"><span>&#9635;</span><span id="vramPill">&ndash; / &ndash; GB</span></div>
       <div class="hdr-badge" id="connBadge" title="GPU state"><div class="dot cold" id="connDot"></div><span id="connLabel">Connecting</span></div>
       <div class="user-menu-trigger" title="Active GPU">
@@ -6953,6 +7105,12 @@ function showGate(reason){
 }
 function showGateIfLocked(){ if(!mlState.unlocked)showGate(
   (mlState.authed&&mlState.remaining===0)?"free_limit_reached":"no_session"); }
+function mlBadgeClick(){
+  // Locked -> sign-in gate. Signed in (the "N free left" badge or a
+  // member) -> open the pricing/upgrade page in a new tab.
+  if(!mlState.unlocked){showGateIfLocked();return;}
+  window.open(mlState.signup||"https://www.missinglink.build/","_blank");
+}
 function mlSwitchAccount(){ mlState.authed=false;mlState.member=false;
   // Real logout: clears the server's cached session (incl. the on-disk
   // token that survives cell re-runs) so a new sign-in is required.
