@@ -1796,6 +1796,95 @@ def _ltx_concat(clip_paths, out_path, tmpd):
 # reading job specs as JSON lines on stdin and printing status lines back.
 # It stays warm until the engine changes (LTX -> Wan) or the model is
 # switched, so a whole multi-clip movie pays the ~1-2 min load ONCE.
+
+_LTX_STREAM_GUARD_SRC = r"""
+
+def _guard_streaming_prequant_scales():
+    """ + '"""' + r"""Make CPU/DISK block streaming work with the PREQUANTIZED fp8 ckpt.
+
+    ltx-core's StreamingModelBuilder decides what to stream by scanning
+    the checkpoint's KEY NAMES:
+
+        _scan_checkpoint_keys() -> SDOps.apply_to_key()
+
+    apply_to_key is key-only: it consults the rename matchers
+    (LTXV_MODEL_COMFY_RENAMING_MAP matches the whole
+    'model.diffusion_model.' prefix) and nothing else. It cannot see the
+    FP8_CAST policy's VALUE-level ops -- and those are exactly what drop
+    the prequant '*_scale' companion tensors. So every scale key in the
+    file is scheduled for streaming, then looked up in the meta model,
+    which has no matching parameter:
+
+        KeyError: 'attn1.to_gate_logits.input_scale'
+
+    (that key is simply the first one alphabetically in block 0 --
+    weight_scale/bias_scale would fail identically, and input_scale is
+    only ever consumed by the Hopper-only fp8-scaled-mm backend.)
+
+    The non-streaming path never hits this: it loads the full state dict,
+    where the value-ops DO fire and drop the scales. Hence >= 38 GB cards
+    render fine and a 24 GB card -- forced onto CPU streaming -- dies on
+    clip 1. ltx-core itself flags the gap in _build_streaming_builder:
+    'Quantization policies that emit companion keys (e.g. .weight_scale)
+    cannot be streamed yet.'
+
+    Dropping those keys is LOSSLESS. build_policy() already read the
+    scale tensors straight out of the checkpoint with _read_scales() and
+    folds them into .weight/.bias at load time from that closure -- not
+    from the state dict. The scale entries in the state dict are pure
+    leftovers.
+
+    We filter per block against the meta model's own parameters and
+    buffers, so only tensors with nowhere to land are dropped -- exactly
+    what the non-streaming loader already does via strict=False.
+    """ + '"""' + r"""
+    try:
+        import ltx_core.block_streaming.builder as _b
+    except Exception as _e:
+        emit({"event":"stream_guard_warn","error":str(_e)[:200]})
+        return
+    if getattr(_b, "_ml_scale_guard", False):
+        return
+
+    def _filter(blocks, block_key_map):
+        clean, dropped = {}, set()
+        for idx, entries in block_key_map.items():
+            have = _b._block_state(blocks[idx])
+            keep = []
+            for sft_key, param_name in entries:
+                if param_name in have:
+                    keep.append((sft_key, param_name))
+                else:
+                    dropped.add(param_name.rsplit(".", 1)[-1])
+            clean[idx] = keep
+        return clean, dropped
+
+    _pinned = _b.StreamingModelBuilder._build_pinned_source
+    _disk = _b.StreamingModelBuilder._build_disk_source
+
+    def _pinned_guarded(self, blocks, dtype, cpu_slots, block_key_map,
+                        *a, **kw):
+        block_key_map, dropped = _filter(blocks, block_key_map)
+        if dropped:
+            emit({"event":"stream_guard","path":"cpu",
+                  "dropped":sorted(dropped)})
+        return _pinned(self, blocks, dtype, cpu_slots, block_key_map,
+                       *a, **kw)
+
+    def _disk_guarded(self, blocks, dtype, cpu_slots, reader,
+                      block_key_map, *a, **kw):
+        block_key_map, dropped = _filter(blocks, block_key_map)
+        if dropped:
+            emit({"event":"stream_guard","path":"disk",
+                  "dropped":sorted(dropped)})
+        return _disk(self, blocks, dtype, cpu_slots, reader,
+                     block_key_map, *a, **kw)
+
+    _b.StreamingModelBuilder._build_pinned_source = _pinned_guarded
+    _b.StreamingModelBuilder._build_disk_source = _disk_guarded
+    _b._ml_scale_guard = True
+"""
+
 _LTX_WORKER_SRC = r'''
 import sys, json, traceback, torch
 from ltx_pipelines.distilled import DistilledPipeline
@@ -1832,12 +1921,14 @@ def _guard_fp8_for_gpu():
               "cc": f"{major}.{minor}"})
     except Exception as _e:
         emit({"event":"fp8_guard_warn","error":str(_e)[:200]})
+''' + _LTX_STREAM_GUARD_SRC + r'''
 
 def emit(obj):
     sys.stdout.write(json.dumps(obj) + "\n"); sys.stdout.flush()
 
 def main():
     _guard_fp8_for_gpu()
+    _guard_streaming_prequant_scales()
     cfg = json.loads(sys.argv[1])
     offload = {"none": OffloadMode.NONE, "cpu": OffloadMode.CPU,
                "disk": OffloadMode.DISK}.get(cfg.get("offload","cpu"),
@@ -2013,6 +2104,13 @@ def _ltx_worker_start(p, offload):
                  "is Hopper-only). LoRAs will attach correctly.")
         elif ev.get("event") == "fp8_guard_warn":
             _log("  [ltx] fp8 guard note: " + str(ev.get("error", ""))[:200])
+        elif ev.get("event") == "stream_guard":
+            _log("  [ltx] prequant scale keys skipped for "
+                 + str(ev.get("path", "cpu")) + " streaming ("
+                 + ", ".join(ev.get("dropped") or []) + ") — they are folded\n         into the weights at load time, not streamed.")
+        elif ev.get("event") == "stream_guard_warn":
+            _log("  [ltx] streaming guard could not install: "
+                 + str(ev.get("error", ""))[:200])
         elif ev.get("event") == "lora_warn":
             _log("  [ltx] a LoRA could not attach — rendering without LoRAs. "
                  + str(ev.get("error", ""))[:200])
@@ -2123,6 +2221,7 @@ def _guard_fp8_for_gpu():
         emit({"event":"fp8_fallback","cc":f"{major}.{minor}"})
     except Exception as e:
         emit({"event":"warn","msg":str(e)[:200]})
+''' + _LTX_STREAM_GUARD_SRC + r'''
 
 # One registry per process holds the loaded state dicts in memory so the
 # weights are NOT re-read from disk on rebuilds — the model stays resident.
@@ -2284,6 +2383,7 @@ def render_job(pipe, tiling, cfg):
 
 def main():
     _guard_fp8_for_gpu()
+    _guard_streaming_prequant_scales()
     pipe = None; tiling = None; key = None
     # Persistent service: read one job per stdin line, keep the model warm
     # across clips, reload only when the load-key changes.
@@ -2697,6 +2797,12 @@ def _run_v2v_clip(clip, ci, out_path, tmpd, fps, seed, params, job):
         elif et == "fp8_fallback":
             _log(f"  [ltx] v2v: pre-Hopper GPU (cc {ev.get('cc')}) — bf16 "
                  "LoRA-merge fallback.")
+        elif et == "stream_guard":
+            _log("  [ltx] v2v: prequant scale keys skipped for "
+                 + str(ev.get("path", "cpu")) + " streaming.")
+        elif et == "stream_guard_warn":
+            _log("  [ltx] v2v: streaming guard could not install: "
+                 + str(ev.get("error", ""))[:200])
         elif et == "ready":
             _log("  [ltx] v2v: model ready, rendering...")
         elif et == "segment":
@@ -7034,10 +7140,14 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
           <button class="gen-btn gen-btn-secondary" id="clipAutoDlgBtn" style="flex:1;padding:9px;font-size:11px" onclick="clipModalAutoDialog()" title="AI writes this clip's scene AND dialogue, continuing the story from previous clips — builds on whatever you've already typed, looks at the start (and end frame if set)">&#10024; Auto-write scene &amp; dialogue</button>
           <button class="spk-gear" onclick="openAutoCfg()" title="Auto Prompt settings: standing instructions &amp; extra context" style="flex:0 0 auto;padding:0 12px">&#9881;</button>
         </div>
+        <div class="hintline" style="margin-top:10px"><b>&#8681; Clip JSON</b> (below) downloads this clip &mdash; speakers, voices, scene prompt, length, frames and every line &mdash; as a file you can edit in any text editor. <b>&#8679; Load JSON</b> reads one back and <b>overrides</b> those fields on this clip.</div>
       </div>
     </div>
     <div class="clip-modal-foot">
       <button class="q-clear" id="clipDelBtn" onclick="deleteClipFromModal()" title="Remove this clip and its lines">&#128465; Delete clip</button>
+      <button class="q-clear" id="clipJsonDl" onclick="downloadClipJSON()" title="Download this clip as .json &mdash; speakers, scene prompt, length, start/end frames, video-to-video settings and dialogue">&#8681; Clip JSON</button>
+      <button class="q-clear" id="clipJsonUp" onclick="$('clipJsonFile').click()" title="Load a clip .json &mdash; OVERRIDES this clip's speakers, scene prompt, length, frames and dialogue">&#8679; Load JSON</button>
+      <input type="file" id="clipJsonFile" accept="application/json,.json" style="display:none" onchange="uploadClipJSON(this.files)">
       <span class="dock-sp"></span>
       <button class="gen-btn" style="width:auto;padding:0 22px" onclick="closeClipModal()">Done</button>
     </div>
@@ -9541,6 +9651,211 @@ function _clipModalClearImg(which){
   if(which==="start")delete clipStartImages[c];
   else delete clipEndImages[c];
   _renderClipModalImgs();renderDialog();
+}
+/* == Per-clip JSON export / import ===================================
+   The clip editor round-trips ONE clip as JSON: the speaker roster
+   (name + voice + look), the scene prompt, the length, the start/end
+   frames, the video-to-video control settings and every dialogue line.
+   Loading a file back OVERRIDES those fields on the clip that's open.
+   Missing keys are left alone, so a hand-trimmed file (e.g. just
+   speakers + lines) is a valid partial patch.                       */
+const _CLIP_JSON_MAX_VIDEO=8*1024*1024;   // don't inline huge control videos
+const _CLIP_JSON_DEFVOICE="a natural adult voice, medium pitch, clear timbre, calm pace";
+
+// Snapshot clip c as a plain object (the shape written to the .json).
+function buildClipScript(c){
+  if(c==null)throw "no clip is open";
+  const fps=parseInt($("fpsV").value,10)||24;
+  const plan=(typeof clipPlan==="function")?clipPlan():[];
+  const pl=plan.find(x=>x.clip===c);
+  const frames=pl?pl.frames:(clipFrameOverrides[c]||null);
+  const lines=dialog.filter(l=>(l.clip||1)===c)
+    .map(l=>({speaker:l.speaker,text:l.text||""}));
+  const used=[];
+  lines.forEach(l=>{if(l.speaker&&used.indexOf(l.speaker)<0)used.push(l.speaker);});
+  const cv=clipControlVideos[c]||null;
+  const big=!!cv&&cv.length>_CLIP_JSON_MAX_VIDEO;
+  const control=cv?{
+    type:clipControlType[c]||"raw",
+    strength:(clipControlStrength[c]!=null?+clipControlStrength[c]:1),
+    copy_source_audio:!!clipCopySrcAudio[c],
+    duration_seconds:(clipControlDur[c]!=null?+(+clipControlDur[c]).toFixed(2):null),
+    video:(big?null:cv),
+    video_omitted:big
+  }:null;
+  return {
+    version:1,
+    kind:"missinglink_clip",
+    clip:c,
+    engine:currentEngine,
+    fps:fps,
+    base_scene:$("prompt").value||"",
+    scene:clipSceneText(c),
+    scene_is_custom:(clipPromptOverrides[c]!==undefined
+      && clipPromptOverrides[c]!==null
+      && clipPromptOverrides[c]!==$("prompt").value),
+    length_frames:frames||null,
+    length_seconds:frames?+(frames/fps).toFixed(2):null,
+    length_overridden:(clipFrameOverrides[c]!==undefined),
+    start_image:clipStartImages[c]||null,
+    end_image:clipEndImages[c]||null,
+    control_video:control,
+    speakers_used:used,
+    speakers:speakers.map(s=>({name:s.name,voice:s.voice||"",look:s.look||""})),
+    lines:lines
+  };
+}
+// Apply a clip object onto clip c, replacing whatever it specifies.
+// Returns a short human summary of what was overridden.
+function applyClipScript(c,sc){
+  if(c==null)throw "no clip is open";
+  if(!sc||typeof sc!=="object"||Array.isArray(sc))throw "that isn't a clip JSON object";
+  if(Array.isArray(sc.clips)&&sc.lines===undefined&&sc.scene===undefined)
+    throw "that's a full storyboard script \u2014 load it with \u21e7 Load in the Agent panel instead";
+  const changed=[];
+  const NM=n=>(n||"SPEAKER").toString().toUpperCase().slice(0,24);
+
+  // -- speakers: the file's roster wins; speakers still spoken by OTHER
+  //    clips are kept so importing here can't orphan their lines.
+  if(Array.isArray(sc.speakers)&&sc.speakers.length){
+    const inc=sc.speakers.map(s=>({
+      name:NM(s&&s.name),
+      voice:((s&&s.voice)||_CLIP_JSON_DEFVOICE),
+      look:((s&&s.look)||"")}));
+    const seen={},roster=[];
+    inc.forEach(s=>{if(!seen[s.name]){seen[s.name]=1;roster.push(s);}});
+    const otherUsed={};
+    dialog.forEach(l=>{if((l.clip||1)!==c)otherUsed[l.speaker]=1;});
+    speakers=roster.concat(speakers.filter(s=>!seen[s.name]&&otherUsed[s.name]));
+    changed.push(roster.length+" speaker(s)");
+  }
+
+  // -- scene prompt
+  if(typeof sc.scene==="string"){
+    if(sc.scene_is_custom===false)delete clipPromptOverrides[c];
+    else clipPromptOverrides[c]=sc.scene;
+    changed.push("scene prompt");
+  }
+
+  // -- length
+  const fps=parseInt($("fpsV").value,10)||24;
+  const _lf=sc.length_frames?parseInt(sc.length_frames,10):null;
+  const _ls=(sc.length_seconds!=null&&sc.length_seconds!=="")?parseFloat(sc.length_seconds):null;
+  if(sc.length_overridden===false){
+    if(clipFrameOverrides[c]!==undefined)changed.push("length (back to auto)");
+    delete clipFrameOverrides[c];
+  }else if(_lf&&_ls!=null&&Math.abs(_ls-_lf/fps)>0.05){
+    // both present but they disagree -> the human-readable seconds field
+    // is the one that was edited by hand, so it wins.
+    clipFrameOverrides[c]=_snapFrames(_ls,fps);changed.push("length");
+  }else if(_lf){clipFrameOverrides[c]=_lf;changed.push("length");}
+  else if(_ls!=null){clipFrameOverrides[c]=_snapFrames(_ls,fps);changed.push("length");}
+
+  // -- start / end frames
+  if("start_image" in sc){
+    const had=!!clipStartImages[c];
+    if(sc.start_image){
+      if(sc.start_image!==clipStartImages[c])changed.push("start image");
+      clipStartImages[c]=sc.start_image;delete clipStartPlaceholders[c];
+      if(c===1){try{_setStartImage(sc.start_image);}catch(e){}}
+    }else{
+      delete clipStartImages[c];
+      if(had)changed.push("start image (cleared)");
+    }
+  }
+  if("end_image" in sc){
+    const hadE=!!clipEndImages[c];
+    if(sc.end_image){
+      if(sc.end_image!==clipEndImages[c])changed.push("end frame");
+      clipEndImages[c]=sc.end_image;
+    }else{
+      delete clipEndImages[c];
+      if(hadE)changed.push("end frame (cleared)");
+    }
+  }
+
+  // -- video-to-video control
+  if("control_video" in sc){
+    const cvj=sc.control_video;
+    if(!cvj){
+      const hadV=!!clipControlVideos[c];
+      delete clipControlVideos[c];delete clipControlType[c];delete clipControlStrength[c];
+      delete clipCopySrcAudio[c];delete clipControlDur[c];delete clipControlSplit[c];
+      if(hadV)changed.push("control video (cleared)");
+    }else{
+      if(cvj.video)clipControlVideos[c]=cvj.video;
+      if(clipControlVideos[c]){
+        clipControlType[c]=cvj.type||"raw";
+        clipControlStrength[c]=(cvj.strength!=null?+cvj.strength:1);
+        clipCopySrcAudio[c]=!!cvj.copy_source_audio;
+        if(cvj.duration_seconds!=null)clipControlDur[c]=+cvj.duration_seconds;
+        changed.push("control video");
+      }else if(cvj.video_omitted){
+        toast("That file lists a control video but the video itself was too big to "
+          +"include \u2014 re-upload it here if you need it.",true);
+      }
+    }
+  }
+
+  // -- dialogue: swap this clip's lines in place, keeping their position
+  //    in the overall running order.
+  if(Array.isArray(sc.lines)){
+    const fallback=(speakers[0]||{}).name||"SPEAKER";
+    const nl=sc.lines.map(l=>{
+      const sp=NM((l&&l.speaker)||fallback);
+      if(!speakers.some(x=>x.name===sp))
+        speakers.push({name:sp,voice:_CLIP_JSON_DEFVOICE,look:""});
+      return {speaker:sp,text:((l&&l.text)||""),clip:c};
+    });
+    const firstIdx=dialog.findIndex(l=>(l.clip||1)===c);
+    let before=0;
+    if(firstIdx>=0)for(let i=0;i<firstIdx;i++)if((dialog[i].clip||1)!==c)before++;
+    const rest=dialog.filter(l=>(l.clip||1)!==c);
+    dialog=(firstIdx<0)?rest.concat(nl)
+      :rest.slice(0,before).concat(nl,rest.slice(before));
+    changed.push(nl.length+" line(s)");
+  }
+
+  return changed.length
+    ? ("Clip "+c+": overrode "+changed.join(", ")+".")
+    : ("Clip "+c+": that file had nothing to apply.");
+}
+// Footer button: download the open clip as .json.
+function downloadClipJSON(){
+  const c=_clipModalC;
+  if(c==null){toast("Open a clip first.",true);return;}
+  try{
+    const sc=buildClipScript(c);
+    const txt=JSON.stringify(sc,null,2);
+    const blob=new Blob([txt],{type:"application/json"});
+    const a=document.createElement("a");a.href=URL.createObjectURL(blob);
+    a.download="missinglink_clip_"+c+".json";
+    document.body.appendChild(a);a.click();a.remove();
+    setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+    toast("Clip "+c+" downloaded \u2014 edit the .json and load it back to override this clip.");
+  }catch(e){toast("Couldn't build the clip JSON: "+e,true);}
+}
+// Footer button: read a clip .json and override the open clip with it.
+function uploadClipJSON(files){
+  const c=_clipModalC;
+  const inp=$("clipJsonFile");
+  const f=(files||[])[0];
+  if(!f){if(inp)inp.value="";return;}
+  if(c==null){toast("Open a clip first.",true);if(inp)inp.value="";return;}
+  const rd=new FileReader();
+  rd.onload=()=>{
+    let msg;
+    try{msg=applyClipScript(c,JSON.parse(rd.result));}
+    catch(e){toast("Couldn't load that clip JSON: "+e,true);return;}
+    try{
+      renderSpeakers();renderDialog();_syncGenerateEnabled();
+      openClipModal(c);        // repaint + rebind every field from state
+    }catch(e){}
+    toast(msg);
+  };
+  rd.onerror=()=>toast("Couldn't read that file.",true);
+  rd.readAsText(f);
+  if(inp)inp.value="";
 }
 function closeClipModal(){
   $("clipModal").style.display="none";_clipModalC=null;
