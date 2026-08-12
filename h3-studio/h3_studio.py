@@ -17,6 +17,26 @@
 COMFY_DIR = "/content/ComfyUI"
 UI_PORT   = 7860
 
+# Which FL2VA transformer to fetch. All are stock-ComfyUI format and load with
+# the built-in loader; the text encoder and both VAEs are shared and unchanged.
+# NVFP4 profiles target Blackwell (RTX 50 / B200) — on Ampere or Ada use INT8.
+DIT_CHOICE = "eros_int8_hq"     # see DITS below
+
+DITS = {
+  # Comfy-Org reference, pruned + int8 convrot
+  "base":        ("Comfy-Org/MiniMax-H3", "diffusion_models",
+                  "minimax_h3_fl2va_pruned_int8_convrot.safetensors"),
+  # 10Eros_Max fine-tune (QKV blocks 0-31), quantized by DmitryDB
+  "eros_int8_hq":("DmitryDB/MiniMax-H3-10Eros-Max-Quants", "FL2VA",
+                  "10Eros_Max_H3_FL2VA-INT8-ConvRot-HQ.safetensors"),
+  "eros_int8":   ("DmitryDB/MiniMax-H3-10Eros-Max-Quants", "FL2VA",
+                  "10Eros_Max_H3_FL2VA-INT8-ConvRot.safetensors"),
+  "eros_nvfp4_hq":("DmitryDB/MiniMax-H3-10Eros-Max-Quants", "FL2VA",
+                  "10Eros_Max_H3_FL2VA-NVFP4-HQ.safetensors"),
+  "eros_nvfp4":  ("DmitryDB/MiniMax-H3-10Eros-Max-Quants", "FL2VA",
+                  "10Eros_Max_H3_FL2VA-NVFP4.safetensors"),
+}
+
 # 4-step Turbo LoRA (larryvrh, converted for the pruned checkpoint by drbaph).
 # ~5x fewer sampling steps. Early preview: under-trained, and audio is its
 # weak point. Use steps 4-8, scheduler "beta", strength ~1.0.
@@ -114,19 +134,42 @@ import torch, numpy as np
 from PIL import Image
 from flask import Flask, request, jsonify, Response, send_file
 
+if not torch.cuda.is_available():
+    raise RuntimeError("No CUDA device. Runtime -> Change runtime type -> GPU.")
+gpu  = torch.cuda.get_device_name(0)
+vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+disk = shutil.disk_usage("/content").free / 1e9
+log(f"  {gpu} · {vram:.0f} GB VRAM · {disk:.0f} GB disk free")
+
 # ── 1. Weights ─────────────────────────────────────────────────────────────
 from huggingface_hub import hf_hub_download
-MODELS = os.path.join(COMFY_DIR,"models")
-FILES = [("diffusion_models","minimax_h3_fl2va_pruned_int8_convrot.safetensors"),
-         ("text_encoders","qwen3vl_32b_minimax_h3_int8_convrot.safetensors"),
-         ("vae","minimax_h3_video_vae_fp16.safetensors"),
-         ("vae","minimax_h3_audio_vae_fp32.safetensors")]
-for sub,fn in FILES:
-    os.makedirs(os.path.join(MODELS,sub), exist_ok=True)
-    if not os.path.exists(os.path.join(MODELS,sub,fn)):
-        log(f"  ↓ {fn}")
-        hf_hub_download("Comfy-Org/MiniMax-H3",filename=fn,subfolder=sub,local_dir=MODELS)
-log("✓ weights present")
+if DIT_CHOICE not in DITS:
+    raise RuntimeError(f"DIT_CHOICE must be one of {list(DITS)}")
+_repo, _sub, DIT_FILE = DITS[DIT_CHOICE]
+
+if "nvfp4" in DIT_CHOICE and not any(k in gpu for k in ("B200","RTX 50","GB200","RTX 60")):
+    log(f"  ⚠ {DIT_CHOICE} is a Blackwell profile and {gpu} is not Blackwell.\n"
+        f"    Expect a slow emulated path or a load failure — use eros_int8 instead.")
+
+MODELS = os.path.join(COMFY_DIR, "models")
+FILES = [("diffusion_models", DIT_FILE, _repo, _sub),
+         ("text_encoders", "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+          "Comfy-Org/MiniMax-H3", "text_encoders"),
+         ("vae", "minimax_h3_video_vae_fp16.safetensors",
+          "Comfy-Org/MiniMax-H3", "vae"),
+         ("vae", "minimax_h3_audio_vae_fp32.safetensors",
+          "Comfy-Org/MiniMax-H3", "vae")]
+for sub, fname, repo, remote_sub in FILES:
+    os.makedirs(os.path.join(MODELS, sub), exist_ok=True)
+    dest = os.path.join(MODELS, sub, fname)
+    if os.path.exists(dest):
+        log(f"  ✓ {fname}"); continue
+    log(f"  ↓ {fname}  ({repo})")
+    p = hf_hub_download(repo, filename=fname, subfolder=remote_sub)
+    # The 10Eros repo nests under FL2VA/ while ComfyUI wants a flat folder.
+    if os.path.abspath(p) != os.path.abspath(dest):
+        shutil.copy(p, dest)
+log(f"✓ transformer: {DIT_FILE}")
 
 if TURBO_LORA:
     # Standard-format LoRAs only — backbone weights that stock LoraLoaderModelOnly
@@ -204,16 +247,17 @@ comfy.utils.set_progress_bar_global_hook(
 
 # ── 4. Model cache ─────────────────────────────────────────────────────────
 CACHE = {}
-def get_models(weight_dtype, lora, lora_strength):
-    """Base weights are cached by dtype only. The LoRA is applied to a clone on
-    every job, so switching or restrengthening a LoRA costs nothing — it used to
-    invalidate the whole cache and reload all 44 GB including the text encoder."""
-    if CACHE.get("key") != weight_dtype:
+def get_models(weight_dtype, lora, lora_strength, unet=None):
+    """Base weights are cached by (transformer, dtype). The LoRA is applied to a
+    clone on every job, so switching or restrengthening a LoRA costs nothing —
+    it used to invalidate the cache and reload all 44 GB including the encoder.
+    Switching the transformer does reload it, but not the encoder or VAEs."""
+    unet = unet or DIT_FILE
+    if CACHE.get("key") != (unet, weight_dtype):
         CACHE.clear()
         PROG["stage"] = "loading unet"
-        base, = call("UNETLoader",
-                     unet_name="minimax_h3_fl2va_pruned_int8_convrot.safetensors",
-                     weight_dtype=weight_dtype)
+        log(f"  loading transformer: {unet}")
+        base, = call("UNETLoader", unet_name=unet, weight_dtype=weight_dtype)
         PROG["stage"] = "loading clip"
         clip, = call("CLIPLoader",
                      clip_name="qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
@@ -221,7 +265,8 @@ def get_models(weight_dtype, lora, lora_strength):
         PROG["stage"] = "loading vae"
         vae,  = call("VAELoader", vae_name="minimax_h3_video_vae_fp16.safetensors")
         avae, = call("VAELoader", vae_name="minimax_h3_audio_vae_fp32.safetensors")
-        CACHE.update(key=weight_dtype, base=base, clip=clip, vae=vae, avae=avae)
+        CACHE.update(key=(unet, weight_dtype), base=base, clip=clip,
+                     vae=vae, avae=avae)
 
     model = CACHE["base"]
     if lora and lora != "none":
@@ -295,7 +340,8 @@ def _generate(jid, p):
         j["memlog"] = f"VRAM at job start: {f0:.1f} GB free\n"
 
         model, clip, vae, avae = get_models(
-            p["weight_dtype"], p.get("lora"), p.get("lora_strength", 1.0))
+            p["weight_dtype"], p.get("lora"), p.get("lora_strength", 1.0),
+            unet=p.get("unet") or DIT_FILE)
 
         model, = call("MiniMaxH3SigmaShift", model=model,
                       shift_video=float(p["shift_video"]),
@@ -413,7 +459,9 @@ def meta():
     # Read the folder fresh so LoRAs dropped in after startup appear.
     folder_paths.cache_helper.clear()
     return jsonify(samplers=SAMPLERS, schedulers=SCHEDULERS,
-                   loras=["none"]+folder_paths.get_filename_list("loras"))
+                   loras=["none"]+folder_paths.get_filename_list("loras"),
+                   unets=folder_paths.get_filename_list("diffusion_models"),
+                   unet_default=DIT_FILE)
 
 @app.get("/api/keepalive")
 def keepalive(): return jsonify(ok=True)
@@ -426,7 +474,7 @@ def api_gen():
     p = {k: request.form.get(k) for k in
          ("prompt","width","height","duration","steps","seed","denoise",
           "shift_video","shift_audio","sampler_name","scheduler",
-          "weight_dtype","lora","lora_strength")}
+          "weight_dtype","lora","lora_strength","unet")}
     for k in ("first_frame","last_frame"):
         f = request.files.get(k)
         if f and f.filename:
@@ -548,6 +596,10 @@ soundscape, then the music.</div>
 12.0 / 3.0 are the released defaults.</div>
 
 <h2>model</h2>
+<label>transformer</label>
+<select id=unet></select>
+<div class=hint>Any FL2VA checkpoint in models/diffusion_models. Switching
+reloads the transformer (~21 GB) but not the text encoder or VAEs.</div>
 <label>weight dtype</label><select id=weight_dtype>
 <option>default</option><option>fp8_e4m3fn</option>
 <option>fp8_e4m3fn_fast</option><option>fp8_e5m2</option></select>
@@ -607,6 +659,10 @@ function loadMeta(){
       `<option${s==='simple'?' selected':''}>${s}</option>`).join('');
     $('lora').innerHTML=m.loras.map(s=>`<option>${s}</option>`).join('');
     if(keep&&m.loras.includes(keep))$('lora').value=keep;
+    const ku=$('unet').value;
+    $('unet').innerHTML=(m.unets||[]).map(s=>
+      `<option${s===m.unet_default?' selected':''}>${s}</option>`).join('');
+    if(ku&&(m.unets||[]).includes(ku))$('unet').value=ku;
     return m;
   });
 }
@@ -635,7 +691,7 @@ $('go').onclick=async()=>{
   const fd=new FormData();
   for(const k of ['prompt','width','height','duration','steps','seed','denoise',
     'shift_video','shift_audio','sampler_name','scheduler','weight_dtype',
-    'lora','lora_strength'])fd.append(k,$(k).value);
+    'lora','lora_strength','unet'])fd.append(k,$(k).value);
   for(const k of ['first_frame','last_frame'])
     if($(k).files[0])fd.append(k,$(k).files[0]);
   $('go').disabled=true;dot('live');say('submitting');
