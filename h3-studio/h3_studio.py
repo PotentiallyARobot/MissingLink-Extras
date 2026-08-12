@@ -64,12 +64,15 @@ if not ML_TOKEN:
     except Exception:
         pass
 
+BUY_URL = ("https://missinglink.build/buy/all_gpu_bundle"
+           "?price=price_1T3lGSJTLzTiUThCUah5Sm7o")
+
 if not ML_TOKEN:
     raise RuntimeError(
         "\n  No MISSING_LINK_TOKEN found.\n"
         "  Add it to Colab secrets (key icon, left sidebar) as MISSING_LINK_TOKEN,\n"
         "  or set os.environ['MISSING_LINK_TOKEN'] before running this cell.\n"
-        "  Get a token: https://www.missinglink.build/pricing.html\n")
+        f"  Get a token: {BUY_URL}\n")
 
 def _validate_token(tok):
     import urllib.request, base64
@@ -89,7 +92,8 @@ def _validate_token(tok):
 if not _validate_token(ML_TOKEN):
     raise RuntimeError(
         "\n  MISSING_LINK_TOKEN was rejected (401/403).\n"
-        "  Check for typos or an expired bundle: https://www.missinglink.build/pricing.html\n")
+        "  Check for typos or an expired bundle.\n"
+        f"  {BUY_URL}\n")
 log("✓ MissingLink token accepted")
 ML_OK = True
 
