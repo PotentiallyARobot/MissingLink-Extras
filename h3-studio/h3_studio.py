@@ -171,16 +171,30 @@ FILES = [("diffusion_models", DIT_FILE, _repo, _sub),
           "Comfy-Org/MiniMax-H3", "vae"),
          ("vae", "minimax_h3_audio_vae_fp32.safetensors",
           "Comfy-Org/MiniMax-H3", "vae")]
-for sub, fname, repo, remote_sub in FILES:
+# The four weight files total ~50 GB and used to download SEQUENTIALLY —
+# the 27 GB text encoder only started after the 21 GB DiT finished, so the
+# first launch spent most of its time waiting on one stream at a time.
+# hf_hub_download is thread-safe (per-file locks in the cache), so they
+# now run concurrently: total wall time collapses toward the single
+# largest file. Progress bars interleave; the byte counts still climb.
+from concurrent.futures import ThreadPoolExecutor as _TPE
+
+def _fetch_one(job):
+    sub, fname, repo, remote_sub = job
     os.makedirs(os.path.join(MODELS, sub), exist_ok=True)
     dest = os.path.join(MODELS, sub, fname)
     if os.path.exists(dest):
-        log(f"  ✓ {fname}"); continue
+        log(f"  ✓ {fname}"); return
     log(f"  ↓ {fname}  ({repo})")
     p = hf_hub_download(repo, filename=fname, subfolder=remote_sub)
     # The 10Eros repo nests under FL2VA/ while ComfyUI wants a flat folder.
     if os.path.abspath(p) != os.path.abspath(dest):
         shutil.copy(p, dest)
+
+with _TPE(max_workers=4) as _pool:
+    # list() propagates the first exception instead of swallowing it —
+    # a missing weight must still be a loud failure, exactly as before.
+    list(_pool.map(_fetch_one, FILES))
 log(f"✓ transformer: {DIT_FILE}")
 
 if TURBO_LORA:
