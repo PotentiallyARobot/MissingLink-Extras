@@ -49,6 +49,50 @@ log("="*74)
 log("  MissingLink · MiniMax Studio   (MiniMax-H3, library mode)")
 log("="*74)
 
+# ── License gate ───────────────────────────────────────────────────────────
+# A MissingLink token is required. Set it in Colab secrets as
+# MISSING_LINK_TOKEN, or export it before running.
+#   https://www.missinglink.build/pricing.html
+MACHINE = os.environ.get("MACHINE", "a100")
+ML_TOKEN = os.environ.get("MISSING_LINK_TOKEN", "").strip()
+
+if not ML_TOKEN:
+    try:
+        from google.colab import userdata
+        ML_TOKEN = (userdata.get("MISSING_LINK_TOKEN") or "").strip()
+        os.environ["MISSING_LINK_TOKEN"] = ML_TOKEN
+    except Exception:
+        pass
+
+if not ML_TOKEN:
+    raise RuntimeError(
+        "\n  No MISSING_LINK_TOKEN found.\n"
+        "  Add it to Colab secrets (key icon, left sidebar) as MISSING_LINK_TOKEN,\n"
+        "  or set os.environ['MISSING_LINK_TOKEN'] before running this cell.\n"
+        "  Get a token: https://www.missinglink.build/pricing.html\n")
+
+def _validate_token(tok):
+    import urllib.request, base64
+    req = urllib.request.Request(f"https://missinglink.build/{MACHINE}.txt")
+    req.add_header("Authorization", "Basic " +
+                   base64.b64encode(f"{tok}:".encode()).decode())
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status == 200
+    except Exception as e:
+        code = getattr(e, "code", None)
+        if code in (401, 403):
+            return False
+        log(f"  ⚠ could not reach missinglink.build ({e}) — continuing offline")
+        return True          # network trouble shouldn't lock you out mid-session
+
+if not _validate_token(ML_TOKEN):
+    raise RuntimeError(
+        "\n  MISSING_LINK_TOKEN was rejected (401/403).\n"
+        "  Check for typos or an expired bundle: https://www.missinglink.build/pricing.html\n")
+log("✓ MissingLink token accepted")
+ML_OK = True
+
 subprocess.run(["pkill","-9","-f","ComfyUI/main.py"], check=False)
 subprocess.run(["pkill","-9","-f","cloudflared"], check=False)
 
@@ -198,10 +242,15 @@ def to_tensor(pil):
     a = np.array(Image.open(pil).convert("RGB")).astype(np.float32)/255.0
     return torch.from_numpy(a)[None,]
 
-def snap_length(n):
-    """The video VAE only decodes frame counts on the 17k+5 grid."""
-    k = max(0, round((int(n)-5)/17))
-    return 17*k + 5
+FPS = 24.0
+
+def frames_from_seconds(sec):
+    """Seconds -> frame count on the model's 17k+5 grid (the only counts the
+    video VAE can decode). Returns (frames, actual_seconds)."""
+    want = float(sec) * FPS
+    k = max(0, round((want - 5) / 17))
+    frames = 17 * k + 5
+    return frames, frames / FPS
 
 # ── 5. Generate ────────────────────────────────────────────────────────────
 OUT = "/content/h3_out"; os.makedirs(OUT, exist_ok=True)
@@ -249,9 +298,11 @@ def _generate(jid, p):
                       shift_audio=float(p["shift_audio"]))
 
         PROG["stage"] = "conditioning"
+        n_frames, actual_sec = frames_from_seconds(p["duration"])
+        log(f"  {p['duration']}s requested -> {n_frames} frames ({actual_sec:.2f}s)")
         kw = dict(clip=clip, vae=vae, prompt=p["prompt"],
                   width=int(p["width"]), height=int(p["height"]),
-                  length=snap_length(p["length"]))
+                  length=n_frames)
         if p.get("first_frame"): kw["first_frame"] = to_tensor(p["first_frame"])
         if p.get("last_frame"):  kw["last_frame"]  = to_tensor(p["last_frame"])
         positive, latent = call("MiniMaxH3ImageToVideo", **kw)
@@ -338,7 +389,8 @@ def _generate(jid, p):
             raise RuntimeError("save_to produced no file")
 
         j.update(status="done", file=os.path.basename(dest),
-                 secs=round(time.time()-j["t0"],1), frames=snap_length(p["length"]))
+                 secs=round(time.time()-j["t0"],1), frames=n_frames,
+                 duration=round(actual_sec, 2))
     except Exception:
         traceback.print_exc()
         # Put the memory readings AT THE TOP of what the panel shows — the panel
@@ -364,9 +416,11 @@ def keepalive(): return jsonify(ok=True)
 
 @app.post("/api/generate")
 def api_gen():
+    if not ML_OK:
+        return jsonify(error="MissingLink token not validated."), 402
     jid = uuid.uuid4().hex[:8]
     p = {k: request.form.get(k) for k in
-         ("prompt","width","height","length","steps","seed","denoise",
+         ("prompt","width","height","duration","steps","seed","denoise",
           "shift_video","shift_audio","sampler_name","scheduler",
           "weight_dtype","lora","lora_strength")}
     for k in ("first_frame","last_frame"):
@@ -465,11 +519,9 @@ soundscape, then the music.</div>
 <div><label>width</label><input id=width type=number value=640 step=32 min=32></div>
 <div><label>height</label><input id=height type=number value=384 step=32 min=32></div>
 </div>
-<label>length (frames @ 24fps)</label>
-<input id=length type=number value=39 step=17 min=5>
-<div class=hint>The VAE decodes all frames in one pass and cannot tile, so
-memory scales with width × height × length. These low values are a deliberate
-floor — get one render out, then raise until it OOMs to find your ceiling.</div>
+<label>duration (seconds)</label>
+<input id=duration type=number value=5 step=0.5 min=0.2>
+<div class=hint id=durhint></div>
 
 <h2>sampling</h2>
 <div class=g2>
@@ -528,6 +580,20 @@ $('rnd').onclick=e=>{e.preventDefault();$('seed').value=Math.floor(Math.random()
 const dot=k=>document.querySelector('.dot').className='dot '+(k||'');
 const say=t=>$('stxt').textContent=t;
 
+// Mirror the server's 17k+5 snapping so the real duration is visible up front.
+function updateDur(){
+  const want=parseFloat($('duration').value||0)*24;
+  const k=Math.max(0,Math.round((want-5)/17));
+  const f=17*k+5, sec=f/24;
+  const trained=f>=124&&f<=362;
+  $('durhint').innerHTML=
+    `→ ${f} frames = <b>${sec.toFixed(2)}s</b> at 24fps (snapped to the VAE's 17k+5 grid)`+
+    (trained?'':`<br><span style="color:#c9a227">outside the trained 124–362 frame `+
+      `range (5.2–15.1s) — quality will suffer</span>`);
+}
+$('duration').addEventListener('input',updateDur);
+updateDur();
+
 function loadMeta(){
   return fetch('/api/meta').then(r=>r.json()).then(m=>{
     const keep=$('lora').value;
@@ -563,7 +629,7 @@ function fail(m){dot('err');say('failed');$('err').style.display='block';
 $('go').onclick=async()=>{
   $('err').style.display='none';
   const fd=new FormData();
-  for(const k of ['prompt','width','height','length','steps','seed','denoise',
+  for(const k of ['prompt','width','height','duration','steps','seed','denoise',
     'shift_video','shift_audio','sampler_name','scheduler','weight_dtype',
     'lora','lora_strength'])fd.append(k,$(k).value);
   for(const k of ['first_frame','last_frame'])
@@ -582,7 +648,7 @@ async function poll(){
     say(`${j.stage||j.status}${j.total?` · ${j.cur}/${j.total}`:''} · ${j.el}s`);
     $('pb').style.width=pct+'%';setTimeout(poll,1500);return}
   if(j.status==='done'){
-    dot('');say(`done in ${j.secs}s · ${j.frames} frames`+
+    dot('');say(`done in ${j.secs}s · ${j.duration}s / ${j.frames} frames`+
       (j.vram_free!==undefined?` · ${j.vram_free} GB free at decode`:''));
     $('pb').style.width='100%';
     $('vwrap').innerHTML=`<video controls autoplay src="/out/${j.file}"></video>`;
