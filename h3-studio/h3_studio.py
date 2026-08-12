@@ -20,20 +20,32 @@ UI_PORT   = 7860
 # Which FL2VA transformer to fetch. All are stock-ComfyUI format and load with
 # the built-in loader; the text encoder and both VAEs are shared and unchanged.
 # NVFP4 profiles target Blackwell (RTX 50 / B200) — on Ampere or Ada use INT8.
-DIT_CHOICE = "eros_int8_hq"     # see DITS below
+#
+# DEFAULT is "base": the Comfy-Org pruned int8 reference paired with the
+# Lightning (lightx2v) 4-step turbo LoRA below — the fast path, and the only
+# thing downloaded out of the box. The 10Eros_Max quants are NOT fetched
+# unless explicitly selected (they are 23 GB+ each and their upstream has
+# been throttling to zero). Override without editing this file by setting
+# the H3_DIT env var in the notebook before launch, e.g.
+#   os.environ["H3_DIT"] = "eros_int8_hq"
+import os as _os  # the main import block sits below this config section
+DIT_CHOICE = _os.environ.get("H3_DIT", "base")
 
 DITS = {
   # Comfy-Org reference, pruned + int8 convrot
   "base":        ("Comfy-Org/MiniMax-H3", "diffusion_models",
                   "minimax_h3_fl2va_pruned_int8_convrot.safetensors"),
-  # 10Eros_Max fine-tune (QKV blocks 0-31), quantized by DmitryDB
-  "eros_int8_hq":("DmitryDB/MiniMax-H3-10Eros-Max-Quants", "FL2VA",
+  # 10Eros_Max fine-tune (QKV blocks 0-31), quantized by DmitryDB.
+  # Served from the disguisequence mirror — a byte-identical duplicate of
+  # DmitryDB/MiniMax-H3-10Eros-Max-Quants (same FL2VA/ layout) — because
+  # downloads from the DmitryDB origin were throttling to ZERO bytes/sec.
+  "eros_int8_hq":("disguisequence/MiniMax-H3-10Eros-Max-Quants", "FL2VA",
                   "10Eros_Max_H3_FL2VA-INT8-ConvRot-HQ.safetensors"),
-  "eros_int8":   ("DmitryDB/MiniMax-H3-10Eros-Max-Quants", "FL2VA",
+  "eros_int8":   ("disguisequence/MiniMax-H3-10Eros-Max-Quants", "FL2VA",
                   "10Eros_Max_H3_FL2VA-INT8-ConvRot.safetensors"),
-  "eros_nvfp4_hq":("DmitryDB/MiniMax-H3-10Eros-Max-Quants", "FL2VA",
+  "eros_nvfp4_hq":("disguisequence/MiniMax-H3-10Eros-Max-Quants", "FL2VA",
                   "10Eros_Max_H3_FL2VA-NVFP4-HQ.safetensors"),
-  "eros_nvfp4":  ("DmitryDB/MiniMax-H3-10Eros-Max-Quants", "FL2VA",
+  "eros_nvfp4":  ("disguisequence/MiniMax-H3-10Eros-Max-Quants", "FL2VA",
                   "10Eros_Max_H3_FL2VA-NVFP4.safetensors"),
 }
 
