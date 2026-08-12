@@ -572,11 +572,23 @@ video{width:100%;max-height:74vh;display:block;background:#000}
 #err{display:none;white-space:pre-wrap;color:#ff8a8a;font-size:10.5px;
  max-height:280px;overflow:auto;border:1px solid #3a2020;background:#160e0e;
  padding:12px;border-radius:7px}
+/* promo card for the browser studios */
+.promo{display:block;margin-top:26px;padding:14px 16px;border:1px solid #3a3010;
+ border-radius:9px;background:linear-gradient(160deg,#15120a,#101012);
+ text-decoration:none;transition:border-color .15s}
+.promo:hover{border-color:#E8A917}
+.promo .pt{color:#E8A917;font-weight:700;font-size:11px;letter-spacing:1.4px;margin-bottom:6px}
+.promo .pb2{color:#a9a9b1;font-size:11px;line-height:1.6}
+.promo .pb2 b{color:#e9e9ec;font-weight:600}
+.promo .pgo{display:inline-block;margin-top:9px;color:#E8A917;font-size:11px;font-weight:700}
 </style></head><body><div class=wrap>
 <div class=side>
-<h1><img id=logo src="https://raw.githubusercontent.com/PotentiallyARobot/MissingLink-Extras/main/image-edit-studio/static/app_logo.png?v=2"
+<h1><a href="https://missinglink.build" target="_blank" rel="noopener"
+ style="display:flex;align-items:center;gap:12px;text-decoration:none;color:inherit"
+ title="missinglink.build — the complete AI creation stack"><img id=logo
+ src="https://raw.githubusercontent.com/PotentiallyARobot/MissingLink-Extras/main/image-edit-studio/static/app_logo.png?v=2"
  alt="MissingLink" onerror="this.style.display='none'"><span class=wm><span
- class=ml>MISSINGLINK</span> <span class=st>MINIMAX STUDIO</span></span></h1>
+ class=ml>MISSINGLINK</span> <span class=st>MINIMAX STUDIO</span></span></a></h1>
 
 <h2>prompt</h2>
 <textarea id=prompt placeholder="[Shot 1] Cinematic medium shot, slow push in…
@@ -645,7 +657,15 @@ Strength 1.0, or 0.6–0.8 for a lighter touch.<br>
 <div class=hint>Selects the turbo LoRA at 0.7 and sets 8 steps / beta / euler.</div>
 
 <button id=go>GENERATE</button>
+<a class=promo href="https://missinglink.build/studio" target="_blank" rel="noopener">
+  <div class=pt>&#10022; MORE MISSINGLINK AI TOOLS</div>
+  <div class=pb2>Same token, no GPU rental needed &mdash; <b>Image Studio</b> edits photos
+  from a text prompt for $0.002, <b>Video Studio</b> turns any still into a clip, and
+  <b>3D Models</b> builds a textured mesh from one photo. All in the browser.</div>
+  <span class=pgo>Open the browser studios &rarr;</span>
+</a>
 </div>
+
 
 <div class=main>
 <div id=status><div class=row><span class=dot></span><span id=stxt>ready</span></div>
