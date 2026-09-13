@@ -1,17 +1,18 @@
 # ======================================================================
-# MiniMax H3 · V93 AUTO GPU PRODUCTION UI · BLACKWELL SM120 + A100 80/40GB + T4/16GB LOW-VRAM
+# MiniMax H3 · SFW FAST-START UI · BLACKWELL SM120 + A100 80/40GB + T4/16GB LOW-VRAM
 # One Colab cell. No prior app cell required.
 # PERFORMANCE UPDATE v20:
 # - Sage is the forced production attention backend and MUST come from the MissingLink prebuilt SM120 wheel.
 # - Includes CUDA/comfy-kitchen ConvRot fast-path audit.
 # - Does NOT replace PyTorch inside a live Comfy runtime. If this cell reports CUDA <13,
 #   compare against a fresh cu130+ runtime rather than hot-swapping torch underneath Comfy.
-# - Keeps the existing resident-DiT benchmark and exact 7.00 s output behavior.
+# - SFW-only build: adult checkpoints/LoRAs and the 18+ mode are removed.
+# - Fast-start defaults defer optional accelerator downloads and GPU preload until first use.
 #
 #
 # Requires Colab Secrets:
 #   MISSING_LINK_TOKEN - required; validated against MissingLink before the UI can start
-#   CIVITAI_API_KEY    - for the adult LoRA download
+#   CIVITAI_API_KEY    - optional; only for user-requested SFW CivitAI LoRA installs
 #   HF_TOKEN           - optional/used by Hugging Face model downloads where applicable
 # SageAttention is never built from source in this UI cell; Blackwell requires the MissingLink wheel.
 #
@@ -44,75 +45,60 @@
 COMFY_DIR = "/content/ComfyUI"
 UI_PORT   = 7860
 
-# Adult catalog checkpoint: TenStrip H3 Eros Max beta5 hybrid Turbo.
-# V94 starts on official Stock H3 and reveals/downloads this checkpoint only after
-# the adult-access acknowledgement. DIT_CHOICE is retained for legacy resolver code.
-DIT_CHOICE = "eros_max_beta5"
-EROS_MAX_REPO = "TenStrip/10Eros-Max"
-EROS_MAX_FILE = "10Eros_Max_h3_TURBO-hybrid_beta5_int8.safetensors"
-EROS_MAX_BF16_FILE = "10Eros_Max_h3_TURBO-hybrid_beta5.safetensors"
-EROS_MAX_SHA256 = "4dd965496e5b1b83cd13c65cbe7a535b8a4d94ae768a7646b4e336d52c4781cf"
-EROS_MAX_GIB = 19.53
-USING_EROS_MAX = False
+# SFW-only checkpoint configuration. The official MiniMax H3 weights are the only
+# built-in model profiles exposed by this studio. Optional SFW acceleration LoRAs
+# remain available and are downloaded lazily on first use.
+FAST_STARTUP = os.environ.get("H3_FAST_STARTUP", "1").strip().lower() not in {"0", "false", "no", "off"} if "os" in globals() else True
+DIT_CHOICE = "stock_quality"
+FALLBACK_DIT_FILE = "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+REF2VA_DIT_FILE = "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+REF2VA_DIT_GIB = 19.53
 
-# Automatic low-VRAM leg. The 11.4 GB (decimal) Q4_0 FL2VA GGUF is the default
-# for T4-class / <=18.5 GiB GPUs so the DiT can be paged by Comfy rather than
-# forcing the ~19.5 GiB INT8 ConvRot transformer fully resident.
+# Automatic low-VRAM leg.
 T4_LOWVRAM_MAX_GIB = 18.5
 T4_RESERVE_VRAM_GIB = 2.0
 T4_DIT_REPO = "molbal/MiniMax-H3-GGUF"
 T4_DIT_FILE = "minimax_h3_fl2va_pruned_fp8_Q4_0.gguf"
 T4_DIT_SHA256 = "50891b806d6d700f4f20931791ca42a083dd9148609838268ccdc782bf899c1c"
-T4_DIT_GIB = 10.62  # 11.4 GB decimal on Hugging Face
+T4_DIT_GIB = 10.62
 T4_TEXT_ENCODER_FILE = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
 T4_TEXT_ENCODER_GIB = 14.61
 
-# A100 profiles. 80GB keeps the quality INT8 conditioning encoder and can keep
-# the whole active stack resident. 40GB uses the smaller official NVFP4/AWQ TE
-# and sequential model handoff; the DiT itself remains the quality INT8/EROS path.
+# A100 profiles.
 A100_80_MIN_GIB = 60.0
 A100_80_RESERVE_VRAM_GIB = 8.0
 A100_40_RESERVE_VRAM_GIB = 5.0
 A100_40_TEXT_ENCODER_FILE = T4_TEXT_ENCODER_FILE
 A100_40_TEXT_ENCODER_GIB = T4_TEXT_ENCODER_GIB
-# RedCraft REDMIX H3 A2A Beta2, CivitAI version 3262321.
-# This merged H3 checkpoint already incorporates NaughtyTimes-derived NSFW tuning
-# and LightX2V/Turbo work, so those LoRAs are NOT stacked by default.
-REDMIX_VERSION = 3262321
-REDMIX_MODEL_ID = 958009
-REDMIX_FILE = "REDMix-MiniMaxH3-A2Ab2-pruned-int8-convrot-ComfyMCP.safetensors"
-REDMIX_FILE_ALIASES = [
-    REDMIX_FILE,
-    "redcraftREDMIXHybridA2A_h3A2AREDBeta2.safetensors",
-]
-FALLBACK_DIT_FILE = "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
-REF2VA_DIT_FILE = "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
-REF2VA_DIT_GIB = 19.53
-REQUIRE_REDMIX = False
-USING_REDMIX = False
-REDMIX_SHA256 = "6a1e09871380982a96c0af058af35cd61b34e4a47a567b4704bdaa7d0f5fd60f"
-REDMIX_PAGE_URL = "https://civitai.red/models/958009/redcraft-or-or-hybrid-h3-a2a-beta2-ltx25-2k"
-REDMIX_DIRECT_URL_SECRET = "REDMIX_DIRECT_URL"  # optional: copy the authorized browser Download link into a Colab Secret
-REDMIX_LOCAL_PATH_SECRET = "REDMIX_LOCAL_PATH"  # optional: exact checkpoint path already mounted in Colab/Drive
-CIVITAI_COOKIE_SECRET = "CIVITAI_COOKIE"        # optional: full Cookie header for an account that has model access
+
 DITS = {
-  "eros_max_beta5": (None, EROS_MAX_REPO, EROS_MAX_FILE),
-  "redmix_beta2": (None, None, REDMIX_FILE),  # legacy/manual
+    "stock_quality": ("Comfy-Org/MiniMax-H3", "diffusion_models", FALLBACK_DIT_FILE),
 }
 
-# SexGod1979 NaughtyTimes v2.0 PRUNED, CivitAI version 3212436.
-# The current release notes recommend v2 at strength 1.0. There is no special
-# activation token; use ordinary descriptive H3 prompts. The author currently
-# recommends I2V over T2V when judging whether the LoRA is having an effect.
-NSFW_LORA_VERSION = 3212436
-NSFW_LORA_FILE = "NaughtyTimes_pruned_r256_v2.safetensors"
-NSFW_LORA_SHA256 = "947efec5a357505bb93bdc1b050d33786ec150aa1c85f24337f0d59f39aaf31a"
-NSFW_LORA_STRENGTH = 1.0
+# Compatibility sentinels for old saved payloads. They are never exposed or installed.
+USING_EROS_MAX = False
+USING_REDMIX = False
+EROS_MAX_FILE = "__sfw_disabled_checkpoint__.safetensors"
+EROS_MAX_REPO = ""
+EROS_MAX_SHA256 = ""
+EROS_MAX_GIB = 19.53
+REDMIX_FILE = "__sfw_disabled_checkpoint_2__.safetensors"
+REDMIX_FILE_ALIASES = [REDMIX_FILE]
+REDMIX_GIB = 19.53
+REDMIX_VERSION = 0
+REDMIX_MODEL_ID = 0
+REDMIX_SHA256 = ""
+REDMIX_PAGE_URL = ""
+REDMIX_DIRECT_URL_SECRET = ""
+REDMIX_LOCAL_PATH_SECRET = ""
+CIVITAI_COOKIE_SECRET = ""
+REQUIRE_REDMIX = False
+NSFW_LORA_FILE = "__sfw_disabled_lora__.safetensors"
+NSFW_LORA_STRENGTH = 0.0
+NSFW_LORA_VERSION = 0
+NSFW_LORA_SHA256 = ""
 
-# Optional LightX2V Lightning / Turbo LoRA. This is the current FL2V 4-step v1.1
-# high-fidelity dynamic-rank ComfyUI resize. It can be stacked after NaughtyTimes
-# for fast previews, but is OFF by default so the NSFW LoRA can be evaluated
-# without an accelerator changing its behavior.
+# Optional SFW acceleration LoRAs.
 LIGHTNING_REPO = "drbaph/MiniMax-H3-Turbo-Lora-ComfyUI"
 LIGHTNING_FILE = "minimax_h3_fl2v_turbo_4step_v1.1_768p_comfyui_resized_avg_rank_64_bf16.safetensors"
 REF2VA_LIGHTNING_REPO = "Comfy-Org/MiniMax-H3"
@@ -124,75 +110,14 @@ LIGHTNING_SHIFT_VIDEO = 6.0
 LIGHTNING_SHIFT_AUDIO = 3.0
 
 # rzgar MiniMax-H3 FL2V 8-Step Motion Enhancer.
-# It is an 8-step replacement for vanilla LightX2V, not something to stack with it.
 MOTION8_REPO = "rzgar/minimax-h3_fl2v_8Step_motion_enhancer"
 MOTION8_FILE = "minimax-h3_fl2v_8Step_motion_enhancer.safetensors"
 MOTION8_STRENGTH = 1.0
 
-# Config-driven specialty LoRA presets.
-#
-# Preserve the original CivitAI specialty family that existed before WHIP was added,
-# and add WHIP plus the additional named CivitAI.red specialty presets as
-# independent entries. The resolver prefers the exact requested version when it is
-# MiniMax-H3 compatible; otherwise it selects the newest H3 sibling from that same
-# CivitAI model family. Presets remain OFF by default.
-SPECIALTY_LORA_PRESETS = [
-    {
-        "key": "original_i2v_specialty",
-        "label": "I2V Specialty LoRA",
-        "model_id": 2011853,
-        "version_id": 2365856,
-        "source_page": "https://civitai.red/models/2011853?modelVersionId=2365856",
-        "default_strength": 0.0,
-        "adult": True,
-        "modes": ["fl2va"],
-    },
-    {
-        "key": "whip_h3",
-        "label": "WHIP MiniMax H3",
-        "model_id": 2920459,
-        "version_id": 3304255,
-        "source_page": "https://civitai.red/models/2920459/whip-minimax-h3?modelVersionId=3304255",
-        "default_strength": 0.0,
-        "adult": True,
-        "modes": ["fl2va"],
-    },
-    {
-        "key": "doggy_style_sex_h3",
-        "label": "Doggy Style Sex",
-        "model_id": 2920568,
-        "version_id": 3304390,
-        "source_page": "https://civitai.red/models/2920568/doggy-style-sex?modelVersionId=3304390",
-        "default_strength": 0.0,
-        "adult": True,
-        "modes": ["fl2va"],
-    },
-    {
-        "key": "blackedraw_doggy_ref2va_h3",
-        "label": "BlackedRaw Style Doggy Style MiniMax H3 Ref2VA",
-        "model_id": 2905434,
-        "version_id": 3285724,
-        "source_page": "https://civitai.red/models/2905434/blackedraw-style-doggy-style-minimax-h3-ref2va?modelVersionId=3285724",
-        "default_strength": 0.0,
-        "adult": True,
-        "modes": ["ref2va"],
-    },
-    {
-        "key": "ultimate_deepthroat_h3",
-        "label": "Ultimate Deepthroat MiniMax H3 LoRA K3nk",
-        "model_id": 2904180,
-        "version_id": 3284171,
-        "source_page": "https://civitai.red/models/2904180/ultimate-deepthroat-minimax-h3-lora-k3nk?modelVersionId=3284171",
-        "default_strength": 0.0,
-        "adult": True,
-        "modes": ["fl2va"],
-    },
-]
+# No built-in specialty/adult catalog in the SFW edition.
+SPECIALTY_LORA_PRESETS = []
 SPECIALTY_LORA_STATES = []
-
-# Legacy single-specialty fields are retained for backward compatibility with
-# older saved UI payloads. V94 uses the config-driven preset registry above.
-ACTION_LABEL = "Legacy Specialty LoRA"
+ACTION_LABEL = "Optional SFW LoRA"
 ACTION_MODEL_ID = 0
 ACTION_REQUESTED_VERSION_ID = 0
 ACTION_LINKED_VERSION = 0
@@ -248,6 +173,7 @@ AUDIO_VAE_GIB     = 0.57
 # completely. It installs the cu130 stack into a private --target directory and
 # launches a clean child interpreter with that directory first on PYTHONPATH.
 import os as _os, sys as _sys, subprocess as _sp, pathlib as _pl, shutil as _shutil, re as _re, textwrap as _textwrap, threading as _threading
+FAST_STARTUP = _os.environ.get("H3_FAST_STARTUP", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 # ======================================================================
 # MISSINGLINK ACCESS GATE · fail closed
@@ -498,14 +424,14 @@ def _show_child_ui(_port, _pid):
     print(f"✓ V86 UI child alive · PID {_pid} · port {_port}", flush=True)
     try:
         from google.colab import output as _co
-        print("Opening MissingLink MiniMax Studio V86...", flush=True)
+        print("Opening MissingLink MiniMax Studio · SFW Fast...", flush=True)
         try:
             _co.serve_kernel_port_as_iframe(_port, height="900")
         except Exception as _e:
             print("iframe warning:", _e)
         try:
             _co.serve_kernel_port_as_window(
-                _port, anchor_text="◤ Open MissingLink MiniMax Studio V86 in a new tab")
+                _port, anchor_text="◤ Open MissingLink MiniMax Studio · SFW Fast in a new tab")
         except Exception as _e:
             print("window warning:", _e)
     except Exception:
@@ -651,10 +577,7 @@ if not _CU130_CHILD:
     _env = _os.environ.copy()
     try:
         from google.colab import userdata as _userdata
-        for _secret in (
-            "MISSING_LINK_TOKEN", "CIVITAI_API_KEY", "HF_TOKEN", "REDMIX_DIRECT_URL",
-            "REDMIX_LOCAL_PATH", "CIVITAI_COOKIE", "OPENAI_API_KEY"
-        ):
+        for _secret in ("MISSING_LINK_TOKEN", "CIVITAI_API_KEY", "HF_TOKEN", "OPENAI_API_KEY"):
             try:
                 _v = (_userdata.get(_secret) or "").strip()
                 if _v:
@@ -1493,8 +1416,15 @@ if _CU130_CHILD:
         if os.path.isdir(p):
             shutil.move(p, "/content/_mgr_disabled_" + uuid.uuid4().hex[:4])
 
-    for pkg in ("flask","nest_asyncio","av","huggingface_hub"):
-        subprocess.run([sys.executable,"-m","pip","install","-q",pkg], check=False)
+    # Fast-start: avoid invoking pip on every rerun when imports already work.
+    import importlib.util as _importlib_util
+    _pkg_imports = {"flask":"flask", "nest_asyncio":"nest_asyncio", "av":"av", "huggingface_hub":"huggingface_hub"}
+    _missing_pkgs = [pkg for pkg, mod in _pkg_imports.items() if _importlib_util.find_spec(mod) is None]
+    if _missing_pkgs:
+        log("  ↓ installing missing Python packages: " + ", ".join(_missing_pkgs))
+        subprocess.run([sys.executable,"-m","pip","install","-q",*_missing_pkgs], check=False)
+    else:
+        log("✓ Python runtime packages already present · pip step skipped")
 
     # T4 / <=18.5 GiB profile: install molbal's maintained ComfyUI-GGUF fork,
     # which includes MiniMax-H3 support and a Dynamic VRAM loader. Keep this out
@@ -1574,22 +1504,23 @@ if _CU130_CHILD:
     _h3opt_commit = ""
     if not LOWVRAM_T4_REQUESTED:
         try:
-            # GitHub credential/proxy rewrites can break `git clone` in Colab even for
-            # public repos. Always use the public source archive, matching the Sage and
-            # ComfyUI bootstrap paths.
-            src_root = _fetch_source_archive([
-                "https://codeload.github.com/Zironic/H3-Optimizations/tar.gz/refs/heads/main",
-                "https://github.com/Zironic/H3-Optimizations/archive/refs/heads/main.tar.gz",
-            ], "H3-Optimizations", min_bytes=10000)
-            shutil.rmtree(H3OPT_DIR, ignore_errors=True)
-            os.makedirs(os.path.dirname(H3OPT_DIR), exist_ok=True)
-            shutil.copytree(src_root, H3OPT_DIR, dirs_exist_ok=True)
-            if not os.path.isfile(os.path.join(H3OPT_DIR, "__init__.py")):
-                raise RuntimeError("H3-Optimizations archive is missing __init__.py")
-            _h3opt_commit = "archive-main"
-            log("✓ H3-Optimizations ready · archive main · NO GIT")
+            if FAST_STARTUP and os.path.isfile(os.path.join(H3OPT_DIR, "__init__.py")):
+                _h3opt_commit = "reused-local"
+                log("✓ H3-Optimizations reused from local custom_nodes · network refresh skipped")
+            else:
+                src_root = _fetch_source_archive([
+                    "https://codeload.github.com/Zironic/H3-Optimizations/tar.gz/refs/heads/main",
+                    "https://github.com/Zironic/H3-Optimizations/archive/refs/heads/main.tar.gz",
+                ], "H3-Optimizations", min_bytes=10000)
+                shutil.rmtree(H3OPT_DIR, ignore_errors=True)
+                os.makedirs(os.path.dirname(H3OPT_DIR), exist_ok=True)
+                shutil.copytree(src_root, H3OPT_DIR, dirs_exist_ok=True)
+                if not os.path.isfile(os.path.join(H3OPT_DIR, "__init__.py")):
+                    raise RuntimeError("H3-Optimizations archive is missing __init__.py")
+                _h3opt_commit = "archive-main"
+                log("✓ H3-Optimizations ready · archive main · NO GIT")
         except Exception as _e:
-            raise RuntimeError("V86 requires H3-Optimizations sparse nodes: " + repr(_e))
+            raise RuntimeError("SFW studio requires H3-Optimizations sparse nodes: " + repr(_e))
     else:
         log("✓ T4 low-VRAM: sparse/Kitchen node pack skipped; dense PyTorch SDPA only")
 
@@ -1827,7 +1758,15 @@ if _CU130_CHILD:
         ATTN_BENCH = {"profile": GPU_PROFILE, "note": "native PyTorch SDPA reliability profile on SM80"}
         log(f"  ✓ {GPU_PROFILE.upper()} dense attention -> PyTorch SDPA (native SM80 path)")
     else:
-        _autotune_attention()
+        if FAST_STARTUP:
+            _sage_ok, _sage_note = _ensure_sageattention()
+            if not _sage_ok:
+                raise RuntimeError("Required MissingLink SageAttention wheel unavailable: " + str(_sage_note))
+            ATTN_BACKEND = "sageattention"
+            ATTN_BENCH = {"profile": "blackwell_sm120", "note": "fast-start: verified Sage wheel; benchmark skipped"}
+            log("  ✓ Blackwell fast-start attention -> SageAttention (startup benchmark skipped)")
+        else:
+            _autotune_attention()
 
     # ── 1. Weights ─────────────────────────────────────────────────────────────
     from huggingface_hub import hf_hub_download
@@ -1837,413 +1776,46 @@ if _CU130_CHILD:
 
     if "nvfp4" in DIT_CHOICE and not any(k in gpu for k in ("B200","RTX 50","GB200","RTX 60")):
         log(f"  ⚠ {DIT_CHOICE} is a Blackwell profile and {gpu} is not Blackwell.\n"
-            f"    Expect a slow emulated path or a load failure — use eros_int8 instead.")
+            f"    Expect a slow emulated path or a load failure — use the stock INT8 profile instead.")
 
     MODELS = os.path.join(COMFY_DIR, "models")
 
-    # REDMIX Beta2 is currently distributed from CivitAI. Download the exact checkpoint
-    # with the user's CIVITAI_API_KEY and verify its published SHA256 before Comfy sees it.
-    def _early_civitai_token():
-        tok = (os.environ.get("CIVITAI_API_KEY") or "").strip()
-        if not tok:
-            from google.colab import userdata
-            tok = (userdata.get("CIVITAI_API_KEY") or "").strip()
-        if not tok:
-            raise RuntimeError("CIVITAI_API_KEY is required to download REDMIX H3 Beta2")
-        os.environ["CIVITAI_API_KEY"] = tok
-        return tok
-
-    def _download_redmix_beta2(*, activate=False):
-        """Robust authenticated CivitAI downloader with metadata + URL fallbacks.
-
-        CivitAI occasionally changes/rotates the concrete download URL returned by
-        the API, and some protected/adult files accept Bearer auth where a query
-        token alone can return HTTP 401/403.  Resolve the exact file by SHA/name,
-        then try both auth styles and the canonical model-version endpoint.  The
-        final SHA256 check is authoritative, so no fallback can silently install a
-        different checkpoint.
-        """
-        import hashlib
-        from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
-        from urllib.error import HTTPError, URLError
-
-        global USING_REDMIX, DIT_FILE, LIGHTNING_DEFAULT
-
-        def _optional_secret(name):
-            value = (os.environ.get(name) or "").strip()
-            if value:
-                return value
-            try:
-                from google.colab import userdata
-                value = (userdata.get(name) or "").strip()
-            except Exception:
-                value = ""
-            if value:
-                os.environ[name] = value
-            return value
-
-        ddir = os.path.join(MODELS, "diffusion_models")
-        os.makedirs(ddir, exist_ok=True)
-        dest = os.path.join(ddir, REDMIX_FILE)
-        part = dest + ".part"
-
-        def sha(path):
-            h = hashlib.sha256()
-            with open(path, "rb") as fh:
-                for b in iter(lambda: fh.read(8 * 1024 * 1024), b""):
-                    h.update(b)
-            return h.hexdigest().lower()
-
-        # Accept either published filename for the exact same hash.  If the user
-        # already has the checkpoint in the Comfy folder, no network access is needed.
-        for alias in REDMIX_FILE_ALIASES:
-            ap = os.path.join(ddir, alias)
-            if os.path.isfile(ap):
-                try:
-                    if sha(ap) == REDMIX_SHA256:
-                        if ap != dest:
-                            try:
-                                os.replace(ap, dest)
-                            except Exception:
-                                shutil.copy2(ap, dest)
-                        log(f"  ✓ {REDMIX_FILE} (SHA256 verified; local checkpoint)")
-                        if activate:
-                            USING_REDMIX = True
-                            DIT_FILE = REDMIX_FILE
-                        return True
-                except Exception:
-                    pass
-        if os.path.exists(dest):
-            os.remove(dest)
-
-        # If the user already downloaded the paid/access-gated checkpoint to Drive
-        # or another mounted path, use it directly and verify the published hash.
-        local_path = _optional_secret(REDMIX_LOCAL_PATH_SECRET)
-        if local_path:
-            local_path = os.path.expanduser(local_path)
-            if not os.path.isfile(local_path):
-                raise RuntimeError(f"{REDMIX_LOCAL_PATH_SECRET} points to a missing file: {local_path}")
-            log(f"  ↳ REDMIX local path supplied via {REDMIX_LOCAL_PATH_SECRET}; verifying SHA256")
-            got = sha(local_path)
-            if got != REDMIX_SHA256:
-                raise RuntimeError(
-                    f"REDMIX local-path SHA256 mismatch: expected {REDMIX_SHA256}, got {got}. "
-                    "Refusing to load a different checkpoint."
-                )
-            try:
-                os.link(local_path, dest)
-            except Exception:
-                shutil.copy2(local_path, dest)
-            log(f"  ✓ {REDMIX_FILE} (SHA256 verified; REDMIX_LOCAL_PATH)")
-            if activate:
-                USING_REDMIX = True
-                DIT_FILE = REDMIX_FILE
-            return True
-
-        tok = _early_civitai_token()
-        direct_url = _optional_secret(REDMIX_DIRECT_URL_SECRET)
-        civitai_cookie = _optional_secret(CIVITAI_COOKIE_SECRET)
-        common_headers = {
-            "Authorization": f"Bearer {tok}",
-            "Accept": "application/json",
-            "User-Agent": "Mozilla/5.0 MiniMax-H3-Sage-Lab/1.0",
+    def _purge_legacy_adult_assets():
+        # User requested an SFW-only build: remove the legacy adult assets this notebook
+        # itself used to manage, including filenames restored from its old catalog cache.
+        exact = {
+            "10Eros_Max_h3_TURBO-hybrid_beta5_int8.safetensors",
+            "10Eros_Max_h3_TURBO-hybrid_beta5.safetensors",
+            "REDMix-MiniMaxH3-A2Ab2-pruned-int8-convrot-ComfyMCP.safetensors",
+            "redcraftREDMIXHybridA2A_h3A2AREDBeta2.safetensors",
+            "NaughtyTimes_pruned_r256_v2.safetensors",
         }
-
-        def api_json(url):
-            req = urllib.request.Request(url, headers=common_headers)
-            try:
-                with urllib.request.urlopen(req, timeout=45) as r:
-                    return json.load(r)
-            except HTTPError as e:
-                body = ""
-                try:
-                    body = e.read(600).decode("utf-8", "replace")
-                except Exception:
-                    pass
-                raise RuntimeError(f"CivitAI metadata HTTP {e.code}: {url}\n{body}") from e
-            except URLError as e:
-                raise RuntimeError(f"CivitAI metadata request failed: {url}: {e}") from e
-
-        # First ask for the known release.  If CivitAI has re-parented/reissued the
-        # file, search the model's current versions and identify it by SHA/name.
-        metas = []
+        lora_dir = os.path.join(MODELS,"loras")
+        old_cache = os.path.join(lora_dir,".h3_adult_lora_catalog.json")
         try:
-            metas.append(api_json(f"https://civitai.com/api/v1/model-versions/{REDMIX_VERSION}"))
-        except Exception as e:
-            log(f"  ⚠ version metadata lookup failed: {e}")
-
-        try:
-            model_meta = api_json(f"https://civitai.com/api/v1/models/{REDMIX_MODEL_ID}")
-            metas.extend(model_meta.get("modelVersions") or [])
-        except Exception as e:
-            log(f"  ⚠ model metadata fallback failed: {e}")
-
-        def file_sha(x):
-            hashes = x.get("hashes") or {}
-            return str(hashes.get("SHA256") or hashes.get("sha256") or "").lower()
-
-        chosen = None
-        for meta in metas:
-            for x in (meta.get("files") or []):
-                if file_sha(x) == REDMIX_SHA256:
-                    chosen = x
-                    break
-            if chosen:
-                break
-        if chosen is None:
-            for meta in metas:
-                for x in (meta.get("files") or []):
-                    name = (x.get("name") or "").lower()
-                    if name == REDMIX_FILE.lower():
-                        chosen = x
-                        break
-                if chosen:
-                    break
-        if chosen is None:
-            for meta in metas:
-                for x in (meta.get("files") or []):
-                    name = (x.get("name") or "").lower()
-                    if name.endswith(".safetensors") and "beta2" in name:
-                        chosen = x
-                        break
-                if chosen:
-                    break
-
-        if not chosen:
-            raise RuntimeError(
-                f"Could not locate REDMIX Beta2 in CivitAI model {REDMIX_MODEL_ID} / "
-                f"version {REDMIX_VERSION}. The release may have been removed or made unavailable."
-            )
-
-        found_name = chosen.get("name") or REDMIX_FILE
-        found_id = chosen.get("id")
-        advertised_sha = file_sha(chosen)
-        advertised_size = int(float(chosen.get("sizeKB") or 0) * 1024)
-        log(f"  ↳ CivitAI resolved file: {found_name}" + (f" (file id {found_id})" if found_id else ""))
-        if advertised_sha and advertised_sha != REDMIX_SHA256:
-            raise RuntimeError(
-                "CivitAI metadata for the REDMIX file no longer matches this pinned build.\n"
-                f"Expected SHA256: {REDMIX_SHA256}\n"
-                f"CivitAI advertises: {advertised_sha}\n"
-                f"Resolved file: {found_name}\n"
-                "Refusing to download a changed revision as if it were the verified Beta2 checkpoint."
-            )
-
-        def _redmix_candidate_ok(path, label):
-            """Reject HTML/JSON/login shells and wrong revisions before accepting a download attempt."""
-            if not os.path.isfile(path):
-                return False, f"{label}: no output file"
-            size = os.path.getsize(path)
-            try:
-                head = open(path, "rb").read(1024)
-            except Exception:
-                head = b""
-            low = head.lstrip().lower()
-            looks_text = (
-                low.startswith(b"<!doctype") or low.startswith(b"<html") or
-                low.startswith(b"{") or low.startswith(b"[") or
-                b"text/html" in low[:256] or b"access denied" in low[:512] or
-                b"cloudflare" in low[:512]
-            )
-            # The real REDMIX checkpoint is ~20 GB. If metadata gives us its size,
-            # reject anything dramatically smaller. Otherwise use a conservative 1 GiB floor.
-            min_binary = max(1 * 1024**3, int(advertised_size * 0.50)) if advertised_size else 1 * 1024**3
-            if looks_text or size < min_binary:
-                preview = head[:180].decode("utf-8", "replace").replace("\n", " ").replace("\r", " ")
-                return False, f"{label}: non-checkpoint response ({size/1024/1024:.2f} MiB) {preview!r}"
-            ok, err = _validate_safetensors_file(path)
-            if not ok:
-                return False, f"{label}: safetensors validation failed: {err}"
-            got = sha(path)
-            if got != REDMIX_SHA256:
-                return False, f"{label}: SHA256 mismatch ({got})"
-            return True, ""
-
-        # Build several equivalent URLs. A browser-authorized direct URL is first
-        # because publisher-gated CivitAI files may be downloadable in the signed-in
-        # browser while the generic API token endpoint still returns the HTML app.
-        raw_urls = []
-        if direct_url:
-            raw_urls.append(direct_url)
-            log(f"  ↳ using authorized {REDMIX_DIRECT_URL_SECRET} before API fallbacks")
-        if chosen.get("downloadUrl"):
-            raw_urls.append(chosen["downloadUrl"])
-        # Try both the canonical API and the civitai.red front-end domain supplied
-        # by the user.  Hash verification prevents a front-end HTML response from
-        # ever being mistaken for the checkpoint.
-        raw_urls.append(f"https://civitai.com/api/download/models/{REDMIX_VERSION}")
-        raw_urls.append(f"https://civitai.red/api/download/models/{REDMIX_VERSION}")
-
-        # Deduplicate while preserving order.
-        seen = set(); raw_urls = [u for u in raw_urls if not (u in seen or seen.add(u))]
-
-        def with_token(u):
-            sp = urlsplit(u)
-            q = dict(parse_qsl(sp.query, keep_blank_values=True))
-            q["token"] = tok
-            return urlunsplit((sp.scheme, sp.netloc, sp.path, urlencode(q), sp.fragment))
-
-        # Each URL is attempted first with Authorization: Bearer and then with the
-        # legacy ?token= form.  Never print the token or a tokenized URL.
-        attempts = []
-        for u in raw_urls:
-            # Signed browser URLs commonly need no extra auth and may break if a
-            # token query parameter is appended, so try them verbatim first.
-            if direct_url and u == direct_url:
-                attempts.append((u, False, False, "authorized direct URL"))
-                if civitai_cookie:
-                    attempts.append((u, False, True, "authorized direct URL + browser cookie"))
-            attempts.append((u, True, False, "Bearer auth"))
-            attempts.append((with_token(u), False, False, "query-token auth"))
-            if civitai_cookie:
-                attempts.append((u, False, True, "browser cookie auth"))
-
-        log(f"  ↓ REDMIX H3 Beta2: {REDMIX_FILE} (~20.97 GB)")
-        errors = []
-        downloaded = False
-
-        for idx, (url, bearer, use_cookie, label) in enumerate(attempts, 1):
-            # A partial file from a prior 401/403/HTML response must never be
-            # resumed.  Resume only a plausible multi-megabyte binary partial.
-            resume = os.path.isfile(part) and os.path.getsize(part) > 8 * 1024 * 1024
-            cmd = [
-                "curl", "-L", "--fail-with-body", "--show-error", "--progress-bar",
-                "--retry", "5", "--retry-delay", "2", "--retry-all-errors",
-                "--connect-timeout", "30", "--speed-time", "120", "--speed-limit", "1024",
-                "-A", "Mozilla/5.0 MiniMax-H3-Sage-Lab/1.0",
-            ]
-            if bearer:
-                cmd += ["-H", f"Authorization: Bearer {tok}"]
-            if use_cookie and civitai_cookie:
-                cmd += ["-H", f"Cookie: {civitai_cookie}"]
-            if resume:
-                cmd += ["--continue-at", "-"]
-            else:
-                try:
-                    os.remove(part)
-                except FileNotFoundError:
-                    pass
-            cmd += ["-o", part, url]
-
-            log(f"    attempt {idx}/{len(attempts)}: {label}" + (" + resume" if resume else ""))
-            rr = subprocess.run(cmd)
-            if rr.returncode == 0 and os.path.isfile(part):
-                ok_candidate, candidate_error = _redmix_candidate_ok(part, label)
-                if ok_candidate:
-                    downloaded = True
-                    break
-                errors.append(candidate_error)
-                try: os.remove(part)
-                except Exception: pass
-                continue
-
-            errors.append(f"{label}: curl exit {rr.returncode}")
-            # Exit 22 is HTTP >=400.  Its body may now be in .part; discard it so a
-            # subsequent authenticated attempt does not send an invalid Range.
-            if rr.returncode == 22:
-                try:
-                    if os.path.isfile(part) and os.path.getsize(part) < 8 * 1024 * 1024:
-                        os.remove(part)
-                except Exception:
-                    pass
-
-        if not downloaded:
-            # CivitAI can return the public website shell (HTTP 200 HTML) for a
-            # publisher-gated file even when API metadata is readable.  If that
-            # happens, give the user one in-run chance to paste the *actual*
-            # authorized Download link from their signed-in browser.  This does not
-            # bypass access controls; it simply uses the entitlement-bearing URL
-            # CivitAI gave the user and still verifies the exact published SHA256.
-            try:
-                if os.path.exists(part): os.remove(part)
-            except Exception:
-                pass
-
-            log("  ⚠ CivitAI returned website HTML instead of REDMIX checkpoint bytes.")
-            log("  ↳ REDMIX is not available to this Colab session; no interactive download-link prompt will be shown.")
-            pasted_url = ""
-
-            if pasted_url:
-                ps = urlsplit(pasted_url)
-                if ps.scheme not in ("http", "https") or not ps.netloc:
-                    raise RuntimeError("The pasted REDMIX_DIRECT_URL is not a valid http(s) URL.")
-
-                # Do not append tokens to an entitlement-bearing browser URL.
-                cmd = [
-                    "curl", "-L", "--fail-with-body", "--show-error", "--progress-bar",
-                    "--retry", "5", "--retry-delay", "2", "--retry-all-errors",
-                    "--connect-timeout", "30", "--speed-time", "120", "--speed-limit", "1024",
-                    "-A", "Mozilla/5.0", "-o", part, pasted_url,
-                ]
-                log("    attempt: pasted authorized browser URL")
-                rr = subprocess.run(cmd)
-                if rr.returncode == 0 and os.path.isfile(part):
-                    ok_candidate, candidate_error = _redmix_candidate_ok(part, "pasted authorized URL")
-                    if ok_candidate:
-                        downloaded = True
-                    else:
-                        errors.append(candidate_error)
-                        try: os.remove(part)
-                        except Exception: pass
-                else:
-                    errors.append(f"pasted authorized URL: curl exit {rr.returncode}")
-
-            if not downloaded:
-                raise RuntimeError(
-                    "The real REDMIX Beta2 checkpoint is still unavailable to this Colab session. "
-                    "CivitAI returned access/login/web responses or files that did not match the pinned checkpoint. "
-                    "The notebook will NOT silently substitute base H3.\n\n"
-                    f"Open: {REDMIX_PAGE_URL}\n"
-                    "Use one of these authorized paths:\n"
-                    f"  • Colab Secret {REDMIX_DIRECT_URL_SECRET}: the actual signed-in Download link\n"
-                    f"  • Colab Secret {REDMIX_LOCAL_PATH_SECRET}: a local/Drive path to the checkpoint\n"
-                    f"  • Place {REDMIX_FILE} directly in /content/ComfyUI/models/diffusion_models/\n\n"
-                    "The expected SHA256 is:\n"
-                    f"  {REDMIX_SHA256}\n\n"
-                    "Download attempts:\n  " + "\n  ".join(errors)
-                )
-
-        # Every accepted attempt has already passed structural validation and the
-        # pinned SHA256 check. Keep one final assertion before replacing the installed file.
-        ok_candidate, candidate_error = _redmix_candidate_ok(part, "final REDMIX candidate")
-        if not ok_candidate:
-            try: os.remove(part)
+            if os.path.exists(old_cache):
+                rows=json.load(open(old_cache,"r",encoding="utf-8"))
+                for row in rows if isinstance(rows,list) else []:
+                    fn=os.path.basename(str((row or {}).get("file") or ""))
+                    if fn: exact.add(fn)
+        except Exception:
+            pass
+        removed=[]
+        for folder in (os.path.join(MODELS,"diffusion_models"), lora_dir):
+            for fn in exact:
+                pth=os.path.join(folder,fn)
+                if os.path.isfile(pth):
+                    try: os.remove(pth); removed.append(fn)
+                    except Exception as e: log(f"  ⚠ could not remove legacy SFW-blocked asset {fn}: {e}")
+        for cache_name in (".h3_adult_lora_catalog.json", ".h3_lora_sources.json"):
+            try: os.remove(os.path.join(lora_dir,cache_name))
+            except FileNotFoundError: pass
             except Exception: pass
-            raise RuntimeError("REDMIX download did not validate: " + candidate_error)
+        if removed: log("✓ SFW cleanup removed legacy adult assets: " + ", ".join(sorted(set(removed))))
 
-        os.replace(part, dest)
-        log(f"  ✓ {REDMIX_FILE} (SHA256 verified)")
-        if activate:
-            USING_REDMIX = True
-            DIT_FILE = REDMIX_FILE
-        return True
+    _purge_legacy_adult_assets()
 
-    def _activate_public_nsfw_fallback(reason=""):
-        global USING_REDMIX, DIT_FILE, LIGHTNING_DEFAULT
-        USING_REDMIX = False
-        DIT_FILE = FALLBACK_DIT_FILE
-        LIGHTNING_DEFAULT = True
-        log("!")
-        log("  ⚠⚠⚠ REDMIX BETA2 NOT LOADED ⚠⚠⚠")
-        log("  ↳ publisher/access gate prevented the real REDMIX checkpoint from loading")
-        log("  ↳ ACTIVATING PUBLIC NSFW FALLBACK: MiniMax-H3 INT8 + NaughtyTimes v2 @ 1.0 + LightX2V 4-step")
-        if reason:
-            msg = str(reason).split("\n", 1)[0]
-            log(f"  ↳ reason: {msg[:320]}")
-        log("!")
-
-    def _activate_eros_max_beta5():
-        global USING_REDMIX, USING_EROS_MAX, DIT_FILE, LIGHTNING_DEFAULT
-        USING_REDMIX = False
-        USING_EROS_MAX = True
-        DIT_FILE = EROS_MAX_FILE
-        LIGHTNING_DEFAULT = False
-        log("!")
-        log("  ✓ H3 EROS MAX beta5 selected as DEFAULT hybrid checkpoint")
-        log(f"  ↳ {EROS_MAX_FILE} · integrated custom Turbo · no external LightX2V by default")
-        log("  ↳ quality recipe: Euler / Simple · 8 steps · video shift 12 · audio shift 7")
-        log("!")
-
+    # SFW edition: no alternate explicit-content checkpoints or download paths are compiled in.
     def _activate_t4_lowvram_q4():
         global USING_REDMIX, USING_EROS_MAX, DIT_FILE, LIGHTNING_DEFAULT
         global TEXT_ENCODER_FILE, TEXT_ENCODER_GIB
@@ -2260,7 +1832,7 @@ if _CU130_CHILD:
         log("!")
 
     def _activate_stock_h3_safe():
-        """Safe-by-default startup. Adult checkpoints/LoRAs remain opt-in behind the age gate."""
+        """SFW-only startup using the official Stock MiniMax H3 checkpoint."""
         global USING_REDMIX, USING_EROS_MAX, DIT_FILE, LIGHTNING_DEFAULT
         USING_REDMIX = False
         USING_EROS_MAX = False
@@ -2268,7 +1840,7 @@ if _CU130_CHILD:
         LIGHTNING_DEFAULT = False
         log("!")
         log("  ✓ SAFE DEFAULT selected: official Stock MiniMax H3 FL2VA")
-        log("  ↳ adult checkpoints and adult LoRAs are not selected or exposed until adult access is acknowledged")
+        log("  ↳ SFW-only build: explicit-content checkpoints/LoRAs are not available")
         log("  ↳ quality recipe: RES Multistep / Simple · 20 steps · video shift 12 · audio shift 3")
         log("!")
 
@@ -2413,88 +1985,48 @@ if _CU130_CHILD:
         list(_pool.map(_fetch_one, FILES))
     log(f"✓ transformer: {DIT_FILE}")
 
-    # Exact integrity check for the active default transformer.
+    # Integrity check for the active default transformer. Fast-start avoids an
+    # unnecessary full-file SHA pass for the official stock safetensors because the
+    # file was already structurally validated above and there is no pinned SHA here.
     import hashlib as _hashlib
     if LOWVRAM_T4_PROFILE:
         _active_integrity_path = os.path.join(MODELS, "unet", T4_DIT_FILE)
         _active_expected_sha = T4_DIT_SHA256
         _active_integrity_label = "T4 Q4_0 GGUF"
-    elif USING_EROS_MAX:
-        _active_integrity_path = os.path.join(MODELS, "diffusion_models", EROS_MAX_FILE)
-        _active_expected_sha = EROS_MAX_SHA256
-        _active_integrity_label = "Eros Max beta5"
     else:
         _active_integrity_path = os.path.join(MODELS, "diffusion_models", FALLBACK_DIT_FILE)
         _active_expected_sha = ""
         _active_integrity_label = "official Stock H3 FL2VA"
-    _h = _hashlib.sha256()
-    with open(_active_integrity_path, "rb") as _f:
-        for _chunk in iter(lambda: _f.read(8 * 1024 * 1024), b""):
-            _h.update(_chunk)
-    _got = _h.hexdigest()
-    if _active_expected_sha and _got != _active_expected_sha:
-        raise RuntimeError(
-            f"{_active_integrity_label} SHA256 mismatch: expected {_active_expected_sha}, got {_got}. "
-            "Refusing to run an unknown model revision."
-        )
     if _active_expected_sha:
+        _h = _hashlib.sha256()
+        with open(_active_integrity_path, "rb") as _f:
+            for _chunk in iter(lambda: _f.read(8 * 1024 * 1024), b""):
+                _h.update(_chunk)
+        _got = _h.hexdigest()
+        if _got != _active_expected_sha:
+            raise RuntimeError(
+                f"{_active_integrity_label} SHA256 mismatch: expected {_active_expected_sha}, got {_got}. "
+                "Refusing to run an unknown model revision."
+            )
         log(f"  ✓ {_active_integrity_label} SHA256 verified: {_got[:16]}…")
     else:
-        log(f"  ✓ {_active_integrity_label} structural validation passed · SHA256 {_got[:16]}…")
+        log(f"  ✓ {_active_integrity_label} structural validation passed · full-file SHA skipped for faster startup")
 
-    # ── NaughtyTimes v2 PRUNED LoRA · adult catalog / lazy install ───────────────
-    # V94 does NOT download or expose this at startup. The exact pruned r256 v2 build
-    # is installed only after the adult-access acknowledgement and a catalog selection.
-    #
-    # Download priority:
-    #   1) already-present local file (SHA256 verified)
-    #   2) optional Hugging Face override via NSFW_LORA_HF_REPO / NSFW_LORA_HF_FILE
-    #   3) optional direct URL override via NSFW_LORA_DIRECT_URL
-    #   4) CivitAI version 3212436 using CIVITAI_API_KEY / *_TOKEN
-    #   5) Colab upload prompt for the exact .safetensors file
-    #
-    # The studio never silently starts without this LoRA.
+    # ── Generic SFW LoRA helpers ───────────────────────────────────────────────
     ldir = os.path.join(MODELS, "loras")
     os.makedirs(ldir, exist_ok=True)
-    NSFW_LORA_PATH = os.path.join(ldir, NSFW_LORA_FILE)
-
-    # Optional non-CivitAI mirror overrides. Leave blank unless you have an exact
-    # mirror of NaughtyTimes_pruned_r256_v2.safetensors. SHA256 is always checked.
-    NSFW_LORA_HF_REPO = os.environ.get("NSFW_LORA_HF_REPO", "").strip()
-    NSFW_LORA_HF_FILE = os.environ.get("NSFW_LORA_HF_FILE", NSFW_LORA_FILE).strip()
-    NSFW_LORA_DIRECT_URL = os.environ.get("NSFW_LORA_DIRECT_URL", "").strip()
-
 
     def _civitai_token():
-        """Return the required CivitAI token from the exact Colab Secret name.
-
-        This studio expects a Colab Secret named CIVITAI_API_KEY with notebook
-        access enabled. We intentionally do not silently probe alternate names:
-        if the configured secret cannot be read, startup should explain exactly
-        what needs fixing.
-        """
         tok = (os.environ.get("CIVITAI_API_KEY") or "").strip()
         if tok:
             return tok
-
         try:
             from google.colab import userdata
             tok = (userdata.get("CIVITAI_API_KEY") or "").strip()
-        except Exception as e:
-            raise RuntimeError(
-                "Could not read the Colab Secret CIVITAI_API_KEY.\n"
-                "Open Colab's Secrets panel (key icon), make sure a secret named "
-                "CIVITAI_API_KEY exists, and enable notebook access for it.\n"
-                f"Colab userdata error: {e}"
-            ) from e
-
-        if not tok:
-            raise RuntimeError(
-                "Colab Secret CIVITAI_API_KEY is missing or empty.\n"
-                "Create/enable that exact secret in Colab's Secrets panel, then rerun."
-            )
-
-        os.environ["CIVITAI_API_KEY"] = tok
+        except Exception:
+            tok = ""
+        if tok:
+            os.environ["CIVITAI_API_KEY"] = tok
         return tok
 
     def _sha256(path):
@@ -2505,29 +2037,9 @@ if _CU130_CHILD:
                 h.update(chunk)
         return h.hexdigest().lower()
 
-
-    def _verify_nsfw_lora(path, label=None, quiet=False):
-        label = label or os.path.basename(path)
-        if not os.path.isfile(path):
-            raise RuntimeError(f"Required NSFW LoRA is missing: {path}")
-        got = _sha256(path)
-        if got != NSFW_LORA_SHA256:
-            raise RuntimeError(
-                f"{label} failed SHA256 verification.\n"
-                f"Expected: {NSFW_LORA_SHA256}\n"
-                f"Got:      {got}\n"
-                "This studio requires the exact pruned r256 v2 LoRA matched to the pruned H3 base.")
-        if not quiet:
-            log(f"  ✓ {NSFW_LORA_FILE} (SHA256 verified)")
-        return True
-
-
     def _civitai_file(version_id, wanted_name, token=""):
         api = f"https://civitai.com/api/v1/model-versions/{version_id}"
-        headers = {
-            "User-Agent": "Standalone-MiniMax-H3-Studio/1.2",
-            "Accept": "application/json",
-        }
+        headers = {"User-Agent":"Standalone-MiniMax-H3-SFW/1.0", "Accept":"application/json"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         req = urllib.request.Request(api, headers=headers)
@@ -2536,193 +2048,39 @@ if _CU130_CHILD:
         files = data.get("files") or []
         exact = [f for f in files if (f.get("name") or "").lower() == wanted_name.lower()]
         if not exact:
-            exact = [f for f in files
-                     if "pruned_r256_v2" in (f.get("name") or "").lower()]
-        if not exact:
-            names = ", ".join(f.get("name", "?") for f in files)
-            raise RuntimeError(
-                f"CivitAI version {version_id} no longer exposes {wanted_name}. "
-                f"Files currently returned: {names or '(none)'}")
+            raise RuntimeError(f"CivitAI version {version_id} does not expose {wanted_name}.")
         f = exact[0]
         url = f.get("downloadUrl")
         if not url:
             raise RuntimeError(f"CivitAI returned no downloadUrl for {f.get('name')}")
         return f, url
 
-
     def _curl_download(url, dest, token="", display_name=None, require_token=False):
-        """Download through curl with resume/retry. For CivitAI, append ?token=.
-        For direct mirrors, leave token blank and require_token=False."""
         display_name = display_name or os.path.basename(dest)
         from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
-
         final_url = url
         if token:
-            p = urlsplit(url)
-            q = dict(parse_qsl(p.query, keep_blank_values=True))
-            q["token"] = token
+            p = urlsplit(url); q = dict(parse_qsl(p.query, keep_blank_values=True)); q["token"] = token
             final_url = urlunsplit((p.scheme, p.netloc, p.path, urlencode(q), p.fragment))
         elif require_token:
             raise RuntimeError("CivitAI token required for this download path.")
-
         part = dest + ".part"
-        cmd = [
-            "curl", "-L", "--fail-with-body", "--show-error", "--progress-bar",
-            "--retry", "5", "--retry-all-errors", "--retry-delay", "3",
-            "--connect-timeout", "30", "--continue-at", "-",
-            "--header", "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
-            "--output", part, final_url,
-        ]
+        cmd = ["curl","-L","--fail-with-body","--show-error","--progress-bar","--retry","5",
+               "--retry-all-errors","--retry-delay","3","--connect-timeout","30","--continue-at","-",
+               "--header","User-Agent: Mozilla/5.0","--output",part,final_url]
         rc = subprocess.run(cmd).returncode
         if rc != 0:
-            try:
-                os.remove(part)
-            except OSError:
-                pass
+            try: os.remove(part)
+            except OSError: pass
             raise RuntimeError(f"Download failed for {display_name} (curl exit {rc}).")
         if str(dest).lower().endswith(".safetensors"):
-            try:
-                size = os.path.getsize(part)
-                head = open(part, "rb").read(512).lstrip().lower()
-            except Exception:
-                size, head = 0, b""
-            if size < 1024 * 1024 or head.startswith(b"<html") or head.startswith(b"<!doctype") or head.startswith(b"{"):
-                try:
-                    os.remove(part)
-                except OSError:
-                    pass
-                raise RuntimeError(
-                    f"Download for {display_name} returned a web/JSON response instead of safetensors bytes. "
-                    "Check CivitAI account access/token permissions for this gated asset."
-                )
-        os.replace(part, dest)
-
-
-    def _download_nsfw_from_hf():
-        if not NSFW_LORA_HF_REPO:
-            return False
-        log(f"  ↳ trying Hugging Face override: {NSFW_LORA_HF_REPO}/{NSFW_LORA_HF_FILE}")
-        try:
-            src = hf_hub_download(NSFW_LORA_HF_REPO, filename=NSFW_LORA_HF_FILE)
-            shutil.copy2(src, NSFW_LORA_PATH)
-            _verify_nsfw_lora(NSFW_LORA_PATH, "Hugging Face NSFW LoRA")
-            return True
-        except Exception as e:
-            log(f"  ⚠ Hugging Face override failed: {e}")
-            if os.path.exists(NSFW_LORA_PATH):
-                try: os.remove(NSFW_LORA_PATH)
+            size = os.path.getsize(part) if os.path.exists(part) else 0
+            head = open(part,"rb").read(512).lstrip().lower() if size else b""
+            if size < 1024*1024 or head.startswith((b"<html",b"<!doctype",b"{")):
+                try: os.remove(part)
                 except OSError: pass
-            return False
-
-
-    def _download_nsfw_from_direct_url():
-        if not NSFW_LORA_DIRECT_URL:
-            return False
-        log("  ↳ trying NSFW_LORA_DIRECT_URL mirror")
-        try:
-            _curl_download(NSFW_LORA_DIRECT_URL, NSFW_LORA_PATH,
-                           display_name=NSFW_LORA_FILE)
-            _verify_nsfw_lora(NSFW_LORA_PATH, "direct-mirror NSFW LoRA")
-            return True
-        except Exception as e:
-            log(f"  ⚠ direct mirror failed: {e}")
-            if os.path.exists(NSFW_LORA_PATH):
-                try: os.remove(NSFW_LORA_PATH)
-                except OSError: pass
-            return False
-
-
-    def _download_nsfw_from_civitai(tok):
-        log(f"  ↳ resolving CivitAI v{NSFW_LORA_VERSION}: {NSFW_LORA_FILE}")
-        meta, url = _civitai_file(NSFW_LORA_VERSION, NSFW_LORA_FILE, tok)
-        api_sha = ((meta.get("hashes") or {}).get("SHA256") or "").lower()
-        if api_sha and api_sha != NSFW_LORA_SHA256:
-            raise RuntimeError(
-                f"CivitAI's SHA256 for {meta.get('name')} changed: {api_sha}. "
-                "Refusing to download an unexpected file.")
-        log(f"  ↓ NSFW LoRA: {meta.get('name', NSFW_LORA_FILE)} "
-            f"({float(meta.get('sizeKB') or 0)/1024/1024:.2f} GB)")
-        _curl_download(url, NSFW_LORA_PATH, tok, NSFW_LORA_FILE, require_token=True)
-        _verify_nsfw_lora(NSFW_LORA_PATH, "CivitAI NSFW LoRA")
-        return True
-
-
-    def _upload_nsfw_in_colab():
-        """Last-resort interactive fallback. The LoRA is still mandatory."""
-        try:
-            from google.colab import files as colab_files
-        except Exception:
-            return False
-
-        log("\n  REQUIRED LoRA not found and no working authenticated/mirror download is available.")
-        log(f"  Upload the exact file now: {NSFW_LORA_FILE}")
-        log(f"  Expected SHA256: {NSFW_LORA_SHA256}")
-        uploaded = colab_files.upload()
-        if not uploaded:
-            return False
-
-        # Prefer exact filename, otherwise accept a single uploaded safetensors file
-        # only if its SHA256 proves it is the exact required LoRA.
-        names = list(uploaded.keys())
-        candidate = NSFW_LORA_FILE if NSFW_LORA_FILE in names else None
-        if candidate is None:
-            safes = [n for n in names if n.lower().endswith(".safetensors")]
-            if len(safes) == 1:
-                candidate = safes[0]
-        if candidate is None:
-            raise RuntimeError(
-                f"Upload must include {NSFW_LORA_FILE} (or exactly one .safetensors file).")
-
-        src = os.path.abspath(candidate)
-        if src != os.path.abspath(NSFW_LORA_PATH):
-            shutil.move(src, NSFW_LORA_PATH)
-        _verify_nsfw_lora(NSFW_LORA_PATH, "uploaded NSFW LoRA")
-        return True
-
-
-    def _ensure_nsfw_lora():
-        # Existing exact file: verify and reuse it.
-        if os.path.exists(NSFW_LORA_PATH):
-            try:
-                return _verify_nsfw_lora(NSFW_LORA_PATH)
-            except Exception as e:
-                bad = NSFW_LORA_PATH + f".bad-{int(time.time())}"
-                log(f"  ⚠ existing {NSFW_LORA_FILE} is invalid; moving to {bad}")
-                os.replace(NSFW_LORA_PATH, bad)
-                log(f"    {e}")
-
-        # The required LoRA is fetched from its exact CivitAI model version using
-        # the user's Colab Secret CIVITAI_API_KEY. This is non-interactive: no
-        # browser upload widget and no optional fallback that can launch without it.
-        tok = _civitai_token()
-        log("  ↳ CivitAI auth: CIVITAI_API_KEY loaded")
-
-        try:
-            return _download_nsfw_from_civitai(tok)
-        except Exception as e:
-            raise RuntimeError(
-                f"Could not download required {NSFW_LORA_FILE} from CivitAI v{NSFW_LORA_VERSION}.\n"
-                "The CIVITAI_API_KEY secret was found, but the authenticated download failed.\n"
-                "Check that the token is valid and has model-download access, then rerun.\n"
-                f"Underlying error: {e}"
-            ) from e
-
-
-    NSFW_LORA_AVAILABLE = False
-    if os.path.exists(NSFW_LORA_PATH):
-        try:
-            _verify_nsfw_lora(NSFW_LORA_PATH, quiet=True)
-            NSFW_LORA_AVAILABLE = True
-            log("✓ gated adult LoRA asset is already installed and verified (hidden until acknowledgement)")
-        except Exception as e:
-            bad = NSFW_LORA_PATH + f".bad-{int(time.time())}"
-            log("  ⚠ existing gated adult LoRA asset is invalid; moving it aside (details hidden before acknowledgement)")
-            try:
-                os.replace(NSFW_LORA_PATH, bad)
-            except Exception:
-                pass
-    else:
-        log("  ↳ gated adult LoRA catalog asset is not installed · it will download only after acknowledgement + selection")
+                raise RuntimeError(f"Download for {display_name} did not return a valid safetensors payload.")
+        os.replace(part,dest)
 
     # ── Optional LightX2V Lightning LoRA ─────────────────────────────────────────
     LIGHTNING_PATH = os.path.join(ldir, LIGHTNING_FILE)
@@ -2737,13 +2095,16 @@ if _CU130_CHILD:
             log(f"  ✓ Lightning: {LIGHTNING_FILE}")
             return True
         except Exception as e:
-            # Lightning is optional; the studio must remain usable with NaughtyTimes only.
+            # Lightning is optional; the studio remains usable in QUALITY mode without it.
             log(f"  ⚠ Lightning download failed (optional): {e}")
             return False
 
     if LOWVRAM_T4_PROFILE:
         LIGHTNING_AVAILABLE = False
-        log("  ✓ T4/LOW-VRAM: Lightning auto-download skipped; base Q4_0 profile stays lean")
+        log("  ✓ T4/LOW-VRAM: Lightning unavailable; base Q4_0 profile stays lean")
+    elif FAST_STARTUP:
+        LIGHTNING_AVAILABLE = True
+        log("  ✓ FAST STARTUP: FL2VA Turbo download deferred until FAST is first used")
     else:
         LIGHTNING_AVAILABLE = _ensure_lightning_lora()
 
@@ -2772,7 +2133,10 @@ if _CU130_CHILD:
 
     if LOWVRAM_T4_PROFILE:
         REF2VA_LIGHTNING_AVAILABLE = False
-        log("  ✓ T4/LOW-VRAM: Ref2VA Turbo auto-download skipped")
+        log("  ✓ T4/LOW-VRAM: Ref2VA Turbo unavailable")
+    elif FAST_STARTUP:
+        REF2VA_LIGHTNING_AVAILABLE = True
+        log("  ✓ FAST STARTUP: Ref2VA Turbo download deferred until FAST is first used")
     else:
         REF2VA_LIGHTNING_AVAILABLE = _ensure_ref2va_lightning_lora()
 
@@ -2797,16 +2161,20 @@ if _CU130_CHILD:
 
     if LOWVRAM_T4_PROFILE:
         MOTION8_AVAILABLE = False
-        log("  ✓ T4/LOW-VRAM: Motion8 auto-download skipped")
+        log("  ✓ T4/LOW-VRAM: Motion8 unavailable")
+    elif FAST_STARTUP:
+        MOTION8_AVAILABLE = True
+        log("  ✓ FAST STARTUP: Motion8 download deferred until first use")
     else:
         MOTION8_AVAILABLE = _ensure_motion8_lora()
 
-    # ── Optional CivitAI action LoRA (auto-select MiniMax H3 version) ────────────
+    # ── User-installed SFW LoRA metadata helpers ───────────────────────────────
+    ACTION_AVAILABLE = False
+    SPECIALTY_LORA_STATES = []
+    LORA_SOURCE_CACHE_FILE = os.path.join(ldir, ".h3_sfw_lora_sources.json")
+
     def _civitai_json(url, token=""):
-        headers = {
-            "User-Agent": "Standalone-MiniMax-H3-Studio/1.1",
-            "Accept": "application/json",
-        }
+        headers = {"User-Agent":"Standalone-MiniMax-H3-SFW/1.0", "Accept":"application/json"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         req = urllib.request.Request(url, headers=headers)
@@ -2814,8 +2182,7 @@ if _CU130_CHILD:
             return json.load(r)
 
     def _is_h3_version(v):
-        # Version descriptions often mention sibling WAN/LTX releases, so do not use
-        # description text for compatibility. Match only the version name/baseModel.
+        v = v or {}
         base = str(v.get("baseModel") or "").lower()
         name = str(v.get("name") or "").lower()
         hay = f"{base} {name}"
@@ -2830,188 +2197,8 @@ if _CU130_CHILD:
             return None
         prim = [f for f in safe if f.get("primary")]
         pool = prim or safe
-        # Prefer normal model files over training data/config artifacts.
         pool.sort(key=lambda f: (str(f.get("type") or "").lower() != "model", -(float(f.get("sizeKB") or 0))))
         return pool[0]
-
-    def _ensure_action_lora():
-        global ACTION_META, ACTION_PATH, ACTION_FILE, ACTION_AVAILABLE
-        tok = _civitai_token()
-        if not tok:
-            log("  ⚠ action LoRA skipped: no CivitAI token available")
-            return False
-        try:
-            model = _civitai_json(f"https://civitai.com/api/v1/models/{ACTION_MODEL_ID}", tok)
-            versions = model.get("modelVersions") or []
-            requested = next((v for v in versions if int(v.get("id") or 0) == ACTION_REQUESTED_VERSION_ID), None)
-            compatible = [v for v in versions if _is_h3_version(v) and _pick_model_file(v)]
-            if requested and _is_h3_version(requested) and _pick_model_file(requested):
-                v = requested
-                resolution = "requested_h3_version"
-            else:
-                if not compatible:
-                    linked_desc = (f"; linked v{ACTION_REQUESTED_VERSION_ID} is {requested.get('name')} / {requested.get('baseModel')}"
-                                   if requested else "")
-                    log(f"  ⚠ {ACTION_LABEL} model {ACTION_MODEL_ID}: no MiniMax-H3 version found{linked_desc}")
-                    return False
-                compatible.sort(key=lambda v: (str(v.get("createdAt") or ""), int(v.get("id") or 0)), reverse=True)
-                v = compatible[0]
-                resolution = "newest_minimax_h3_sibling"
-            f = _pick_model_file(v)
-            ACTION_FILE = f.get("name")
-            ACTION_PATH = os.path.join(ldir, ACTION_FILE)
-            ACTION_META = {
-                "model_id": ACTION_MODEL_ID,
-                "version_id": int(v.get("id") or 0),
-                "version_name": v.get("name") or "",
-                "base_model": v.get("baseModel") or "",
-                "trained_words": v.get("trainedWords") or [],
-                "file": ACTION_FILE,
-                "size_kb": float(f.get("sizeKB") or 0),
-                "sha256": ((f.get("hashes") or {}).get("SHA256") or "").lower(),
-                "source_page": ACTION_SOURCE_PAGE,
-                "source_label": ACTION_LABEL,
-                "resolution": resolution,
-            }
-            if resolution == "requested_h3_version":
-                log(f"  ↳ {ACTION_LABEL}: using requested H3 v{ACTION_META['version_id']} {ACTION_META['version_name']} "
-                    f"({ACTION_META['base_model']})")
-            else:
-                log(f"  ↳ {ACTION_LABEL}: requested v{ACTION_REQUESTED_VERSION_ID} is not H3; "
-                    f"using H3 v{ACTION_META['version_id']} {ACTION_META['version_name']} "
-                    f"({ACTION_META['base_model']})")
-            if ACTION_META["trained_words"]:
-                log("  ↳ action trigger words: " + ", ".join(ACTION_META["trained_words"]))
-
-            expected = ACTION_META["sha256"]
-            if os.path.exists(ACTION_PATH):
-                if expected:
-                    got = _sha256(ACTION_PATH)
-                    if got == expected:
-                        log(f"  ✓ {ACTION_LABEL} LoRA: {ACTION_FILE} (SHA256 verified)")
-                        ACTION_AVAILABLE = True
-                        return True
-                    bad = ACTION_PATH + f".bad-{int(time.time())}"
-                    log(f"  ⚠ existing action LoRA hash mismatch; moving to {bad}")
-                    os.replace(ACTION_PATH, bad)
-                else:
-                    log(f"  ✓ {ACTION_LABEL} LoRA already present: {ACTION_FILE}")
-                    ACTION_AVAILABLE = True
-                    return True
-
-            url = f.get("downloadUrl") or v.get("downloadUrl")
-            if not url:
-                raise RuntimeError("CivitAI API returned no download URL for the H3 action LoRA")
-            log(f"  ↓ {ACTION_LABEL} LoRA: {ACTION_FILE} ({ACTION_META['size_kb']/1024/1024:.2f} GB)")
-            _curl_download(url, ACTION_PATH, tok, ACTION_FILE)
-            if expected:
-                got = _sha256(ACTION_PATH)
-                if got != expected:
-                    raise RuntimeError(f"Action LoRA SHA256 mismatch: expected {expected}, got {got}")
-                log(f"  ✓ action LoRA: {ACTION_FILE} (SHA256 verified)")
-            else:
-                log(f"  ✓ {ACTION_LABEL} LoRA: {ACTION_FILE}")
-            ACTION_AVAILABLE = True
-            return True
-        except Exception as e:
-            ACTION_AVAILABLE = False
-            log(f"  ⚠ {ACTION_LABEL} LoRA unavailable (optional): {e}")
-            return False
-
-    ACTION_AVAILABLE = False  # V93: legacy single-specialty path disabled
-
-    def _ensure_specialty_lora_preset(spec):
-        """Resolve/install one configured MiniMax-H3 CivitAI preset safely."""
-        key = str(spec.get("key") or "").strip()
-        label = str(spec.get("label") or key or "Specialty LoRA").strip()
-        model_id = spec.get("model_id")
-        version_id = spec.get("version_id")
-        source_page = str(spec.get("source_page") or "").strip()
-        try:
-            default_strength = float(spec.get("default_strength") or 0.0)
-        except Exception:
-            default_strength = 0.0
-
-        state = {
-            "key": key, "label": label, "model_id": model_id,
-            "requested_version_id": version_id, "source_page": source_page,
-            "default_strength": default_strength, "available": False,
-            "file": "", "version_id": None, "version_name": "",
-            "base_model": "", "trained_words": [], "resolution": "unconfigured",
-            "error": "",
-        }
-        if not key or not model_id or not version_id:
-            state["error"] = "Preset is not configured."
-            return state
-
-        tok = _civitai_token()
-        if not tok:
-            state["error"] = "CIVITAI_API_KEY is not available."
-            return state
-
-        try:
-            model_id = int(model_id); version_id = int(version_id)
-            model = _civitai_json(f"https://civitai.com/api/v1/models/{model_id}", tok)
-            versions = model.get("modelVersions") or []
-            requested = next((v for v in versions if int(v.get("id") or 0) == version_id), None)
-            if requested and _is_h3_version(requested) and _pick_model_file(requested):
-                v = requested
-                resolution = "requested_h3_version"
-            else:
-                compatible = [v for v in versions if _is_h3_version(v) and _pick_model_file(v)]
-                if not compatible:
-                    raise RuntimeError(f"CivitAI model {model_id} exposes no MiniMax-H3-compatible .safetensors version.")
-                compatible.sort(key=lambda x: (str(x.get("createdAt") or ""), int(x.get("id") or 0)), reverse=True)
-                v = compatible[0]
-                resolution = "newest_minimax_h3_sibling"
-
-            fobj = _pick_model_file(v)
-            if not fobj:
-                raise RuntimeError("CivitAI version exposes no .safetensors model file.")
-            base = os.path.basename(str(fobj.get("name") or ""))
-            if not base.lower().endswith(".safetensors"):
-                raise RuntimeError("Only .safetensors LoRA files are accepted.")
-            dest = os.path.join(ldir, base)
-            expected = ((fobj.get("hashes") or {}).get("SHA256") or "").lower()
-
-            if os.path.exists(dest) and expected:
-                got = _sha256(dest)
-                if got != expected:
-                    bad = dest + f".bad-{int(time.time())}"
-                    os.replace(dest, bad)
-                    log(f"  ⚠ {label}: existing hash mismatch; moved to {bad}")
-            if not os.path.exists(dest):
-                dl = fobj.get("downloadUrl") or v.get("downloadUrl")
-                if not dl:
-                    raise RuntimeError("CivitAI returned no download URL.")
-                log(f"  ↓ specialty LoRA: {label} · {base}")
-                _curl_download(dl, dest, tok, base)
-
-            ok, err = _validate_safetensors_file(dest)
-            if not ok:
-                raise RuntimeError(f"Downloaded LoRA failed safetensors validation: {err}")
-            if expected:
-                got = _sha256(dest)
-                if got != expected:
-                    raise RuntimeError(f"SHA256 mismatch for {base}: expected {expected}, got {got}")
-
-            state.update(
-                available=True, file=base, version_id=int(v.get("id") or 0),
-                version_name=v.get("name") or "", base_model=v.get("baseModel") or "",
-                trained_words=v.get("trainedWords") or [], resolution=resolution, error="",
-            )
-            log(f"  ✓ specialty preset ready: {label} · {base}")
-            return state
-        except Exception as e:
-            state["error"] = str(e)
-            log(f"  ⚠ specialty preset unavailable ({label}): {e}")
-            return state
-
-    # Adult specialty presets are catalog metadata only at startup. Persist only the
-    # resolved filename/compatibility metadata so a restarted UI can keep already-
-    # installed adult LoRAs hidden before acknowledgement without re-querying CivitAI.
-    SPECIALTY_LORA_STATE_FILE = os.path.join(ldir, ".h3_adult_lora_catalog.json")
-    LORA_SOURCE_CACHE_FILE = os.path.join(ldir, ".h3_lora_sources.json")
 
     def _hf_repo_url(repo_id):
         repo_id = str(repo_id or "").strip().strip("/")
@@ -3019,116 +2206,38 @@ if _CU130_CHILD:
 
     def _load_lora_source_cache():
         try:
-            if not os.path.exists(LORA_SOURCE_CACHE_FILE):
-                return {}
-            with open(LORA_SOURCE_CACHE_FILE, "r", encoding="utf-8") as fh:
-                raw = json.load(fh)
-            if not isinstance(raw, dict):
-                return {}
-            out = {}
-            for k, v in raw.items():
-                fn = os.path.basename(str(k or ""))
-                url = str(v or "").strip()
-                if fn and url:
-                    out[fn] = url
-            return out
-        except Exception as e:
-            log(f"  ⚠ LoRA source cache restore skipped: {e}")
+            if not os.path.exists(LORA_SOURCE_CACHE_FILE): return {}
+            raw = json.load(open(LORA_SOURCE_CACHE_FILE,"r",encoding="utf-8"))
+            return {os.path.basename(str(k)):str(v).strip() for k,v in raw.items() if k and v}
+        except Exception:
             return {}
 
     def _save_lora_source_cache(cache):
         try:
-            keep = {}
-            for k, v in dict(cache or {}).items():
-                fn = os.path.basename(str(k or ""))
-                url = str(v or "").strip()
-                if fn and url and os.path.exists(os.path.join(ldir, fn)):
-                    keep[fn] = url
-            with open(LORA_SOURCE_CACHE_FILE, "w", encoding="utf-8") as fh:
-                json.dump(keep, fh, indent=2)
+            keep = {os.path.basename(str(k)):str(v).strip() for k,v in dict(cache or {}).items()
+                    if k and v and os.path.exists(os.path.join(ldir,os.path.basename(str(k))))}
+            with open(LORA_SOURCE_CACHE_FILE,"w",encoding="utf-8") as fh: json.dump(keep,fh,indent=2)
         except Exception as e:
             log(f"  ⚠ LoRA source cache save skipped: {e}")
 
     LORA_SOURCE_CACHE = _load_lora_source_cache()
 
     def _remember_lora_source(file_name, source_url):
-        fn = os.path.basename(str(file_name or ""))
-        url = str(source_url or "").strip()
-        if not fn or not url:
-            return
-        LORA_SOURCE_CACHE[fn] = url
-        _save_lora_source_cache(LORA_SOURCE_CACHE)
+        fn=os.path.basename(str(file_name or "")); url=str(source_url or "").strip()
+        if fn and url:
+            LORA_SOURCE_CACHE[fn]=url; _save_lora_source_cache(LORA_SOURCE_CACHE)
 
-    def _lora_source_map(adult_ok=False):
+    def _lora_source_map(*_args, **_kwargs):
         out = {}
-        if MOTION8_FILE:
-            out[MOTION8_FILE] = _hf_repo_url(MOTION8_REPO)
-        if LIGHTNING_FILE:
-            out[LIGHTNING_FILE] = _hf_repo_url(LIGHTNING_REPO)
-        if REF2VA_LIGHTNING_FILE:
-            out[REF2VA_LIGHTNING_FILE] = _hf_repo_url(REF2VA_LIGHTNING_REPO)
-        if adult_ok and NSFW_LORA_FILE:
-            out[NSFW_LORA_FILE] = f"https://civitai.red/models?modelVersionId={NSFW_LORA_VERSION}"
-        by_key = {str(s.get("key")): s for s in SPECIALTY_LORA_PRESETS}
-        for row in SPECIALTY_LORA_STATES:
-            fn = os.path.basename(str(row.get("file") or ""))
-            if not fn:
-                continue
-            spec = by_key.get(str(row.get("key") or "")) or {}
-            url = str(row.get("source_page") or spec.get("source_page") or "").strip()
-            if url and (adult_ok or not _is_adult_lora_name(fn)):
-                out[fn] = url
-        for fn, url in dict(LORA_SOURCE_CACHE).items():
-            if not fn or not url:
-                continue
-            if adult_ok or not _is_adult_lora_name(fn):
-                out[fn] = url
+        if MOTION8_FILE: out[MOTION8_FILE] = _hf_repo_url(MOTION8_REPO)
+        if LIGHTNING_FILE: out[LIGHTNING_FILE] = _hf_repo_url(LIGHTNING_REPO)
+        if REF2VA_LIGHTNING_FILE: out[REF2VA_LIGHTNING_FILE] = _hf_repo_url(REF2VA_LIGHTNING_REPO)
+        for fn,url in dict(LORA_SOURCE_CACHE).items():
+            if fn and url and not _sfw_asset_blocked(fn): out[fn]=url
         return out
 
-    def _load_specialty_lora_state_cache():
-        try:
-            if not os.path.exists(SPECIALTY_LORA_STATE_FILE):
-                return []
-            with open(SPECIALTY_LORA_STATE_FILE, "r", encoding="utf-8") as fh:
-                rows = json.load(fh)
-            if not isinstance(rows, list):
-                return []
-            valid_keys = {str(s.get("key")) for s in SPECIALTY_LORA_PRESETS}
-            out = []
-            for row in rows:
-                if not isinstance(row, dict) or str(row.get("key")) not in valid_keys:
-                    continue
-                fn = os.path.basename(str(row.get("file") or ""))
-                if fn and os.path.exists(os.path.join(ldir, fn)):
-                    row = dict(row)
-                    row["file"] = fn
-                    row["available"] = True
-                    out.append(row)
-            return out
-        except Exception as e:
-            log(f"  ⚠ adult LoRA catalog state restore skipped: {e}")
-            return []
-
-    def _save_specialty_lora_state_cache():
-        try:
-            rows = []
-            for row in SPECIALTY_LORA_STATES:
-                if not row.get("file"):
-                    continue
-                keep = {k: row.get(k) for k in (
-                    "key", "label", "file", "version_id", "version_name",
-                    "base_model", "trained_words", "resolution", "source_page"
-                )}
-                keep["available"] = True
-                rows.append(keep)
-            with open(SPECIALTY_LORA_STATE_FILE, "w", encoding="utf-8") as fh:
-                json.dump(rows, fh, indent=2)
-        except Exception as e:
-            log(f"  ⚠ adult LoRA catalog state save skipped: {e}")
-
-    SPECIALTY_LORA_STATES = _load_specialty_lora_state_cache()
-
     # ── 2. Import ComfyUI as a library ─────────────────────────────────────────
+
     sys.path.insert(0, COMFY_DIR)
     import nest_asyncio; nest_asyncio.apply()
 
@@ -3254,7 +2363,7 @@ if _CU130_CHILD:
 
     # V86-BW1 Blackwell full-residency policy.
     #
-    # Eros/stock pruned INT8 ConvRot DiT (~19.5 GiB) + Qwen3-VL INT8 ConvRot
+    # Stock pruned INT8 ConvRot DiT (~19.5 GiB) + Qwen3-VL INT8 ConvRot
     # (~25.2 GiB) + video/audio VAEs (~5.4 GiB) is ~50.2 GiB of weights before
     # activations/workspaces/LoRA patch state. Arm full residency whenever the
     # physical Blackwell has enough room for those weights plus a conservative working
@@ -3263,7 +2372,7 @@ if _CU130_CHILD:
     FULL_RESIDENCY_MIN_FREE_BEFORE_DECODE_GIB = 10.0
     _active_dit_estimate_gib = (
         T4_DIT_GIB if LOWVRAM_T4_PROFILE else
-        (EROS_MAX_GIB if USING_EROS_MAX else (REDMIX_GIB if USING_REDMIX else 19.55))
+        (T4_DIT_GIB if LOWVRAM_T4_PROFILE else 19.55)
     )
     _full_stack_weights_gib = (
         _active_dit_estimate_gib + TEXT_ENCODER_GIB + VIDEO_VAE_GIB + AUDIO_VAE_GIB
@@ -3726,9 +2835,19 @@ if _CU130_CHILD:
                 total += 1
         return total
 
+    def _ensure_optional_lora_selected(name):
+        base = os.path.basename(str(name or ""))
+        if base == MOTION8_FILE and not os.path.exists(MOTION8_PATH):
+            if not _ensure_motion8_lora(): raise RuntimeError("Motion Enhancer could not be downloaded.")
+        elif base == LIGHTNING_FILE and not os.path.exists(LIGHTNING_PATH):
+            if not _ensure_lightning_lora(): raise RuntimeError("FL2VA Turbo accelerator could not be downloaded.")
+        elif base == REF2VA_LIGHTNING_FILE and not os.path.exists(REF2VA_LIGHTNING_PATH):
+            if not _ensure_ref2va_lightning_lora(): raise RuntimeError("Ref2VA Turbo accelerator could not be downloaded.")
+
     def _apply_lora_checked(model, name, strength, label):
         if not name or name == "none" or float(strength) == 0:
             return model, None
+        _ensure_optional_lora_selected(name)
         before = _patch_count(model)
         model, = call("LoraLoaderModelOnly", model=model, lora_name=name,
                       strength_model=float(strength))
@@ -3791,10 +2910,6 @@ if _CU130_CHILD:
 
         use_action = str(action).lower() in ("1", "true", "yes", "on")
         use_lightning = str(lightning).lower() in ("1", "true", "yes", "on")
-        is_eros_max = os.path.basename(str(unet)) == EROS_MAX_FILE
-        if is_eros_max and use_lightning:
-            log("  ↳ Eros Max beta5 already contains its merged Turbo; external LightX2V/Ref2VA Turbo disabled")
-            use_lightning = False
         norm_extra_loras = []
         for item in (extra_loras or []):
             try:
@@ -3861,9 +2976,9 @@ if _CU130_CHILD:
             is_ref2va = os.path.basename(str(unet)).lower().startswith("minimax_h3_ref2va")
             lightning_file = REF2VA_LIGHTNING_FILE if is_ref2va else LIGHTNING_FILE
             lightning_path = REF2VA_LIGHTNING_PATH if is_ref2va else LIGHTNING_PATH
+            _ensure_optional_lora_selected(lightning_file)
             if not os.path.exists(lightning_path):
-                raise RuntimeError(
-                    f"Turbo/Lightning is enabled but {lightning_file} is not present in {ldir}.")
+                raise RuntimeError(f"Turbo/Lightning is enabled but {lightning_file} could not be prepared.")
             if lightning_file in already_applied:
                 log("  ↳ Turbo/Lightning file is already present in the LoRA rack; not applying twice")
             else:
@@ -3879,15 +2994,15 @@ if _CU130_CHILD:
     # and A100-80 can keep the quality stack resident. A100-40 uses the smaller TE and
     # the partitioned TE↔DiT handoff, while T4 stays on-demand DynamicVRAM.
     # the remaining activation/workspace margin is too small at 1152x768. Keep the
-    # patched REDMIX DiT resident, then let Comfy smart-memory swap the TE onto the GPU
-    # for conditioning and restore REDMIX for sampling.
+    # Keep the stock DiT resident when the VRAM budget permits; otherwise let Comfy
+    # smart-memory swap the text encoder and DiT between conditioning and sampling.
     def _log_vram_budget():
         try:
             total = torch.cuda.get_device_properties(0).total_memory / 1024**3
         except Exception:
             total = 39.5
-        dit_gib = EROS_MAX_GIB if USING_EROS_MAX else (REDMIX_GIB if USING_REDMIX else 19.55)
-        dit_label = "EROS MAX beta5" if USING_EROS_MAX else ("REDMIX" if USING_REDMIX else "base H3 INT8")
+        dit_gib = T4_DIT_GIB if LOWVRAM_T4_PROFILE else 19.55
+        dit_label = "T4 Q4_0" if LOWVRAM_T4_PROFILE else "Stock H3 INT8"
         core = dit_gib + TEXT_ENCODER_GIB
         all_weights = core + VIDEO_VAE_GIB + AUDIO_VAE_GIB
         log(f"  VRAM budget -> {dit_label} ~{dit_gib:.2f} GiB + TE ~{TEXT_ENCODER_GIB:.2f} GiB = ~{core:.2f} GiB")
@@ -3899,12 +3014,12 @@ if _CU130_CHILD:
                 f"estimated requirement {_full_stack_required_gib:.1f} GiB"
             )
         else:
-            log(f"  VRAM policy -> keep {'EROS MAX beta5' if USING_EROS_MAX else ('REDMIX' if USING_REDMIX else 'base H3 + LoRAs')} resident; GPU-swap {TEXT_ENCODER_FILE} for conditioning; reserve {RESERVE_VRAM:.1f} GiB")
+            log(f"  VRAM policy -> keep Stock H3 + selected SFW LoRAs resident when possible; GPU-swap {TEXT_ENCODER_FILE} for conditioning; reserve {RESERVE_VRAM:.1f} GiB")
 
     def _preload_default_gpu_stack():
         PROG["stage"] = "startup preload"
         _log_vram_budget()
-        log("  ↳ preloading " + ("EROS MAX beta5 hybrid" if USING_EROS_MAX else ("REDMIX H3 Beta2" if USING_REDMIX else "public H3 stack")) + " to GPU before UI launch")
+        log("  ↳ preloading Stock H3 stack to GPU before UI launch")
         try:
             preload_lora = "none"
             preload_lora_strength = 0.0
@@ -3947,6 +3062,10 @@ if _CU130_CHILD:
         STARTUP_GPU_PRELOADED = False
         PROG["stage"] = "ready"
         log("✓ T4/LOW-VRAM startup: no force-full GPU preload; Q4_0 DiT loads/pages on first GENERATE")
+    elif FAST_STARTUP:
+        STARTUP_GPU_PRELOADED = False
+        PROG["stage"] = "ready"
+        log("✓ FAST STARTUP: GPU model preload deferred until first GENERATE")
     else:
         STARTUP_GPU_PRELOADED = _preload_default_gpu_stack()
 
@@ -4849,7 +3968,7 @@ if _CU130_CHILD:
             _set_job_stage(jid, "loading model")
             _check_job_cancel(jid)
             model, clip, vae, avae, lora_info = get_models(
-                p["weight_dtype"], p.get("lora"), p.get("lora_strength", NSFW_LORA_STRENGTH),
+                p["weight_dtype"], p.get("lora"), p.get("lora_strength", 0.0),
                 action=p.get("action", "0"),
                 action_strength=p.get("action_strength", ACTION_STRENGTH),
                 lightning=p.get("lightning", "0"),
@@ -5407,202 +4526,83 @@ if _CU130_CHILD:
 
     # ── 6. UI ──────────────────────────────────────────────────────────────────
     app = Flask(__name__)
-    # Signed browser-session gate for adult features. The gate is deliberately
-    # server-side as well as client-side: hiding DOM options alone is not access control.
+    # SFW-only policy: adult checkpoints/catalogs are not part of this build.
     app.config["SECRET_KEY"] = os.environ.get("H3_SESSION_SECRET") or os.urandom(32)
     app.config["SESSION_COOKIE_HTTPONLY"] = True
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
-    ADULT_ACK_VERSION = "2026-09-12-v1"
-    ADULT_ACK_COPY = {
-        "age": "I certify that I am at least 18 years old and have reached the age of majority where I am located.",
-        "law": "I will use adult-generation features only where lawful and will comply with all applicable local, state/provincial, national laws, regulations, court orders, and the service terms that apply to my use.",
-        "consent": "I will not create or upload sexual content involving minors or anyone depicted as a minor, non-consensual sexual content, sexual exploitation, or intimate imagery of a real person without the rights and consent required by law. I have permission to use any real person's likeness or source media I provide.",
-        "notice": "This acknowledgement does not determine whether a particular generation is lawful. You are responsible for compliance, and adult features may be restricted where prohibited.",
-    }
-
-    # This is an intent trigger for the acknowledgement flow, not a content-policy
-    # classifier. It intentionally favors strong adult/explicit terms to reduce false
-    # positives such as medical/anatomical prompts.
-    _ADULT_PROMPT_RE = re.compile(
-        r"(?i)(?:"
-        r"\bnsfw\b|\bporn(?:ographic|ography)?\b|\berotic(?:a|ally)?\b|"
-        r"\bnud(?:e|ity)\b|\bnaked\b(?!\s+eye\b)|\bsex(?:ual|ually)?\b|\bhave\s+sex\b|\bsex\s+scene\b|"
-        r"\bintercourse\b|\bblow\s*job\b|\bhand\s*job\b|\bdeep\s*throat\b|\bdeepthroat\b|"
-        r"\boral\s+sex\b|\banal\s+sex\b|\bdoggy\s+style\b|\bmasturbat\w*\b|"
-        r"\borgasm\w*\b|\bejaculat\w*\b|\bcum(?:ming)?\b|\bfetish\b|\bbdsm\b"
-        r")"
+    _SFW_BLOCK_RE = re.compile(
+        r"(?i)(?:\bnsfw\b|\bporn(?:ographic|ography)?\b|\berotic(?:a|ally)?\b|"
+        r"\bnud(?:e|ity)\b|\bnaked\b(?!\s+eye\b)|\bsexual(?:ly)?\b|\bsex\s+scene\b|"
+        r"\bintercourse\b|\bblow\s*job\b|\bhand\s*job\b|\bdeep\s*throat\b|"
+        r"\boral\s+sex\b|\banal\s+sex\b|\bmasturbat\w*\b|\borgasm\w*\b|"
+        r"\bejaculat\w*\b|\bfetish\b|\bbdsm\b|\bgenitals?\b)"
+    )
+    _SFW_BLOCKED_ASSET_RE = re.compile(
+        r"(?i)(naughtytimes|eros[_ -]?max|redmix.*h3|deepthroat|doggy[_ -]?style[_ -]?sex|blackedraw|(?:^|[_ -])nsfw(?:[_ .-]|$))"
     )
 
     def _adult_access_ok():
-        return session.get("adult_ack_version") == ADULT_ACK_VERSION
+        return False
 
     def _prompt_requests_adult(text):
-        return bool(_ADULT_PROMPT_RE.search(str(text or "")))
+        return bool(_SFW_BLOCK_RE.search(str(text or "")))
 
-    def _adult_specialty_state_files():
-        return {
-            os.path.basename(str(s.get("file") or ""))
-            for s in SPECIALTY_LORA_STATES
-            if s.get("file")
-        }
+    def _sfw_asset_blocked(name):
+        return bool(_SFW_BLOCKED_ASSET_RE.search(os.path.basename(str(name or ""))))
 
     def _is_adult_lora_name(name):
-        base = os.path.basename(str(name or ""))
-        if not base or base == "none":
-            return False
-        if base == NSFW_LORA_FILE or base in _adult_specialty_state_files():
-            return True
-        # Known adult catalog filenames/labels can be recognizable even before
-        # installation. Keep this conservative and exact-ish.
-        low = base.lower()
-        return any(x in low for x in (
-            "naughtytimes", "doggy_style_sex", "doggy-style-sex", "doggystyle", "doggy style",
-            "deepthroat", "deep-throat", "ultimate_dt", "ultimatedt",
-            "blackedraw", "blacked_", "blacked-", "whip", "whip_minimax", "whip-minimax",
-            "mh3_cum", "mh3-cum", "_cum_", "-cum-", "sex_h3", "sex-h3"
-        ))
+        return _sfw_asset_blocked(name)
 
     def _is_adult_unet_name(name):
-        base = os.path.basename(str(name or ""))
-        return base in {EROS_MAX_FILE, REDMIX_FILE, *REDMIX_FILE_ALIASES}
+        return _sfw_asset_blocked(name)
 
-    def _profile_from_unet(unet_name):
-        base = os.path.basename(str(unet_name or ""))
-        if base == EROS_MAX_FILE:
-            return "eros"
-        if base in {REDMIX_FILE, *REDMIX_FILE_ALIASES}:
-            return "redmix"
+    def _profile_from_unet(_unet_name):
         return "stock_quality"
 
     def _compat_record(*, profiles=None, modes=None, adult=False, label=""):
-        return {
-            "profiles": list(profiles or ["stock_quality"]),
-            "modes": list(modes or ["fl2va", "ref2va"]),
-            "adult": bool(adult),
-            "label": str(label or ""),
-        }
+        return {"profiles":list(profiles or ["stock_quality"]), "modes":list(modes or ["fl2va","ref2va"]),
+                "adult":False, "label":str(label or "")}
 
     def _lora_compatibility_map():
-        """Known compatibility only. Unknown user-installed LoRAs remain selectable."""
-        out = {
-            MOTION8_FILE: _compat_record(
-                profiles=["stock_quality"], modes=["fl2va"], adult=False,
-                label="Motion 8-Step Enhancer · Stock H3 FL2VA only"),
-            LIGHTNING_FILE: _compat_record(
-                profiles=["stock_quality"], modes=["fl2va"], adult=False,
-                label="FL2VA Turbo accelerator · managed by FAST preset"),
-            REF2VA_LIGHTNING_FILE: _compat_record(
-                profiles=["stock_quality"], modes=["ref2va"], adult=False,
-                label="Ref2VA Turbo accelerator · managed by FAST preset"),
-            NSFW_LORA_FILE: _compat_record(
-                profiles=["stock_quality"], modes=["fl2va"], adult=True,
-                label="NaughtyTimes v2 · Stock H3 FL2VA"),
+        return {
+            MOTION8_FILE:_compat_record(profiles=["stock_quality"],modes=["fl2va"],label="Motion 8-Step Enhancer · Stock H3 FL2VA only"),
+            LIGHTNING_FILE:_compat_record(profiles=["stock_quality"],modes=["fl2va"],label="FL2VA Turbo accelerator · managed by FAST preset"),
+            REF2VA_LIGHTNING_FILE:_compat_record(profiles=["stock_quality"],modes=["ref2va"],label="Ref2VA Turbo accelerator · managed by FAST preset"),
         }
-        by_key = {str(s.get("key")): s for s in SPECIALTY_LORA_PRESETS}
-        for state in SPECIALTY_LORA_STATES:
-            fn = os.path.basename(str(state.get("file") or ""))
-            if not fn:
-                continue
-            spec = by_key.get(str(state.get("key") or "")) or {}
-            out[fn] = _compat_record(
-                profiles=["stock_quality", "redmix", "eros"],
-                modes=spec.get("modes") or ["fl2va"],
-                adult=bool(spec.get("adult", True)),
-                label=spec.get("label") or state.get("label") or fn,
-            )
-        return out
 
     def _known_lora_compatible(name, unet_name, mode):
-        base = os.path.basename(str(name or ""))
-        if not base or base == "none":
-            return True, ""
-        info = _lora_compatibility_map().get(base)
-        if not info:
-            return True, ""  # unknown/custom LoRA: do not guess
-        profile = _profile_from_unet(unet_name)
-        if profile not in info["profiles"] or str(mode or "fl2va") not in info["modes"]:
+        base=os.path.basename(str(name or ""))
+        if not base or base=="none": return True,""
+        if _sfw_asset_blocked(base): return False,"SFW-only build"
+        info=_lora_compatibility_map().get(base)
+        if not info: return True,""
+        if "stock_quality" not in info["profiles"] or str(mode or "fl2va") not in info["modes"]:
             return False, info.get("label") or base
-        return True, ""
+        return True,""
 
     def _adult_catalog():
-        if not _adult_access_ok():
-            return []
-        installed = set(folder_paths.get_filename_list("loras"))
-        rows = []
-        rows.append({
-            "key": "naughty_times_v2",
-            "label": "NaughtyTimes v2",
-            "adult": True,
-            "installed": NSFW_LORA_FILE in installed,
-            "file": NSFW_LORA_FILE if NSFW_LORA_FILE in installed else "",
-            "profiles": ["stock_quality"],
-            "modes": ["fl2va"],
-            "source_page": f"https://civitai.red/models?modelVersionId={NSFW_LORA_VERSION}",
-        })
-        states = {str(s.get("key")): s for s in SPECIALTY_LORA_STATES}
-        for spec in SPECIALTY_LORA_PRESETS:
-            if not spec.get("adult", True):
-                continue
-            state = states.get(str(spec.get("key"))) or {}
-            fn = os.path.basename(str(state.get("file") or ""))
-            rows.append({
-                "key": str(spec.get("key")),
-                "label": str(spec.get("label") or spec.get("key")),
-                "adult": True,
-                "installed": bool(fn and fn in installed),
-                "file": fn if fn in installed else "",
-                "profiles": ["stock_quality", "redmix", "eros"],
-                "modes": list(spec.get("modes") or ["fl2va"]),
-                "source_page": str(state.get("source_page") or spec.get("source_page") or ""),
-            })
-        return rows
+        return []
 
     def _adult_request_from_generate_form(form):
-        if _prompt_requests_adult(form.get("prompt")):
-            return True
-        if _is_adult_unet_name(form.get("unet")):
-            return True
-        names = [form.get("lora")]
-        names += [form.get(f"extra_lora_{i}") for i in range(1, 5)]
+        if _prompt_requests_adult(form.get("prompt")): return True
+        if _sfw_asset_blocked(form.get("unet")): return True
+        names=[form.get("lora")]+[form.get(f"extra_lora_{i}") for i in range(1,5)]
         try:
-            for item in json.loads(form.get("lora_stack_json") or "[]"):
-                if isinstance(item, dict):
-                    names.append(item.get("file"))
-        except Exception:
-            pass
-        for item in (form.get("extra_loras") or []):
-            try:
-                names.append(item[0])
-            except Exception:
-                pass
-        return any(_is_adult_lora_name(x) for x in names)
+            names += [x.get("file") for x in json.loads(form.get("lora_stack_json") or "[]") if isinstance(x,dict)]
+        except Exception: pass
+        return any(_sfw_asset_blocked(x) for x in names if x)
 
     def _adult_gate_response():
-        return jsonify(
-            error="Adult-access acknowledgement required before this request can continue.",
-            code="adult_ack_required",
-            adult_ack_required=True,
-            ack_version=ADULT_ACK_VERSION,
-            acknowledgement=ADULT_ACK_COPY,
-        ), 428
+        return jsonify(error="This is the SFW-only build. Adult/explicit prompts, models, and LoRAs are disabled.",
+                       code="sfw_only"), 400
 
     @app.post("/api/adult/ack")
     def api_adult_ack():
-        body = request.get_json(silent=True) or {}
-        required = ("age", "law", "consent")
-        if not all(body.get(k) is True for k in required):
-            return jsonify(error="All adult-access acknowledgements are required."), 400
-        session["adult_ack_version"] = ADULT_ACK_VERSION
-        session["adult_ack_time"] = int(time.time())
-        return jsonify(ok=True, adult_enabled=True, ack_version=ADULT_ACK_VERSION)
+        return jsonify(error="The SFW-only build has no 18+ mode.", code="sfw_only"), 404
 
     @app.post("/api/adult/exit")
     def api_adult_exit():
-        # Explicit UI exit: clear only the adult-access acknowledgement. Installed
-        # files remain on disk but disappear from /api/meta again immediately.
-        session.pop("adult_ack_version", None)
-        session.pop("adult_ack_time", None)
         return jsonify(ok=True, adult_enabled=False)
 
     @app.before_request
@@ -5633,161 +4633,49 @@ if _CU130_CHILD:
 
     @app.get("/api/meta")
     def meta():
-        # Read folders fresh so newly installed LoRAs/models appear immediately.
         folder_paths.cache_helper.clear()
-        adult_ok = _adult_access_ok()
-
         all_loras = list(folder_paths.get_filename_list("loras"))
-        # Turbo/Lightning is a performance implementation detail controlled by FAST,
-        # not a second user-facing LoRA stack.
         hidden_accelerators = {LIGHTNING_FILE, REF2VA_LIGHTNING_FILE}
-        visible_loras = [
-            x for x in all_loras
-            if x not in hidden_accelerators
-            and (adult_ok or not _is_adult_lora_name(x))
-        ]
-        all_unets = sorted(set(
-            folder_paths.get_filename_list("diffusion_models") +
-            (folder_paths.get_filename_list("unet_gguf") if LOWVRAM_T4_PROFILE else [])
-        ))
-        visible_unets = [x for x in all_unets if adult_ok or not _is_adult_unet_name(x)]
-
+        visible_loras = [x for x in all_loras if x not in hidden_accelerators and not _sfw_asset_blocked(x)]
+        all_unets = sorted(set(folder_paths.get_filename_list("diffusion_models") +
+                               (folder_paths.get_filename_list("unet_gguf") if LOWVRAM_T4_PROFILE else [])))
+        allowed_unets = {FALLBACK_DIT_FILE, REF2VA_DIT_FILE, T4_DIT_FILE}
+        visible_unets = [x for x in all_unets if os.path.basename(str(x)) in allowed_unets]
         compat = _lora_compatibility_map()
-        visible_compat = {
-            k: v for k, v in compat.items()
-            if (k in visible_loras) or adult_ok
-        }
-
-        adult_models = []
-        if adult_ok and not LOWVRAM_T4_PROFILE:
-            adult_models.extend([
-                {
-                    "value": "eros",
-                    "label": "EROS MAX β5 · INT8 / TURBO",
-                    "installed": os.path.exists(os.path.join(MODELS, "diffusion_models", EROS_MAX_FILE)),
-                    "adult": True,
-                    "modes": ["fl2va", "ref2va"],
-                },
-                {
-                    "value": "redmix",
-                    "label": "REDMIX H3 BETA2 · INT8 CONVROT / TURBO",
-                    "installed": any(os.path.exists(os.path.join(MODELS, "diffusion_models", n)) for n in REDMIX_FILE_ALIASES),
-                    "adult": True,
-                    "modes": ["fl2va"],
-                },
-            ])
-
         profile_state = _model_profile_state()
-        if not adult_ok:
-            profile_state = dict(profile_state)
-            profile_state["eros_installed"] = False
-            profile_state["redmix_installed"] = False
-            profile_state["naughty_installed"] = False
-
         return jsonify(
-            samplers=SAMPLERS,
-            schedulers=SCHEDULERS,
-            loras=["none"] + visible_loras,
-            lora_default="none",
-            lora_strength_default=0.0,
-            lora_compatibility=visible_compat,
-            lora_catalog=_adult_catalog(),
-            lora_source_map=_lora_source_map(adult_ok),
-            adult_enabled=adult_ok,
-            adult_ack_version=ADULT_ACK_VERSION,
-            adult_model_profiles=adult_models,
-            gpu_profile=GPU_PROFILE,
-            gpu_name=gpu,
-            gpu_cc=f"{GPU_CC[0]}.{GPU_CC[1]}",
-            gpu_arch_label=GPU_ARCH_LABEL,
-            lowvram_t4=bool(LOWVRAM_T4_PROFILE),
-            a100_profile=bool(A100_PROFILE),
-            a100_80=bool(A100_80_PROFILE),
-            a100_40=bool(A100_40_PROFILE),
-            t4_default_unet=(T4_DIT_FILE if LOWVRAM_T4_PROFILE else ""),
-            specialty_loras=[],
-            lightning_file=LIGHTNING_FILE,
-            lightning_available=os.path.exists(LIGHTNING_PATH),
-            ref2va_lightning_file=REF2VA_LIGHTNING_FILE,
-            ref2va_lightning_available=os.path.exists(REF2VA_LIGHTNING_PATH),
-            lightning_default=False,
-            lightning_strength_default=LIGHTNING_STRENGTH,
-            action_label=ACTION_LABEL,
-            action_model_id=ACTION_MODEL_ID,
-            action_linked_version=ACTION_LINKED_VERSION,
-            action_available=bool(ACTION_AVAILABLE and ACTION_FILE and ACTION_PATH and os.path.exists(ACTION_PATH)),
-            action_file=ACTION_FILE,
-            action_strength_default=ACTION_STRENGTH,
-            action_requested_version_id=ACTION_REQUESTED_VERSION_ID,
-            action_version_id=ACTION_META.get("version_id"),
-            action_source_page=ACTION_SOURCE_PAGE,
-            action_resolution=ACTION_META.get("resolution") or "",
-            action_version_name=ACTION_META.get("version_name", ""),
-            action_base_model=ACTION_META.get("base_model", ""),
-            action_trained_words=ACTION_META.get("trained_words", []),
-            sparse_available=bool(SPARSE_NODE_NAME),
-            sparse_node=SPARSE_NODE_NAME or "",
-            sparse_default_percent=DEFAULT_SPARSE_PERCENT,
-            attention_backend=ATTN_BACKEND,
-            torch_version=torch.__version__,
-            torch_cuda=str(torch.version.cuda),
-            startup_gpu_preloaded=bool(STARTUP_GPU_PRELOADED),
-            full_stack_residency=bool(FULL_STACK_RESIDENCY),
-            full_stack_weights_gib=round(_full_stack_weights_gib, 2),
-            full_stack_required_gib=round(_full_stack_required_gib, 2),
-            physical_vram_gib=round(_physical_vram_gib, 2),
-            h3opt_commit=_h3opt_commit[:12] if _h3opt_commit else "",
-            ref2va_available=bool(REF2VA_NODE_NAME),
-            ref2va_node=REF2VA_NODE_NAME or "",
-            ref2va_unet=(EROS_MAX_FILE if adult_ok else ""),
-            stock_ref2va_unet=REF2VA_DIT_FILE,
+            samplers=SAMPLERS, schedulers=SCHEDULERS, loras=["none"]+visible_loras,
+            lora_default="none", lora_strength_default=0.0,
+            lora_compatibility={k:v for k,v in compat.items() if k in visible_loras or k in hidden_accelerators or k==MOTION8_FILE},
+            lora_catalog=[], lora_source_map=_lora_source_map(), adult_enabled=False, adult_ack_version="", adult_model_profiles=[],
+            gpu_profile=GPU_PROFILE, gpu_name=gpu, gpu_cc=f"{GPU_CC[0]}.{GPU_CC[1]}", gpu_arch_label=GPU_ARCH_LABEL,
+            lowvram_t4=bool(LOWVRAM_T4_PROFILE), a100_profile=bool(A100_PROFILE), a100_80=bool(A100_80_PROFILE), a100_40=bool(A100_40_PROFILE),
+            t4_default_unet=(T4_DIT_FILE if LOWVRAM_T4_PROFILE else ""), specialty_loras=[],
+            lightning_file=LIGHTNING_FILE, lightning_available=bool(not LOWVRAM_T4_PROFILE),
+            ref2va_lightning_file=REF2VA_LIGHTNING_FILE, ref2va_lightning_available=bool(not LOWVRAM_T4_PROFILE),
+            lightning_default=False, lightning_strength_default=LIGHTNING_STRENGTH,
+            action_label=ACTION_LABEL, action_model_id=0, action_linked_version=0, action_available=False, action_file=None,
+            action_strength_default=0.0, action_requested_version_id=0, action_version_id=None, action_source_page="",
+            action_resolution="", action_version_name="", action_base_model="", action_trained_words=[],
+            sparse_available=bool(SPARSE_NODE_NAME), sparse_node=SPARSE_NODE_NAME or "", sparse_default_percent=DEFAULT_SPARSE_PERCENT,
+            attention_backend=ATTN_BACKEND, torch_version=torch.__version__, torch_cuda=str(torch.version.cuda),
+            startup_gpu_preloaded=bool(STARTUP_GPU_PRELOADED), fast_startup=bool(FAST_STARTUP),
+            full_stack_residency=bool(FULL_STACK_RESIDENCY), full_stack_weights_gib=round(_full_stack_weights_gib,2),
+            full_stack_required_gib=round(_full_stack_required_gib,2), physical_vram_gib=round(_physical_vram_gib,2),
+            h3opt_commit=_h3opt_commit[:12] if _h3opt_commit else "", ref2va_available=bool(REF2VA_NODE_NAME), ref2va_node=REF2VA_NODE_NAME or "",
+            ref2va_unet=REF2VA_DIT_FILE, stock_ref2va_unet=REF2VA_DIT_FILE,
             base_fl2va_unet=(T4_DIT_FILE if LOWVRAM_T4_PROFILE else FALLBACK_DIT_FILE),
-            eros_max_unet=(EROS_MAX_FILE if adult_ok else ""),
-            redmix_unet=(REDMIX_FILE if adult_ok else ""),
-            redmix_steps=6,
-            redmix_sampler="er_sde",
-            redmix_scheduler="beta",
-            redmix_shift_video=6.0,
-            redmix_shift_audio=3.0,
-            eros_max_sha256=(EROS_MAX_SHA256 if adult_ok else ""),
-            eros_integrated_turbo=bool(adult_ok),
-            motion8_file=MOTION8_FILE,
-            motion8_available=bool(MOTION8_AVAILABLE and os.path.exists(MOTION8_PATH)),
-            model_profiles=profile_state,
-            naughty_file=(NSFW_LORA_FILE if adult_ok else ""),
-            naughty_strength=NSFW_LORA_STRENGTH,
-            stock_quality_sampler="res_multistep",
-            stock_quality_scheduler="simple",
-            stock_quality_steps=20,
-            stock_quality_shift_video=12.0,
-            stock_quality_shift_audio=3.0,
-            quality_text_encoder=TEXT_ENCODER_FILE,
-            quality_sampler="euler",
-            quality_scheduler="simple",
-            quality_steps=8,
-            quality_shift_video=12.0,
-            quality_shift_audio=7.0,
-            fast_sampler="lcm",
-            fast_scheduler="simple",
-            fast_steps=6,
-            fast_shift_video=1.0,
-            fast_shift_audio=1.0,
-            ref2va_max_images=9,
-            ref2va_max_videos=3,
-            ref2va_max_audios=3,
-            unets=visible_unets,
-            unet_default=DIT_FILE,
-            using_redmix=False,  # runtime safe default remains Stock; REDMIX is selectable in Adult Mode
-            using_eros_max=False,
-            model_mode=(
-                "T4 LOW-VRAM · Q4_0 GGUF · Dynamic VRAM"
-                if LOWVRAM_T4_PROFILE
-                else "STOCK H3"
-            ),
-            fallback_notice="",
-            recommended_steps=20,
-            recommended_sampler="res_multistep",
-            recommended_scheduler="simple",
+            eros_max_unet="", redmix_unet="", eros_max_sha256="", eros_integrated_turbo=False,
+            motion8_file=MOTION8_FILE, motion8_available=bool(not LOWVRAM_T4_PROFILE), model_profiles=profile_state,
+            naughty_file="", naughty_strength=0.0,
+            stock_quality_sampler="res_multistep", stock_quality_scheduler="simple", stock_quality_steps=20,
+            stock_quality_shift_video=12.0, stock_quality_shift_audio=3.0,
+            quality_text_encoder=TEXT_ENCODER_FILE, quality_sampler="euler", quality_scheduler="simple", quality_steps=8,
+            quality_shift_video=12.0, quality_shift_audio=7.0, fast_sampler="lcm", fast_scheduler="simple", fast_steps=6,
+            fast_shift_video=1.0, fast_shift_audio=1.0, ref2va_max_images=9, ref2va_max_videos=3, ref2va_max_audios=3,
+            unets=visible_unets, unet_default=DIT_FILE, using_redmix=False, using_eros_max=False,
+            model_mode=("T4 LOW-VRAM · Q4_0 GGUF · Dynamic VRAM" if LOWVRAM_T4_PROFILE else "STOCK H3 · SFW"),
+            fallback_notice="", recommended_steps=20, recommended_sampler="res_multistep", recommended_scheduler="simple",
         )
 
     AUTO_PROMPT_MODELS = [
@@ -5866,7 +4754,7 @@ Follow MiniMax H3's documented prompt grammar:
 9. Dialogue belongs in integrated_multimodal_description. Preserve user-provided dialogue verbatim. For speaking subjects use stable IDs like (S1) and H3 dialogue tags such as <d>[English] exact words</d> when appropriate.
 10. overall_soundscape is 1-4 sentences of ambience, physical sounds, and non-verbal human sounds; do not duplicate dialogue. Use N/A only if the user explicitly wants complete silence.
 11. non_diegetic_music is 1-3 sentences describing instrumentation, tempo/rhythm, and dynamics, or N/A when no background score is wanted.
-12. Respect the user's creative intent and tone. Do not moralize, scold, sanitize harmless adult themes, or append warnings. If the scene is adult-oriented, keep every depicted person unmistakably adult. Do not invent graphic sexual details that the user did not ask for.
+12. Keep the result SFW. Do not introduce nudity, sexual acts, fetish content, or pornographic framing. Preserve harmless romance or affection without sexualizing the scene.
 13. Keep the prompt precise enough to control H3 but concise enough that the main movement and camera path remain dominant.
 
 Additional user Auto Prompt instructions:
@@ -5999,6 +4887,11 @@ Additional user Auto Prompt instructions:
         if input_mode not in {"fl2va", "ref2va"}:
             input_mode = "fl2va"
         p["input_mode"] = input_mode
+        _allowed_unets = {FALLBACK_DIT_FILE, REF2VA_DIT_FILE, T4_DIT_FILE}
+        requested_unet = os.path.basename(str(p.get("unet") or DIT_FILE))
+        if requested_unet not in _allowed_unets:
+            return jsonify(error="Only official Stock MiniMax H3 checkpoints are allowed in the SFW-only build."), 400
+        p["unet"] = requested_unet
         # Normal GENERATE is raw/local: it never invokes OpenAI Auto Prompt.
         p["prompt_source"] = "raw_local"
 
@@ -6067,8 +4960,6 @@ Additional user Auto Prompt instructions:
         if abs(motion8_strength) > 1e-6:
             if input_mode != "fl2va":
                 return jsonify(error="Motion Enhancer is CURRENT / FL2VA only. Switch to CURRENT · KEYFRAMES."), 400
-            if (p.get("unet") or DIT_FILE) == EROS_MAX_FILE:
-                return jsonify(error="Motion Enhancer targets stock H3 FL2VA, not Eros Max beta5. Select Stock H3 or NaughtyTimes."), 400
             extra_loras = [(n, s) for n, s in extra_loras if n != MOTION8_FILE]
             extra_loras.append((MOTION8_FILE, motion8_strength))
             # Never silently cancel another ON switch. Motion8 and the 4-step
@@ -6105,10 +4996,9 @@ Additional user Auto Prompt instructions:
                 ), 400
 
         if input_mode == "ref2va":
-            # Eros Max beta5 is a hybrid reference/T2VA checkpoint. The UI selects
-            # beta5 here by default; stock Ref2VA remains available in the dropdown.
+            # SFW-only Ref2VA uses the official MiniMax H3 reference checkpoint.
             if not p.get("unet"):
-                p["unet"] = EROS_MAX_FILE
+                p["unet"] = REF2VA_DIT_FILE
             ref_images = []
             ref_videos = []
             ref_audios = []
@@ -6329,138 +5219,38 @@ Additional user Auto Prompt instructions:
 
     def _model_profile_state():
         return dict(
-            eros_installed=(False if LOWVRAM_T4_PROFILE else os.path.exists(os.path.join(MODELS, "diffusion_models", EROS_MAX_FILE))),
-            redmix_installed=(False if LOWVRAM_T4_PROFILE else any(
-                os.path.exists(os.path.join(MODELS, "diffusion_models", n)) for n in REDMIX_FILE_ALIASES
-            )),
-            stock_fl2va_installed=(
-                os.path.exists(os.path.join(MODELS, "unet", T4_DIT_FILE))
-                if LOWVRAM_T4_PROFILE else
-                os.path.exists(os.path.join(MODELS, "diffusion_models", FALLBACK_DIT_FILE))
-            ),
-            stock_ref2va_installed=(False if LOWVRAM_T4_PROFILE else os.path.exists(os.path.join(MODELS, "diffusion_models", REF2VA_DIT_FILE))),
-            naughty_installed=(False if LOWVRAM_T4_PROFILE else os.path.exists(NSFW_LORA_PATH)),
+            stock_fl2va_installed=(os.path.exists(os.path.join(MODELS,"unet",T4_DIT_FILE)) if LOWVRAM_T4_PROFILE else os.path.exists(os.path.join(MODELS,"diffusion_models",FALLBACK_DIT_FILE))),
+            stock_ref2va_installed=(False if LOWVRAM_T4_PROFILE else os.path.exists(os.path.join(MODELS,"diffusion_models",REF2VA_DIT_FILE))),
+            eros_installed=False, redmix_installed=False, naughty_installed=False,
         )
 
     @app.post("/api/model_profiles/install")
     def api_model_profile_install():
-        global NSFW_LORA_AVAILABLE
-        body = request.get_json(silent=True) or {}
-        profile = str(body.get("profile") or "").strip().lower()
-        mode = str(body.get("mode") or "fl2va").strip().lower()
-        if mode not in {"fl2va", "ref2va"}:
-            mode = "fl2va"
-
+        body=request.get_json(silent=True) or {}
+        profile=str(body.get("profile") or "stock_quality").strip().lower()
+        mode=str(body.get("mode") or "fl2va").strip().lower()
+        if profile != "stock_quality":
+            return jsonify(error="Only the official Stock H3 profile is available in the SFW-only build."), 400
+        if mode not in {"fl2va","ref2va"}: mode="fl2va"
         try:
-            if LOWVRAM_T4_PROFILE and profile != "stock_quality":
-                return jsonify(error="T4/LOW-VRAM mode is pinned to the Q4_0 Stock H3 profile to protect 16 GB VRAM."), 400
-            if profile in {"eros", "redmix"} and not _adult_access_ok():
-                return _adult_gate_response()
-            if profile == "eros":
-                _fetch_one((
-                    "diffusion_models", EROS_MAX_FILE,
-                    EROS_MAX_REPO, None
-                ))
-                eros_path = os.path.join(MODELS, "diffusion_models", EROS_MAX_FILE)
-                got = _sha256(eros_path)
-                if got != EROS_MAX_SHA256:
-                    try:
-                        os.remove(eros_path)
-                    except Exception:
-                        pass
-                    raise RuntimeError(
-                        f"Eros Max beta5 SHA256 mismatch: expected {EROS_MAX_SHA256}, got {got}."
-                    )
-            elif profile == "redmix":
-                if mode != "fl2va":
-                    return jsonify(error="REDMIX H3 Beta2 is exposed as a CURRENT / FL2VA checkpoint profile. Switch to CURRENT · KEYFRAMES first."), 400
-                _download_redmix_beta2(activate=False)
-            elif profile == "stock_quality":
-                if LOWVRAM_T4_PROFILE:
-                    _fetch_one(("unet", T4_DIT_FILE, T4_DIT_REPO, None))
-                elif mode == "ref2va":
-                    _fetch_one((
-                        "diffusion_models", REF2VA_DIT_FILE,
-                        "Comfy-Org/MiniMax-H3", "diffusion_models"
-                    ))
-                else:
-                    _fetch_one((
-                        "diffusion_models", FALLBACK_DIT_FILE,
-                        "Comfy-Org/MiniMax-H3", "diffusion_models"
-                    ))
-                # T4 branch is complete here; skip the legacy body duplicated below.
-                if LOWVRAM_T4_PROFILE:
-                    folder_paths.cache_helper.clear()
-                    return jsonify(ok=True, state=_model_profile_state())
+            if LOWVRAM_T4_PROFILE:
+                if mode=="ref2va": return jsonify(error="Ref2VA is not enabled on the T4 low-VRAM profile."),400
+                _fetch_one(("unet",T4_DIT_FILE,T4_DIT_REPO,None))
+            elif mode=="ref2va":
+                _fetch_one(("diffusion_models",REF2VA_DIT_FILE,"Comfy-Org/MiniMax-H3","diffusion_models"))
             else:
-                return jsonify(error=f"Unknown model profile: {profile or '(blank)'}"), 400
-
-            try:
-                folder_paths.cache_helper.clear()
-            except Exception:
-                pass
-
-            _profile_loras = list(folder_paths.get_filename_list("loras"))
-            if not _adult_access_ok():
-                _profile_loras = [x for x in _profile_loras if not _is_adult_lora_name(x)]
-            _profile_unets = list(folder_paths.get_filename_list("diffusion_models"))
-            if not _adult_access_ok():
-                _profile_unets = [x for x in _profile_unets if not _is_adult_unet_name(x)]
-            _profile_state = _model_profile_state()
-            if not _adult_access_ok():
-                _profile_state = dict(_profile_state)
-                _profile_state["eros_installed"] = False
-                _profile_state["naughty_installed"] = False
-            return jsonify(
-                ok=True,
-                profile=profile,
-                mode=mode,
-                state=_profile_state,
-                unets=_profile_unets,
-                loras=["none"] + _profile_loras,
-            )
+                _fetch_one(("diffusion_models",FALLBACK_DIT_FILE,"Comfy-Org/MiniMax-H3","diffusion_models"))
+            folder_paths.cache_helper.clear()
+            _allowed_unets={FALLBACK_DIT_FILE,REF2VA_DIT_FILE,T4_DIT_FILE}
+            unets=[x for x in folder_paths.get_filename_list("diffusion_models") if os.path.basename(str(x)) in _allowed_unets]
+            loras=[x for x in folder_paths.get_filename_list("loras") if not _sfw_asset_blocked(x)]
+            return jsonify(ok=True,profile="stock_quality",mode=mode,state=_model_profile_state(),unets=unets,loras=["none"]+loras)
         except Exception as e:
-            log(f"  ⚠ model profile install failed ({profile}): {e}")
-            return jsonify(error=str(e), state=_model_profile_state()), 400
+            return jsonify(error=str(e),state=_model_profile_state()),400
 
     @app.post("/api/loras/catalog_install")
     def api_lora_catalog_install():
-        global NSFW_LORA_AVAILABLE, SPECIALTY_LORA_STATES
-        if not _adult_access_ok():
-            return _adult_gate_response()
-        body = request.get_json(silent=True) or {}
-        key = str(body.get("key") or "").strip()
-        if not key:
-            return jsonify(error="Choose an adult LoRA catalog entry."), 400
-        try:
-            if key == "naughty_times_v2":
-                _ensure_nsfw_lora()
-                NSFW_LORA_AVAILABLE = True
-                installed_name = NSFW_LORA_FILE
-            else:
-                spec = next((s for s in SPECIALTY_LORA_PRESETS if str(s.get("key")) == key), None)
-                if not spec:
-                    return jsonify(error=f"Unknown LoRA catalog entry: {key}"), 404
-                state = _ensure_specialty_lora_preset(spec)
-                if not state.get("available") or not state.get("file"):
-                    raise RuntimeError(state.get("error") or "Could not install the selected LoRA.")
-                by_key = {str(s.get("key")): s for s in SPECIALTY_LORA_STATES}
-                by_key[key] = state
-                SPECIALTY_LORA_STATES = list(by_key.values())
-                _save_specialty_lora_state_cache()
-                installed_name = os.path.basename(str(state["file"]))
-            folder_paths.cache_helper.clear()
-            source_page = ""
-            if key == "naughty_times_v2":
-                source_page = f"https://civitai.red/models?modelVersionId={NSFW_LORA_VERSION}"
-            else:
-                source_page = str((spec or {}).get("source_page") or by_key.get(key, {}).get("source_page") or "")
-            _remember_lora_source(installed_name, source_page)
-            log(f"  ✓ gated LoRA catalog install: {installed_name}")
-            return jsonify(ok=True, file=installed_name, source_url=source_page)
-        except Exception as e:
-            log(f"  ⚠ gated LoRA catalog install failed ({key}): {e}")
-            return jsonify(error=str(e)), 400
+        return jsonify(error="The built-in adult LoRA catalog was removed from the SFW-only build.", code="sfw_only"), 404
 
     @app.post("/api/loras/install")
     def api_lora_install():
@@ -6490,7 +5280,7 @@ Additional user Auto Prompt instructions:
                 base = os.path.basename(filename)
                 if not base.lower().endswith(".safetensors"):
                     raise ValueError("Only .safetensors LoRA files are accepted.")
-                if _is_adult_lora_name(base) and not _adult_access_ok():
+                if _sfw_asset_blocked(base):
                     return _adult_gate_response()
                 token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN") or None
                 src_path = hf_hub_download(repo_id, filename=filename, revision=revision, token=token)
@@ -6513,6 +5303,8 @@ Additional user Auto Prompt instructions:
                 elif len(seg) >= 2 and seg[0] == "models":
                     model_id = int(seg[1].split("-")[0])
                     model = _civitai_json(f"https://civitai.com/api/v1/models/{model_id}", tok)
+                    if bool(model.get("nsfw")):
+                        return _adult_gate_response()
                     versions = model.get("modelVersions") or []
                     requested = (q.get("modelVersionId") or [None])[0]
                     if requested:
@@ -6531,6 +5323,8 @@ Additional user Auto Prompt instructions:
                 else:
                     raise ValueError("CivitAI URL must be a civitai.com/civitai.red model page or /api/download/models/<versionId> URL.")
 
+                if bool((version_obj or {}).get("nsfw")) or int((version_obj or {}).get("nsfwLevel") or 0) > 1:
+                    return _adult_gate_response()
                 if not _is_h3_version(version_obj):
                     raise ValueError(
                         f"CivitAI version {version_obj.get('id')} is labeled "
@@ -6542,7 +5336,7 @@ Additional user Auto Prompt instructions:
                 base = os.path.basename(str(fobj.get("name") or ""))
                 if not base.lower().endswith(".safetensors"):
                     raise ValueError("Only .safetensors LoRA files are accepted.")
-                if _is_adult_lora_name(base) and not _adult_access_ok():
+                if _sfw_asset_blocked(base):
                     return _adult_gate_response()
                 dl = fobj.get("downloadUrl") or version_obj.get("downloadUrl")
                 if not dl:
@@ -6749,7 +5543,7 @@ Additional user Auto Prompt instructions:
 
     PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
     <meta name=viewport content="width=device-width,initial-scale=1">
-    <title>MissingLink MiniMax Studio V98</title>
+    <title>MissingLink MiniMax Studio · SFW Fast</title>
     <link rel="icon" href="https://raw.githubusercontent.com/PotentiallyARobot/MissingLink-Extras/main/image-edit-studio/static/app_logo.png?v=2">
     <style>
     *{box-sizing:border-box}
@@ -6801,7 +5595,7 @@ Additional user Auto Prompt instructions:
     <div class=side>
     <a class=brand href="https://missinglink.build" target="_blank" rel="noopener"><img id=logo src="https://raw.githubusercontent.com/PotentiallyARobot/MissingLink-Extras/main/image-edit-studio/static/app_logo.png?v=2" alt="" onerror="this.style.display='none'"><span><span class=ml>MISSINGLINK</span> <span class=st>MINIMAX H3</span></span></a>
 
-    <div class=card><div class="cardtitle modelcardtitle"><span>Model Mode · <span id=arch_label>AUTO GPU</span></span><button id=adult_mode_btn class=adultmodebtn type=button aria-pressed=false title="Adult models and LoRAs are hidden">18+</button></div><div class=cardbody>
+    <div class=card><div class="cardtitle modelcardtitle"><span>Model Mode · <span id=arch_label>AUTO GPU</span></span><button id=adult_mode_btn type=button hidden aria-hidden=true tabindex=-1></button></div><div class=cardbody>
     <input id=input_mode type=hidden value=fl2va>
     <div class=modetabs><button id=tab_fl2va class="modetab active" type=button>CURRENT · KEYFRAMES</button><button id=tab_ref2va class=modetab type=button>REF2VA · REFERENCES</button></div>
 
@@ -7011,19 +5805,7 @@ Additional user Auto Prompt instructions:
         </div>
       </div>
     </div>
-    <div id=adult_gate_modal class=uimodal role=dialog aria-modal=true aria-labelledby=adult_gate_title>
-      <div class=uidialog>
-        <div class=uihead><b id=adult_gate_title>Adult feature acknowledgement</b><button id=adult_gate_close class=uiclose type=button>✕</button></div>
-        <div class=uibody>
-          <div class=adultlegal>Adult models and adult LoRAs are hidden by default. To reveal them and continue an adult-oriented request, acknowledge all of the following:</div>
-          <label class=adultcheck><input id=adult_ack_age type=checkbox><span>I certify that I am at least 18 years old and have reached the age of majority where I am located.</span></label>
-          <label class=adultcheck><input id=adult_ack_law type=checkbox><span>I will use adult-generation features only where lawful and will comply with all applicable local, state/provincial, national laws, regulations, court orders, and the service terms that apply to my use.</span></label>
-          <label class=adultcheck><input id=adult_ack_consent type=checkbox><span>I will not create or upload sexual content involving minors or anyone depicted as a minor, non-consensual sexual content, sexual exploitation, or intimate imagery of a real person without the rights and consent required by law. I have permission to use any real person's likeness or source media I provide.</span></label>
-          <div class=adultnotice>This acknowledgement does not determine whether a particular generation is lawful. You are responsible for compliance, and adult features may be restricted where prohibited.</div>
-        </div>
-        <div class=uiactions><button id=adult_gate_cancel class=uicancel type=button>Cancel</button><button id=adult_gate_accept class=uiconfirm type=button disabled>ACKNOWLEDGE & CONTINUE</button></div>
-      </div>
-    </div>
+    <div id=adult_gate_modal hidden><input id=adult_ack_age type=checkbox><input id=adult_ack_law type=checkbox><input id=adult_ack_consent type=checkbox><button id=adult_gate_close type=button></button><button id=adult_gate_cancel type=button></button><button id=adult_gate_accept type=button disabled></button></div>
     <script>
     const $=i=>document.getElementById(i);
     let job=null;
@@ -7050,9 +5832,7 @@ Additional user Auto Prompt instructions:
         $('continuity_hint').innerHTML='<b>LAST-FRAME CONTINUITY:</b> the next GENERATE will use the previous timeline clip\'s lossless final frame as its first-frame anchor. No latent state, overlap, or latent checkpoint is used.';
       }
     }
-    function activeModelLabel(){
-      return ACTIVE_MODEL_PROFILE==='eros' ? 'Eros Max β5' : (ACTIVE_MODEL_PROFILE==='redmix' ? 'REDMIX H3 Beta2' : 'Stock H3');
-    }
+    function activeModelLabel(){return 'Stock H3'}
     function updateModeHint(){
       const m=window.H3META||{},mode=currentModelMode(),el=$('mode_hint'),name=activeModelLabel();
       if(mode==='ref2va'){
@@ -7076,31 +5856,11 @@ Additional user Auto Prompt instructions:
       localStorage.setItem(MODEL_MODE_STORE_KEY,mode);
 
       try{
-        // Eros is hybrid. REDMIX is kept as the optimized CURRENT/FL2VA checkpoint.
-        if(ACTIVE_MODEL_PROFILE==='eros'){
-          if(m.eros_max_unet&&[...$('unet').options].some(x=>x.value===m.eros_max_unet)){
-            $('unet').value=m.eros_max_unet;
-          }
-        }else if(ACTIVE_MODEL_PROFILE==='redmix'){
-          if(mode!=='fl2va')throw new Error('REDMIX H3 Beta2 is available in CURRENT · KEYFRAMES mode.');
-          if(!(await _ensureProfile('redmix','fl2va')))throw new Error('Could not prepare REDMIX H3 Beta2.');
-          await loadMeta();m=window.H3META||{};
-          if(!m.redmix_unet||![...$('unet').options].some(x=>x.value===m.redmix_unet))throw new Error('REDMIX H3 Beta2 checkpoint is not available after install.');
-          $('unet').value=m.redmix_unet;
-        }else{
-          // Stock H3 requires the mode-matching official transformer.
-          if(!(await _ensureProfile(ACTIVE_MODEL_PROFILE,mode))){
-            throw new Error(`Could not prepare ${activeModelLabel()} for ${mode==='ref2va'?'Ref2VA':'Current'} mode.`);
-          }
-          await loadMeta();
-          m=window.H3META||{};
-          const target=mode==='ref2va'?m.stock_ref2va_unet:m.base_fl2va_unet;
-          if(!target||![...$('unet').options].some(x=>x.value===target)){
-            throw new Error(`Matching ${mode==='ref2va'?'Ref2VA':'FL2VA'} transformer is not available for ${activeModelLabel()}.`);
-          }
-          $('unet').value=target;
-
-        }
+        if(!(await _ensureProfile('stock_quality',mode))) throw new Error(`Could not prepare Stock H3 for ${mode==='ref2va'?'Ref2VA':'Current'} mode.`);
+        await loadMeta(); m=window.H3META||{};
+        const target=mode==='ref2va'?m.stock_ref2va_unet:m.base_fl2va_unet;
+        if(!target||![...$('unet').options].some(x=>x.value===target)) throw new Error(`Matching ${mode==='ref2va'?'Ref2VA':'FL2VA'} transformer is not available for Stock H3.`);
+        $('unet').value=target;
 
         // Reapply the selected model's current performance preset for the new mode.
         await applyPerformancePreset(ACTIVE_PERF_PRESET);
@@ -7128,16 +5888,8 @@ Additional user Auto Prompt instructions:
     let ACTIVE_PERF_PRESET='quality';
 
     function presetRecipe(profile=ACTIVE_MODEL_PROFILE,mode=currentModelMode(),kind=ACTIVE_PERF_PRESET){
-      if(profile==='eros'){
-        return kind==='fast'
-          ? {short:'EROS',label:'Eros Max β5',steps:6,summary:'LCM / Simple · 6 steps · integrated Turbo · identity shifts 1/1 · dense'}
-          : {short:'EROS',label:'Eros Max β5',steps:8,summary:'Euler / Simple · 8 steps · shifts 12/7 · dense'};
-      }
-      if(profile==='redmix'){
-        return {short:'REDMIX',label:'REDMIX H3 Beta2',steps:6,summary:'INT8 ConvRot · integrated NaughtyTimes-derived tuning + Turbo · ER SDE / Beta · 6 steps'};
-      }
       return kind==='fast'
-        ? {short:'STOCK',label:'Stock H3',steps:4,summary:(mode==='ref2va'?'Ref2VA Turbo · shifts 12/3':'FL2VA Turbo · shifts 6/3')+' · Euler / Simple · 4 steps · Sparse Sage 5%'}
+        ? {short:'STOCK',label:'Stock H3',steps:4,summary:(mode==='ref2va'?'Ref2VA Turbo · shifts 12/3':'FL2VA Turbo · shifts 6/3')+' · Euler / Simple · 4 steps · lazy accelerator download'}
         : {short:'STOCK',label:'Stock H3',steps:20,summary:(mode==='ref2va'?'Ref2VA':'FL2VA')+' · RES Multistep / Simple · 20 steps · shifts 12/3 · dense'};
     }
 
@@ -7164,27 +5916,15 @@ Additional user Auto Prompt instructions:
     function _modelProfileState(){return (window.H3META||{}).model_profiles||{}}
     function _hasProfileFile(profile,mode=currentModelMode()){
       const s=_modelProfileState();
-      if(profile==='eros')return !!s.eros_installed;
-      if(profile==='redmix')return mode==='fl2va'&&!!s.redmix_installed;
-      if(profile==='stock_quality')return mode==='ref2va'?!!s.stock_ref2va_installed:!!s.stock_fl2va_installed;
-      return false;
+      return mode==='ref2va'?!!s.stock_ref2va_installed:!!s.stock_fl2va_installed;
     }
     function syncModelProfileOptions(m=window.H3META||{}){
       const sel=$('model_profile_select');
-      const current=ACTIVE_MODEL_PROFILE;
-      const s=m.model_profiles||{};
-      const mode=currentModelMode();
-      const stockReady=mode==='ref2va'?!!s.stock_ref2va_installed:!!s.stock_fl2va_installed;
-      const rows=[{value:'stock_quality',label:'STOCK H3 · MAX QUALITY'+(stockReady?'':' · DOWNLOAD')}];
-      if(m.adult_enabled && !m.lowvram_t4){
-        for(const x of (m.adult_model_profiles||[])){
-          if(Array.isArray(x.modes)&&!x.modes.includes(mode))continue;
-          rows.push({value:x.value,label:(x.label||x.value)+(x.installed?'':' · DOWNLOAD')});
-        }
-      }
-      sel.innerHTML=rows.map(x=>`<option value="${esc(x.value)}">${esc(x.label)}</option>`).join('');
-      if(rows.some(x=>x.value===current))sel.value=current;
-      else{ACTIVE_MODEL_PROFILE='stock_quality';sel.value='stock_quality'}
+      const mode=currentModelMode(),s=m.model_profiles||{};
+      const ready=mode==='ref2va'?!!s.stock_ref2va_installed:!!s.stock_fl2va_installed;
+      ACTIVE_MODEL_PROFILE='stock_quality';
+      sel.innerHTML=`<option value="stock_quality">STOCK H3 · MAX QUALITY${ready?'':' · DOWNLOAD'}</option>`;
+      sel.value='stock_quality';
     }
 
     function syncModelProfileUI(){
@@ -7211,10 +5951,6 @@ Additional user Auto Prompt instructions:
         body:JSON.stringify({profile,mode})
       });
       const r=await resp.json();
-      if(r.adult_ack_required){
-        const ok=await requestAdultAcknowledgement();
-        return ok?_ensureProfile(profile,mode):false;
-      }
       if(r.error){await uiAlert(r.error,'Model profile download failed');return false}
       await loadMeta();
       return true;
@@ -7228,1190 +5964,7 @@ Additional user Auto Prompt instructions:
       $('sparse_percent').value=0;$('sparse_slider').value=0;updateSparseUI('number');
       $('playback_speed').value=1.0;$('denoise').value=1.0;
 
-      if(profile==='eros'){
-        if(m.eros_max_unet&&[...$('unet').options].some(x=>x.value===m.eros_max_unet))$('unet').value=m.eros_max_unet;
-        $('steps').value=m.quality_steps||8;
-        if([...$('sampler_name').options].some(x=>x.value===(m.quality_sampler||'euler')))$('sampler_name').value=m.quality_sampler||'euler';
-        if([...$('scheduler').options].some(x=>x.value===(m.quality_scheduler||'simple')))$('scheduler').value=m.quality_scheduler||'simple';
-        $('shift_video').value=m.quality_shift_video??12;$('shift_audio').value=m.quality_shift_audio??7;
-        if(mode==='ref2va')$('ref_image_size').value='max';
-        ACTIVE_MODEL_PROFILE='eros';
-        say(`EROS MAX β5 active · ${(window.H3META&&window.H3META.gpu_arch_label)||'AUTO GPU'} optimized`);
-      }else if(profile==='redmix'){
-        if(mode!=='fl2va')throw new Error('REDMIX H3 Beta2 is CURRENT / FL2VA only in this studio.');
-        if(m.redmix_unet&&[...$('unet').options].some(x=>x.value===m.redmix_unet))$('unet').value=m.redmix_unet;
-        $('steps').value=m.redmix_steps||6;
-        const rs=(m.samplers||[]).includes(m.redmix_sampler||'er_sde')?(m.redmix_sampler||'er_sde'):'euler';
-        const rc=(m.schedulers||[]).includes(m.redmix_scheduler||'beta')?(m.redmix_scheduler||'beta'):'simple';
-        $('sampler_name').value=rs;$('scheduler').value=rc;
-        $('shift_video').value=m.redmix_shift_video??6;$('shift_audio').value=m.redmix_shift_audio??3;
-        ACTIVE_MODEL_PROFILE='redmix';
-        say('REDMIX H3 Beta2 · INT8 ConvRot · integrated adult tuning + Turbo');
-      }else if(profile==='stock_quality'){
-        const unet=mode==='ref2va'?m.stock_ref2va_unet:m.base_fl2va_unet;
-        if(unet&&[...$('unet').options].some(x=>x.value===unet))$('unet').value=unet;
-        $('steps').value=m.stock_quality_steps||20;
-        if([...$('sampler_name').options].some(x=>x.value===(m.stock_quality_sampler||'res_multistep')))$('sampler_name').value=m.stock_quality_sampler||'res_multistep';
-        if([...$('scheduler').options].some(x=>x.value===(m.stock_quality_scheduler||'simple')))$('scheduler').value=m.stock_quality_scheduler||'simple';
-        $('shift_video').value=m.stock_quality_shift_video??12;$('shift_audio').value=m.stock_quality_shift_audio??3;
-        if(mode==='ref2va')$('ref_image_size').value='max';
-        ACTIVE_MODEL_PROFILE='stock_quality';
-        say(`STOCK H3 ${mode==='ref2va'?'REF2VA':'FL2VA'} MAX QUALITY active`);
-
-      }
-      ACTIVE_PERF_PRESET='quality';
-      updateDur();syncModelProfileUI();syncPresetUI();
-    }
-
-    $('model_profile_select').onchange=async()=>{
-      const sel=$('model_profile_select');
-      const requested=sel.value;
-      const previous=ACTIVE_MODEL_PROFILE;
-      sel.disabled=true;
-      say('switching model · checking matching '+(currentModelMode()==='ref2va'?'Ref2VA':'FL2VA')+' files…');
-      try{
-        await applyModelProfile(requested);
-      }catch(e){
-        ACTIVE_MODEL_PROFILE=previous;
-        await uiAlert(String(e&&e.message?e.message:e),'Model switch failed');
-      }finally{
-        sel.disabled=false;
-        syncModelProfileUI();
-      }
-    };
-
-    $('gpu_overlay_toggle').onclick=()=>{
-      const p=$('gpu_overlay');
-      const mini=p.classList.toggle('minimized');
-      $('gpu_overlay_toggle').textContent=mini?'＋':'−';
-      $('gpu_overlay_toggle').title=mini?'Expand GPU stats':'Minimize GPU stats';
-    };
-
-    // App-owned modal system. Never use browser alert/confirm/prompt dialogs.
-    let _uiDialogResolve=null;
-    function _closeUIDialog(value){
-      $('ui_modal').classList.remove('show');
-      const r=_uiDialogResolve; _uiDialogResolve=null;
-      if(r)r(value);
-    }
-    function uiDialog({title='Notice',message='',input=false,value='',confirmLabel='OK',cancelLabel='Cancel',showCancel=true,danger=false}={}){
-      if(_uiDialogResolve)_closeUIDialog(null);
-      $('ui_modal_title').textContent=title;
-      $('ui_modal_message').textContent=message;
-      const inp=$('ui_modal_input');
-      inp.style.display=input?'block':'none';
-      inp.value=input?String(value??''):'';
-      $('ui_modal_confirm').textContent=confirmLabel;
-      $('ui_modal_confirm').className='uiconfirm '+(danger?'danger':'neutral');
-      $('ui_modal_cancel').textContent=cancelLabel;
-      $('ui_modal_cancel').style.display=showCancel?'':'none';
-      $('ui_modal').classList.add('show');
-      return new Promise(resolve=>{
-        _uiDialogResolve=resolve;
-        requestAnimationFrame(()=>{(input?inp:$('ui_modal_confirm')).focus(); if(input)inp.select()});
-      });
-    }
-    function uiAlert(message,title='Notice'){return uiDialog({title,message,showCancel:false,confirmLabel:'OK'})}
-    function uiConfirm(message,{title='Confirm',confirmLabel='Confirm',danger=false}={}){return uiDialog({title,message,showCancel:true,confirmLabel,danger})}
-    function uiPrompt(message,value='',{title='New sequence',confirmLabel='Create'}={}){return uiDialog({title,message,input:true,value,showCancel:true,confirmLabel})}
-    $('ui_modal_close').onclick=()=>_closeUIDialog(null);
-    $('ui_modal_cancel').onclick=()=>_closeUIDialog(null);
-    $('ui_modal_confirm').onclick=()=>_closeUIDialog($('ui_modal_input').style.display==='none'?true:$('ui_modal_input').value.trim());
-    $('ui_modal').addEventListener('click',e=>{if(e.target===$('ui_modal'))_closeUIDialog(null)});
-    $('ui_modal_input').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();$('ui_modal_confirm').click()}else if(e.key==='Escape'){e.preventDefault();_closeUIDialog(null)}});
-
-    // Adult-access acknowledgement is intentionally a signed server-session gate.
-    let _adultGateResolve=null;
-    function _syncAdultGateAccept(){
-      $('adult_gate_accept').disabled=!($('adult_ack_age').checked&&$('adult_ack_law').checked&&$('adult_ack_consent').checked);
-    }
-    function _closeAdultGate(value){
-      $('adult_gate_modal').classList.remove('show');
-      const r=_adultGateResolve;_adultGateResolve=null;
-      if(r)r(!!value);
-    }
-    async function requestAdultAcknowledgement(){
-      if((window.H3META||{}).adult_enabled)return true;
-      for(const id of ['adult_ack_age','adult_ack_law','adult_ack_consent'])$(id).checked=false;
-      _syncAdultGateAccept();
-      $('adult_gate_modal').classList.add('show');
-      return new Promise(resolve=>{_adultGateResolve=resolve;requestAnimationFrame(()=>$('adult_ack_age').focus())});
-    }
-    for(const id of ['adult_ack_age','adult_ack_law','adult_ack_consent'])$(id).addEventListener('change',_syncAdultGateAccept);
-    $('adult_gate_close').onclick=()=>_closeAdultGate(false);
-    $('adult_gate_cancel').onclick=()=>_closeAdultGate(false);
-    $('adult_gate_modal').addEventListener('click',e=>{if(e.target===$('adult_gate_modal'))_closeAdultGate(false)});
-    $('adult_gate_accept').onclick=async()=>{
-      if($('adult_gate_accept').disabled)return;
-      $('adult_gate_accept').disabled=true;
-      say('unlocking adult catalog…');
-      try{
-        const resp=await fetch('/api/adult/ack',{
-          method:'POST',headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({age:true,law:true,consent:true})
-        });
-        const r=await resp.json();
-        if(!resp.ok||r.error){await uiAlert(r.error||'Adult acknowledgement failed.','Adult access');_syncAdultGateAccept();return}
-        await loadMeta();
-        _closeAdultGate(true);
-        say('Adult Mode enabled');
-      }catch(e){
-        await uiAlert(String(e),'Adult access');
-        _syncAdultGateAccept();
-      }
-    };
-
-    function syncAdultModeButton(m=window.H3META||{}){
-      const b=$('adult_mode_btn');if(!b)return;
-      const on=!!m.adult_enabled;
-      b.classList.toggle('on',on);
-      b.textContent='18+';
-      b.setAttribute('aria-pressed',on?'true':'false');
-      b.title=on?'Adult catalog enabled · click to exit':'Adult models and LoRAs are hidden · click to enable';
-    }
-    function clearAdultLoraCardState(m=window.H3META||{}){
-      for(const card of _namedLoraCards(m)){
-        if(card.adult||card.kind==='catalog')LORA_CARD_STATE.delete(_cardKey(card));
-      }
-    }
-    $('adult_mode_btn').onclick=async()=>{
-      const m=window.H3META||{};
-      if(!m.adult_enabled){
-        const ok=await requestAdultAcknowledgement();
-        if(ok){syncAdultModeButton(window.H3META||{});renderNamedLoraRows(window.H3META||{});syncModelProfileUI()}
-        return;
-      }
-      if(!(await uiConfirm('Exit Adult Mode? Adult models and adult LoRAs will be hidden and any active adult LoRA selections will be cleared. Installed files stay on disk.',{title:'Exit Adult Mode',confirmLabel:'Exit Adult Mode'})))return;
-      clearAdultLoraCardState(m);
-      const resp=await fetch('/api/adult/exit',{method:'POST'});
-      const r=await resp.json();
-      if(!resp.ok||r.error){await uiAlert(r.error||'Could not exit Adult Mode.','Adult Mode');return}
-      if(['eros','redmix'].includes(ACTIVE_MODEL_PROFILE))ACTIVE_MODEL_PROFILE='stock_quality';
-      await loadMeta();
-      syncAdultModeButton(window.H3META||{});
-      say('Adult Mode off');
-    };
-
-    // One user-facing LoRA stack. There are no legacy LoRA slot/dropdown controls
-    // in the DOM. All strengths—including Motion and Fast Accelerator—live here.
-    // State is keyed by installed filename or gated catalog key so loadMeta() can
-    // refresh compatibility/adult visibility without losing the user's strengths.
-    const LORA_CARD_STATE=new Map();
-
-    function _catalogEntryForKey(key,m=window.H3META||{}){
-      return (m.lora_catalog||[]).find(x=>String(x.key)===String(key))||null;
-    }
-    function _catalogEntryForFile(file,m=window.H3META||{}){
-      return (m.lora_catalog||[]).find(x=>x.file&&String(x.file)===String(file))||null;
-    }
-    function _compatForFile(file,m=window.H3META||{}){
-      return (m.lora_compatibility||{})[String(file||'')]||null;
-    }
-    function _compatProfileForUI(m=window.H3META||{}){
-      const unet=$('unet')?$('unet').value:'';
-      return unet&&m.eros_max_unet&&unet===m.eros_max_unet?'eros':'stock_quality';
-    }
-    function _loraFileCompatible(file,m=window.H3META||{}){
-      if(!file)return true;
-      const info=_compatForFile(file,m);
-      if(!info)return true; // unknown user LoRA: don't invent incompatibility
-      return (info.profiles||[]).includes(_compatProfileForUI(m))&&(info.modes||[]).includes(currentModelMode());
-    }
-    function _humanLoraName(file){
-      return String(file||'LoRA').replace(/\.safetensors$/i,'').replace(/[_-]+/g,' ').replace(/\s+/g,' ').trim();
-    }
-    function _cardKey(card){return card.kind==='catalog'?'catalog:'+card.catalogKey:'file:'+card.file}
-    function _loraSourceMap(m=window.H3META||{}){return m.lora_source_map||{}}
-    function _cardTitleHTML(card){
-      const label=esc(card.label||'LoRA');
-      const url=String(card.source_url||'').trim();
-      if(!url)return label;
-      return `<a class="loratitlelink" href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="Open source page">${label}</a>`;
-    }
-    function _stateForCard(card){
-      const k=_cardKey(card);
-      if(!LORA_CARD_STATE.has(k))LORA_CARD_STATE.set(k,{strength:0});
-      return LORA_CARD_STATE.get(k);
-    }
-    function _namedLoraCards(m=window.H3META||{}){
-      const cards=[];
-      const sourceMap=_loraSourceMap(m);
-      const catalogByFile=new Map((m.lora_catalog||[]).filter(x=>x.file).map(x=>[x.file,x]));
-      const seen=new Set();
-
-      // Keep the controls that were useful before: Motion Enhancer and the matching
-      // Fast-mode accelerator, but place them in this same stack.
-      if(m.motion8_file){
-        cards.push({kind:'motion8',file:m.motion8_file,label:'Motion Enhancer LoRA',available:!!m.motion8_available,
-          detail:'rzgar H3 FL2V 8-step',source_url:sourceMap[m.motion8_file]||''});seen.add(m.motion8_file);
-      }
-      const accelFile=currentModelMode()==='ref2va'?m.ref2va_lightning_file:m.lightning_file;
-      const accelAvailable=currentModelMode()==='ref2va'?m.ref2va_lightning_available:m.lightning_available;
-      if(accelFile){
-        cards.push({kind:'lightning',file:accelFile,label:'Fast-Mode Accelerator',available:!!accelAvailable,
-          detail:currentModelMode()==='ref2va'?'Ref2VA 4-step Turbo':'FL2VA 4-step Turbo',source_url:sourceMap[accelFile]||''});seen.add(accelFile);
-      }
-
-      // Installed creative LoRAs become named cards. /api/meta has already stripped
-      // adult filenames when Adult Mode is off, so they cannot leak into this list.
-      for(const file of (m.loras||[])){
-        if(!file||file==='none'||seen.has(file))continue;
-        const cat=catalogByFile.get(file),info=_compatForFile(file,m);
-        cards.push({kind:'creative',file,label:(cat&&cat.label)||(info&&info.label)||_humanLoraName(file),available:true,
-          adult:!!((cat&&cat.adult)||(info&&info.adult)),detail:cat&&cat.adult?'Adult LoRA':(info&&info.label)||'Installed LoRA',
-          source_url:(cat&&cat.source_page)||sourceMap[file]||''});
-        seen.add(file);
-      }
-
-      // Gated adult catalog rows only arrive from /api/meta after acknowledgement.
-      // Uninstalled rows still appear as named cards and install only when switched ON.
-      for(const cat of (m.lora_catalog||[])){
-        if(cat.file&&seen.has(cat.file))continue;
-        cards.push({kind:'catalog',catalogKey:cat.key,file:cat.file||'',label:cat.label||cat.key,adult:!!cat.adult,
-          available:true,installed:!!cat.installed,detail:cat.installed?'Adult LoRA':'Adult LoRA · download on enable',
-          source_url:cat.source_page||sourceMap[cat.file||'']||''});
-      }
-      return cards;
-    }
-    function _cardCompatible(card,m=window.H3META||{}){
-      if(card.kind==='motion8')return currentModelMode()==='fl2va'&&_compatProfileForUI(m)==='stock_quality'&&!!card.available;
-      if(card.kind==='lightning')return _compatProfileForUI(m)==='stock_quality'&&!!card.available;
-      if(card.kind==='catalog'&&!card.installed){
-        const cat=_catalogEntryForKey(card.catalogKey,m);
-        return !!cat&&(cat.profiles||['stock_quality']).includes(_compatProfileForUI(m))&&(cat.modes||['fl2va']).includes(currentModelMode());
-      }
-      return !!card.available&&_loraFileCompatible(card.file,m);
-    }
-    function _strengthForKind(kind,m=window.H3META||{}){
-      const card=_namedLoraCards(m).find(x=>x.kind===kind);
-      if(!card)return 0;
-      return Number(_stateForCard(card).strength||0);
-    }
-    function _setStrengthForKind(kind,strength,m=window.H3META||{}){
-      const card=_namedLoraCards(m).find(x=>x.kind===kind);
-      if(!card)return;
-      _stateForCard(card).strength=Number(strength||0);
-    }
-    async function _installCatalogCard(card){
-      const resp=await fetch('/api/loras/catalog_install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:card.catalogKey})});
-      const r=await resp.json();
-      if(r.adult_ack_required){const ok=await requestAdultAcknowledgement();if(!ok)return null;return _installCatalogCard(card)}
-      if(!resp.ok||r.error){await uiAlert(r.error||'LoRA install failed.','LoRA install failed');return null}
-      const oldKey=_cardKey(card),state=LORA_CARD_STATE.get(oldKey)||{strength:0};
-      LORA_CARD_STATE.delete(oldKey);LORA_CARD_STATE.set('file:'+r.file,state);
-      await loadMeta();
-      return r.file;
-    }
-    function renderNamedLoraRows(m=window.H3META||{}){
-      const box=$('unified_lora_rows');if(!box)return;box.innerHTML='';
-      const cards=_namedLoraCards(m);
-      if(!cards.length){
-        box.innerHTML='<div class="lorarow"><div class=lorarowhead><div><div class=lorarowtitle>No LoRAs available</div><div class=lorarowmeta>Install a compatible LoRA to add it here.</div></div></div></div>';
-        return;
-      }
-      for(const card of cards){
-        const st=_stateForCard(card),compatible=_cardCompatible(card,m);
-        // Compatibility never erases a user's selection. Incompatible cards are
-        // disabled/greyed and omitted from generation, then become active again if
-        // the user switches back to a compatible model or input mode.
-        const selected=Math.abs(Number(st.strength||0))>1e-6;
-        const active=compatible&&selected;
-        const row=document.createElement('div');row.className='lorarow'+(compatible?'':' incompatible');
-        const safeId='lc_'+Math.random().toString(36).slice(2);
-        const status=!compatible?`incompatible with current model / mode${selected?` · saved ${Number(st.strength).toFixed(2)}`:''}`:(active?`active · ${Number(st.strength).toFixed(2)}`:(card.kind==='catalog'&&!card.installed?'download on enable':'off'));
-        row.innerHTML=`<div class=lorarowhead><div><div class=lorarowtitle>${_cardTitleHTML(card)}</div><div class=lorarowmeta>${esc(status)}</div></div>`+
-          `<button class="loratoggle${selected?' on':''}" type=button aria-pressed="${selected?'true':'false'}" ${compatible?'':'disabled'}>${selected?'ON':'OFF'}</button></div>`+
-          `<div class=sliderline><input id="${safeId}" type=range min="0" max="5" step=".05" value="${Math.max(0,Math.min(5,Number(st.strength||0)))}" ${compatible?'':'disabled'}><input class="slidervalue loranumber" type=number step="any" value="${Number(st.strength||0).toFixed(2)}" aria-label="${esc(card.label)} strength" ${compatible?'':'disabled'}></div>`+
-          `<div class=hint>${esc(card.detail||'')}</div>`;
-        box.appendChild(row);
-        const slider=row.querySelector('input[type=range]'),out=row.querySelector('.loranumber'),toggle=row.querySelector('.loratoggle'),meta=row.querySelector('.lorarowmeta');
-        const sliderMin=0,sliderMax=5;
-        const sliderValueFor=n=>Math.max(sliderMin,Math.min(sliderMax,Number(n)));
-        const syncState=(n,{normalizeNumber=true}={})=>{
-          if(!Number.isFinite(n))return;
-          // The numeric field is authoritative and intentionally unbounded. The
-          // slider is only a 0–5 convenience control, so out-of-range numbers pin
-          // the thumb to the nearest endpoint without changing the stored strength.
-          st.strength=n;
-          slider.value=String(sliderValueFor(n));
-          if(normalizeNumber)out.value=String(n);
-          const on=Math.abs(n)>1e-6;
-          toggle.classList.toggle('on',on);toggle.textContent=on?'ON':'OFF';toggle.setAttribute('aria-pressed',on?'true':'false');
-          meta.textContent=on?`active · ${n}`:'off';
-        };
-        const commitNumber=v=>{const n=Number(v);if(Number.isFinite(n))syncState(n)};
-        slider.addEventListener('input',()=>syncState(Number(slider.value)));
-        out.addEventListener('input',()=>{
-          const raw=out.value.trim();
-          if(raw===''||raw==='-'||raw==='+'||raw==='.'||raw==='-.'||raw==='+.'||/[eE][+-]?$/.test(raw))return;
-          const n=Number(raw);if(Number.isFinite(n))syncState(n,{normalizeNumber:false});
-        });
-        out.addEventListener('change',()=>commitNumber(out.value));
-        out.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();commitNumber(out.value);out.blur()}});
-        toggle.onclick=async e=>{
-          e.preventDefault();
-          if(toggle.disabled)return;
-          const enabling=!toggle.classList.contains('on');
-
-          // The switch is authoritative: OFF always means strength 0.00 and ON
-          // always means strength 1.00. syncState updates the stored strength,
-          // numeric field, slider thumb, switch label, and status text together.
-          if(card.kind==='catalog'&&!card.installed){
-            if(!enabling){syncState(0);return}
-            toggle.disabled=true;
-            meta.textContent='downloading…';
-            const file=await _installCatalogCard(card);
-            if(!file){renderNamedLoraRows(window.H3META||{});return}
-            const ns=LORA_CARD_STATE.get('file:'+file)||{strength:0};
-            ns.strength=1;
-            LORA_CARD_STATE.set('file:'+file,ns);
-            renderNamedLoraRows(window.H3META||{});
-            return;
-          }
-          syncState(enabling?1:0);
-        };
-      }
-    }
-    function syncUnifiedLoraCompatibility(){renderNamedLoraRows(window.H3META||{})}
-    $('unet').addEventListener('change',syncUnifiedLoraCompatibility);
-
-    function activeCreativeLoraStack(){
-      const m=window.H3META||{},out=[];
-      for(const card of _namedLoraCards(m)){
-        if(card.kind!=='creative')continue;
-        const st=_stateForCard(card),strength=Number(st.strength||0);
-        if(card.file&&Math.abs(strength)>1e-6&&_cardCompatible(card,m))out.push({file:card.file,strength});
-      }
-      return out;
-    }
-    function submittedSpecialStrength(kind){
-      const m=window.H3META||{},card=_namedLoraCards(m).find(x=>x.kind===kind);
-      if(!card||!_cardCompatible(card,m))return 0;
-      return Number(_stateForCard(card).strength||0);
-    }
-    function resetNamedLoras(){
-      LORA_CARD_STATE.clear();renderNamedLoraRows(window.H3META||{});
-    }
-
-    async function _installUserLoraUrl(url){
-      let resp=await fetch('/api/loras/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
-      let r=await resp.json();
-      if(r.adult_ack_required){
-        const ok=await requestAdultAcknowledgement();
-        if(!ok)return null;
-        resp=await fetch('/api/loras/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
-        r=await resp.json();
-      }
-      if(r.error){await uiAlert(r.error,'LoRA install failed');return null}
-      return r;
-    }
-    $('install_lora').onclick=async()=>{
-      const url=await uiPrompt('Paste a direct Hugging Face .safetensors file URL or a MiniMax-H3 CivitAI model/version URL.','',{title:'Install LoRA',confirmLabel:'Install'});
-      if(!url)return;
-      say('installing LoRA…');$('install_lora').disabled=true;
-      try{
-        const r=await _installUserLoraUrl(url);if(!r)return;
-        await loadMeta();
-        LORA_CARD_STATE.set('file:'+r.file,{strength:1});
-        renderNamedLoraRows(window.H3META||{});
-        say('LoRA installed · '+r.file);
-      }catch(e){await uiAlert(String(e),'LoRA install failed')}finally{$('install_lora').disabled=false}
-    };
-
-    function syncMotionPace(){$('motion_pace_value').textContent=Number($('playback_speed').value||1).toFixed(2)+'×'}
-    $('playback_speed').addEventListener('input',syncMotionPace);syncMotionPace();
-
-    const AP_STORE_KEY='h3_auto_prompt_settings_v86';
-    const AP_LEGACY_STORE_KEY='h3_auto_prompt_settings_v83';
-    const AP_PROFILE_STORE_KEY='h3_auto_prompt_instruction_profiles_v86';
-    const AP_ACTIVE_PROFILE_KEY='h3_auto_prompt_active_profile_v86';
-    const AP_DEFAULT={model:'gpt-5.6-terra',customModel:'',extra:''};
-
-    function getAPSettings(){try{const raw=localStorage.getItem(AP_STORE_KEY)||localStorage.getItem(AP_LEGACY_STORE_KEY)||'{}';return {...AP_DEFAULT,...JSON.parse(raw)}}catch(e){return {...AP_DEFAULT}}}
-    function saveAPSettings(s){localStorage.setItem(AP_STORE_KEY,JSON.stringify({...AP_DEFAULT,...s}))}
-    function getAPProfiles(){try{const a=JSON.parse(localStorage.getItem(AP_PROFILE_STORE_KEY)||'[]');return Array.isArray(a)?a.filter(x=>x&&x.id&&x.name):[]}catch(e){return []}}
-    function saveAPProfiles(a){localStorage.setItem(AP_PROFILE_STORE_KEY,JSON.stringify(a))}
-    function activeAPProfileId(){return localStorage.getItem(AP_ACTIVE_PROFILE_KEY)||''}
-    function setActiveAPProfileId(id){if(id)localStorage.setItem(AP_ACTIVE_PROFILE_KEY,id);else localStorage.removeItem(AP_ACTIVE_PROFILE_KEY)}
-    function currentAPModel(){const s=getAPSettings();return s.model==='__custom__'?(s.customModel||'').trim():(s.model||AP_DEFAULT.model)}
-
-    function syncAPProfileSelectors(){
-      const profiles=getAPProfiles(),active=activeAPProfileId();
-      const opts=['<option value="">Current / unsaved</option>'].concat(profiles.map(p=>`<option value="${esc(p.id)}">${esc(p.name)}</option>`)).join('');
-      // Saved instruction profiles live only inside the ⚙ settings modal.
-      // Keep the main Prompt toolbar intentionally clean: AUTO PROMPT + settings only.
-      $('ap_profile_select').innerHTML=opts;
-      const valid=profiles.some(p=>p.id===active)?active:'';
-      $('ap_profile_select').value=valid;
-      const p=profiles.find(x=>x.id===valid);
-      $('ap_profile_name').value=p?p.name:'';
-      $('ap_profile_delete').disabled=!p;
-    }
-
-    function syncAPModal(){
-      const s=getAPSettings();
-      $('ap_model').value=[...$('ap_model').options].some(o=>o.value===s.model)?s.model:'__custom__';
-      $('ap_custom_model').value=s.customModel||((s.model&&!['gpt-5.6-terra','gpt-5.6-sol','gpt-5.6-luna','__custom__'].includes(s.model))?s.model:'');
-      $('ap_extra').value=s.extra||'';
-      $('ap_custom_wrap').style.display=$('ap_model').value==='__custom__'?'block':'none';
-      syncAPProfileSelectors();
-    }
-
-    function applyAPProfile(id){
-      if(!id){setActiveAPProfileId('');syncAPProfileSelectors();return}
-      const p=getAPProfiles().find(x=>x.id===id);if(!p)return;
-      saveAPSettings({model:p.model||AP_DEFAULT.model,customModel:p.customModel||'',extra:p.extra||''});
-      setActiveAPProfileId(id);syncAPModal();syncAPProfileSelectors();
-      $('auto_prompt_hint').innerHTML=`Auto Prompt instructions: <b>${esc(p.name)}</b> · model <b>${esc(currentAPModel())}</b>.`;
-      say('Auto Prompt profile selected · '+p.name);
-    }
-
-    async function checkAPKey(){const el=$('ap_key_status');el.className='apstatus';el.textContent='Checking OPENAI_API_KEY…';try{const d=await(await fetch('/api/auto_prompt/meta',{cache:'no-store'})).json();if(d.key_available){el.className='apstatus ok';el.textContent='✓ OPENAI_API_KEY available to Auto Prompt.'}else{el.className='apstatus err';el.textContent='OPENAI_API_KEY is not available to this UI process. Add it in Colab Secrets, then rerun V86.'}}catch(e){el.className='apstatus err';el.textContent='Could not check OPENAI_API_KEY.'}}
-    function openAPModal(){syncAPModal();$('auto_prompt_modal').classList.add('show');checkAPKey();$('ap_profile_select').focus()}
-    function closeAPModal(){$('auto_prompt_modal').classList.remove('show')}
-    $('auto_prompt_settings').onclick=openAPModal;$('ap_close').onclick=closeAPModal;$('ap_cancel').onclick=closeAPModal;
-    $('auto_prompt_modal').addEventListener('click',e=>{if(e.target===$('auto_prompt_modal'))closeAPModal()});
-    $('ap_model').onchange=()=>{$('ap_custom_wrap').style.display=$('ap_model').value==='__custom__'?'block':'none'};
-    $('ap_profile_select').onchange=()=>applyAPProfile($('ap_profile_select').value);
-
-    $('ap_profile_save').onclick=()=>{
-      const name=$('ap_profile_name').value.trim(),model=$('ap_model').value,customModel=$('ap_custom_model').value.trim(),extra=$('ap_extra').value;
-      if(!name){$('ap_key_status').className='apstatus err';$('ap_key_status').textContent='Give this instruction profile a name first.';return}
-      if(model==='__custom__'&&!customModel){$('ap_key_status').className='apstatus err';$('ap_key_status').textContent='Enter a custom model ID first.';return}
-      const profiles=getAPProfiles();let id=activeAPProfileId();const active=profiles.find(p=>p.id===id);
-      if(!active||active.name!==name){const same=profiles.find(p=>p.name.toLowerCase()===name.toLowerCase());id=same?same.id:((crypto&&crypto.randomUUID)?crypto.randomUUID():`${Date.now()}-${Math.random()}`)}
-      const row={id,name,model,customModel,extra,updated:Date.now()},idx=profiles.findIndex(p=>p.id===id);
-      if(idx>=0)profiles[idx]=row;else profiles.push(row);
-      profiles.sort((a,b)=>a.name.localeCompare(b.name));saveAPProfiles(profiles);saveAPSettings({model,customModel,extra});setActiveAPProfileId(id);syncAPProfileSelectors();
-      $('ap_key_status').className='apstatus ok';$('ap_key_status').textContent=`✓ Saved instruction profile "${name}".`;
-      $('auto_prompt_hint').innerHTML=`Auto Prompt instructions: <b>${esc(name)}</b> · model <b>${esc(model==='__custom__'?customModel:model)}</b>.`;
-      say('Auto Prompt instruction profile saved · '+name);
-    };
-
-    $('ap_profile_delete').onclick=async()=>{
-      const id=activeAPProfileId(),p=getAPProfiles().find(x=>x.id===id);if(!p)return;
-      const ok=await uiConfirm(`Delete saved Auto Prompt instruction profile "${p.name}"?`,{title:'Delete Auto Prompt profile',confirmLabel:'Delete'});if(!ok)return;
-      saveAPProfiles(getAPProfiles().filter(x=>x.id!==id));setActiveAPProfileId('');syncAPProfileSelectors();$('ap_profile_name').value='';
-      $('ap_key_status').className='apstatus';$('ap_key_status').textContent='Profile deleted. Current instructions remain until you change them.';say('Auto Prompt profile deleted');
-    };
-
-    $('ap_save').onclick=()=>{
-      const model=$('ap_model').value,customModel=$('ap_custom_model').value.trim(),extra=$('ap_extra').value;
-      if(model==='__custom__'&&!customModel){$('ap_key_status').className='apstatus err';$('ap_key_status').textContent='Enter a custom model ID first.';return}
-      saveAPSettings({model,customModel,extra});
-      const active=getAPProfiles().find(p=>p.id===activeAPProfileId());
-      if(active&&(active.model!==model||active.customModel!==customModel||active.extra!==extra))setActiveAPProfileId('');
-      syncAPProfileSelectors();closeAPModal();
-      $('auto_prompt_hint').innerHTML=`Auto Prompt model: <b>${esc(model==='__custom__'?customModel:model)}</b> · current instructions saved locally.`;
-      say('Auto Prompt settings saved');
-    };
-
-    syncAPProfileSelectors();
-    $('auto_prompt_btn').onclick=async()=>{
-      const s=getAPSettings(),model=currentAPModel(),btn=$('auto_prompt_btn'),hint=$('auto_prompt_hint');
-      if(!model){openAPModal();return}
-      const fd=new FormData();
-      fd.append('rough_prompt',$('prompt').value||'');
-      fd.append('model',model);
-      fd.append('extra_instructions',s.extra||'');
-      for(const k of ['duration','width','height','playback_speed','use_stage_last'])fd.append(k,$(k).value);
-      for(const k of ['first_frame','last_frame'])if($(k).files[0])fd.append(k,$(k).files[0]);
-      btn.disabled=true;btn.classList.add('working');btn.textContent='✦ WRITING H3 PROMPT…';
-      hint.textContent='Analyzing intent'+(($('first_frame').files[0]||$('last_frame').files[0]||$('use_stage_last').value==='1')?' + reference frame(s)':'')+'…';
-      say('Auto Prompt · '+model);
-      try{
-        const resp=await fetch('/api/auto_prompt',{method:'POST',body:fd});
-        const r=await resp.json();
-        if(r.adult_ack_required){
-          const ok=await requestAdultAcknowledgement();
-          if(ok){setTimeout(()=>$('auto_prompt_btn').click(),0);return}
-          hint.textContent='Adult Auto Prompt request cancelled; rough prompt preserved.';
-          return;
-        }
-        if(r.error){
-          hint.innerHTML=`<span style="color:#ff8181">${esc(r.error)}</span><br>Raw prompt preserved — GENERATE still sends it directly to local H3.`;
-          say('Auto Prompt failed · raw prompt preserved');return
-        }
-        $('prompt').value=r.prompt||'';$('prompt').dispatchEvent(new Event('input',{bubbles:true}));
-        const refs=[r.used_first_image?'FIRST':null,r.used_last_image?'LAST':null].filter(Boolean).join(' + ');
-        hint.innerHTML=`✓ <b>${esc(r.model)}</b> · ${esc(String(r.mode||'').toUpperCase())}${refs?` · ${refs} vision reference${refs.includes(' + ')?'s':''} used`:''}`;
-        say('Auto Prompt ready · prompt field populated')
-      }catch(e){
-        hint.innerHTML=`<span style="color:#ff8181">Auto Prompt request failed: ${esc(e)}</span><br>Raw prompt preserved — GENERATE remains local.`;
-        say('Auto Prompt failed · raw prompt preserved')
-      }finally{
-        btn.disabled=false;btn.classList.remove('working');btn.textContent='✦ AUTO PROMPT'
-      }
-    };
-    function syncStageClear(){
-      const hasVideo=!!$('vwrap').querySelector('video');
-      $('stage_controls').style.display=hasVideo?'flex':'none';
-    }
-    async function _waitForVideoMetadata(v){
-      if(Number.isFinite(v.duration)&&v.duration>0&&v.videoWidth&&v.videoHeight)return;
-      await new Promise((resolve,reject)=>{
-        const done=()=>{cleanup();resolve()};
-        const fail=()=>{cleanup();reject(new Error('Could not read staged video metadata.'))};
-        const cleanup=()=>{v.removeEventListener('loadedmetadata',done);v.removeEventListener('error',fail)};
-        v.addEventListener('loadedmetadata',done,{once:true});
-        v.addEventListener('error',fail,{once:true});
-        try{v.load()}catch(_){}
-      });
-    }
-    async function stageLastFrameToFirst(){
-      const v=$('vwrap').querySelector('video');
-      if(!v){await uiAlert('Put a clip on the Stage first.','No staged clip');return}
-      const btn=$('stage_last_to_first');
-      const originalText=btn.textContent;
-      btn.classList.add('working');btn.textContent='CAPTURING…';
-      try{
-        await _waitForVideoMetadata(v);
-        const wasPaused=v.paused;
-        const oldTime=Number.isFinite(v.currentTime)?v.currentTime:0;
-        try{v.pause()}catch(_){}
-        const frameStep=1/24;
-        const target=Math.max(0,Number(v.duration)-frameStep);
-        if(Math.abs(v.currentTime-target)>0.002){
-          await new Promise((resolve,reject)=>{
-            let settled=false;
-            const finish=()=>{if(settled)return;settled=true;cleanup();resolve()};
-            const fail=()=>{if(settled)return;settled=true;cleanup();reject(new Error('Could not seek to the last frame.'))};
-            const cleanup=()=>{v.removeEventListener('seeked',finish);v.removeEventListener('error',fail)};
-            v.addEventListener('seeked',finish,{once:true});
-            v.addEventListener('error',fail,{once:true});
-            v.currentTime=target;
-          });
-        }
-        const canvas=document.createElement('canvas');
-        canvas.width=v.videoWidth;canvas.height=v.videoHeight;
-        const ctx=canvas.getContext('2d',{alpha:false});
-        if(!ctx)throw new Error('Canvas capture is unavailable in this browser.');
-        ctx.drawImage(v,0,0,canvas.width,canvas.height);
-        const blob=await new Promise((resolve,reject)=>canvas.toBlob(b=>b?resolve(b):reject(new Error('Could not encode the captured frame.')),'image/png'));
-        const file=new File([blob],`stage_last_${Date.now()}.png`,{type:'image/png'});
-        const dt=new DataTransfer();dt.items.add(file);
-        $('first_frame').files=dt.files;
-
-        // The existing first-frame change handler updates the preview, aspect,
-        // continuation flag, and generation payload exactly like a normal upload.
-        $('first_frame').dispatchEvent(new Event('change',{bubbles:true}));
-        if(currentModelMode()!=='fl2va')await setModelMode('fl2va');
-
-        // Restore the viewer position so grabbing a frame does not wreck the Stage.
-        try{
-          if(Number.isFinite(oldTime)&&Math.abs(oldTime-target)>0.002)v.currentTime=Math.min(oldTime,v.duration||oldTime);
-          if(!wasPaused){
-            const playPromise=v.play();
-            if(playPromise&&playPromise.catch)playPromise.catch(()=>{});
-          }
-        }catch(_){}
-        say('stage last frame assigned to FIRST FRAME');
-      }catch(e){
-        await uiAlert(String(e&&e.message?e.message:e),'Could not capture last frame');
-      }finally{
-        btn.classList.remove('working');btn.textContent=originalText;
-      }
-    }
-    $('stage_last_to_first').onclick=stageLastFrameToFirst;
-    $('clear_stage').onclick=()=>{$('vwrap').innerHTML='<div id="empty">generated video appears here</div>';$('meta').textContent='';syncStageClear();say('stage cleared')};
-    syncStageClear();
-
-    function setPanelMin(panel,on){panel.classList.toggle('minimized',!!on)}
-    $('history_hide').onclick=()=>{$('history_panel').style.display='none'};
-    $('queue_hide').onclick=()=>{$('queue_panel').style.display='none'};
-    $('show_history').onclick=()=>{setPanelMin($('history_panel'),false);$('history_panel').style.display='block';$('history_panel').style.zIndex=1210};
-    $('show_queue').onclick=()=>{setPanelMin($('queue_panel'),false);$('queue_panel').style.display='block';$('queue_panel').style.zIndex=1210};
-    $('show_console').onclick=()=>{$('consolebox').style.display='block';$('consolebox').style.zIndex=1220};
-    $('history_expand').onclick=()=>{const p=$('history_panel');const big=p.dataset.big==='1';p.dataset.big=big?'0':'1';p.style.width=big?'':'min(500px,calc(100vw - 20px))';$('history_expand').textContent=big?'⛶ Expand':'↙ Normal'};
-    function makeFloating(panel){
-      const head=panel.querySelector('.floathead');let drag=null;
-      head.addEventListener('pointerdown',e=>{if(e.target.closest('button'))return;const r=panel.getBoundingClientRect();drag={dx:e.clientX-r.left,dy:e.clientY-r.top};head.setPointerCapture(e.pointerId)});
-      head.addEventListener('pointermove',e=>{if(!drag)return;const x=Math.max(4,Math.min(window.innerWidth-panel.offsetWidth-4,e.clientX-drag.dx));const y=Math.max(4,Math.min(window.innerHeight-panel.offsetHeight-4,e.clientY-drag.dy));panel.style.left=x+'px';panel.style.top=y+'px';panel.style.right='auto';panel.style.bottom='auto'});
-      head.addEventListener('pointerup',e=>{drag=null;try{head.releasePointerCapture(e.pointerId)}catch(_){}});
-    }
-    makeFloating($('history_panel'));makeFloating($('queue_panel'));makeFloating($('consolebox'));
-
-    // Live raw stdout/stderr from the Python/ComfyUI process. This is global because
-    // the studio only allows one GPU generation at a time.
-    let consoleSeq=0;
-    let consolePaused=false;
-    $('clearconsole').onclick=e=>{e.preventDefault();$('console').textContent='';};
-    $('copyconsole').onclick=async e=>{
-      e.preventDefault();
-      const text=$('console').textContent||'';
-      const btn=$('copyconsole');
-      try{
-        if(navigator.clipboard&&window.isSecureContext){
-          await navigator.clipboard.writeText(text);
-        }else{
-          const ta=document.createElement('textarea'); ta.value=text; ta.style.position='absolute'; ta.style.left='-9999px';
-          document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove();
-        }
-        const old=btn.textContent; btn.textContent='COPIED'; setTimeout(()=>btn.textContent=old,900);
-      }catch(err){
-        const old=btn.textContent; btn.textContent='COPY FAILED'; setTimeout(()=>btn.textContent=old,1200);
-      }
-    };
-    $('minconsole').onclick=e=>{e.preventDefault();$('consolebox').style.display='none'};
-    async function pollConsole(){
-      try{
-        const r=await fetch('/api/console?since='+consoleSeq,{cache:'no-store'});
-        const d=await r.json();
-        if(Array.isArray(d.lines)&&d.lines.length){
-          const box=$('console');
-          const nearBottom=(box.scrollHeight-box.scrollTop-box.clientHeight)<50;
-          for(const row of d.lines){
-            const text=(row.stream==='stderr'?'[stderr] ':'')+row.text+'\n';
-            box.appendChild(document.createTextNode(text));
-            consoleSeq=Math.max(consoleSeq,Number(row.seq||0));
-          }
-          // Avoid unbounded browser DOM growth while retaining a useful raw tail.
-          if(box.textContent.length>240000) box.textContent=box.textContent.slice(-180000);
-          if(nearBottom) box.scrollTop=box.scrollHeight;
-        }else if(Number(d.latest||0)>consoleSeq){
-          consoleSeq=Number(d.latest||0);
-        }
-      }catch(e){}
-      setTimeout(pollConsole,700);
-    }
-    pollConsole();
-
-    // Continuous GPU telemetry. This is independent of job polling, so it remains
-    // visible during model load/unload, VAE decode, muxing, and after an error.
-    async function pollGPU(){
-      try{
-        const r=await fetch('/api/gpu',{cache:'no-store'});
-        const d=await r.json();
-        if(d.ok){
-          const util=Number(d.util||0), mu=Number(d.mem_util||0);
-          const used=Number(d.mem_used_mb||0)/1024, total=Number(d.mem_total_mb||0)/1024;
-          const temp=Number(d.temp_c||0), pw=Number(d.power_w||0), pl=Number(d.power_limit_w||0);
-          $('gpu_util').textContent=util.toFixed(0)+'%';
-          $('gpu_vram').textContent=used.toFixed(1)+' / '+total.toFixed(1)+' GiB';
-          $('gpu_memutil').textContent=mu.toFixed(0)+'%';
-          $('gpu_temp').textContent=temp.toFixed(0)+' °C';
-          $('gpu_power').textContent=pw.toFixed(0)+' / '+pl.toFixed(0)+' W';
-          $('gpu_clock').textContent=Number(d.clock_mhz||0).toFixed(0)+' MHz';
-          $('gpu_util').className='gpuv '+(util>=70?'busy':'');
-          $('gpu_temp').className='gpuv '+(temp>=80?'hot':'');
-        }else{
-          $('gpu_util').textContent='nvidia-smi unavailable';
-        }
-      }catch(e){}
-      setTimeout(pollGPU,1000);
-    }
-    pollGPU();
-
-    // H3 uses a fixed 24-fps latent clock and legal frame lengths 17*n+5.
-    function snapFrames(v){
-      v=Number(v||5);
-      let k=Math.round((v-5)/17);
-      return Math.max(5,Math.min(3592,17*Math.max(0,k)+5));
-    }
-    function updateDur(){
-      const mode=$('length_mode').value;
-      const speed=Math.max(.05,Number($('playback_speed').value||1));
-      let f;
-      if(mode==='frames'){
-        f=snapFrames(Number($('frames').value||124));
-      }else{
-        const finalSec=Math.max(.01,Number($('duration').value||7));
-        f=snapFrames(finalSec*speed*24);
-      }
-      const modelSec=f/24, finalSec=modelSec/speed;
-      const trained=f>=124&&f<=362;
-      syncMotionPace();
-      $('durhint').innerHTML=`→ H3 model: <b>${f} frames / ${modelSec.toFixed(2)}s</b> · final MP4 ≈ <b>${finalSec.toFixed(2)}s</b> · motion pace ${speed.toFixed(2)}×`+
-        (trained?'':`<br><span style="color:#c9a227">outside the best-tested 124–362 frame range (≈5.2–15.1s model time); H3 accepts it, but quality/memory are less predictable.</span>`);
-    }
-    $('duration').addEventListener('input',()=>{$('length_mode').value='seconds';updateDur();});
-    $('frames').addEventListener('input',()=>{$('length_mode').value='frames';updateDur();});
-    $('playback_speed').addEventListener('input',updateDur);
-
-    function updateSparseUI(source){
-      let pct;
-      if(source==='slider'){
-        pct=Number($('sparse_slider').value||0);
-        $('sparse_percent').value=pct;
-      }else{
-        pct=Math.max(0,Math.min(100,Number($('sparse_percent').value||0)));
-        $('sparse_percent').value=pct;
-        $('sparse_slider').value=pct;
-      }
-      const m=window.H3META||{};
-      if(m.sparse_available===false){
-        $('sparsehint').textContent='Sparse attention is unavailable in this session. Set this to 0% or restart V37.';
-      }else if(pct<=0){
-        $('sparsehint').innerHTML='<b>Dense / max quality.</b> Sparse attention is disabled.';
-      }else{
-        $('sparsehint').innerHTML=`<b>${pct.toFixed(1)}% video-attention budget.</b> Lower is faster; raise this if detail or motion quality drops. 0% = dense.`;
-      }
-    }
-    $('sparse_slider').addEventListener('input',()=>updateSparseUI('slider'));
-    $('sparse_percent').addEventListener('input',()=>updateSparseUI('number'));
-    $('length_mode').addEventListener('change',updateDur);
-    updateDur();
-
-    let firstImageDims=null;
-    function snap32(v){return Math.max(32,Math.round(v/32)*32)}
-    function fitCanvas(){
-      if(!firstImageDims){say('choose a first frame first');return}
-      const short=Math.max(256,snap32(Number($('short_edge').value||768)));
-      const ar=firstImageDims.w/firstImageDims.h;
-      let w,h;
-      if(ar>=1){h=short;w=Math.max(32,Math.floor((short*ar)/32)*32)}
-      else{w=short;h=Math.max(32,Math.floor((short/ar)/32)*32)}
-      $('width').value=w;$('height').value=h;
-      say(`canvas fitted to ${w}×${h}`);
-    }
-    function releaseSlotObjectURL(img){const u=img.dataset.objectUrl;if(u){try{URL.revokeObjectURL(u)}catch(_){}delete img.dataset.objectUrl}}
-    function clearImageSlot(kind,{keepContinuation=false}={}){
-      const input=$(kind+'_frame'),img=$(kind+'_preview'),slot=$(kind+'_slot');
-      releaseSlotObjectURL(img);input.value='';img.removeAttribute('src');slot.classList.remove('has-image');delete slot.dataset.source;
-      if(kind==='first'){firstImageDims=null;if(!keepContinuation){stageButtonActive(false);refreshStageState(true)}}
-    }
-    function showImageModal(src){if(!src)return;$('image_view_full').src=src;$('image_view_modal').classList.add('show')}
-    function closeImageModal(){$('image_view_modal').classList.remove('show');$('image_view_full').removeAttribute('src')}
-    $('image_view_close').onclick=closeImageModal;$('image_view_modal').addEventListener('click',e=>{if(e.target===$('image_view_modal'))closeImageModal()});
-    function bindImageSlot(kind,isFirst){
-      const input=$(kind+'_frame'),img=$(kind+'_preview'),slot=$(kind+'_slot'),trash=$(kind+'_trash');
-      function openOrPick(){if(slot.classList.contains('has-image')&&img.src)showImageModal(img.src);else input.click()}
-      slot.addEventListener('click',e=>{if(e.target.closest('.slottrash'))return;openOrPick()});
-      slot.addEventListener('keydown',e=>{if((e.key==='Enter'||e.key===' ')&&!e.target.closest('.slottrash')){e.preventDefault();openOrPick()}});
-      trash.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();clearImageSlot(kind);say(kind+' frame cleared')});
-      input.addEventListener('change',()=>{
-        const f=input.files[0];if(!f){clearImageSlot(kind,{keepContinuation:true});return}
-        if(isFirst){stageButtonActive(false);refreshStageState(true)}
-        releaseSlotObjectURL(img);const u=URL.createObjectURL(f);img.dataset.objectUrl=u;
-        img.onload=()=>{slot.classList.add('has-image');slot.dataset.source='upload';if(isFirst){firstImageDims={w:img.naturalWidth,h:img.naturalHeight};if($('auto_aspect').checked)fitCanvas()}};
-        img.src=u;
-      });
-    }
-    bindImageSlot('first',true);bindImageSlot('last',false);
-    function clearRefImageSlot(index){const input=$('ref_image_'+index),img=$('ref_image_preview_'+index),slot=$('ref_image_slot_'+index);releaseSlotObjectURL(img);input.value='';img.removeAttribute('src');slot.classList.remove('has-image');delete slot.dataset.source}
-    function bindRefImageSlot(index){const input=$('ref_image_'+index),img=$('ref_image_preview_'+index),slot=$('ref_image_slot_'+index),trash=$('ref_image_trash_'+index);function openOrPick(){if(slot.classList.contains('has-image')&&img.src)showImageModal(img.src);else input.click()}slot.addEventListener('click',e=>{if(e.target.closest('.slottrash'))return;openOrPick()});slot.addEventListener('keydown',e=>{if((e.key==='Enter'||e.key===' ')&&!e.target.closest('.slottrash')){e.preventDefault();openOrPick()}});trash.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();clearRefImageSlot(index);say('reference image '+index+' cleared')});input.addEventListener('change',()=>{const f=input.files[0];if(!f){clearRefImageSlot(index);return}releaseSlotObjectURL(img);const u=URL.createObjectURL(f);img.dataset.objectUrl=u;img.onload=()=>{slot.classList.add('has-image');slot.dataset.source='upload'};img.src=u})}
-    function bindNamedFileInput(prefix,index,emptyLabel){const input=$(prefix+'_'+index),pick=$(prefix+'_pick_'+index),clear=$(prefix+'_clear_'+index),name=$(prefix+'_name_'+index);const sync=()=>{const f=input.files[0];name.textContent=f?f.name:emptyLabel;clear.disabled=!f};pick.onclick=e=>{e.preventDefault();input.click()};clear.onclick=e=>{e.preventDefault();input.value='';sync();say(prefix.replace('_',' ')+' '+index+' cleared')};input.addEventListener('change',sync);sync()}
-    for(let i=1;i<=9;i++)bindRefImageSlot(i);
-    for(let i=1;i<=3;i++){bindNamedFileInput('ref_video',i,'No video selected');bindNamedFileInput('ref_audio',i,'No audio selected')}
-    function clearFirstPreview(){clearImageSlot('first',{keepContinuation:true})}
-    function stageButtonActive(on){$('use_stage_last').value=on?'1':'0'}
-    async function refreshStageState(quiet=false){
-      try{const s=await (await fetch('/api/stage_state')).json();window.STAGE_STATE=s||{ok:false};return s}catch(e){if(!quiet)console.warn(e);return null}
-    }
-
-    let firstMeta=true;
-    function loadMeta(){
-      const prevSampler=$('sampler_name').value,prevScheduler=$('scheduler').value,prevUnet=$('unet').value;
-      return fetch('/api/meta').then(r=>r.json()).then(m=>{
-        window.H3META=m;
-        window.ADULT_ENABLED=!!m.adult_enabled;
-        syncAdultModeButton(m);
-        if(firstMeta)ACTIVE_MODEL_PROFILE='stock_quality';
-
-        $('sampler_name').innerHTML=(m.samplers||[]).map(s=>`<option>${esc(s)}</option>`).join('');
-        $('scheduler').innerHTML=(m.schedulers||[]).map(s=>`<option>${esc(s)}</option>`).join('');
-        if((m.samplers||[]).includes(prevSampler))$('sampler_name').value=prevSampler;
-        else if((m.samplers||[]).includes(m.stock_quality_sampler||'res_multistep'))$('sampler_name').value=m.stock_quality_sampler||'res_multistep';
-        if((m.schedulers||[]).includes(prevScheduler))$('scheduler').value=prevScheduler;
-        else if((m.schedulers||[]).includes(m.stock_quality_scheduler||'simple'))$('scheduler').value=m.stock_quality_scheduler||'simple';
-
-        syncModelProfileOptions(m);
-
-        $('unet').innerHTML=(m.unets||[]).map(s=>`<option value="${esc(s)}">${esc(s)}</option>`).join('');
-        if(prevUnet&&(m.unets||[]).includes(prevUnet))$('unet').value=prevUnet;
-        else if(m.unet_default&&(m.unets||[]).includes(m.unet_default))$('unet').value=m.unet_default;
-
-        renderNamedLoraRows(m);
-
-        if(firstMeta){
-          // Safe startup: Stock H3, all creative LoRAs OFF. Adult catalog stays hidden.
-          $('length_mode').value='seconds';
-          ACTIVE_MODEL_PROFILE='stock_quality';
-          $('model_profile_select').value='stock_quality';
-          $('duration').value=m.lowvram_t4?5.17:7;
-          $('frames').value=m.lowvram_t4?124:175;
-          if(m.lowvram_t4){
-            $('width').value=640;$('height').value=480;$('short_edge').value=480;
-            $('model_profile_select').disabled=true;
-          }
-          LORA_CARD_STATE.clear();
-          _setStrengthForKind('lightning',0,m);
-          _setStrengthForKind('motion8',0,m);
-          $('playback_speed').value=1.0;$('denoise').value=1.0;
-          $('steps').value=m.stock_quality_steps||20;
-          if((m.samplers||[]).includes(m.stock_quality_sampler||'res_multistep'))$('sampler_name').value=m.stock_quality_sampler||'res_multistep';
-          if((m.schedulers||[]).includes(m.stock_quality_scheduler||'simple'))$('scheduler').value=m.stock_quality_scheduler||'simple';
-          $('shift_video').value=m.stock_quality_shift_video??12;
-          $('shift_audio').value=m.stock_quality_shift_audio??3;
-          $('sparse_percent').value=0;$('sparse_slider').value=0;updateSparseUI('number');
-          updateDur();
-          say(m.lowvram_t4
-            ? 'ready · T4 LOW-VRAM · Stock H3'
-            : 'ready · Stock H3');
-          firstMeta=false;
-        }else if(!m.adult_enabled&&['eros','redmix'].includes(ACTIVE_MODEL_PROFILE)){
-          // A restarted/expired browser session must fail closed back to the safe model.
-          ACTIVE_MODEL_PROFILE='stock_quality';
-          const target=currentModelMode()==='ref2va'?m.stock_ref2va_unet:m.base_fl2va_unet;
-          if(target&&(m.unets||[]).includes(target))$('unet').value=target;
-        }
-
-        $('tab_ref2va').disabled=!m.ref2va_available;
-        if(!m.ref2va_available && currentModelMode()==='ref2va'){
-          localStorage.setItem(MODEL_MODE_STORE_KEY,'fl2va');$('input_mode').value='fl2va';
-        }
-        syncModelModeUI();
-        syncModelProfileUI();
-        syncUnifiedLoraCompatibility();
-
-        const arch=$('arch_label');
-        if(arch)arch.textContent=(m.gpu_arch_label||m.gpu_profile||'AUTO GPU').toUpperCase();
-        const mh=$('modelhint');
-        if(mh){
-          const profileBlurb=m.lowvram_t4
-            ? '<b>T4 / 16GB LOW-VRAM STACK</b> · Q4_0 GGUF + Dynamic VRAM · Stock H3 only.'
-            : (m.a100_80
-              ? '<b>A100 80GB QUALITY STACK</b> · native SM80 quality path.'
-              : (m.a100_40
-                ? '<b>A100 40GB QUALITY STACK</b> · sequential TE→DiT→VAE handoff.'
-                : '<b>BLACKWELL SM120 QUALITY STACK</b> · CUDA13 quality path.'));
-          mh.innerHTML=profileBlurb
-            + `<br><span style="color:#9aa0aa">Residency</span> · ${m.lowvram_t4?'DYNAMIC VRAM / CPU↔GPU paging':(m.full_stack_residency?'FULL STACK RESIDENT':'PARTITIONED TE↔DiT handoff')} · ${m.physical_vram_gib||'?'} GiB physical`
-            + `<br><span style="color:#9aa0aa">Conditioning TE</span> · ${m.quality_text_encoder||'Qwen3-VL-32B'}`
-            + '<br>' + (m.ref2va_available
-              ? `<span style="color:#9aa0aa">Ref2VA available</span> · stock Ref2VA downloads on first use · ${m.ref2va_max_images||9} image / ${m.ref2va_max_videos||3} video / ${m.ref2va_max_audios||3} audio slots.`
-              : '<span style="color:#d99191">Ref2VA unavailable</span> · update ComfyUI to expose MiniMaxH3ReferenceToVideo.');
-        }
-        return m;
-      });
-    }
-    syncModelModeUI();
-    loadMeta();
-    refreshStageState(true);
-    refreshTimeline(true);
-    $('project_menu_btn').onclick=()=>{$('project_popover').classList.toggle('show')};
-    $('project_pop_close').onclick=()=>{$('project_popover').classList.remove('show')};
-    document.addEventListener('click',e=>{const p=$('project_popover');if(!p.classList.contains('show'))return;if(e.target.closest('#project_popover')||e.target.closest('#project_menu_btn'))return;p.classList.remove('show')});
-    $('refresh').onclick=e=>{e.preventDefault();loadMeta().then(m=>
-      say(`${Math.max(0,(m.loras||[]).length-1)} visible LoRA(s) found`))};
-
-    function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-    function previewTimelineFile(file){
-      if(!file)return;
-      $('vwrap').innerHTML=`<video controls autoplay src="/out/${encodeURIComponent(file)}?t=${Date.now()}"></video>`;
-      syncStageClear();
-    }
-    async function deleteTimelineClip(segmentId){
-      if(!(await uiConfirm('Remove this clip from the active timeline? The render will remain available in History.',{title:'Remove clip',confirmLabel:'Remove',danger:true})))return;
-      const r=await(await fetch('/api/timeline/segment/'+encodeURIComponent(segmentId),{method:'DELETE'})).json();
-      if(r.error){fail(r.error);return}await refreshTimeline(true);say('clip removed and sequence restitched');
-    }
-    async function sendTimelineOrder(){
-      const order=[...document.querySelectorAll('#timeline .tclip')].map(el=>el.dataset.segment);
-      const r=await(await fetch('/api/timeline/reorder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order})})).json();
-      if(r.error){fail(r.error);return}await refreshTimeline(true);say('timeline reordered + restitched');
-    }
-    const timelineDropInflight=new Set();
-    async function addHistoryToTimeline(historyId,index=null,dragId=null){
-      const key=dragId||`${historyId}:${index===null?'end':index}`;
-      if(timelineDropInflight.has(key))return;
-      timelineDropInflight.add(key);
-      try{
-        const r=await(await fetch('/api/timeline/add_history',{
-          method:'POST',
-          headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({history_id:historyId,index,drag_id:dragId})
-        })).json();
-        if(r.error){fail(r.error);return}
-        if(!r.duplicate_suppressed){
-          await refreshTimeline(true);
-          say('1 history clip added to active timeline');
-        }
-      }finally{
-        timelineDropInflight.delete(key);
-      }
-    }
-    function wireTimelineDnD(){
-      const tl=$('timeline');
-      let dragging=null;
-
-      // Clip-level listeners live on freshly-rendered nodes, so these do not accumulate.
-      [...tl.querySelectorAll('.tclip')].forEach(el=>{
-        el.draggable=true;
-        el.addEventListener('dragstart',e=>{
-          dragging=el;
-          el.classList.add('dragging');
-          e.dataTransfer.effectAllowed='move';
-          e.dataTransfer.setData('application/x-h3-segment',el.dataset.segment);
-        });
-        el.addEventListener('dragend',()=>{
-          el.classList.remove('dragging');
-          dragging=null;
-          [...tl.querySelectorAll('.tclip')].forEach(x=>x.classList.remove('drop-before','drop-after'));
-        });
-        el.addEventListener('dragover',e=>{
-          e.preventDefault();
-          e.stopPropagation();
-          const r=el.getBoundingClientRect();
-          el.classList.toggle('drop-before',e.clientX<r.left+r.width/2);
-          el.classList.toggle('drop-after',e.clientX>=r.left+r.width/2);
-        });
-        el.addEventListener('dragleave',()=>el.classList.remove('drop-before','drop-after'));
-        el.addEventListener('drop',async e=>{
-          e.preventDefault();
-          e.stopPropagation();
-          const r=el.getBoundingClientRect();
-          const before=e.clientX<r.left+r.width/2;
-          const hid=e.dataTransfer.getData('application/x-h3-history');
-          const dragId=e.dataTransfer.getData('application/x-h3-drag-id')||null;
-          if(hid){
-            const clips=[...tl.querySelectorAll('.tclip')];
-            const idx=Math.max(0,clips.indexOf(el)+(before?0:1));
-            await addHistoryToTimeline(hid,idx,dragId);
-            return;
-          }
-          if(dragging&&dragging!==el){
-            el.parentNode.insertBefore(dragging,before?el:el.nextSibling);
-            await sendTimelineOrder();
-          }
-        });
-      });
-
-      // IMPORTANT: these are property handlers, not addEventListener().
-      // refreshTimeline() calls wireTimelineDnD repeatedly, and addEventListener()
-      // used to stack duplicate drop callbacks on the persistent timeline node.
-      tl.ondragover=e=>{
-        if(e.dataTransfer && [...e.dataTransfer.types].includes('application/x-h3-history')){
-          e.preventDefault();
-          tl.classList.add('drop-target');
-        }
-      };
-      tl.ondragleave=e=>{
-        if(!tl.contains(e.relatedTarget))tl.classList.remove('drop-target');
-      };
-      tl.ondrop=async e=>{
-        tl.classList.remove('drop-target');
-        const hid=e.dataTransfer?.getData('application/x-h3-history');
-        if(!hid)return;
-        e.preventDefault();
-        if(e.target.closest('.tclip'))return;
-        const dragId=e.dataTransfer.getData('application/x-h3-drag-id')||null;
-        await addHistoryToTimeline(hid,null,dragId);
-      };
-    }
-    $('sequence_select').addEventListener('change',async e=>{
-      if(!e.target.value)return;
-      const r=await(await fetch('/api/timeline/select_sequence',{
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({sequence_id:e.target.value})
-      })).json();
-      if(r.error){fail(r.error);return}
-      refreshTimeline(true);
-      say('active sequence changed');
-    });
-
-    async function refreshTimeline(quiet=false){
-      let t;
-      try{t=await (await fetch('/api/timeline')).json()}catch(e){if(!quiet)console.warn(e);return null}
-      window.H3TIMELINE=t;
-      const segs=t.segments||[];const seqs=t.sequences||[];const active=t.active_sequence||{};
-      if(document.activeElement!==$('project_name')) $('project_name').value=t.project_name||'Current Project';
-      updateContinuityAvailability(); $('timeline_retry').disabled=!segs.length;
-      $('timeline_compile').disabled=!segs.length;
-      $('timeline_clear').disabled=!segs.length;
-      const dl=$('project_download');if(t.project_file){dl.classList.remove('disabled');dl.dataset.href='/out/timeline_projects/'+encodeURIComponent(t.project_file)}else{dl.classList.add('disabled');delete dl.dataset.href}
-      const ps=$('project_select'),saved=t.saved_projects||[];ps.innerHTML=saved.length?saved.map(p=>`<option value="${esc(p.project_file)}" ${p.project_file===t.project_file?'selected':''}>${esc(p.project_name||p.project_file)} · ${p.clip_count||0} clip(s) · ${(Number(p.total_duration)||0).toFixed(2)}s</option>`).join(''):'<option value="">No saved timelines yet</option>';
-      $('timeline_project_hint').textContent=`${t.project_name||'Current Project'} · ${seqs.length} sequence${seqs.length===1?'':'s'} · ${Number(t.project_clip_count||0)} clips · autosaved`;
-      $('timeline_foot').textContent=`Active: ${(active.name||'Sequence')} · ${segs.length} clip${segs.length===1?'':'s'} · ${(Number(t.total_duration)||0).toFixed(2)} s`+(t.master_file?` · master ${t.master_file}`:'');
-      $('timeline_context').textContent=`${active.name||'Sequence'} · ${segs.length} clip${segs.length===1?'':'s'} · ${(Number(t.total_duration)||0).toFixed(2)} s`;
-      const seqSelect=$('sequence_select');
-      if(seqs.length>1){
-        seqSelect.innerHTML=seqs.map((s,i)=>`<option value="${esc(s.id)}" ${s.active?'selected':''}>${i+1}. ${esc(s.name||'Sequence')}</option>`).join('');
-        seqSelect.classList.add('show');
-      }else{
-        seqSelect.innerHTML='';
-        seqSelect.classList.remove('show');
-      }
-      if(!segs.length){$('timeline').innerHTML='<div class=timelineempty>Drop a History clip here or generate the first clip.</div>';wireTimelineDnD();return t}
-      $('timeline').innerHTML=segs.map((s,i)=>{const thumb=s.last_frame_file?`<img src="/out/${encodeURIComponent(s.last_frame_file)}?t=${t.updated||0}">`:'';const p=esc((s.prompt||'').slice(0,58));return `<div class=tclip data-segment="${esc(s.segment_id||s.job)}" data-file="${esc(s.file)}" title="Drag to move · ${esc(s.prompt||'')}"><span class=dragbadge>⠿ ${i+1}</span><div class=ttools><button class=recallprompt data-prompt="${esc(s.prompt||'')}" title="Restore full prompt">P</button><button class=tdelete data-segment="${esc(s.segment_id||s.job)}" title="Delete clip">⌫</button></div><div class=tthumb>${thumb}</div><div class=tinfo><b>${s.continued?'LAST-FRAME CONTINUITY':'SHOT'}</b> · ${Number(s.duration||0).toFixed(2)}s<br>${s.width||'?'}×${s.height||'?'} · seed ${s.seed??'?'}<br>${p||'—'}</div></div>`}).join('');
-      [...document.querySelectorAll('.tclip')].forEach(el=>el.addEventListener('click',e=>{if(!e.target.closest('button'))previewTimelineFile(el.dataset.file)}));
-      [...document.querySelectorAll('.tclip .recallprompt')].forEach(b=>b.onclick=e=>{e.stopPropagation();restoreClipPrompt(b.dataset.prompt||'')});
-      [...document.querySelectorAll('.tdelete')].forEach(b=>b.onclick=e=>{e.stopPropagation();deleteTimelineClip(b.dataset.segment)});
-      wireTimelineDnD();return t
-    }
-
-    function restoreClipPrompt(prompt){
-      $('prompt').value=prompt||'';
-      $('prompt').dispatchEvent(new Event('input',{bubbles:true}));
-      $('prompt').focus();
-      $('prompt').scrollIntoView({behavior:'smooth',block:'center'});
-      say('clip prompt restored to editor');
-    }
-
-    async function refreshHistory(){
-      try{const d=await(await fetch('/api/history',{cache:'no-store'})).json();const rows=d.items||[];$('history_count').textContent=rows.length; $('history_launch_count').textContent=rows.length?rows.length:'';
-        if(!rows.length){$('history_body').innerHTML='<div class=floatempty>No completed generations yet.</div>';return}
-        $('history_body').innerHTML=rows.map(h=>{const thumb=h.last_frame_file?`<img src="/out/${encodeURIComponent(h.last_frame_file)}?t=${h.created||0}">`:'';return `<article class=historyitem draggable=true data-history="${esc(h.history_id)}" data-file="${esc(h.file)}"><div class=histthumb>${thumb}</div><div class=histmain><div class=histstatus>✅ Done</div><div class=histsub>${Number(h.duration||0).toFixed(2)}s · ${h.width||'?'}×${h.height||'?'} · seed ${h.seed??'?'}</div><div class=addhist>drag to timeline · double-click to preview</div></div><button class=recallprompt data-prompt="${esc(h.prompt||'')}" title="Restore this clip's full prompt">PROMPT</button><button class=trash data-history="${esc(h.history_id)}" title="Remove from history">⌫</button></article>`}).join('');
-        [...document.querySelectorAll('.historyitem')].forEach(el=>{
-          el.addEventListener('dragstart',e=>{
-            const dragId=(crypto&&crypto.randomUUID)?crypto.randomUUID():`${Date.now()}-${Math.random()}`;
-            e.dataTransfer.effectAllowed='copy';
-            e.dataTransfer.setData('application/x-h3-history',el.dataset.history);
-            e.dataTransfer.setData('application/x-h3-drag-id',dragId);
-          });
-          el.addEventListener('dblclick',()=>previewTimelineFile(el.dataset.file));
-        });
-        [...document.querySelectorAll('.historyitem .recallprompt')].forEach(b=>b.onclick=e=>{e.stopPropagation();restoreClipPrompt(b.dataset.prompt||'')});
-        [...document.querySelectorAll('.historyitem .trash')].forEach(b=>b.onclick=async e=>{e.stopPropagation();await fetch('/api/history/'+encodeURIComponent(b.dataset.history),{method:'DELETE'});refreshHistory()});
-      }catch(e){}
-    }
-    async function refreshQueue(){
-      try{
-        const d=await(await fetch('/api/queue',{cache:'no-store'})).json();
-        const rows=d.items||[];
-        activeQueueJob=d.active||null;
-        $('queue_count').textContent=rows.length?`${d.active?'1':'0'}/${rows.length}`:'0';
-        $('queue_launch_count').textContent=rows.length?`(${rows.length})`:'';
-
-        const active=rows.find(q=>q.status==='running');
-        if(active){
-          const stage=active.cancel_requested?'stopping…':(active.stage_label||active.stage||'running');
-          const step=(active.stage==='sampling'&&Number(active.sample_steps||0)>0)
-            ? ` · step ${Number(active.sample_step||0)}/${Number(active.sample_steps||0)}`
-            : '';
-          const eta=(active.stage==='sampling'&&active.sample_eta!=null)
-            ? ` · ETA ~${Number(active.sample_eta)}s`
-            : '';
-          const gpu=active.gpu_busy
-            ? ` · GPU ${Number(active.gpu_util||0).toFixed(0)}%`
-            : '';
-          const waiting=Number(d.queued||0)>0?` · ${Number(d.queued)} waiting`:'';
-          dot(active.possible_stall?'err':'live');
-          say(`${stage}${step} · stage ${Number(active.stage_elapsed||0)}s · total ${Number(active.elapsed||0)}s${eta}${gpu}${waiting}`);
-          $('pb').style.width=Math.max(0,Math.min(100,Number(active.pipeline_pct||0)))+'%';
-        }else if(Number(d.queued||0)>0){
-          if(d.worker_alive===false){
-            dot('err');
-            say(`QUEUE WORKER STOPPED · ${Number(d.queued)} waiting`);
-          }else{
-            dot('live');
-            say(`queue starting · ${Number(d.queued)} waiting`);
-          }
-          $('pb').style.width='0%';
-        }
-
-        if(!rows.length){
-          $('queue_body').innerHTML='<div class=floatempty>Queue is empty. Generate repeatedly to stack jobs.</div>';
-          return
-        }
-
-        $('queue_body').innerHTML=rows.map((q,i)=>{
-          const thumb=q.thumb_file?`<img src="/out/${encodeURIComponent(q.thumb_file)}">`:'';
-          const pct=Math.max(0,Math.min(100,Number(q.pipeline_pct||0)));
-          const stage=q.status==='running'?(q.cancel_requested?'stopping…':(q.stage_label||q.stage||'running')):'queued';
-
-          let health='';
-          if(q.status==='running'){
-            health=q.possible_stall
-              ? '<span class=queuehealth warn>CHECK</span>'
-              : q.gpu_busy
-                ? `<span class=queuehealth busy>GPU ${Number(q.gpu_util||0).toFixed(0)}%</span>`
-                : '<span class=queuehealth>ACTIVE</span>';
-          }
-
-          let detail='';
-          if(q.status==='running'){
-            const sample=(q.stage==='sampling'&&Number(q.sample_steps||0)>0)
-              ? ` · step ${Number(q.sample_step||0)}/${Number(q.sample_steps||0)}`
-              : '';
-            const eta=(q.stage==='sampling'&&q.sample_eta!=null)
-              ? ` · ETA ~${Number(q.sample_eta)}s`
-              : '';
-            detail=`<b>${esc(stage)}</b>${sample} · stage ${Number(q.stage_elapsed||0)}s · total ${Number(q.elapsed||0)}s${eta}`;
-          }else{
-            detail='waiting for active GPU job';
-          }
-
-          const action=q.status==='queued'
-            ? `<button class=cancel data-job="${q.id}" title="Cancel this queued generation">CANCEL</button>`
-            : `<button class=stoprun data-job="${q.id}" ${q.cancel_requested?'disabled':''} title="Stop at the next safe sampler/stage boundary">${q.cancel_requested?'STOPPING…':'STOP'}</button>`;
-
-          return `<article class=queueitem><div class=qthumb>${thumb}</div><div class=qmain><div class=qstatus>${q.status==='running'?'⚙ Running':'⌛ Queued'} <span class=queuebadge>${i+1}/${rows.length}</span> ${health}</div><div class=qsub>${detail}<br>${esc((q.prompt||'').slice(0,64))||'generation'} · output ${Number(q.duration||0).toFixed(1)}s</div><div class=queueprogress title="${pct.toFixed(0)}% overall pipeline"><i style="width:${pct}%"></i></div></div>${action}</article>`;
-        }).join('');
-
-        [...document.querySelectorAll('.queueitem .cancel,.queueitem .stoprun')].forEach(b=>b.onclick=async()=>{
-          b.disabled=true;
-          b.textContent=b.classList.contains('stoprun')?'STOPPING…':'CANCELLING…';
-          const r=await(await fetch('/api/queue/'+encodeURIComponent(b.dataset.job),{method:'DELETE'})).json();
-          if(r.error)await uiAlert(r.error,'Queue');
-          else say(r.running?'stop requested for running generation':'queued generation cancelled');
-          refreshQueue();
-        });
-      }catch(e){}
-    }
-
-    $('queue_clear').onclick=async()=>{await fetch('/api/queue/clear',{method:'POST'});refreshQueue();say('all waiting jobs cancelled · running job left alone')};
-    setInterval(refreshQueue,900);setInterval(refreshHistory,1800);refreshQueue();refreshHistory();
-
-    async function applyPerformancePreset(kind){
-      const m=window.H3META||{};
-      const profile=ACTIVE_MODEL_PROFILE;
-      const mode=currentModelMode();
-      const fast=kind==='fast';
-
-      if(fast && m.motion8_file && Math.abs(_strengthForKind('motion8',m))>1e-6){
-        await uiAlert('FAST uses the 4-step accelerator, while Motion Enhancer is an alternative acceleration LoRA. Turn Motion Enhancer OFF first. No LoRA selections were changed.','FAST preset conflict');
-        return;
-      }
-
-      // Performance presets configure the active model's sampler/accelerator.
-      // They do not activate optional specialty/style LoRAs.
-      $('denoise').value=1.0;
-      $('playback_speed').value=1.0;
-
-      if(profile==='eros'){
-        // Eros beta5 has its own merged Turbo. External Lightning stays OFF.
-        _setStrengthForKind('lightning',0,m);
-        if(m.eros_max_unet&&[...$('unet').options].some(x=>x.value===m.eros_max_unet))$('unet').value=m.eros_max_unet;
-
-        if(fast){
-          let sampler=m.fast_sampler||'lcm';
-          if(![...$('sampler_name').options].some(x=>x.value===sampler)){
-            sampler='euler';
-            $('steps').value=m.quality_steps||8;
-            $('shift_video').value=m.quality_shift_video??12;
-            $('shift_audio').value=m.quality_shift_audio??7;
-          }else{
-            $('steps').value=m.fast_steps||6;
-            $('shift_video').value=m.fast_shift_video??1;
-            $('shift_audio').value=m.fast_shift_audio??1;
-          }
-          $('sampler_name').value=sampler;
-          if([...$('scheduler').options].some(x=>x.value===(m.fast_scheduler||'simple')))$('scheduler').value=m.fast_scheduler||'simple';
-          $('sparse_percent').value=0;$('sparse_slider').value=0;updateSparseUI('number');
-        }else{
-          $('steps').value=m.quality_steps||8;
-          if([...$('sampler_name').options].some(x=>x.value===(m.quality_sampler||'euler')))$('sampler_name').value=m.quality_sampler||'euler';
-          if([...$('scheduler').options].some(x=>x.value===(m.quality_scheduler||'simple')))$('scheduler').value=m.quality_scheduler||'simple';
-          $('shift_video').value=m.quality_shift_video??12;$('shift_audio').value=m.quality_shift_audio??7;
-          $('sparse_percent').value=0;$('sparse_slider').value=0;updateSparseUI('number');
-          if(mode==='ref2va')$('ref_image_size').value='max';
-        }
-
-      }else if(profile==='redmix'){
-        // REDMIX Beta2 is already a merged INT8 ConvRot + Turbo checkpoint.
-        // Do not stack the external FAST accelerator on top of it.
-        _setStrengthForKind('lightning',0,m);
-        if(m.redmix_unet&&[...$('unet').options].some(x=>x.value===m.redmix_unet))$('unet').value=m.redmix_unet;
-        $('steps').value=m.redmix_steps||6;
-        const rs=(m.samplers||[]).includes(m.redmix_sampler||'er_sde')?(m.redmix_sampler||'er_sde'):'euler';
-        const rc=(m.schedulers||[]).includes(m.redmix_scheduler||'beta')?(m.redmix_scheduler||'beta'):'simple';
-        $('sampler_name').value=rs;$('scheduler').value=rc;
-        $('shift_video').value=m.redmix_shift_video??6;$('shift_audio').value=m.redmix_shift_audio??3;
-        $('sparse_percent').value=0;$('sparse_slider').value=0;updateSparseUI('number');
-
-      }else{
+      {
         // Stock H3 sampler path. Creative LoRA choices are never changed by a
         // performance preset; the single unified rack owns those choices.
         const target=mode==='ref2va'?m.stock_ref2va_unet:m.base_fl2va_unet;
@@ -8488,16 +6041,6 @@ Additional user Auto Prompt instructions:
       dot('live');say(timelineAction==='continue'?'adding generation with previous last-frame continuity':(mode==='ref2va'?'adding Ref2VA generation to queue':'adding generation to queue'));
       const resp=await fetch('/api/generate',{method:'POST',body:fd});
       const r=await resp.json();
-      if(r.adult_ack_required){
-        dot('');say('adult acknowledgement required');
-        const ok=await requestAdultAcknowledgement();
-        if(ok){
-          say('adult catalog unlocked · choose the model/LoRAs you want, then add the generation again');
-          return;
-        }
-        say('adult request cancelled');
-        return;
-      }
       if(r.error){fail(r.error);refreshTimeline(true);return}
       job=r.id;poll(job);refreshQueue();
     }
@@ -8528,11 +6071,6 @@ Additional user Auto Prompt instructions:
       dot('live');say('adding retry to queue with a new seed');
       const resp=await fetch('/api/timeline/retry_last',{method:'POST'});
       const r=await resp.json();
-      if(r.adult_ack_required){
-        dot('');const ok=await requestAdultAcknowledgement();
-        if(ok)return $('timeline_retry').click();
-        say('adult retry cancelled');return;
-      }
       if(r.error){fail(r.error);refreshTimeline(true);return}
       $('seed').value=r.seed;
       job=r.id;poll(job);refreshQueue();
@@ -8651,7 +6189,7 @@ Additional user Auto Prompt instructions:
             log(f"  iframe failed: {e}")
         try:
             _co.serve_kernel_port_as_window(
-                UI_PORT, anchor_text="◤ Open MissingLink MiniMax Studio V86 in a new tab")
+                UI_PORT, anchor_text="◤ Open MissingLink MiniMax Studio · SFW Fast in a new tab")
             mode = (mode or "") + "+window"
         except Exception as e:
             log(f"  window failed: {e}")
@@ -8681,15 +6219,12 @@ Additional user Auto Prompt instructions:
 
     log("="*74)
     if STARTUP_GPU_PRELOADED:
-        if USING_EROS_MAX:
-            log(f"  ✓ EROS MAX beta5 hybrid is preloaded; conditioning TE: {TEXT_ENCODER_FILE}.")
-        elif USING_REDMIX:
-            log(f"  ✓ legacy REDMIX H3 A2A Beta2 is preloaded; conditioning TE: {TEXT_ENCODER_FILE}.")
-        else:
-            log(f"  ✓ Stock H3 safe default is preloaded; adult checkpoints/LoRAs remain gated; conditioning TE: {TEXT_ENCODER_FILE}.")
+        log(f"  ✓ Stock H3 SFW default preloaded; conditioning TE: {TEXT_ENCODER_FILE}.")
     else:
         if LOWVRAM_T4_PROFILE:
             log(f"  ✓ T4/LOW-VRAM on-demand model: {T4_DIT_FILE} · Dynamic VRAM · no startup preload by design.")
+        elif FAST_STARTUP:
+            log(f"  ✓ FAST STARTUP active · {GPU_PROFILE.upper()} · model loading deferred until first GENERATE.")
         elif A100_PROFILE:
             log(f"  ✓ {GPU_PROFILE.upper()} active · native SM80 runtime · "
                 + ("full-card quality residency" if FULL_STACK_RESIDENCY else "safe TE↔DiT↔VAE handoff"))
