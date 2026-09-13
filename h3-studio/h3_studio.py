@@ -104,7 +104,7 @@ LIGHTNING_FILE = "minimax_h3_fl2v_turbo_4step_v1.1_768p_comfyui_resized_avg_rank
 REF2VA_LIGHTNING_REPO = "Comfy-Org/MiniMax-H3"
 REF2VA_LIGHTNING_FILE = "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"
 LIGHTNING_STRENGTH = 1.0
-LIGHTNING_DEFAULT = False
+LIGHTNING_DEFAULT = True
 LIGHTNING_STEPS = 4
 LIGHTNING_SHIFT_VIDEO = 6.0
 LIGHTNING_SHIFT_AUDIO = 3.0
@@ -1837,7 +1837,7 @@ if _CU130_CHILD:
         USING_REDMIX = False
         USING_EROS_MAX = False
         DIT_FILE = FALLBACK_DIT_FILE
-        LIGHTNING_DEFAULT = False
+        LIGHTNING_DEFAULT = True
         log("!")
         log("  ✓ SAFE DEFAULT selected: official Stock MiniMax H3 FL2VA")
         log("  ↳ SFW-only build: explicit-content checkpoints/LoRAs are not available")
@@ -4653,7 +4653,7 @@ if _CU130_CHILD:
             t4_default_unet=(T4_DIT_FILE if LOWVRAM_T4_PROFILE else ""), specialty_loras=[],
             lightning_file=LIGHTNING_FILE, lightning_available=bool(not LOWVRAM_T4_PROFILE),
             ref2va_lightning_file=REF2VA_LIGHTNING_FILE, ref2va_lightning_available=bool(not LOWVRAM_T4_PROFILE),
-            lightning_default=False, lightning_strength_default=LIGHTNING_STRENGTH,
+            lightning_default=bool(not LOWVRAM_T4_PROFILE), lightning_strength_default=LIGHTNING_STRENGTH,
             action_label=ACTION_LABEL, action_model_id=0, action_linked_version=0, action_available=False, action_file=None,
             action_strength_default=0.0, action_requested_version_id=0, action_version_id=None, action_source_page="",
             action_resolution="", action_version_name="", action_base_model="", action_trained_words=[],
@@ -5674,7 +5674,7 @@ Additional user Auto Prompt instructions:
     </div></div>
 
     <div class=card><div class=cardtitle>Generation Presets</div><div class=cardbody>
-    <div class=g2><button id=fastpreset class=inlinebtn>FAST</button><button id=qualitypreset class="inlinebtn active">QUALITY</button></div>
+    <div class=g2><button id=fastpreset class="inlinebtn active">FAST</button><button id=qualitypreset class=inlinebtn>QUALITY</button></div>
     <div class=hint id=preset_hint>Preset recipe follows the model selected above.</div>
     <div class=hint id=modelhint>Model mode will be shown here after startup.</div>
     </div></div>
@@ -5832,7 +5832,9 @@ Additional user Auto Prompt instructions:
         $('continuity_hint').innerHTML='<b>LAST-FRAME CONTINUITY:</b> the next GENERATE will use the previous timeline clip\'s lossless final frame as its first-frame anchor. No latent state, overlap, or latent checkpoint is used.';
       }
     }
-    function activeModelLabel(){return 'Stock H3'}
+    function activeModelLabel(){
+      return ACTIVE_MODEL_PROFILE==='eros' ? 'Eros Max β5' : (ACTIVE_MODEL_PROFILE==='redmix' ? 'REDMIX H3 Beta2' : 'Stock H3');
+    }
     function updateModeHint(){
       const m=window.H3META||{},mode=currentModelMode(),el=$('mode_hint'),name=activeModelLabel();
       if(mode==='ref2va'){
@@ -5856,11 +5858,31 @@ Additional user Auto Prompt instructions:
       localStorage.setItem(MODEL_MODE_STORE_KEY,mode);
 
       try{
-        if(!(await _ensureProfile('stock_quality',mode))) throw new Error(`Could not prepare Stock H3 for ${mode==='ref2va'?'Ref2VA':'Current'} mode.`);
-        await loadMeta(); m=window.H3META||{};
-        const target=mode==='ref2va'?m.stock_ref2va_unet:m.base_fl2va_unet;
-        if(!target||![...$('unet').options].some(x=>x.value===target)) throw new Error(`Matching ${mode==='ref2va'?'Ref2VA':'FL2VA'} transformer is not available for Stock H3.`);
-        $('unet').value=target;
+        // Eros is hybrid. REDMIX is kept as the optimized CURRENT/FL2VA checkpoint.
+        if(ACTIVE_MODEL_PROFILE==='eros'){
+          if(m.eros_max_unet&&[...$('unet').options].some(x=>x.value===m.eros_max_unet)){
+            $('unet').value=m.eros_max_unet;
+          }
+        }else if(ACTIVE_MODEL_PROFILE==='redmix'){
+          if(mode!=='fl2va')throw new Error('REDMIX H3 Beta2 is available in CURRENT · KEYFRAMES mode.');
+          if(!(await _ensureProfile('redmix','fl2va')))throw new Error('Could not prepare REDMIX H3 Beta2.');
+          await loadMeta();m=window.H3META||{};
+          if(!m.redmix_unet||![...$('unet').options].some(x=>x.value===m.redmix_unet))throw new Error('REDMIX H3 Beta2 checkpoint is not available after install.');
+          $('unet').value=m.redmix_unet;
+        }else{
+          // Stock H3 requires the mode-matching official transformer.
+          if(!(await _ensureProfile(ACTIVE_MODEL_PROFILE,mode))){
+            throw new Error(`Could not prepare ${activeModelLabel()} for ${mode==='ref2va'?'Ref2VA':'Current'} mode.`);
+          }
+          await loadMeta();
+          m=window.H3META||{};
+          const target=mode==='ref2va'?m.stock_ref2va_unet:m.base_fl2va_unet;
+          if(!target||![...$('unet').options].some(x=>x.value===target)){
+            throw new Error(`Matching ${mode==='ref2va'?'Ref2VA':'FL2VA'} transformer is not available for ${activeModelLabel()}.`);
+          }
+          $('unet').value=target;
+
+        }
 
         // Reapply the selected model's current performance preset for the new mode.
         await applyPerformancePreset(ACTIVE_PERF_PRESET);
@@ -5885,11 +5907,19 @@ Additional user Auto Prompt instructions:
     $('continuity_enabled').addEventListener('change',updateContinuityAvailability);
 
     let ACTIVE_MODEL_PROFILE='stock_quality';
-    let ACTIVE_PERF_PRESET='quality';
+    let ACTIVE_PERF_PRESET='fast';
 
     function presetRecipe(profile=ACTIVE_MODEL_PROFILE,mode=currentModelMode(),kind=ACTIVE_PERF_PRESET){
+      if(profile==='eros'){
+        return kind==='fast'
+          ? {short:'EROS',label:'Eros Max β5',steps:6,summary:'LCM / Simple · 6 steps · integrated Turbo · identity shifts 1/1 · dense'}
+          : {short:'EROS',label:'Eros Max β5',steps:8,summary:'Euler / Simple · 8 steps · shifts 12/7 · dense'};
+      }
+      if(profile==='redmix'){
+        return {short:'REDMIX',label:'REDMIX H3 Beta2',steps:6,summary:'INT8 ConvRot · integrated NaughtyTimes-derived tuning + Turbo · ER SDE / Beta · 6 steps'};
+      }
       return kind==='fast'
-        ? {short:'STOCK',label:'Stock H3',steps:4,summary:(mode==='ref2va'?'Ref2VA Turbo · shifts 12/3':'FL2VA Turbo · shifts 6/3')+' · Euler / Simple · 4 steps · lazy accelerator download'}
+        ? {short:'STOCK',label:'Stock H3',steps:4,summary:(mode==='ref2va'?'Ref2VA Turbo · shifts 12/3':'FL2VA Turbo · shifts 6/3')+' · Euler / Simple · 4 steps · Sparse Sage 5%'}
         : {short:'STOCK',label:'Stock H3',steps:20,summary:(mode==='ref2va'?'Ref2VA':'FL2VA')+' · RES Multistep / Simple · 20 steps · shifts 12/3 · dense'};
     }
 
@@ -5916,15 +5946,27 @@ Additional user Auto Prompt instructions:
     function _modelProfileState(){return (window.H3META||{}).model_profiles||{}}
     function _hasProfileFile(profile,mode=currentModelMode()){
       const s=_modelProfileState();
-      return mode==='ref2va'?!!s.stock_ref2va_installed:!!s.stock_fl2va_installed;
+      if(profile==='eros')return !!s.eros_installed;
+      if(profile==='redmix')return mode==='fl2va'&&!!s.redmix_installed;
+      if(profile==='stock_quality')return mode==='ref2va'?!!s.stock_ref2va_installed:!!s.stock_fl2va_installed;
+      return false;
     }
     function syncModelProfileOptions(m=window.H3META||{}){
       const sel=$('model_profile_select');
-      const mode=currentModelMode(),s=m.model_profiles||{};
-      const ready=mode==='ref2va'?!!s.stock_ref2va_installed:!!s.stock_fl2va_installed;
-      ACTIVE_MODEL_PROFILE='stock_quality';
-      sel.innerHTML=`<option value="stock_quality">STOCK H3 · MAX QUALITY${ready?'':' · DOWNLOAD'}</option>`;
-      sel.value='stock_quality';
+      const current=ACTIVE_MODEL_PROFILE;
+      const s=m.model_profiles||{};
+      const mode=currentModelMode();
+      const stockReady=mode==='ref2va'?!!s.stock_ref2va_installed:!!s.stock_fl2va_installed;
+      const rows=[{value:'stock_quality',label:'STOCK H3 · MAX QUALITY'+(stockReady?'':' · DOWNLOAD')}];
+      if(m.adult_enabled && !m.lowvram_t4){
+        for(const x of (m.adult_model_profiles||[])){
+          if(Array.isArray(x.modes)&&!x.modes.includes(mode))continue;
+          rows.push({value:x.value,label:(x.label||x.value)+(x.installed?'':' · DOWNLOAD')});
+        }
+      }
+      sel.innerHTML=rows.map(x=>`<option value="${esc(x.value)}">${esc(x.label)}</option>`).join('');
+      if(rows.some(x=>x.value===current))sel.value=current;
+      else{ACTIVE_MODEL_PROFILE='stock_quality';sel.value='stock_quality'}
     }
 
     function syncModelProfileUI(){
@@ -5951,20 +5993,1190 @@ Additional user Auto Prompt instructions:
         body:JSON.stringify({profile,mode})
       });
       const r=await resp.json();
+      if(r.adult_ack_required){
+        const ok=await requestAdultAcknowledgement();
+        return ok?_ensureProfile(profile,mode):false;
+      }
       if(r.error){await uiAlert(r.error,'Model profile download failed');return false}
       await loadMeta();
       return true;
     }
     async function applyModelProfile(profile,{install=true}={}){
-      let mode=currentModelMode();
-      if(install && !(await _ensureProfile(profile,mode)))return;
+      const mode=currentModelMode();
+      if(profile!=='stock_quality'){
+        await uiAlert('Only Stock MiniMax H3 is available in the SFW-only build.','SFW model selection');
+        return;
+      }
+      if(install && !(await _ensureProfile('stock_quality',mode)))return;
       const m=window.H3META||{};
+      const target=mode==='ref2va'?m.stock_ref2va_unet:m.base_fl2va_unet;
+      if(target&&[...$('unet').options].some(x=>x.value===target))$('unet').value=target;
+      ACTIVE_MODEL_PROFILE='stock_quality';
+      await applyPerformancePreset(ACTIVE_PERF_PRESET||'fast');
+      syncModelProfileUI();
+    }
 
-      _setStrengthForKind('lightning',0);
-      $('sparse_percent').value=0;$('sparse_slider').value=0;updateSparseUI('number');
-      $('playback_speed').value=1.0;$('denoise').value=1.0;
+    $('model_profile_select').onchange=async()=>{
+      const sel=$('model_profile_select');
+      const requested=sel.value;
+      const previous=ACTIVE_MODEL_PROFILE;
+      sel.disabled=true;
+      say('switching model · checking matching '+(currentModelMode()==='ref2va'?'Ref2VA':'FL2VA')+' files…');
+      try{
+        await applyModelProfile(requested);
+      }catch(e){
+        ACTIVE_MODEL_PROFILE=previous;
+        await uiAlert(String(e&&e.message?e.message:e),'Model switch failed');
+      }finally{
+        sel.disabled=false;
+        syncModelProfileUI();
+      }
+    };
 
-      {
+    $('gpu_overlay_toggle').onclick=()=>{
+      const p=$('gpu_overlay');
+      const mini=p.classList.toggle('minimized');
+      $('gpu_overlay_toggle').textContent=mini?'＋':'−';
+      $('gpu_overlay_toggle').title=mini?'Expand GPU stats':'Minimize GPU stats';
+    };
+
+    // App-owned modal system. Never use browser alert/confirm/prompt dialogs.
+    let _uiDialogResolve=null;
+    function _closeUIDialog(value){
+      $('ui_modal').classList.remove('show');
+      const r=_uiDialogResolve; _uiDialogResolve=null;
+      if(r)r(value);
+    }
+    function uiDialog({title='Notice',message='',input=false,value='',confirmLabel='OK',cancelLabel='Cancel',showCancel=true,danger=false}={}){
+      if(_uiDialogResolve)_closeUIDialog(null);
+      $('ui_modal_title').textContent=title;
+      $('ui_modal_message').textContent=message;
+      const inp=$('ui_modal_input');
+      inp.style.display=input?'block':'none';
+      inp.value=input?String(value??''):'';
+      $('ui_modal_confirm').textContent=confirmLabel;
+      $('ui_modal_confirm').className='uiconfirm '+(danger?'danger':'neutral');
+      $('ui_modal_cancel').textContent=cancelLabel;
+      $('ui_modal_cancel').style.display=showCancel?'':'none';
+      $('ui_modal').classList.add('show');
+      return new Promise(resolve=>{
+        _uiDialogResolve=resolve;
+        requestAnimationFrame(()=>{(input?inp:$('ui_modal_confirm')).focus(); if(input)inp.select()});
+      });
+    }
+    function uiAlert(message,title='Notice'){return uiDialog({title,message,showCancel:false,confirmLabel:'OK'})}
+    function uiConfirm(message,{title='Confirm',confirmLabel='Confirm',danger=false}={}){return uiDialog({title,message,showCancel:true,confirmLabel,danger})}
+    function uiPrompt(message,value='',{title='New sequence',confirmLabel='Create'}={}){return uiDialog({title,message,input:true,value,showCancel:true,confirmLabel})}
+    $('ui_modal_close').onclick=()=>_closeUIDialog(null);
+    $('ui_modal_cancel').onclick=()=>_closeUIDialog(null);
+    $('ui_modal_confirm').onclick=()=>_closeUIDialog($('ui_modal_input').style.display==='none'?true:$('ui_modal_input').value.trim());
+    $('ui_modal').addEventListener('click',e=>{if(e.target===$('ui_modal'))_closeUIDialog(null)});
+    $('ui_modal_input').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();$('ui_modal_confirm').click()}else if(e.key==='Escape'){e.preventDefault();_closeUIDialog(null)}});
+
+    // Adult-access acknowledgement is intentionally a signed server-session gate.
+    let _adultGateResolve=null;
+    function _syncAdultGateAccept(){
+      $('adult_gate_accept').disabled=!($('adult_ack_age').checked&&$('adult_ack_law').checked&&$('adult_ack_consent').checked);
+    }
+    function _closeAdultGate(value){
+      $('adult_gate_modal').classList.remove('show');
+      const r=_adultGateResolve;_adultGateResolve=null;
+      if(r)r(!!value);
+    }
+    async function requestAdultAcknowledgement(){
+      if((window.H3META||{}).adult_enabled)return true;
+      for(const id of ['adult_ack_age','adult_ack_law','adult_ack_consent'])$(id).checked=false;
+      _syncAdultGateAccept();
+      $('adult_gate_modal').classList.add('show');
+      return new Promise(resolve=>{_adultGateResolve=resolve;requestAnimationFrame(()=>$('adult_ack_age').focus())});
+    }
+    for(const id of ['adult_ack_age','adult_ack_law','adult_ack_consent'])$(id).addEventListener('change',_syncAdultGateAccept);
+    $('adult_gate_close').onclick=()=>_closeAdultGate(false);
+    $('adult_gate_cancel').onclick=()=>_closeAdultGate(false);
+    $('adult_gate_modal').addEventListener('click',e=>{if(e.target===$('adult_gate_modal'))_closeAdultGate(false)});
+    $('adult_gate_accept').onclick=async()=>{
+      if($('adult_gate_accept').disabled)return;
+      $('adult_gate_accept').disabled=true;
+      say('unlocking adult catalog…');
+      try{
+        const resp=await fetch('/api/adult/ack',{
+          method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({age:true,law:true,consent:true})
+        });
+        const r=await resp.json();
+        if(!resp.ok||r.error){await uiAlert(r.error||'Adult acknowledgement failed.','Adult access');_syncAdultGateAccept();return}
+        await loadMeta();
+        _closeAdultGate(true);
+        say('Adult Mode enabled');
+      }catch(e){
+        await uiAlert(String(e),'Adult access');
+        _syncAdultGateAccept();
+      }
+    };
+
+    function syncAdultModeButton(m=window.H3META||{}){
+      const b=$('adult_mode_btn');if(!b)return;
+      const on=!!m.adult_enabled;
+      b.classList.toggle('on',on);
+      b.textContent='18+';
+      b.setAttribute('aria-pressed',on?'true':'false');
+      b.title=on?'Adult catalog enabled · click to exit':'Adult models and LoRAs are hidden · click to enable';
+    }
+    function clearAdultLoraCardState(m=window.H3META||{}){
+      for(const card of _namedLoraCards(m)){
+        if(card.adult||card.kind==='catalog')LORA_CARD_STATE.delete(_cardKey(card));
+      }
+    }
+    $('adult_mode_btn').onclick=async()=>{
+      const m=window.H3META||{};
+      if(!m.adult_enabled){
+        const ok=await requestAdultAcknowledgement();
+        if(ok){syncAdultModeButton(window.H3META||{});renderNamedLoraRows(window.H3META||{});syncModelProfileUI()}
+        return;
+      }
+      if(!(await uiConfirm('Exit Adult Mode? Adult models and adult LoRAs will be hidden and any active adult LoRA selections will be cleared. Installed files stay on disk.',{title:'Exit Adult Mode',confirmLabel:'Exit Adult Mode'})))return;
+      clearAdultLoraCardState(m);
+      const resp=await fetch('/api/adult/exit',{method:'POST'});
+      const r=await resp.json();
+      if(!resp.ok||r.error){await uiAlert(r.error||'Could not exit Adult Mode.','Adult Mode');return}
+      if(['eros','redmix'].includes(ACTIVE_MODEL_PROFILE))ACTIVE_MODEL_PROFILE='stock_quality';
+      await loadMeta();
+      syncAdultModeButton(window.H3META||{});
+      say('Adult Mode off');
+    };
+
+    // One user-facing LoRA stack. There are no legacy LoRA slot/dropdown controls
+    // in the DOM. All strengths—including Motion and Fast Accelerator—live here.
+    // State is keyed by installed filename or gated catalog key so loadMeta() can
+    // refresh compatibility/adult visibility without losing the user's strengths.
+    const LORA_CARD_STATE=new Map();
+
+    function _catalogEntryForKey(key,m=window.H3META||{}){
+      return (m.lora_catalog||[]).find(x=>String(x.key)===String(key))||null;
+    }
+    function _catalogEntryForFile(file,m=window.H3META||{}){
+      return (m.lora_catalog||[]).find(x=>x.file&&String(x.file)===String(file))||null;
+    }
+    function _compatForFile(file,m=window.H3META||{}){
+      return (m.lora_compatibility||{})[String(file||'')]||null;
+    }
+    function _compatProfileForUI(m=window.H3META||{}){
+      const unet=$('unet')?$('unet').value:'';
+      return unet&&m.eros_max_unet&&unet===m.eros_max_unet?'eros':'stock_quality';
+    }
+    function _loraFileCompatible(file,m=window.H3META||{}){
+      if(!file)return true;
+      const info=_compatForFile(file,m);
+      if(!info)return true; // unknown user LoRA: don't invent incompatibility
+      return (info.profiles||[]).includes(_compatProfileForUI(m))&&(info.modes||[]).includes(currentModelMode());
+    }
+    function _humanLoraName(file){
+      return String(file||'LoRA').replace(/\.safetensors$/i,'').replace(/[_-]+/g,' ').replace(/\s+/g,' ').trim();
+    }
+    function _cardKey(card){return card.kind==='catalog'?'catalog:'+card.catalogKey:'file:'+card.file}
+    function _loraSourceMap(m=window.H3META||{}){return m.lora_source_map||{}}
+    function _cardTitleHTML(card){
+      const label=esc(card.label||'LoRA');
+      const url=String(card.source_url||'').trim();
+      if(!url)return label;
+      return `<a class="loratitlelink" href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="Open source page">${label}</a>`;
+    }
+    function _stateForCard(card){
+      const k=_cardKey(card);
+      if(!LORA_CARD_STATE.has(k))LORA_CARD_STATE.set(k,{strength:0});
+      return LORA_CARD_STATE.get(k);
+    }
+    function _namedLoraCards(m=window.H3META||{}){
+      const cards=[];
+      const sourceMap=_loraSourceMap(m);
+      const catalogByFile=new Map((m.lora_catalog||[]).filter(x=>x.file).map(x=>[x.file,x]));
+      const seen=new Set();
+
+      // Keep the controls that were useful before: Motion Enhancer and the matching
+      // Fast-mode accelerator, but place them in this same stack.
+      if(m.motion8_file){
+        cards.push({kind:'motion8',file:m.motion8_file,label:'Motion Enhancer LoRA',available:!!m.motion8_available,
+          detail:'rzgar H3 FL2V 8-step',source_url:sourceMap[m.motion8_file]||''});seen.add(m.motion8_file);
+      }
+      const accelFile=currentModelMode()==='ref2va'?m.ref2va_lightning_file:m.lightning_file;
+      const accelAvailable=currentModelMode()==='ref2va'?m.ref2va_lightning_available:m.lightning_available;
+      if(accelFile){
+        cards.push({kind:'lightning',file:accelFile,label:'Fast-Mode Accelerator',available:!!accelAvailable,
+          detail:currentModelMode()==='ref2va'?'Ref2VA 4-step Turbo':'FL2VA 4-step Turbo',source_url:sourceMap[accelFile]||''});seen.add(accelFile);
+      }
+
+      // Installed creative LoRAs become named cards. /api/meta has already stripped
+      // adult filenames when Adult Mode is off, so they cannot leak into this list.
+      for(const file of (m.loras||[])){
+        if(!file||file==='none'||seen.has(file))continue;
+        const cat=catalogByFile.get(file),info=_compatForFile(file,m);
+        cards.push({kind:'creative',file,label:(cat&&cat.label)||(info&&info.label)||_humanLoraName(file),available:true,
+          adult:!!((cat&&cat.adult)||(info&&info.adult)),detail:cat&&cat.adult?'Adult LoRA':(info&&info.label)||'Installed LoRA',
+          source_url:(cat&&cat.source_page)||sourceMap[file]||''});
+        seen.add(file);
+      }
+
+      // Gated adult catalog rows only arrive from /api/meta after acknowledgement.
+      // Uninstalled rows still appear as named cards and install only when switched ON.
+      for(const cat of (m.lora_catalog||[])){
+        if(cat.file&&seen.has(cat.file))continue;
+        cards.push({kind:'catalog',catalogKey:cat.key,file:cat.file||'',label:cat.label||cat.key,adult:!!cat.adult,
+          available:true,installed:!!cat.installed,detail:cat.installed?'Adult LoRA':'Adult LoRA · download on enable',
+          source_url:cat.source_page||sourceMap[cat.file||'']||''});
+      }
+      return cards;
+    }
+    function _cardCompatible(card,m=window.H3META||{}){
+      if(card.kind==='motion8')return currentModelMode()==='fl2va'&&_compatProfileForUI(m)==='stock_quality'&&!!card.available;
+      if(card.kind==='lightning')return _compatProfileForUI(m)==='stock_quality'&&!!card.available;
+      if(card.kind==='catalog'&&!card.installed){
+        const cat=_catalogEntryForKey(card.catalogKey,m);
+        return !!cat&&(cat.profiles||['stock_quality']).includes(_compatProfileForUI(m))&&(cat.modes||['fl2va']).includes(currentModelMode());
+      }
+      return !!card.available&&_loraFileCompatible(card.file,m);
+    }
+    function _strengthForKind(kind,m=window.H3META||{}){
+      const card=_namedLoraCards(m).find(x=>x.kind===kind);
+      if(!card)return 0;
+      return Number(_stateForCard(card).strength||0);
+    }
+    function _setStrengthForKind(kind,strength,m=window.H3META||{}){
+      const card=_namedLoraCards(m).find(x=>x.kind===kind);
+      if(!card)return;
+      _stateForCard(card).strength=Number(strength||0);
+    }
+    async function _installCatalogCard(card){
+      const resp=await fetch('/api/loras/catalog_install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:card.catalogKey})});
+      const r=await resp.json();
+      if(r.adult_ack_required){const ok=await requestAdultAcknowledgement();if(!ok)return null;return _installCatalogCard(card)}
+      if(!resp.ok||r.error){await uiAlert(r.error||'LoRA install failed.','LoRA install failed');return null}
+      const oldKey=_cardKey(card),state=LORA_CARD_STATE.get(oldKey)||{strength:0};
+      LORA_CARD_STATE.delete(oldKey);LORA_CARD_STATE.set('file:'+r.file,state);
+      await loadMeta();
+      return r.file;
+    }
+    function renderNamedLoraRows(m=window.H3META||{}){
+      const box=$('unified_lora_rows');if(!box)return;box.innerHTML='';
+      const cards=_namedLoraCards(m);
+      if(!cards.length){
+        box.innerHTML='<div class="lorarow"><div class=lorarowhead><div><div class=lorarowtitle>No LoRAs available</div><div class=lorarowmeta>Install a compatible LoRA to add it here.</div></div></div></div>';
+        return;
+      }
+      for(const card of cards){
+        const st=_stateForCard(card),compatible=_cardCompatible(card,m);
+        // Compatibility never erases a user's selection. Incompatible cards are
+        // disabled/greyed and omitted from generation, then become active again if
+        // the user switches back to a compatible model or input mode.
+        const selected=Math.abs(Number(st.strength||0))>1e-6;
+        const active=compatible&&selected;
+        const row=document.createElement('div');row.className='lorarow'+(compatible?'':' incompatible');
+        const safeId='lc_'+Math.random().toString(36).slice(2);
+        const status=!compatible?`incompatible with current model / mode${selected?` · saved ${Number(st.strength).toFixed(2)}`:''}`:(active?`active · ${Number(st.strength).toFixed(2)}`:(card.kind==='catalog'&&!card.installed?'download on enable':'off'));
+        row.innerHTML=`<div class=lorarowhead><div><div class=lorarowtitle>${_cardTitleHTML(card)}</div><div class=lorarowmeta>${esc(status)}</div></div>`+
+          `<button class="loratoggle${selected?' on':''}" type=button aria-pressed="${selected?'true':'false'}" ${compatible?'':'disabled'}>${selected?'ON':'OFF'}</button></div>`+
+          `<div class=sliderline><input id="${safeId}" type=range min="0" max="5" step=".05" value="${Math.max(0,Math.min(5,Number(st.strength||0)))}" ${compatible?'':'disabled'}><input class="slidervalue loranumber" type=number step="any" value="${Number(st.strength||0).toFixed(2)}" aria-label="${esc(card.label)} strength" ${compatible?'':'disabled'}></div>`+
+          `<div class=hint>${esc(card.detail||'')}</div>`;
+        box.appendChild(row);
+        const slider=row.querySelector('input[type=range]'),out=row.querySelector('.loranumber'),toggle=row.querySelector('.loratoggle'),meta=row.querySelector('.lorarowmeta');
+        const sliderMin=0,sliderMax=5;
+        const sliderValueFor=n=>Math.max(sliderMin,Math.min(sliderMax,Number(n)));
+        const syncState=(n,{normalizeNumber=true}={})=>{
+          if(!Number.isFinite(n))return;
+          // The numeric field is authoritative and intentionally unbounded. The
+          // slider is only a 0–5 convenience control, so out-of-range numbers pin
+          // the thumb to the nearest endpoint without changing the stored strength.
+          st.strength=n;
+          slider.value=String(sliderValueFor(n));
+          if(normalizeNumber)out.value=String(n);
+          const on=Math.abs(n)>1e-6;
+          toggle.classList.toggle('on',on);toggle.textContent=on?'ON':'OFF';toggle.setAttribute('aria-pressed',on?'true':'false');
+          meta.textContent=on?`active · ${n}`:'off';
+        };
+        const commitNumber=v=>{const n=Number(v);if(Number.isFinite(n))syncState(n)};
+        slider.addEventListener('input',()=>syncState(Number(slider.value)));
+        out.addEventListener('input',()=>{
+          const raw=out.value.trim();
+          if(raw===''||raw==='-'||raw==='+'||raw==='.'||raw==='-.'||raw==='+.'||/[eE][+-]?$/.test(raw))return;
+          const n=Number(raw);if(Number.isFinite(n))syncState(n,{normalizeNumber:false});
+        });
+        out.addEventListener('change',()=>commitNumber(out.value));
+        out.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();commitNumber(out.value);out.blur()}});
+        toggle.onclick=async e=>{
+          e.preventDefault();
+          if(toggle.disabled)return;
+          const enabling=!toggle.classList.contains('on');
+
+          // The switch is authoritative: OFF always means strength 0.00 and ON
+          // always means strength 1.00. syncState updates the stored strength,
+          // numeric field, slider thumb, switch label, and status text together.
+          if(card.kind==='catalog'&&!card.installed){
+            if(!enabling){syncState(0);return}
+            toggle.disabled=true;
+            meta.textContent='downloading…';
+            const file=await _installCatalogCard(card);
+            if(!file){renderNamedLoraRows(window.H3META||{});return}
+            const ns=LORA_CARD_STATE.get('file:'+file)||{strength:0};
+            ns.strength=1;
+            LORA_CARD_STATE.set('file:'+file,ns);
+            renderNamedLoraRows(window.H3META||{});
+            return;
+          }
+          syncState(enabling?1:0);
+        };
+      }
+    }
+    function syncUnifiedLoraCompatibility(){renderNamedLoraRows(window.H3META||{})}
+    $('unet').addEventListener('change',syncUnifiedLoraCompatibility);
+
+    function activeCreativeLoraStack(){
+      const m=window.H3META||{},out=[];
+      for(const card of _namedLoraCards(m)){
+        if(card.kind!=='creative')continue;
+        const st=_stateForCard(card),strength=Number(st.strength||0);
+        if(card.file&&Math.abs(strength)>1e-6&&_cardCompatible(card,m))out.push({file:card.file,strength});
+      }
+      return out;
+    }
+    function submittedSpecialStrength(kind){
+      const m=window.H3META||{},card=_namedLoraCards(m).find(x=>x.kind===kind);
+      if(!card||!_cardCompatible(card,m))return 0;
+      return Number(_stateForCard(card).strength||0);
+    }
+    function resetNamedLoras(){
+      LORA_CARD_STATE.clear();renderNamedLoraRows(window.H3META||{});
+    }
+
+    async function _installUserLoraUrl(url){
+      let resp=await fetch('/api/loras/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
+      let r=await resp.json();
+      if(r.adult_ack_required){
+        const ok=await requestAdultAcknowledgement();
+        if(!ok)return null;
+        resp=await fetch('/api/loras/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
+        r=await resp.json();
+      }
+      if(r.error){await uiAlert(r.error,'LoRA install failed');return null}
+      return r;
+    }
+    $('install_lora').onclick=async()=>{
+      const url=await uiPrompt('Paste a direct Hugging Face .safetensors file URL or a MiniMax-H3 CivitAI model/version URL.','',{title:'Install LoRA',confirmLabel:'Install'});
+      if(!url)return;
+      say('installing LoRA…');$('install_lora').disabled=true;
+      try{
+        const r=await _installUserLoraUrl(url);if(!r)return;
+        await loadMeta();
+        LORA_CARD_STATE.set('file:'+r.file,{strength:1});
+        renderNamedLoraRows(window.H3META||{});
+        say('LoRA installed · '+r.file);
+      }catch(e){await uiAlert(String(e),'LoRA install failed')}finally{$('install_lora').disabled=false}
+    };
+
+    function syncMotionPace(){$('motion_pace_value').textContent=Number($('playback_speed').value||1).toFixed(2)+'×'}
+    $('playback_speed').addEventListener('input',syncMotionPace);syncMotionPace();
+
+    const AP_STORE_KEY='h3_auto_prompt_settings_v86';
+    const AP_LEGACY_STORE_KEY='h3_auto_prompt_settings_v83';
+    const AP_PROFILE_STORE_KEY='h3_auto_prompt_instruction_profiles_v86';
+    const AP_ACTIVE_PROFILE_KEY='h3_auto_prompt_active_profile_v86';
+    const AP_DEFAULT={model:'gpt-5.6-terra',customModel:'',extra:''};
+
+    function getAPSettings(){try{const raw=localStorage.getItem(AP_STORE_KEY)||localStorage.getItem(AP_LEGACY_STORE_KEY)||'{}';return {...AP_DEFAULT,...JSON.parse(raw)}}catch(e){return {...AP_DEFAULT}}}
+    function saveAPSettings(s){localStorage.setItem(AP_STORE_KEY,JSON.stringify({...AP_DEFAULT,...s}))}
+    function getAPProfiles(){try{const a=JSON.parse(localStorage.getItem(AP_PROFILE_STORE_KEY)||'[]');return Array.isArray(a)?a.filter(x=>x&&x.id&&x.name):[]}catch(e){return []}}
+    function saveAPProfiles(a){localStorage.setItem(AP_PROFILE_STORE_KEY,JSON.stringify(a))}
+    function activeAPProfileId(){return localStorage.getItem(AP_ACTIVE_PROFILE_KEY)||''}
+    function setActiveAPProfileId(id){if(id)localStorage.setItem(AP_ACTIVE_PROFILE_KEY,id);else localStorage.removeItem(AP_ACTIVE_PROFILE_KEY)}
+    function currentAPModel(){const s=getAPSettings();return s.model==='__custom__'?(s.customModel||'').trim():(s.model||AP_DEFAULT.model)}
+
+    function syncAPProfileSelectors(){
+      const profiles=getAPProfiles(),active=activeAPProfileId();
+      const opts=['<option value="">Current / unsaved</option>'].concat(profiles.map(p=>`<option value="${esc(p.id)}">${esc(p.name)}</option>`)).join('');
+      // Saved instruction profiles live only inside the ⚙ settings modal.
+      // Keep the main Prompt toolbar intentionally clean: AUTO PROMPT + settings only.
+      $('ap_profile_select').innerHTML=opts;
+      const valid=profiles.some(p=>p.id===active)?active:'';
+      $('ap_profile_select').value=valid;
+      const p=profiles.find(x=>x.id===valid);
+      $('ap_profile_name').value=p?p.name:'';
+      $('ap_profile_delete').disabled=!p;
+    }
+
+    function syncAPModal(){
+      const s=getAPSettings();
+      $('ap_model').value=[...$('ap_model').options].some(o=>o.value===s.model)?s.model:'__custom__';
+      $('ap_custom_model').value=s.customModel||((s.model&&!['gpt-5.6-terra','gpt-5.6-sol','gpt-5.6-luna','__custom__'].includes(s.model))?s.model:'');
+      $('ap_extra').value=s.extra||'';
+      $('ap_custom_wrap').style.display=$('ap_model').value==='__custom__'?'block':'none';
+      syncAPProfileSelectors();
+    }
+
+    function applyAPProfile(id){
+      if(!id){setActiveAPProfileId('');syncAPProfileSelectors();return}
+      const p=getAPProfiles().find(x=>x.id===id);if(!p)return;
+      saveAPSettings({model:p.model||AP_DEFAULT.model,customModel:p.customModel||'',extra:p.extra||''});
+      setActiveAPProfileId(id);syncAPModal();syncAPProfileSelectors();
+      $('auto_prompt_hint').innerHTML=`Auto Prompt instructions: <b>${esc(p.name)}</b> · model <b>${esc(currentAPModel())}</b>.`;
+      say('Auto Prompt profile selected · '+p.name);
+    }
+
+    async function checkAPKey(){const el=$('ap_key_status');el.className='apstatus';el.textContent='Checking OPENAI_API_KEY…';try{const d=await(await fetch('/api/auto_prompt/meta',{cache:'no-store'})).json();if(d.key_available){el.className='apstatus ok';el.textContent='✓ OPENAI_API_KEY available to Auto Prompt.'}else{el.className='apstatus err';el.textContent='OPENAI_API_KEY is not available to this UI process. Add it in Colab Secrets, then rerun V86.'}}catch(e){el.className='apstatus err';el.textContent='Could not check OPENAI_API_KEY.'}}
+    function openAPModal(){syncAPModal();$('auto_prompt_modal').classList.add('show');checkAPKey();$('ap_profile_select').focus()}
+    function closeAPModal(){$('auto_prompt_modal').classList.remove('show')}
+    $('auto_prompt_settings').onclick=openAPModal;$('ap_close').onclick=closeAPModal;$('ap_cancel').onclick=closeAPModal;
+    $('auto_prompt_modal').addEventListener('click',e=>{if(e.target===$('auto_prompt_modal'))closeAPModal()});
+    $('ap_model').onchange=()=>{$('ap_custom_wrap').style.display=$('ap_model').value==='__custom__'?'block':'none'};
+    $('ap_profile_select').onchange=()=>applyAPProfile($('ap_profile_select').value);
+
+    $('ap_profile_save').onclick=()=>{
+      const name=$('ap_profile_name').value.trim(),model=$('ap_model').value,customModel=$('ap_custom_model').value.trim(),extra=$('ap_extra').value;
+      if(!name){$('ap_key_status').className='apstatus err';$('ap_key_status').textContent='Give this instruction profile a name first.';return}
+      if(model==='__custom__'&&!customModel){$('ap_key_status').className='apstatus err';$('ap_key_status').textContent='Enter a custom model ID first.';return}
+      const profiles=getAPProfiles();let id=activeAPProfileId();const active=profiles.find(p=>p.id===id);
+      if(!active||active.name!==name){const same=profiles.find(p=>p.name.toLowerCase()===name.toLowerCase());id=same?same.id:((crypto&&crypto.randomUUID)?crypto.randomUUID():`${Date.now()}-${Math.random()}`)}
+      const row={id,name,model,customModel,extra,updated:Date.now()},idx=profiles.findIndex(p=>p.id===id);
+      if(idx>=0)profiles[idx]=row;else profiles.push(row);
+      profiles.sort((a,b)=>a.name.localeCompare(b.name));saveAPProfiles(profiles);saveAPSettings({model,customModel,extra});setActiveAPProfileId(id);syncAPProfileSelectors();
+      $('ap_key_status').className='apstatus ok';$('ap_key_status').textContent=`✓ Saved instruction profile "${name}".`;
+      $('auto_prompt_hint').innerHTML=`Auto Prompt instructions: <b>${esc(name)}</b> · model <b>${esc(model==='__custom__'?customModel:model)}</b>.`;
+      say('Auto Prompt instruction profile saved · '+name);
+    };
+
+    $('ap_profile_delete').onclick=async()=>{
+      const id=activeAPProfileId(),p=getAPProfiles().find(x=>x.id===id);if(!p)return;
+      const ok=await uiConfirm(`Delete saved Auto Prompt instruction profile "${p.name}"?`,{title:'Delete Auto Prompt profile',confirmLabel:'Delete'});if(!ok)return;
+      saveAPProfiles(getAPProfiles().filter(x=>x.id!==id));setActiveAPProfileId('');syncAPProfileSelectors();$('ap_profile_name').value='';
+      $('ap_key_status').className='apstatus';$('ap_key_status').textContent='Profile deleted. Current instructions remain until you change them.';say('Auto Prompt profile deleted');
+    };
+
+    $('ap_save').onclick=()=>{
+      const model=$('ap_model').value,customModel=$('ap_custom_model').value.trim(),extra=$('ap_extra').value;
+      if(model==='__custom__'&&!customModel){$('ap_key_status').className='apstatus err';$('ap_key_status').textContent='Enter a custom model ID first.';return}
+      saveAPSettings({model,customModel,extra});
+      const active=getAPProfiles().find(p=>p.id===activeAPProfileId());
+      if(active&&(active.model!==model||active.customModel!==customModel||active.extra!==extra))setActiveAPProfileId('');
+      syncAPProfileSelectors();closeAPModal();
+      $('auto_prompt_hint').innerHTML=`Auto Prompt model: <b>${esc(model==='__custom__'?customModel:model)}</b> · current instructions saved locally.`;
+      say('Auto Prompt settings saved');
+    };
+
+    syncAPProfileSelectors();
+    $('auto_prompt_btn').onclick=async()=>{
+      const s=getAPSettings(),model=currentAPModel(),btn=$('auto_prompt_btn'),hint=$('auto_prompt_hint');
+      if(!model){openAPModal();return}
+      const fd=new FormData();
+      fd.append('rough_prompt',$('prompt').value||'');
+      fd.append('model',model);
+      fd.append('extra_instructions',s.extra||'');
+      for(const k of ['duration','width','height','playback_speed','use_stage_last'])fd.append(k,$(k).value);
+      for(const k of ['first_frame','last_frame'])if($(k).files[0])fd.append(k,$(k).files[0]);
+      btn.disabled=true;btn.classList.add('working');btn.textContent='✦ WRITING H3 PROMPT…';
+      hint.textContent='Analyzing intent'+(($('first_frame').files[0]||$('last_frame').files[0]||$('use_stage_last').value==='1')?' + reference frame(s)':'')+'…';
+      say('Auto Prompt · '+model);
+      try{
+        const resp=await fetch('/api/auto_prompt',{method:'POST',body:fd});
+        const r=await resp.json();
+        if(r.adult_ack_required){
+          const ok=await requestAdultAcknowledgement();
+          if(ok){setTimeout(()=>$('auto_prompt_btn').click(),0);return}
+          hint.textContent='Adult Auto Prompt request cancelled; rough prompt preserved.';
+          return;
+        }
+        if(r.error){
+          hint.innerHTML=`<span style="color:#ff8181">${esc(r.error)}</span><br>Raw prompt preserved — GENERATE still sends it directly to local H3.`;
+          say('Auto Prompt failed · raw prompt preserved');return
+        }
+        $('prompt').value=r.prompt||'';$('prompt').dispatchEvent(new Event('input',{bubbles:true}));
+        const refs=[r.used_first_image?'FIRST':null,r.used_last_image?'LAST':null].filter(Boolean).join(' + ');
+        hint.innerHTML=`✓ <b>${esc(r.model)}</b> · ${esc(String(r.mode||'').toUpperCase())}${refs?` · ${refs} vision reference${refs.includes(' + ')?'s':''} used`:''}`;
+        say('Auto Prompt ready · prompt field populated')
+      }catch(e){
+        hint.innerHTML=`<span style="color:#ff8181">Auto Prompt request failed: ${esc(e)}</span><br>Raw prompt preserved — GENERATE remains local.`;
+        say('Auto Prompt failed · raw prompt preserved')
+      }finally{
+        btn.disabled=false;btn.classList.remove('working');btn.textContent='✦ AUTO PROMPT'
+      }
+    };
+    function syncStageClear(){
+      const hasVideo=!!$('vwrap').querySelector('video');
+      $('stage_controls').style.display=hasVideo?'flex':'none';
+    }
+    async function _waitForVideoMetadata(v){
+      if(Number.isFinite(v.duration)&&v.duration>0&&v.videoWidth&&v.videoHeight)return;
+      await new Promise((resolve,reject)=>{
+        const done=()=>{cleanup();resolve()};
+        const fail=()=>{cleanup();reject(new Error('Could not read staged video metadata.'))};
+        const cleanup=()=>{v.removeEventListener('loadedmetadata',done);v.removeEventListener('error',fail)};
+        v.addEventListener('loadedmetadata',done,{once:true});
+        v.addEventListener('error',fail,{once:true});
+        try{v.load()}catch(_){}
+      });
+    }
+    async function stageLastFrameToFirst(){
+      const v=$('vwrap').querySelector('video');
+      if(!v){await uiAlert('Put a clip on the Stage first.','No staged clip');return}
+      const btn=$('stage_last_to_first');
+      const originalText=btn.textContent;
+      btn.classList.add('working');btn.textContent='CAPTURING…';
+      try{
+        await _waitForVideoMetadata(v);
+        const wasPaused=v.paused;
+        const oldTime=Number.isFinite(v.currentTime)?v.currentTime:0;
+        try{v.pause()}catch(_){}
+        const frameStep=1/24;
+        const target=Math.max(0,Number(v.duration)-frameStep);
+        if(Math.abs(v.currentTime-target)>0.002){
+          await new Promise((resolve,reject)=>{
+            let settled=false;
+            const finish=()=>{if(settled)return;settled=true;cleanup();resolve()};
+            const fail=()=>{if(settled)return;settled=true;cleanup();reject(new Error('Could not seek to the last frame.'))};
+            const cleanup=()=>{v.removeEventListener('seeked',finish);v.removeEventListener('error',fail)};
+            v.addEventListener('seeked',finish,{once:true});
+            v.addEventListener('error',fail,{once:true});
+            v.currentTime=target;
+          });
+        }
+        const canvas=document.createElement('canvas');
+        canvas.width=v.videoWidth;canvas.height=v.videoHeight;
+        const ctx=canvas.getContext('2d',{alpha:false});
+        if(!ctx)throw new Error('Canvas capture is unavailable in this browser.');
+        ctx.drawImage(v,0,0,canvas.width,canvas.height);
+        const blob=await new Promise((resolve,reject)=>canvas.toBlob(b=>b?resolve(b):reject(new Error('Could not encode the captured frame.')),'image/png'));
+        const file=new File([blob],`stage_last_${Date.now()}.png`,{type:'image/png'});
+        const dt=new DataTransfer();dt.items.add(file);
+        $('first_frame').files=dt.files;
+
+        // The existing first-frame change handler updates the preview, aspect,
+        // continuation flag, and generation payload exactly like a normal upload.
+        $('first_frame').dispatchEvent(new Event('change',{bubbles:true}));
+        if(currentModelMode()!=='fl2va')await setModelMode('fl2va');
+
+        // Restore the viewer position so grabbing a frame does not wreck the Stage.
+        try{
+          if(Number.isFinite(oldTime)&&Math.abs(oldTime-target)>0.002)v.currentTime=Math.min(oldTime,v.duration||oldTime);
+          if(!wasPaused){
+            const playPromise=v.play();
+            if(playPromise&&playPromise.catch)playPromise.catch(()=>{});
+          }
+        }catch(_){}
+        say('stage last frame assigned to FIRST FRAME');
+      }catch(e){
+        await uiAlert(String(e&&e.message?e.message:e),'Could not capture last frame');
+      }finally{
+        btn.classList.remove('working');btn.textContent=originalText;
+      }
+    }
+    $('stage_last_to_first').onclick=stageLastFrameToFirst;
+    $('clear_stage').onclick=()=>{$('vwrap').innerHTML='<div id="empty">generated video appears here</div>';$('meta').textContent='';syncStageClear();say('stage cleared')};
+    syncStageClear();
+
+    function setPanelMin(panel,on){panel.classList.toggle('minimized',!!on)}
+    $('history_hide').onclick=()=>{$('history_panel').style.display='none'};
+    $('queue_hide').onclick=()=>{$('queue_panel').style.display='none'};
+    $('show_history').onclick=()=>{setPanelMin($('history_panel'),false);$('history_panel').style.display='block';$('history_panel').style.zIndex=1210};
+    $('show_queue').onclick=()=>{setPanelMin($('queue_panel'),false);$('queue_panel').style.display='block';$('queue_panel').style.zIndex=1210};
+    $('show_console').onclick=()=>{$('consolebox').style.display='block';$('consolebox').style.zIndex=1220};
+    $('history_expand').onclick=()=>{const p=$('history_panel');const big=p.dataset.big==='1';p.dataset.big=big?'0':'1';p.style.width=big?'':'min(500px,calc(100vw - 20px))';$('history_expand').textContent=big?'⛶ Expand':'↙ Normal'};
+    function makeFloating(panel){
+      const head=panel.querySelector('.floathead');let drag=null;
+      head.addEventListener('pointerdown',e=>{if(e.target.closest('button'))return;const r=panel.getBoundingClientRect();drag={dx:e.clientX-r.left,dy:e.clientY-r.top};head.setPointerCapture(e.pointerId)});
+      head.addEventListener('pointermove',e=>{if(!drag)return;const x=Math.max(4,Math.min(window.innerWidth-panel.offsetWidth-4,e.clientX-drag.dx));const y=Math.max(4,Math.min(window.innerHeight-panel.offsetHeight-4,e.clientY-drag.dy));panel.style.left=x+'px';panel.style.top=y+'px';panel.style.right='auto';panel.style.bottom='auto'});
+      head.addEventListener('pointerup',e=>{drag=null;try{head.releasePointerCapture(e.pointerId)}catch(_){}});
+    }
+    makeFloating($('history_panel'));makeFloating($('queue_panel'));makeFloating($('consolebox'));
+
+    // Live raw stdout/stderr from the Python/ComfyUI process. This is global because
+    // the studio only allows one GPU generation at a time.
+    let consoleSeq=0;
+    let consolePaused=false;
+    $('clearconsole').onclick=e=>{e.preventDefault();$('console').textContent='';};
+    $('copyconsole').onclick=async e=>{
+      e.preventDefault();
+      const text=$('console').textContent||'';
+      const btn=$('copyconsole');
+      try{
+        if(navigator.clipboard&&window.isSecureContext){
+          await navigator.clipboard.writeText(text);
+        }else{
+          const ta=document.createElement('textarea'); ta.value=text; ta.style.position='absolute'; ta.style.left='-9999px';
+          document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove();
+        }
+        const old=btn.textContent; btn.textContent='COPIED'; setTimeout(()=>btn.textContent=old,900);
+      }catch(err){
+        const old=btn.textContent; btn.textContent='COPY FAILED'; setTimeout(()=>btn.textContent=old,1200);
+      }
+    };
+    $('minconsole').onclick=e=>{e.preventDefault();$('consolebox').style.display='none'};
+    async function pollConsole(){
+      try{
+        const r=await fetch('/api/console?since='+consoleSeq,{cache:'no-store'});
+        const d=await r.json();
+        if(Array.isArray(d.lines)&&d.lines.length){
+          const box=$('console');
+          const nearBottom=(box.scrollHeight-box.scrollTop-box.clientHeight)<50;
+          for(const row of d.lines){
+            const text=(row.stream==='stderr'?'[stderr] ':'')+row.text+'\n';
+            box.appendChild(document.createTextNode(text));
+            consoleSeq=Math.max(consoleSeq,Number(row.seq||0));
+          }
+          // Avoid unbounded browser DOM growth while retaining a useful raw tail.
+          if(box.textContent.length>240000) box.textContent=box.textContent.slice(-180000);
+          if(nearBottom) box.scrollTop=box.scrollHeight;
+        }else if(Number(d.latest||0)>consoleSeq){
+          consoleSeq=Number(d.latest||0);
+        }
+      }catch(e){}
+      setTimeout(pollConsole,700);
+    }
+    pollConsole();
+
+    // Continuous GPU telemetry. This is independent of job polling, so it remains
+    // visible during model load/unload, VAE decode, muxing, and after an error.
+    async function pollGPU(){
+      try{
+        const r=await fetch('/api/gpu',{cache:'no-store'});
+        const d=await r.json();
+        if(d.ok){
+          const util=Number(d.util||0), mu=Number(d.mem_util||0);
+          const used=Number(d.mem_used_mb||0)/1024, total=Number(d.mem_total_mb||0)/1024;
+          const temp=Number(d.temp_c||0), pw=Number(d.power_w||0), pl=Number(d.power_limit_w||0);
+          $('gpu_util').textContent=util.toFixed(0)+'%';
+          $('gpu_vram').textContent=used.toFixed(1)+' / '+total.toFixed(1)+' GiB';
+          $('gpu_memutil').textContent=mu.toFixed(0)+'%';
+          $('gpu_temp').textContent=temp.toFixed(0)+' °C';
+          $('gpu_power').textContent=pw.toFixed(0)+' / '+pl.toFixed(0)+' W';
+          $('gpu_clock').textContent=Number(d.clock_mhz||0).toFixed(0)+' MHz';
+          $('gpu_util').className='gpuv '+(util>=70?'busy':'');
+          $('gpu_temp').className='gpuv '+(temp>=80?'hot':'');
+        }else{
+          $('gpu_util').textContent='nvidia-smi unavailable';
+        }
+      }catch(e){}
+      setTimeout(pollGPU,1000);
+    }
+    pollGPU();
+
+    // H3 uses a fixed 24-fps latent clock and legal frame lengths 17*n+5.
+    function snapFrames(v){
+      v=Number(v||5);
+      let k=Math.round((v-5)/17);
+      return Math.max(5,Math.min(3592,17*Math.max(0,k)+5));
+    }
+    function updateDur(){
+      const mode=$('length_mode').value;
+      const speed=Math.max(.05,Number($('playback_speed').value||1));
+      let f;
+      if(mode==='frames'){
+        f=snapFrames(Number($('frames').value||124));
+      }else{
+        const finalSec=Math.max(.01,Number($('duration').value||7));
+        f=snapFrames(finalSec*speed*24);
+      }
+      const modelSec=f/24, finalSec=modelSec/speed;
+      const trained=f>=124&&f<=362;
+      syncMotionPace();
+      $('durhint').innerHTML=`→ H3 model: <b>${f} frames / ${modelSec.toFixed(2)}s</b> · final MP4 ≈ <b>${finalSec.toFixed(2)}s</b> · motion pace ${speed.toFixed(2)}×`+
+        (trained?'':`<br><span style="color:#c9a227">outside the best-tested 124–362 frame range (≈5.2–15.1s model time); H3 accepts it, but quality/memory are less predictable.</span>`);
+    }
+    $('duration').addEventListener('input',()=>{$('length_mode').value='seconds';updateDur();});
+    $('frames').addEventListener('input',()=>{$('length_mode').value='frames';updateDur();});
+    $('playback_speed').addEventListener('input',updateDur);
+
+    function updateSparseUI(source){
+      let pct;
+      if(source==='slider'){
+        pct=Number($('sparse_slider').value||0);
+        $('sparse_percent').value=pct;
+      }else{
+        pct=Math.max(0,Math.min(100,Number($('sparse_percent').value||0)));
+        $('sparse_percent').value=pct;
+        $('sparse_slider').value=pct;
+      }
+      const m=window.H3META||{};
+      if(m.sparse_available===false){
+        $('sparsehint').textContent='Sparse attention is unavailable in this session. Set this to 0% or restart V37.';
+      }else if(pct<=0){
+        $('sparsehint').innerHTML='<b>Dense / max quality.</b> Sparse attention is disabled.';
+      }else{
+        $('sparsehint').innerHTML=`<b>${pct.toFixed(1)}% video-attention budget.</b> Lower is faster; raise this if detail or motion quality drops. 0% = dense.`;
+      }
+    }
+    $('sparse_slider').addEventListener('input',()=>updateSparseUI('slider'));
+    $('sparse_percent').addEventListener('input',()=>updateSparseUI('number'));
+    $('length_mode').addEventListener('change',updateDur);
+    updateDur();
+
+    let firstImageDims=null;
+    function snap32(v){return Math.max(32,Math.round(v/32)*32)}
+    function fitCanvas(){
+      if(!firstImageDims){say('choose a first frame first');return}
+      const short=Math.max(256,snap32(Number($('short_edge').value||768)));
+      const ar=firstImageDims.w/firstImageDims.h;
+      let w,h;
+      if(ar>=1){h=short;w=Math.max(32,Math.floor((short*ar)/32)*32)}
+      else{w=short;h=Math.max(32,Math.floor((short/ar)/32)*32)}
+      $('width').value=w;$('height').value=h;
+      say(`canvas fitted to ${w}×${h}`);
+    }
+    function releaseSlotObjectURL(img){const u=img.dataset.objectUrl;if(u){try{URL.revokeObjectURL(u)}catch(_){}delete img.dataset.objectUrl}}
+    function clearImageSlot(kind,{keepContinuation=false}={}){
+      const input=$(kind+'_frame'),img=$(kind+'_preview'),slot=$(kind+'_slot');
+      releaseSlotObjectURL(img);input.value='';img.removeAttribute('src');slot.classList.remove('has-image');delete slot.dataset.source;
+      if(kind==='first'){firstImageDims=null;if(!keepContinuation){stageButtonActive(false);refreshStageState(true)}}
+    }
+    function showImageModal(src){if(!src)return;$('image_view_full').src=src;$('image_view_modal').classList.add('show')}
+    function closeImageModal(){$('image_view_modal').classList.remove('show');$('image_view_full').removeAttribute('src')}
+    $('image_view_close').onclick=closeImageModal;$('image_view_modal').addEventListener('click',e=>{if(e.target===$('image_view_modal'))closeImageModal()});
+    function bindImageSlot(kind,isFirst){
+      const input=$(kind+'_frame'),img=$(kind+'_preview'),slot=$(kind+'_slot'),trash=$(kind+'_trash');
+      function openOrPick(){if(slot.classList.contains('has-image')&&img.src)showImageModal(img.src);else input.click()}
+      slot.addEventListener('click',e=>{if(e.target.closest('.slottrash'))return;openOrPick()});
+      slot.addEventListener('keydown',e=>{if((e.key==='Enter'||e.key===' ')&&!e.target.closest('.slottrash')){e.preventDefault();openOrPick()}});
+      trash.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();clearImageSlot(kind);say(kind+' frame cleared')});
+      input.addEventListener('change',()=>{
+        const f=input.files[0];if(!f){clearImageSlot(kind,{keepContinuation:true});return}
+        if(isFirst){stageButtonActive(false);refreshStageState(true)}
+        releaseSlotObjectURL(img);const u=URL.createObjectURL(f);img.dataset.objectUrl=u;
+        img.onload=()=>{slot.classList.add('has-image');slot.dataset.source='upload';if(isFirst){firstImageDims={w:img.naturalWidth,h:img.naturalHeight};if($('auto_aspect').checked)fitCanvas()}};
+        img.src=u;
+      });
+    }
+    bindImageSlot('first',true);bindImageSlot('last',false);
+    function clearRefImageSlot(index){const input=$('ref_image_'+index),img=$('ref_image_preview_'+index),slot=$('ref_image_slot_'+index);releaseSlotObjectURL(img);input.value='';img.removeAttribute('src');slot.classList.remove('has-image');delete slot.dataset.source}
+    function bindRefImageSlot(index){const input=$('ref_image_'+index),img=$('ref_image_preview_'+index),slot=$('ref_image_slot_'+index),trash=$('ref_image_trash_'+index);function openOrPick(){if(slot.classList.contains('has-image')&&img.src)showImageModal(img.src);else input.click()}slot.addEventListener('click',e=>{if(e.target.closest('.slottrash'))return;openOrPick()});slot.addEventListener('keydown',e=>{if((e.key==='Enter'||e.key===' ')&&!e.target.closest('.slottrash')){e.preventDefault();openOrPick()}});trash.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();clearRefImageSlot(index);say('reference image '+index+' cleared')});input.addEventListener('change',()=>{const f=input.files[0];if(!f){clearRefImageSlot(index);return}releaseSlotObjectURL(img);const u=URL.createObjectURL(f);img.dataset.objectUrl=u;img.onload=()=>{slot.classList.add('has-image');slot.dataset.source='upload'};img.src=u})}
+    function bindNamedFileInput(prefix,index,emptyLabel){const input=$(prefix+'_'+index),pick=$(prefix+'_pick_'+index),clear=$(prefix+'_clear_'+index),name=$(prefix+'_name_'+index);const sync=()=>{const f=input.files[0];name.textContent=f?f.name:emptyLabel;clear.disabled=!f};pick.onclick=e=>{e.preventDefault();input.click()};clear.onclick=e=>{e.preventDefault();input.value='';sync();say(prefix.replace('_',' ')+' '+index+' cleared')};input.addEventListener('change',sync);sync()}
+    for(let i=1;i<=9;i++)bindRefImageSlot(i);
+    for(let i=1;i<=3;i++){bindNamedFileInput('ref_video',i,'No video selected');bindNamedFileInput('ref_audio',i,'No audio selected')}
+    function clearFirstPreview(){clearImageSlot('first',{keepContinuation:true})}
+    function stageButtonActive(on){$('use_stage_last').value=on?'1':'0'}
+    async function refreshStageState(quiet=false){
+      try{const s=await (await fetch('/api/stage_state')).json();window.STAGE_STATE=s||{ok:false};return s}catch(e){if(!quiet)console.warn(e);return null}
+    }
+
+    let firstMeta=true;
+    function loadMeta(){
+      const prevSampler=$('sampler_name').value,prevScheduler=$('scheduler').value,prevUnet=$('unet').value;
+      return fetch('/api/meta').then(r=>r.json()).then(m=>{
+        window.H3META=m;
+        window.ADULT_ENABLED=!!m.adult_enabled;
+        syncAdultModeButton(m);
+        if(firstMeta)ACTIVE_MODEL_PROFILE='stock_quality';
+
+        $('sampler_name').innerHTML=(m.samplers||[]).map(s=>`<option>${esc(s)}</option>`).join('');
+        $('scheduler').innerHTML=(m.schedulers||[]).map(s=>`<option>${esc(s)}</option>`).join('');
+        if((m.samplers||[]).includes(prevSampler))$('sampler_name').value=prevSampler;
+        else if((m.samplers||[]).includes(m.stock_quality_sampler||'res_multistep'))$('sampler_name').value=m.stock_quality_sampler||'res_multistep';
+        if((m.schedulers||[]).includes(prevScheduler))$('scheduler').value=prevScheduler;
+        else if((m.schedulers||[]).includes(m.stock_quality_scheduler||'simple'))$('scheduler').value=m.stock_quality_scheduler||'simple';
+
+        syncModelProfileOptions(m);
+
+        $('unet').innerHTML=(m.unets||[]).map(s=>`<option value="${esc(s)}">${esc(s)}</option>`).join('');
+        if(prevUnet&&(m.unets||[]).includes(prevUnet))$('unet').value=prevUnet;
+        else if(m.unet_default&&(m.unets||[]).includes(m.unet_default))$('unet').value=m.unet_default;
+
+        renderNamedLoraRows(m);
+
+        if(firstMeta){
+          // Safe startup: Stock H3, all creative LoRAs OFF. Adult catalog stays hidden.
+          $('length_mode').value='seconds';
+          ACTIVE_MODEL_PROFILE='stock_quality';
+          $('model_profile_select').value='stock_quality';
+          $('duration').value=m.lowvram_t4?5.17:7;
+          $('frames').value=m.lowvram_t4?124:175;
+          if(m.lowvram_t4){
+            $('width').value=640;$('height').value=480;$('short_edge').value=480;
+            $('model_profile_select').disabled=true;
+          }
+          LORA_CARD_STATE.clear();
+          _setStrengthForKind('motion8',0,m);
+          $('playback_speed').value=1.0;$('denoise').value=1.0;
+          if(m.lowvram_t4){
+            // T4 stays on its lean Q4 profile; the BF16 Lightning LoRA is intentionally unavailable there.
+            ACTIVE_PERF_PRESET='quality';
+            _setStrengthForKind('lightning',0,m);
+            $('steps').value=m.stock_quality_steps||20;
+            if((m.samplers||[]).includes(m.stock_quality_sampler||'res_multistep'))$('sampler_name').value=m.stock_quality_sampler||'res_multistep';
+            if((m.schedulers||[]).includes(m.stock_quality_scheduler||'simple'))$('scheduler').value=m.stock_quality_scheduler||'simple';
+            $('shift_video').value=m.stock_quality_shift_video??12;
+            $('shift_audio').value=m.stock_quality_shift_audio??3;
+            say('ready · T4 LOW-VRAM · Stock H3');
+          }else{
+            // Default setting requested: use the matching Lightning/Turbo LoRA.
+            ACTIVE_PERF_PRESET='fast';
+            _setStrengthForKind('lightning',m.lightning_strength_default||1.0,m);
+            $('steps').value=4;
+            if((m.samplers||[]).includes('euler'))$('sampler_name').value='euler';
+            if((m.schedulers||[]).includes('simple'))$('scheduler').value='simple';
+            $('shift_video').value=currentModelMode()==='ref2va'?12:6;
+            $('shift_audio').value=3;
+            say('ready · Stock H3 · Lightning/Turbo default');
+          }
+          $('sparse_percent').value=0;$('sparse_slider').value=0;updateSparseUI('number');
+          updateDur();
+          firstMeta=false;
+        }else if(!m.adult_enabled&&['eros','redmix'].includes(ACTIVE_MODEL_PROFILE)){
+          // A restarted/expired browser session must fail closed back to the safe model.
+          ACTIVE_MODEL_PROFILE='stock_quality';
+          const target=currentModelMode()==='ref2va'?m.stock_ref2va_unet:m.base_fl2va_unet;
+          if(target&&(m.unets||[]).includes(target))$('unet').value=target;
+        }
+
+        $('tab_ref2va').disabled=!m.ref2va_available;
+        if(!m.ref2va_available && currentModelMode()==='ref2va'){
+          localStorage.setItem(MODEL_MODE_STORE_KEY,'fl2va');$('input_mode').value='fl2va';
+        }
+        syncModelModeUI();
+        syncModelProfileUI();
+        syncUnifiedLoraCompatibility();
+
+        const arch=$('arch_label');
+        if(arch)arch.textContent=(m.gpu_arch_label||m.gpu_profile||'AUTO GPU').toUpperCase();
+        const mh=$('modelhint');
+        if(mh){
+          const profileBlurb=m.lowvram_t4
+            ? '<b>T4 / 16GB LOW-VRAM STACK</b> · Q4_0 GGUF + Dynamic VRAM · Stock H3 only.'
+            : (m.a100_80
+              ? '<b>A100 80GB QUALITY STACK</b> · native SM80 quality path.'
+              : (m.a100_40
+                ? '<b>A100 40GB QUALITY STACK</b> · sequential TE→DiT→VAE handoff.'
+                : '<b>BLACKWELL SM120 QUALITY STACK</b> · CUDA13 quality path.'));
+          mh.innerHTML=profileBlurb
+            + `<br><span style="color:#9aa0aa">Residency</span> · ${m.lowvram_t4?'DYNAMIC VRAM / CPU↔GPU paging':(m.full_stack_residency?'FULL STACK RESIDENT':'PARTITIONED TE↔DiT handoff')} · ${m.physical_vram_gib||'?'} GiB physical`
+            + `<br><span style="color:#9aa0aa">Conditioning TE</span> · ${m.quality_text_encoder||'Qwen3-VL-32B'}`
+            + '<br>' + (m.ref2va_available
+              ? `<span style="color:#9aa0aa">Ref2VA available</span> · stock Ref2VA downloads on first use · ${m.ref2va_max_images||9} image / ${m.ref2va_max_videos||3} video / ${m.ref2va_max_audios||3} audio slots.`
+              : '<span style="color:#d99191">Ref2VA unavailable</span> · update ComfyUI to expose MiniMaxH3ReferenceToVideo.');
+        }
+        return m;
+      });
+    }
+    syncModelModeUI();
+    loadMeta();
+    refreshStageState(true);
+    refreshTimeline(true);
+    $('project_menu_btn').onclick=()=>{$('project_popover').classList.toggle('show')};
+    $('project_pop_close').onclick=()=>{$('project_popover').classList.remove('show')};
+    document.addEventListener('click',e=>{const p=$('project_popover');if(!p.classList.contains('show'))return;if(e.target.closest('#project_popover')||e.target.closest('#project_menu_btn'))return;p.classList.remove('show')});
+    $('refresh').onclick=e=>{e.preventDefault();loadMeta().then(m=>
+      say(`${Math.max(0,(m.loras||[]).length-1)} visible LoRA(s) found`))};
+
+    function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+    function previewTimelineFile(file){
+      if(!file)return;
+      $('vwrap').innerHTML=`<video controls autoplay src="/out/${encodeURIComponent(file)}?t=${Date.now()}"></video>`;
+      syncStageClear();
+    }
+    async function deleteTimelineClip(segmentId){
+      if(!(await uiConfirm('Remove this clip from the active timeline? The render will remain available in History.',{title:'Remove clip',confirmLabel:'Remove',danger:true})))return;
+      const r=await(await fetch('/api/timeline/segment/'+encodeURIComponent(segmentId),{method:'DELETE'})).json();
+      if(r.error){fail(r.error);return}await refreshTimeline(true);say('clip removed and sequence restitched');
+    }
+    async function sendTimelineOrder(){
+      const order=[...document.querySelectorAll('#timeline .tclip')].map(el=>el.dataset.segment);
+      const r=await(await fetch('/api/timeline/reorder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order})})).json();
+      if(r.error){fail(r.error);return}await refreshTimeline(true);say('timeline reordered + restitched');
+    }
+    const timelineDropInflight=new Set();
+    async function addHistoryToTimeline(historyId,index=null,dragId=null){
+      const key=dragId||`${historyId}:${index===null?'end':index}`;
+      if(timelineDropInflight.has(key))return;
+      timelineDropInflight.add(key);
+      try{
+        const r=await(await fetch('/api/timeline/add_history',{
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({history_id:historyId,index,drag_id:dragId})
+        })).json();
+        if(r.error){fail(r.error);return}
+        if(!r.duplicate_suppressed){
+          await refreshTimeline(true);
+          say('1 history clip added to active timeline');
+        }
+      }finally{
+        timelineDropInflight.delete(key);
+      }
+    }
+    function wireTimelineDnD(){
+      const tl=$('timeline');
+      let dragging=null;
+
+      // Clip-level listeners live on freshly-rendered nodes, so these do not accumulate.
+      [...tl.querySelectorAll('.tclip')].forEach(el=>{
+        el.draggable=true;
+        el.addEventListener('dragstart',e=>{
+          dragging=el;
+          el.classList.add('dragging');
+          e.dataTransfer.effectAllowed='move';
+          e.dataTransfer.setData('application/x-h3-segment',el.dataset.segment);
+        });
+        el.addEventListener('dragend',()=>{
+          el.classList.remove('dragging');
+          dragging=null;
+          [...tl.querySelectorAll('.tclip')].forEach(x=>x.classList.remove('drop-before','drop-after'));
+        });
+        el.addEventListener('dragover',e=>{
+          e.preventDefault();
+          e.stopPropagation();
+          const r=el.getBoundingClientRect();
+          el.classList.toggle('drop-before',e.clientX<r.left+r.width/2);
+          el.classList.toggle('drop-after',e.clientX>=r.left+r.width/2);
+        });
+        el.addEventListener('dragleave',()=>el.classList.remove('drop-before','drop-after'));
+        el.addEventListener('drop',async e=>{
+          e.preventDefault();
+          e.stopPropagation();
+          const r=el.getBoundingClientRect();
+          const before=e.clientX<r.left+r.width/2;
+          const hid=e.dataTransfer.getData('application/x-h3-history');
+          const dragId=e.dataTransfer.getData('application/x-h3-drag-id')||null;
+          if(hid){
+            const clips=[...tl.querySelectorAll('.tclip')];
+            const idx=Math.max(0,clips.indexOf(el)+(before?0:1));
+            await addHistoryToTimeline(hid,idx,dragId);
+            return;
+          }
+          if(dragging&&dragging!==el){
+            el.parentNode.insertBefore(dragging,before?el:el.nextSibling);
+            await sendTimelineOrder();
+          }
+        });
+      });
+
+      // IMPORTANT: these are property handlers, not addEventListener().
+      // refreshTimeline() calls wireTimelineDnD repeatedly, and addEventListener()
+      // used to stack duplicate drop callbacks on the persistent timeline node.
+      tl.ondragover=e=>{
+        if(e.dataTransfer && [...e.dataTransfer.types].includes('application/x-h3-history')){
+          e.preventDefault();
+          tl.classList.add('drop-target');
+        }
+      };
+      tl.ondragleave=e=>{
+        if(!tl.contains(e.relatedTarget))tl.classList.remove('drop-target');
+      };
+      tl.ondrop=async e=>{
+        tl.classList.remove('drop-target');
+        const hid=e.dataTransfer?.getData('application/x-h3-history');
+        if(!hid)return;
+        e.preventDefault();
+        if(e.target.closest('.tclip'))return;
+        const dragId=e.dataTransfer.getData('application/x-h3-drag-id')||null;
+        await addHistoryToTimeline(hid,null,dragId);
+      };
+    }
+    $('sequence_select').addEventListener('change',async e=>{
+      if(!e.target.value)return;
+      const r=await(await fetch('/api/timeline/select_sequence',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({sequence_id:e.target.value})
+      })).json();
+      if(r.error){fail(r.error);return}
+      refreshTimeline(true);
+      say('active sequence changed');
+    });
+
+    async function refreshTimeline(quiet=false){
+      let t;
+      try{t=await (await fetch('/api/timeline')).json()}catch(e){if(!quiet)console.warn(e);return null}
+      window.H3TIMELINE=t;
+      const segs=t.segments||[];const seqs=t.sequences||[];const active=t.active_sequence||{};
+      if(document.activeElement!==$('project_name')) $('project_name').value=t.project_name||'Current Project';
+      updateContinuityAvailability(); $('timeline_retry').disabled=!segs.length;
+      $('timeline_compile').disabled=!segs.length;
+      $('timeline_clear').disabled=!segs.length;
+      const dl=$('project_download');if(t.project_file){dl.classList.remove('disabled');dl.dataset.href='/out/timeline_projects/'+encodeURIComponent(t.project_file)}else{dl.classList.add('disabled');delete dl.dataset.href}
+      const ps=$('project_select'),saved=t.saved_projects||[];ps.innerHTML=saved.length?saved.map(p=>`<option value="${esc(p.project_file)}" ${p.project_file===t.project_file?'selected':''}>${esc(p.project_name||p.project_file)} · ${p.clip_count||0} clip(s) · ${(Number(p.total_duration)||0).toFixed(2)}s</option>`).join(''):'<option value="">No saved timelines yet</option>';
+      $('timeline_project_hint').textContent=`${t.project_name||'Current Project'} · ${seqs.length} sequence${seqs.length===1?'':'s'} · ${Number(t.project_clip_count||0)} clips · autosaved`;
+      $('timeline_foot').textContent=`Active: ${(active.name||'Sequence')} · ${segs.length} clip${segs.length===1?'':'s'} · ${(Number(t.total_duration)||0).toFixed(2)} s`+(t.master_file?` · master ${t.master_file}`:'');
+      $('timeline_context').textContent=`${active.name||'Sequence'} · ${segs.length} clip${segs.length===1?'':'s'} · ${(Number(t.total_duration)||0).toFixed(2)} s`;
+      const seqSelect=$('sequence_select');
+      if(seqs.length>1){
+        seqSelect.innerHTML=seqs.map((s,i)=>`<option value="${esc(s.id)}" ${s.active?'selected':''}>${i+1}. ${esc(s.name||'Sequence')}</option>`).join('');
+        seqSelect.classList.add('show');
+      }else{
+        seqSelect.innerHTML='';
+        seqSelect.classList.remove('show');
+      }
+      if(!segs.length){$('timeline').innerHTML='<div class=timelineempty>Drop a History clip here or generate the first clip.</div>';wireTimelineDnD();return t}
+      $('timeline').innerHTML=segs.map((s,i)=>{const thumb=s.last_frame_file?`<img src="/out/${encodeURIComponent(s.last_frame_file)}?t=${t.updated||0}">`:'';const p=esc((s.prompt||'').slice(0,58));return `<div class=tclip data-segment="${esc(s.segment_id||s.job)}" data-file="${esc(s.file)}" title="Drag to move · ${esc(s.prompt||'')}"><span class=dragbadge>⠿ ${i+1}</span><div class=ttools><button class=recallprompt data-prompt="${esc(s.prompt||'')}" title="Restore full prompt">P</button><button class=tdelete data-segment="${esc(s.segment_id||s.job)}" title="Delete clip">⌫</button></div><div class=tthumb>${thumb}</div><div class=tinfo><b>${s.continued?'LAST-FRAME CONTINUITY':'SHOT'}</b> · ${Number(s.duration||0).toFixed(2)}s<br>${s.width||'?'}×${s.height||'?'} · seed ${s.seed??'?'}<br>${p||'—'}</div></div>`}).join('');
+      [...document.querySelectorAll('.tclip')].forEach(el=>el.addEventListener('click',e=>{if(!e.target.closest('button'))previewTimelineFile(el.dataset.file)}));
+      [...document.querySelectorAll('.tclip .recallprompt')].forEach(b=>b.onclick=e=>{e.stopPropagation();restoreClipPrompt(b.dataset.prompt||'')});
+      [...document.querySelectorAll('.tdelete')].forEach(b=>b.onclick=e=>{e.stopPropagation();deleteTimelineClip(b.dataset.segment)});
+      wireTimelineDnD();return t
+    }
+
+    function restoreClipPrompt(prompt){
+      $('prompt').value=prompt||'';
+      $('prompt').dispatchEvent(new Event('input',{bubbles:true}));
+      $('prompt').focus();
+      $('prompt').scrollIntoView({behavior:'smooth',block:'center'});
+      say('clip prompt restored to editor');
+    }
+
+    async function refreshHistory(){
+      try{const d=await(await fetch('/api/history',{cache:'no-store'})).json();const rows=d.items||[];$('history_count').textContent=rows.length; $('history_launch_count').textContent=rows.length?rows.length:'';
+        if(!rows.length){$('history_body').innerHTML='<div class=floatempty>No completed generations yet.</div>';return}
+        $('history_body').innerHTML=rows.map(h=>{const thumb=h.last_frame_file?`<img src="/out/${encodeURIComponent(h.last_frame_file)}?t=${h.created||0}">`:'';return `<article class=historyitem draggable=true data-history="${esc(h.history_id)}" data-file="${esc(h.file)}"><div class=histthumb>${thumb}</div><div class=histmain><div class=histstatus>✅ Done</div><div class=histsub>${Number(h.duration||0).toFixed(2)}s · ${h.width||'?'}×${h.height||'?'} · seed ${h.seed??'?'}</div><div class=addhist>drag to timeline · double-click to preview</div></div><button class=recallprompt data-prompt="${esc(h.prompt||'')}" title="Restore this clip's full prompt">PROMPT</button><button class=trash data-history="${esc(h.history_id)}" title="Remove from history">⌫</button></article>`}).join('');
+        [...document.querySelectorAll('.historyitem')].forEach(el=>{
+          el.addEventListener('dragstart',e=>{
+            const dragId=(crypto&&crypto.randomUUID)?crypto.randomUUID():`${Date.now()}-${Math.random()}`;
+            e.dataTransfer.effectAllowed='copy';
+            e.dataTransfer.setData('application/x-h3-history',el.dataset.history);
+            e.dataTransfer.setData('application/x-h3-drag-id',dragId);
+          });
+          el.addEventListener('dblclick',()=>previewTimelineFile(el.dataset.file));
+        });
+        [...document.querySelectorAll('.historyitem .recallprompt')].forEach(b=>b.onclick=e=>{e.stopPropagation();restoreClipPrompt(b.dataset.prompt||'')});
+        [...document.querySelectorAll('.historyitem .trash')].forEach(b=>b.onclick=async e=>{e.stopPropagation();await fetch('/api/history/'+encodeURIComponent(b.dataset.history),{method:'DELETE'});refreshHistory()});
+      }catch(e){}
+    }
+    async function refreshQueue(){
+      try{
+        const d=await(await fetch('/api/queue',{cache:'no-store'})).json();
+        const rows=d.items||[];
+        activeQueueJob=d.active||null;
+        $('queue_count').textContent=rows.length?`${d.active?'1':'0'}/${rows.length}`:'0';
+        $('queue_launch_count').textContent=rows.length?`(${rows.length})`:'';
+
+        const active=rows.find(q=>q.status==='running');
+        if(active){
+          const stage=active.cancel_requested?'stopping…':(active.stage_label||active.stage||'running');
+          const step=(active.stage==='sampling'&&Number(active.sample_steps||0)>0)
+            ? ` · step ${Number(active.sample_step||0)}/${Number(active.sample_steps||0)}`
+            : '';
+          const eta=(active.stage==='sampling'&&active.sample_eta!=null)
+            ? ` · ETA ~${Number(active.sample_eta)}s`
+            : '';
+          const gpu=active.gpu_busy
+            ? ` · GPU ${Number(active.gpu_util||0).toFixed(0)}%`
+            : '';
+          const waiting=Number(d.queued||0)>0?` · ${Number(d.queued)} waiting`:'';
+          dot(active.possible_stall?'err':'live');
+          say(`${stage}${step} · stage ${Number(active.stage_elapsed||0)}s · total ${Number(active.elapsed||0)}s${eta}${gpu}${waiting}`);
+          $('pb').style.width=Math.max(0,Math.min(100,Number(active.pipeline_pct||0)))+'%';
+        }else if(Number(d.queued||0)>0){
+          if(d.worker_alive===false){
+            dot('err');
+            say(`QUEUE WORKER STOPPED · ${Number(d.queued)} waiting`);
+          }else{
+            dot('live');
+            say(`queue starting · ${Number(d.queued)} waiting`);
+          }
+          $('pb').style.width='0%';
+        }
+
+        if(!rows.length){
+          $('queue_body').innerHTML='<div class=floatempty>Queue is empty. Generate repeatedly to stack jobs.</div>';
+          return
+        }
+
+        $('queue_body').innerHTML=rows.map((q,i)=>{
+          const thumb=q.thumb_file?`<img src="/out/${encodeURIComponent(q.thumb_file)}">`:'';
+          const pct=Math.max(0,Math.min(100,Number(q.pipeline_pct||0)));
+          const stage=q.status==='running'?(q.cancel_requested?'stopping…':(q.stage_label||q.stage||'running')):'queued';
+
+          let health='';
+          if(q.status==='running'){
+            health=q.possible_stall
+              ? '<span class=queuehealth warn>CHECK</span>'
+              : q.gpu_busy
+                ? `<span class=queuehealth busy>GPU ${Number(q.gpu_util||0).toFixed(0)}%</span>`
+                : '<span class=queuehealth>ACTIVE</span>';
+          }
+
+          let detail='';
+          if(q.status==='running'){
+            const sample=(q.stage==='sampling'&&Number(q.sample_steps||0)>0)
+              ? ` · step ${Number(q.sample_step||0)}/${Number(q.sample_steps||0)}`
+              : '';
+            const eta=(q.stage==='sampling'&&q.sample_eta!=null)
+              ? ` · ETA ~${Number(q.sample_eta)}s`
+              : '';
+            detail=`<b>${esc(stage)}</b>${sample} · stage ${Number(q.stage_elapsed||0)}s · total ${Number(q.elapsed||0)}s${eta}`;
+          }else{
+            detail='waiting for active GPU job';
+          }
+
+          const action=q.status==='queued'
+            ? `<button class=cancel data-job="${q.id}" title="Cancel this queued generation">CANCEL</button>`
+            : `<button class=stoprun data-job="${q.id}" ${q.cancel_requested?'disabled':''} title="Stop at the next safe sampler/stage boundary">${q.cancel_requested?'STOPPING…':'STOP'}</button>`;
+
+          return `<article class=queueitem><div class=qthumb>${thumb}</div><div class=qmain><div class=qstatus>${q.status==='running'?'⚙ Running':'⌛ Queued'} <span class=queuebadge>${i+1}/${rows.length}</span> ${health}</div><div class=qsub>${detail}<br>${esc((q.prompt||'').slice(0,64))||'generation'} · output ${Number(q.duration||0).toFixed(1)}s</div><div class=queueprogress title="${pct.toFixed(0)}% overall pipeline"><i style="width:${pct}%"></i></div></div>${action}</article>`;
+        }).join('');
+
+        [...document.querySelectorAll('.queueitem .cancel,.queueitem .stoprun')].forEach(b=>b.onclick=async()=>{
+          b.disabled=true;
+          b.textContent=b.classList.contains('stoprun')?'STOPPING…':'CANCELLING…';
+          const r=await(await fetch('/api/queue/'+encodeURIComponent(b.dataset.job),{method:'DELETE'})).json();
+          if(r.error)await uiAlert(r.error,'Queue');
+          else say(r.running?'stop requested for running generation':'queued generation cancelled');
+          refreshQueue();
+        });
+      }catch(e){}
+    }
+
+    $('queue_clear').onclick=async()=>{await fetch('/api/queue/clear',{method:'POST'});refreshQueue();say('all waiting jobs cancelled · running job left alone')};
+    setInterval(refreshQueue,900);setInterval(refreshHistory,1800);refreshQueue();refreshHistory();
+
+    async function applyPerformancePreset(kind){
+      const m=window.H3META||{};
+      const profile=ACTIVE_MODEL_PROFILE;
+      const mode=currentModelMode();
+      const fast=kind==='fast';
+
+      if(fast && m.motion8_file && Math.abs(_strengthForKind('motion8',m))>1e-6){
+        await uiAlert('FAST uses the 4-step accelerator, while Motion Enhancer is an alternative acceleration LoRA. Turn Motion Enhancer OFF first. No LoRA selections were changed.','FAST preset conflict');
+        return;
+      }
+
+      // Performance presets configure the active model's sampler/accelerator.
+      // They do not activate optional specialty/style LoRAs.
+      $('denoise').value=1.0;
+      $('playback_speed').value=1.0;
+
+      if(profile==='eros'){
+        // Eros beta5 has its own merged Turbo. External Lightning stays OFF.
+        _setStrengthForKind('lightning',0,m);
+        if(m.eros_max_unet&&[...$('unet').options].some(x=>x.value===m.eros_max_unet))$('unet').value=m.eros_max_unet;
+
+        if(fast){
+          let sampler=m.fast_sampler||'lcm';
+          if(![...$('sampler_name').options].some(x=>x.value===sampler)){
+            sampler='euler';
+            $('steps').value=m.quality_steps||8;
+            $('shift_video').value=m.quality_shift_video??12;
+            $('shift_audio').value=m.quality_shift_audio??7;
+          }else{
+            $('steps').value=m.fast_steps||6;
+            $('shift_video').value=m.fast_shift_video??1;
+            $('shift_audio').value=m.fast_shift_audio??1;
+          }
+          $('sampler_name').value=sampler;
+          if([...$('scheduler').options].some(x=>x.value===(m.fast_scheduler||'simple')))$('scheduler').value=m.fast_scheduler||'simple';
+          $('sparse_percent').value=0;$('sparse_slider').value=0;updateSparseUI('number');
+        }else{
+          $('steps').value=m.quality_steps||8;
+          if([...$('sampler_name').options].some(x=>x.value===(m.quality_sampler||'euler')))$('sampler_name').value=m.quality_sampler||'euler';
+          if([...$('scheduler').options].some(x=>x.value===(m.quality_scheduler||'simple')))$('scheduler').value=m.quality_scheduler||'simple';
+          $('shift_video').value=m.quality_shift_video??12;$('shift_audio').value=m.quality_shift_audio??7;
+          $('sparse_percent').value=0;$('sparse_slider').value=0;updateSparseUI('number');
+          if(mode==='ref2va')$('ref_image_size').value='max';
+        }
+
+      }else if(profile==='redmix'){
+        // REDMIX Beta2 is already a merged INT8 ConvRot + Turbo checkpoint.
+        // Do not stack the external FAST accelerator on top of it.
+        _setStrengthForKind('lightning',0,m);
+        if(m.redmix_unet&&[...$('unet').options].some(x=>x.value===m.redmix_unet))$('unet').value=m.redmix_unet;
+        $('steps').value=m.redmix_steps||6;
+        const rs=(m.samplers||[]).includes(m.redmix_sampler||'er_sde')?(m.redmix_sampler||'er_sde'):'euler';
+        const rc=(m.schedulers||[]).includes(m.redmix_scheduler||'beta')?(m.redmix_scheduler||'beta'):'simple';
+        $('sampler_name').value=rs;$('scheduler').value=rc;
+        $('shift_video').value=m.redmix_shift_video??6;$('shift_audio').value=m.redmix_shift_audio??3;
+        $('sparse_percent').value=0;$('sparse_slider').value=0;updateSparseUI('number');
+
+      }else{
         // Stock H3 sampler path. Creative LoRA choices are never changed by a
         // performance preset; the single unified rack owns those choices.
         const target=mode==='ref2va'?m.stock_ref2va_unet:m.base_fl2va_unet;
@@ -6041,6 +7253,16 @@ Additional user Auto Prompt instructions:
       dot('live');say(timelineAction==='continue'?'adding generation with previous last-frame continuity':(mode==='ref2va'?'adding Ref2VA generation to queue':'adding generation to queue'));
       const resp=await fetch('/api/generate',{method:'POST',body:fd});
       const r=await resp.json();
+      if(r.adult_ack_required){
+        dot('');say('adult acknowledgement required');
+        const ok=await requestAdultAcknowledgement();
+        if(ok){
+          say('adult catalog unlocked · choose the model/LoRAs you want, then add the generation again');
+          return;
+        }
+        say('adult request cancelled');
+        return;
+      }
       if(r.error){fail(r.error);refreshTimeline(true);return}
       job=r.id;poll(job);refreshQueue();
     }
@@ -6071,6 +7293,11 @@ Additional user Auto Prompt instructions:
       dot('live');say('adding retry to queue with a new seed');
       const resp=await fetch('/api/timeline/retry_last',{method:'POST'});
       const r=await resp.json();
+      if(r.adult_ack_required){
+        dot('');const ok=await requestAdultAcknowledgement();
+        if(ok)return $('timeline_retry').click();
+        say('adult retry cancelled');return;
+      }
       if(r.error){fail(r.error);refreshTimeline(true);return}
       $('seed').value=r.seed;
       job=r.id;poll(job);refreshQueue();
