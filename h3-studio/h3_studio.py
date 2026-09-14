@@ -313,6 +313,225 @@ elif _PARENT_A100:
         flush=True,
     )
 
+# ======================================================================
+# PREBUILT RUNTIME SNAPSHOT · HUGGING FACE STORAGE BUCKET
+# ======================================================================
+# A successfully-prepared Colab runtime can be snapshotted with the companion
+# builder cell and stored in the MissingLinkBuilder/MissingLink_H3_Minimax bucket.
+# On a fresh runtime we restore that snapshot before the normal bootstrap. The
+# existing runtime probes below remain authoritative: if the restored binary
+# environment is stale/incompatible, FAST-REUSE rejects it and the normal builder
+# path takes over. Model weights are deliberately NOT part of the snapshot.
+H3_RUNTIME_BUCKET = (_os.environ.get("H3_RUNTIME_BUCKET") or
+                     "MissingLinkBuilder/MissingLink_H3_Minimax").strip()
+H3_RUNTIME_BUNDLE_ENABLED = _os.environ.get("H3_RUNTIME_BUNDLE", "1").strip().lower() not in {"0","false","no","off"}
+H3_RUNTIME_BUNDLE_REQUIRED = _os.environ.get("H3_RUNTIME_BUNDLE_REQUIRED", "0").strip().lower() in {"1","true","yes","on"}
+H3_RUNTIME_CACHE_DIR = _pl.Path("/content/.missinglink_h3_runtime")
+H3_RUNTIME_MARKER = _pl.Path("/content/.missinglink_h3_runtime_restored.json")
+
+def _read_hf_token_parent():
+    tok = (_os.environ.get("HF_TOKEN") or _os.environ.get("HUGGINGFACE_TOKEN") or "").strip()
+    if not tok:
+        try:
+            from google.colab import userdata as _hf_userdata
+            tok = (_hf_userdata.get("HF_TOKEN") or "").strip()
+        except Exception:
+            tok = ""
+    if tok:
+        _os.environ["HF_TOKEN"] = tok
+    return tok
+
+def _runtime_profile_key():
+    if _PARENT_LOWVRAM:
+        return "t4_16gb"
+    if _PARENT_A100:
+        return "a100_80gb" if _PARENT_GPU_GIB >= A100_80_MIN_GIB else "a100_40gb"
+    return "blackwell_sm120"
+
+def _ensure_runtime_bucket_deps():
+    try:
+        import huggingface_hub as _hfh
+        from huggingface_hub import HfFileSystem as _HfFileSystem  # noqa: F401
+        from huggingface_hub import get_bucket_file_metadata as _get_bucket_file_metadata  # noqa: F401
+        import zstandard as _zstd  # noqa: F401
+        return
+    except Exception:
+        pass
+    print("  ↓ preparing HF Storage Bucket runtime client (one-time tiny dependency step)", flush=True)
+    _sp.run([
+        _sys.executable, "-m", "pip", "install", "-q", "--upgrade",
+        "huggingface_hub>=1.5.0,<2", "zstandard>=0.22"
+    ], check=True)
+
+def _bucket_download_progress(remote_path, local_path, *, label):
+    from huggingface_hub import HfFileSystem, get_bucket_file_metadata
+    import time as _time
+
+    token = _read_hf_token_parent() or None
+    local_path = _pl.Path(local_path)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    part = _pl.Path(str(local_path) + ".part")
+    meta = get_bucket_file_metadata(H3_RUNTIME_BUCKET, remote_path, token=token)
+    total = int(getattr(meta, "size", 0) or 0)
+    fs = HfFileSystem(token=token)
+    hf_path = f"buckets/{H3_RUNTIME_BUCKET}/{remote_path}"
+
+    offset = part.stat().st_size if part.exists() else 0
+    if total and offset > total:
+        part.unlink(missing_ok=True); offset = 0
+    mode = "ab" if offset else "wb"
+    t0 = _time.time(); last = t0; last_bytes = offset
+
+    with fs.open(hf_path, "rb") as src:
+        if offset:
+            try:
+                src.seek(offset)
+                print(f"  ↻ resuming {label} at {offset/1024**3:.2f} GiB", flush=True)
+            except Exception:
+                part.unlink(missing_ok=True); offset = 0; mode = "wb"
+                src.seek(0)
+        done = offset
+        with open(part, mode) as dst:
+            while True:
+                chunk = src.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk); done += len(chunk)
+                now = _time.time()
+                if now - last >= 0.45 or (total and done >= total):
+                    speed = (done - last_bytes) / max(0.001, now - last)
+                    pct = (100.0 * done / total) if total else 0.0
+                    if total:
+                        msg = (f"\r  ↓ {label}: {pct:6.2f}% · {done/1024**3:.2f}/{total/1024**3:.2f} GiB "
+                               f"· {speed/1024**2:.1f} MiB/s")
+                    else:
+                        msg = f"\r  ↓ {label}: {done/1024**2:.1f} MiB · {speed/1024**2:.1f} MiB/s"
+                    print(msg, end="", flush=True)
+                    last, last_bytes = now, done
+    print(flush=True)
+    if total and part.stat().st_size != total:
+        raise RuntimeError(f"Bucket download size mismatch for {remote_path}: {part.stat().st_size} != {total}")
+    _os.replace(part, local_path)
+    return total
+
+def _sha256_file(path):
+    import hashlib as _hashlib
+    h = _hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(8 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _restore_runtime_bundle():
+    if _PARENT_IS_CHILD or not H3_RUNTIME_BUNDLE_ENABLED:
+        return False
+    if H3_RUNTIME_MARKER.exists() and _os.environ.get("H3_RUNTIME_FORCE_REFRESH", "0").strip().lower() not in {"1","true","yes","on"}:
+        try:
+            old = __import__("json").loads(H3_RUNTIME_MARKER.read_text())
+            print(f"✓ prebuilt runtime already restored in this VM · build {old.get('build_id','unknown')}", flush=True)
+            return True
+        except Exception:
+            pass
+
+    profile = _runtime_profile_key()
+    py_tag = f"py{_sys.version_info.major}{_sys.version_info.minor}"
+    pointer_remote = f"runtimes/{profile}/{py_tag}/latest.json"
+    H3_RUNTIME_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    pointer_local = H3_RUNTIME_CACHE_DIR / f"{profile}-{py_tag}-latest.json"
+
+    try:
+        _ensure_runtime_bucket_deps()
+        _bucket_download_progress(pointer_remote, pointer_local, label="runtime manifest")
+        import json as _json, platform as _platform, tarfile as _tarfile, time as _time
+        import zstandard as _zstd
+        manifest = _json.loads(pointer_local.read_text())
+        expected_profile = str(manifest.get("profile") or "")
+        expected_py = str(manifest.get("python_major_minor") or "")
+        expected_machine = str(manifest.get("machine") or "")
+        if expected_profile != profile:
+            raise RuntimeError(f"runtime profile mismatch: bucket={expected_profile!r}, local={profile!r}")
+        if expected_py and expected_py != f"{_sys.version_info.major}.{_sys.version_info.minor}":
+            raise RuntimeError(f"runtime Python mismatch: bucket={expected_py}, local={_sys.version_info.major}.{_sys.version_info.minor}")
+        if expected_machine and expected_machine != _platform.machine():
+            raise RuntimeError(f"runtime machine mismatch: bucket={expected_machine}, local={_platform.machine()}")
+        archive_remote = str(manifest.get("archive_path") or "")
+        expected_sha = str(manifest.get("archive_sha256") or "").lower()
+        if not archive_remote or not expected_sha:
+            raise RuntimeError("runtime pointer is missing archive_path/archive_sha256")
+
+        archive_local = H3_RUNTIME_CACHE_DIR / _pl.Path(archive_remote).name
+        print(f"⚡ MissingLink runtime snapshot found · {profile} · build {manifest.get('build_id','?')}", flush=True)
+        _bucket_download_progress(archive_remote, archive_local, label="prebuilt runtime")
+        print("  ↳ verifying runtime SHA256…", flush=True)
+        got_sha = _sha256_file(archive_local)
+        if got_sha != expected_sha:
+            archive_local.unlink(missing_ok=True)
+            raise RuntimeError(f"runtime SHA256 mismatch: expected {expected_sha}, got {got_sha}")
+
+        staging = _pl.Path(f"/content/.h3_runtime_extract_{_os.getpid()}")
+        _shutil.rmtree(staging, ignore_errors=True); staging.mkdir(parents=True, exist_ok=True)
+        total_payload = int(manifest.get("payload_bytes") or 0)
+        extracted = 0; last_notice = 0.0
+        print("  ↳ extracting prebuilt runtime…", flush=True)
+        with open(archive_local, "rb") as raw:
+            with _zstd.ZstdDecompressor().stream_reader(raw) as zr:
+                with _tarfile.open(fileobj=zr, mode="r|") as tf:
+                    for member in tf:
+                        tf.extract(member, path=staging, filter="data")
+                        if member.isfile():
+                            extracted += int(member.size or 0)
+                        now = _time.time()
+                        if now - last_notice >= 0.8:
+                            if total_payload:
+                                print(f"\r  ↳ extract: {min(100.0,100.0*extracted/total_payload):6.2f}% · {extracted/1024**3:.2f}/{total_payload/1024**3:.2f} GiB", end="", flush=True)
+                            else:
+                                print(f"\r  ↳ extract: {extracted/1024**3:.2f} GiB", end="", flush=True)
+                            last_notice = now
+        print(flush=True)
+
+        roots = manifest.get("roots") or []
+        if not roots:
+            roots = [{"path": x, "mode": "replace"} for x in _os.listdir(staging)]
+        for item in roots:
+            rel = str((item or {}).get("path") or "").strip().strip("/")
+            mode = str((item or {}).get("mode") or "replace")
+            if not rel:
+                continue
+            src = staging / rel
+            dst = _pl.Path("/content") / rel
+            if not src.exists() and not src.is_symlink():
+                continue
+            if mode == "merge":
+                if src.is_dir():
+                    dst.mkdir(parents=True, exist_ok=True)
+                    _shutil.copytree(src, dst, dirs_exist_ok=True, symlinks=True)
+                else:
+                    dst.parent.mkdir(parents=True, exist_ok=True); _shutil.copy2(src, dst)
+            else:
+                if dst.exists() or dst.is_symlink():
+                    if dst.is_dir() and not dst.is_symlink(): _shutil.rmtree(dst, ignore_errors=True)
+                    else: dst.unlink(missing_ok=True)
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                _shutil.move(str(src), str(dst))
+        _shutil.rmtree(staging, ignore_errors=True)
+        H3_RUNTIME_MARKER.write_text(_json.dumps({
+            "build_id": manifest.get("build_id"), "profile": profile,
+            "archive_sha256": expected_sha, "restored_at": _time.time(),
+        }, indent=2))
+        if _os.environ.get("H3_KEEP_RUNTIME_ARCHIVE", "0").strip().lower() not in {"1","true","yes","on"}:
+            archive_local.unlink(missing_ok=True)
+        print(f"✓ prebuilt runtime restored · build {manifest.get('build_id','?')} · normal compatibility probes will verify it", flush=True)
+        return True
+    except Exception as exc:
+        msg = f"prebuilt runtime unavailable; falling back to normal bootstrap: {type(exc).__name__}: {exc}"
+        if H3_RUNTIME_BUNDLE_REQUIRED:
+            raise RuntimeError(msg) from exc
+        print("⚠ " + msg, flush=True)
+        return False
+
+if not _PARENT_IS_CHILD:
+    _restore_runtime_bundle()
+
 # Historical name retained because the main UI body is guarded by it. A100/T4
 # execute that body directly; Blackwell still uses the isolated CUDA13 child.
 _CU130_CHILD = _PARENT_IS_CHILD or _PARENT_LOWVRAM or _PARENT_A100
@@ -1460,21 +1679,24 @@ if _CU130_CHILD:
     # of the Blackwell path so V86-BW1 remains unchanged.
     GGUF_NODE_DIR = os.path.join(COMFY_DIR, "custom_nodes", "ComfyUI-GGUF")
     if LOWVRAM_T4_REQUESTED:
-        log("  ↓ T4 low-VRAM dependency: molbal/ComfyUI-GGUF (MiniMax-H3 Dynamic VRAM)")
-        gguf_src = _fetch_source_archive([
-            "https://codeload.github.com/molbal/ComfyUI-GGUF/tar.gz/refs/heads/main",
-            "https://github.com/molbal/ComfyUI-GGUF/archive/refs/heads/main.tar.gz",
-        ], "ComfyUI-GGUF", min_bytes=10000)
-        shutil.rmtree(GGUF_NODE_DIR, ignore_errors=True)
-        os.makedirs(os.path.dirname(GGUF_NODE_DIR), exist_ok=True)
-        shutil.copytree(gguf_src, GGUF_NODE_DIR, dirs_exist_ok=True)
-        req = os.path.join(GGUF_NODE_DIR, "requirements.txt")
-        if os.path.isfile(req):
-            rr = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", req],
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            if rr.returncode != 0:
-                raise RuntimeError("ComfyUI-GGUF dependency install failed:\n" + rr.stdout[-3000:])
-        log("✓ ComfyUI-GGUF ready · molbal/main · T4 Dynamic VRAM loader enabled")
+        if FAST_STARTUP and os.path.isfile(os.path.join(GGUF_NODE_DIR, "__init__.py")):
+            log("✓ ComfyUI-GGUF reused from prebuilt/local custom_nodes · network refresh skipped")
+        else:
+            log("  ↓ T4 low-VRAM dependency: molbal/ComfyUI-GGUF (MiniMax-H3 Dynamic VRAM)")
+            gguf_src = _fetch_source_archive([
+                "https://codeload.github.com/molbal/ComfyUI-GGUF/tar.gz/refs/heads/main",
+                "https://github.com/molbal/ComfyUI-GGUF/archive/refs/heads/main.tar.gz",
+            ], "ComfyUI-GGUF", min_bytes=10000)
+            shutil.rmtree(GGUF_NODE_DIR, ignore_errors=True)
+            os.makedirs(os.path.dirname(GGUF_NODE_DIR), exist_ok=True)
+            shutil.copytree(gguf_src, GGUF_NODE_DIR, dirs_exist_ok=True)
+            req = os.path.join(GGUF_NODE_DIR, "requirements.txt")
+            if os.path.isfile(req):
+                rr = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", req],
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                if rr.returncode != 0:
+                    raise RuntimeError("ComfyUI-GGUF dependency install failed:\n" + rr.stdout[-3000:])
+            log("✓ ComfyUI-GGUF ready · molbal/main · T4 Dynamic VRAM loader enabled")
 
     # Current ComfyUI initializes comfy-aimdo BEFORE torch/model_management during
     # normal main.py startup. This studio imports ComfyUI as a library, so reproduce
