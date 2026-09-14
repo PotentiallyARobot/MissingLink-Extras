@@ -456,6 +456,107 @@ def _bucket_download_progress(remote_path, local_path, *, label,
     _os.replace(part, local_path)
     return actual
 
+def _bucket_download_xet(remote_path, local_path, *, label, expected_size=None, strict_size=False):
+    """Download an immutable HF Storage Bucket object through hf_xet.
+
+    HfFileSystem.open() is intentionally NOT used here: it behaves like a normal
+    sequential file stream and leaves most of Colab's available bandwidth idle on
+    multi-GiB runtime images. `download_bucket_files()` hands the object to hf_xet,
+    which reconstructs it from Xet chunks with parallel range transfers.
+
+    Existing legacy `.part` files from the old sequential downloader cannot be
+    safely adopted by Xet, so they are discarded. Xet's own chunk cache provides
+    restart/retry reuse instead.
+    """
+    token = _read_hf_token_parent() or None
+    local_path = _pl.Path(local_path)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    part = _pl.Path(str(local_path) + '.xet.part')
+
+    expected_size = int(expected_size or 0)
+    if local_path.exists() and expected_size and local_path.stat().st_size == expected_size:
+        print(f"✓ {label} already downloaded · {_human_bytes(expected_size)}", flush=True)
+        return expected_size
+
+    # Remove the old single-stream partial because hf_xet reconstructs the file using
+    # its own chunk graph/cache rather than appending a contiguous HTTP byte range.
+    legacy_part = _pl.Path(str(local_path) + '.part')
+    if legacy_part.exists():
+        old_size = legacy_part.stat().st_size
+        print(
+            f"  ↳ switching {label} from legacy single-stream transfer to Xet parallel transfer; "
+            f"discarding {_human_bytes(old_size)} legacy partial",
+            flush=True,
+        )
+        legacy_part.unlink(missing_ok=True)
+    part.unlink(missing_ok=True)
+
+    # hf_xet reads these when its transfer client is created. Keep the settings
+    # conservative on normal Colab VMs, but allow high-RAM machines to saturate the
+    # network much more aggressively.
+    try:
+        host_ram = int(_os.sysconf('SC_PHYS_PAGES')) * int(_os.sysconf('SC_PAGE_SIZE'))
+    except Exception:
+        host_ram = 0
+    try:
+        free_disk = _shutil.disk_usage(str(local_path.parent)).free
+    except Exception:
+        free_disk = 0
+
+    if host_ram >= 96 * 1024**3:
+        _os.environ.setdefault('HF_XET_HIGH_PERFORMANCE', '1')
+        xet_mode = 'high-performance'
+    else:
+        _os.environ.setdefault('HF_XET_FIXED_DOWNLOAD_CONCURRENCY', '16' if host_ram >= 32 * 1024**3 else '8')
+        xet_mode = f"fixed-{_os.environ.get('HF_XET_FIXED_DOWNLOAD_CONCURRENCY')} streams"
+
+    # Enable a modest chunk cache when disk allows it. This is what makes retries
+    # useful with Xet; it avoids depending on a fragile contiguous .part file.
+    if free_disk >= 16 * 1024**3:
+        _os.environ.setdefault('HF_XET_CHUNK_CACHE_SIZE_BYTES', str(8 * 1024**3))
+
+    from huggingface_hub import download_bucket_files, get_bucket_paths_info
+    infos = list(get_bucket_paths_info(H3_RUNTIME_BUCKET, [remote_path], token=token))
+    if not infos:
+        raise RuntimeError(f"Bucket object not found: {remote_path}")
+    info = infos[0]
+    meta_size = int(getattr(info, 'size', 0) or 0)
+    if expected_size and meta_size and meta_size != expected_size:
+        print(
+            f"  ↳ {label}: manifest says {_human_bytes(expected_size)}, bucket metadata says {_human_bytes(meta_size)}; "
+            "downloading and verifying the manifest size/SHA afterwards",
+            flush=True,
+        )
+
+    print(
+        f"  ↓ {label}: Xet parallel download · {xet_mode} · "
+        f"{_human_bytes(expected_size or meta_size)}",
+        flush=True,
+    )
+    import time as _time
+    t0 = _time.time()
+    download_bucket_files(
+        H3_RUNTIME_BUCKET,
+        files=[(info, str(part))],
+        token=token,
+        raise_on_missing_files=True,
+    )
+    elapsed = max(0.001, _time.time() - t0)
+    actual = part.stat().st_size if part.exists() else 0
+    if actual <= 0:
+        raise RuntimeError(f"Xet bucket download returned an empty object: {remote_path}")
+    if strict_size and expected_size and actual != expected_size:
+        part.unlink(missing_ok=True)
+        raise RuntimeError(f"Runtime archive size mismatch for {remote_path}: {actual} != {expected_size}")
+    print(
+        f"  ✓ {label}: {_human_bytes(actual)} in {elapsed:.1f}s · "
+        f"{actual / elapsed / 1024**2:.1f} MiB/s average",
+        flush=True,
+    )
+    _os.replace(part, local_path)
+    return actual
+
+
 def _sha256_file(path):
     import hashlib as _hashlib
     h = _hashlib.sha256()
@@ -503,10 +604,10 @@ def _restore_runtime_bundle():
 
         archive_local = H3_RUNTIME_CACHE_DIR / _pl.Path(archive_remote).name
         print(f"⚡ MissingLink runtime snapshot found · {profile} · build {manifest.get('build_id','?')}", flush=True)
-        _bucket_download_progress(
+        _bucket_download_xet(
             archive_remote, archive_local, label="prebuilt runtime",
             expected_size=int(manifest.get("archive_size") or 0) or None,
-            strict_size=bool(int(manifest.get("archive_size") or 0)), resume=True
+            strict_size=bool(int(manifest.get("archive_size") or 0))
         )
         print("  ↳ verifying runtime SHA256…", flush=True)
         got_sha = _sha256_file(archive_local)
