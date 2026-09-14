@@ -1,18 +1,18 @@
 # ======================================================================
-# MiniMax H3 · SFW FAST-START UI · BLACKWELL SM120 + A100 80/40GB + T4/16GB LOW-VRAM
+# MiniMax H3 · FAST-START UI · BLACKWELL SM120 + A100 80/40GB + T4/16GB LOW-VRAM
 # One Colab cell. No prior app cell required.
 # PERFORMANCE UPDATE v20:
 # - Sage is the forced production attention backend and MUST come from the MissingLink prebuilt SM120 wheel.
 # - Includes CUDA/comfy-kitchen ConvRot fast-path audit.
 # - Does NOT replace PyTorch inside a live Comfy runtime. If this cell reports CUDA <13,
 #   compare against a fresh cu130+ runtime rather than hot-swapping torch underneath Comfy.
-# - SFW-only build: adult checkpoints/LoRAs and the 18+ mode are removed.
+# - User-provided Hugging Face base models are supported with live download progress.
 # - Fast-start defaults defer optional accelerator downloads and GPU preload until first use.
 #
 #
 # Requires Colab Secrets:
 #   MISSING_LINK_TOKEN - required; validated against MissingLink before the UI can start
-#   CIVITAI_API_KEY    - optional; only for user-requested SFW CivitAI LoRA installs
+#   CIVITAI_API_KEY    - optional; only for user-requested CivitAI LoRA installs
 #   HF_TOKEN           - optional/used by Hugging Face model downloads where applicable
 # SageAttention is never built from source in this UI cell; Blackwell requires the MissingLink wheel.
 #
@@ -45,8 +45,8 @@
 COMFY_DIR = "/content/ComfyUI"
 UI_PORT   = 7860
 
-# SFW-only checkpoint configuration. The official MiniMax H3 weights are the only
-# built-in model profiles exposed by this studio. Optional SFW acceleration LoRAs
+# Built-in checkpoint configuration. The official MiniMax H3 weights are the default
+# built-in model profiles exposed by this studio. Optional acceleration LoRAs
 # remain available and are downloaded lazily on first use.
 FAST_STARTUP = os.environ.get("H3_FAST_STARTUP", "1").strip().lower() not in {"0", "false", "no", "off"} if "os" in globals() else True
 DIT_CHOICE = "stock_quality"
@@ -78,11 +78,11 @@ DITS = {
 # Compatibility sentinels for old saved payloads. They are never exposed or installed.
 USING_EROS_MAX = False
 USING_REDMIX = False
-EROS_MAX_FILE = "__sfw_disabled_checkpoint__.safetensors"
+EROS_MAX_FILE = "__legacy_disabled_checkpoint__.safetensors"
 EROS_MAX_REPO = ""
 EROS_MAX_SHA256 = ""
 EROS_MAX_GIB = 19.53
-REDMIX_FILE = "__sfw_disabled_checkpoint_2__.safetensors"
+REDMIX_FILE = "__legacy_disabled_checkpoint_2__.safetensors"
 REDMIX_FILE_ALIASES = [REDMIX_FILE]
 REDMIX_GIB = 19.53
 REDMIX_VERSION = 0
@@ -93,12 +93,12 @@ REDMIX_DIRECT_URL_SECRET = ""
 REDMIX_LOCAL_PATH_SECRET = ""
 CIVITAI_COOKIE_SECRET = ""
 REQUIRE_REDMIX = False
-NSFW_LORA_FILE = "__sfw_disabled_lora__.safetensors"
-NSFW_LORA_STRENGTH = 0.0
-NSFW_LORA_VERSION = 0
-NSFW_LORA_SHA256 = ""
+LEGACY_DISABLED_LORA_FILE = "__legacy_disabled_lora__.safetensors"
+LEGACY_DISABLED_LORA_STRENGTH = 0.0
+LEGACY_DISABLED_LORA_VERSION = 0
+LEGACY_DISABLED_LORA_SHA256 = ""
 
-# Optional SFW acceleration LoRAs.
+# Optional acceleration LoRAs.
 LIGHTNING_REPO = "drbaph/MiniMax-H3-Turbo-Lora-ComfyUI"
 LIGHTNING_FILE = "minimax_h3_fl2v_turbo_4step_v1.1_768p_comfyui_resized_avg_rank_64_bf16.safetensors"
 REF2VA_LIGHTNING_REPO = "Comfy-Org/MiniMax-H3"
@@ -114,10 +114,10 @@ MOTION8_REPO = "rzgar/minimax-h3_fl2v_8Step_motion_enhancer"
 MOTION8_FILE = "minimax-h3_fl2v_8Step_motion_enhancer.safetensors"
 MOTION8_STRENGTH = 1.0
 
-# No built-in specialty/adult catalog in the SFW edition.
+# No built-in specialty catalog is configured.
 SPECIALTY_LORA_PRESETS = []
 SPECIALTY_LORA_STATES = []
-ACTION_LABEL = "Optional SFW LoRA"
+ACTION_LABEL = "Optional LoRA"
 ACTION_MODEL_ID = 0
 ACTION_REQUESTED_VERSION_ID = 0
 ACTION_LINKED_VERSION = 0
@@ -424,14 +424,14 @@ def _show_child_ui(_port, _pid):
     print(f"✓ V86 UI child alive · PID {_pid} · port {_port}", flush=True)
     try:
         from google.colab import output as _co
-        print("Opening MissingLink MiniMax Studio · SFW Fast...", flush=True)
+        print("Opening MissingLink MiniMax Studio · Fast...", flush=True)
         try:
             _co.serve_kernel_port_as_iframe(_port, height="900")
         except Exception as _e:
             print("iframe warning:", _e)
         try:
             _co.serve_kernel_port_as_window(
-                _port, anchor_text="◤ Open MissingLink MiniMax Studio · SFW Fast in a new tab")
+                _port, anchor_text="◤ Open MissingLink MiniMax Studio · Fast in a new tab")
         except Exception as _e:
             print("window warning:", _e)
     except Exception:
@@ -487,12 +487,41 @@ if not _CU130_CHILD:
     except Exception:
         _src = None
     if not _src:
+        # exec(open(...).read()) does not reliably point __file__ at this script.
+        # Recover from common Colab launch patterns by finding the actual studio file.
+        _source_candidates = []
+        _env_source = (_os.environ.get("H3_STUDIO_SOURCE") or "").strip()
+        if _env_source:
+            _source_candidates.append(_pl.Path(_env_source))
+        _source_candidates += [
+            _pl.Path.cwd() / "h3_studio.py",
+            _pl.Path.cwd() / "h3_studio_updated.py",
+            _pl.Path("/content/MissingLink-Extras/h3-studio/h3_studio.py"),
+            _pl.Path("/content/MissingLink-Extras/h3-studio/h3_studio_updated.py"),
+        ]
+        try:
+            _source_candidates += sorted(_pl.Path.cwd().glob("h3_studio*.py"))
+        except Exception:
+            pass
+        for _candidate in _source_candidates:
+            try:
+                if _candidate.is_file():
+                    _maybe = _candidate.read_text()
+                    if "CU130 BOOTSTRAP · V86" in _maybe:
+                        _src = _maybe
+                        break
+            except Exception:
+                pass
+    if not _src:
         try:
             _src = get_ipython().user_ns["In"][-1]
         except Exception:
             _src = None
     if not _src or "CU130 BOOTSTRAP · V86" not in _src:
-        raise RuntimeError("Could not capture the V86 source correctly. Upload/run this .py file directly.")
+        raise RuntimeError(
+            "Could not capture the H3 Studio source. Set H3_STUDIO_SOURCE to the .py file, "
+            "or run it with %run."
+        )
     _self.write_text(_src)
 
     # ------------------------------------------------------------------
@@ -1520,7 +1549,7 @@ if _CU130_CHILD:
                 _h3opt_commit = "archive-main"
                 log("✓ H3-Optimizations ready · archive main · NO GIT")
         except Exception as _e:
-            raise RuntimeError("SFW studio requires H3-Optimizations sparse nodes: " + repr(_e))
+            raise RuntimeError("MiniMax H3 Studio requires H3-Optimizations sparse nodes: " + repr(_e))
     else:
         log("✓ T4 low-VRAM: sparse/Kitchen node pack skipped; dense PyTorch SDPA only")
 
@@ -1769,7 +1798,7 @@ if _CU130_CHILD:
             _autotune_attention()
 
     # ── 1. Weights ─────────────────────────────────────────────────────────────
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import hf_hub_download, HfApi, hf_hub_url
     if DIT_CHOICE not in DITS:
         raise RuntimeError(f"DIT_CHOICE must be one of {list(DITS)}")
     _repo, _sub, DIT_FILE = DITS[DIT_CHOICE]
@@ -1781,7 +1810,7 @@ if _CU130_CHILD:
     MODELS = os.path.join(COMFY_DIR, "models")
 
     def _purge_legacy_adult_assets():
-        # User requested an SFW-only build: remove the legacy adult assets this notebook
+        # User requested an studio: remove the legacy adult assets this notebook
         # itself used to manage, including filenames restored from its old catalog cache.
         exact = {
             "10Eros_Max_h3_TURBO-hybrid_beta5_int8.safetensors",
@@ -1806,16 +1835,16 @@ if _CU130_CHILD:
                 pth=os.path.join(folder,fn)
                 if os.path.isfile(pth):
                     try: os.remove(pth); removed.append(fn)
-                    except Exception as e: log(f"  ⚠ could not remove legacy SFW-blocked asset {fn}: {e}")
+                    except Exception as e: log(f"  ⚠ could not remove legacy managed asset {fn}: {e}")
         for cache_name in (".h3_adult_lora_catalog.json", ".h3_lora_sources.json"):
             try: os.remove(os.path.join(lora_dir,cache_name))
             except FileNotFoundError: pass
             except Exception: pass
-        if removed: log("✓ SFW cleanup removed legacy adult assets: " + ", ".join(sorted(set(removed))))
+        if removed: log("✓ legacy asset cleanup removed: " + ", ".join(sorted(set(removed))))
 
-    _purge_legacy_adult_assets()
+    # User-owned model assets are never deleted by the studio.
 
-    # SFW edition: no alternate explicit-content checkpoints or download paths are compiled in.
+    # Custom base models are installed explicitly from Hugging Face through the UI.
     def _activate_t4_lowvram_q4():
         global USING_REDMIX, USING_EROS_MAX, DIT_FILE, LIGHTNING_DEFAULT
         global TEXT_ENCODER_FILE, TEXT_ENCODER_GIB
@@ -1832,7 +1861,7 @@ if _CU130_CHILD:
         log("!")
 
     def _activate_stock_h3_safe():
-        """SFW-only startup using the official Stock MiniMax H3 checkpoint."""
+        """studio startup using the official Stock MiniMax H3 checkpoint."""
         global USING_REDMIX, USING_EROS_MAX, DIT_FILE, LIGHTNING_DEFAULT
         USING_REDMIX = False
         USING_EROS_MAX = False
@@ -1840,7 +1869,7 @@ if _CU130_CHILD:
         LIGHTNING_DEFAULT = True
         log("!")
         log("  ✓ SAFE DEFAULT selected: official Stock MiniMax H3 FL2VA")
-        log("  ↳ SFW-only build: explicit-content checkpoints/LoRAs are not available")
+        log("  ↳ additional Hugging Face base models can be added from the Studio UI")
         log("  ↳ quality recipe: RES Multistep / Simple · 20 steps · video shift 12 · audio shift 3")
         log("!")
 
@@ -2012,7 +2041,7 @@ if _CU130_CHILD:
     else:
         log(f"  ✓ {_active_integrity_label} structural validation passed · full-file SHA skipped for faster startup")
 
-    # ── Generic SFW LoRA helpers ───────────────────────────────────────────────
+    # ── Generic LoRA helpers ───────────────────────────────────────────────
     ldir = os.path.join(MODELS, "loras")
     os.makedirs(ldir, exist_ok=True)
 
@@ -2039,7 +2068,7 @@ if _CU130_CHILD:
 
     def _civitai_file(version_id, wanted_name, token=""):
         api = f"https://civitai.com/api/v1/model-versions/{version_id}"
-        headers = {"User-Agent":"Standalone-MiniMax-H3-SFW/1.0", "Accept":"application/json"}
+        headers = {"User-Agent":"Standalone-MiniMax-H3/1.0", "Accept":"application/json"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         req = urllib.request.Request(api, headers=headers)
@@ -2168,13 +2197,13 @@ if _CU130_CHILD:
     else:
         MOTION8_AVAILABLE = _ensure_motion8_lora()
 
-    # ── User-installed SFW LoRA metadata helpers ───────────────────────────────
+    # ── User-installed LoRA metadata helpers ───────────────────────────────
     ACTION_AVAILABLE = False
     SPECIALTY_LORA_STATES = []
-    LORA_SOURCE_CACHE_FILE = os.path.join(ldir, ".h3_sfw_lora_sources.json")
+    LORA_SOURCE_CACHE_FILE = os.path.join(ldir, ".h3_studio_lora_sources.json")
 
     def _civitai_json(url, token=""):
-        headers = {"User-Agent":"Standalone-MiniMax-H3-SFW/1.0", "Accept":"application/json"}
+        headers = {"User-Agent":"Standalone-MiniMax-H3/1.0", "Accept":"application/json"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         req = urllib.request.Request(url, headers=headers)
@@ -2233,7 +2262,7 @@ if _CU130_CHILD:
         if LIGHTNING_FILE: out[LIGHTNING_FILE] = _hf_repo_url(LIGHTNING_REPO)
         if REF2VA_LIGHTNING_FILE: out[REF2VA_LIGHTNING_FILE] = _hf_repo_url(REF2VA_LIGHTNING_REPO)
         for fn,url in dict(LORA_SOURCE_CACHE).items():
-            if fn and url and not _sfw_asset_blocked(fn): out[fn]=url
+            if fn and url: out[fn]=url
         return out
 
     # ── 2. Import ComfyUI as a library ─────────────────────────────────────────
@@ -3014,7 +3043,7 @@ if _CU130_CHILD:
                 f"estimated requirement {_full_stack_required_gib:.1f} GiB"
             )
         else:
-            log(f"  VRAM policy -> keep Stock H3 + selected SFW LoRAs resident when possible; GPU-swap {TEXT_ENCODER_FILE} for conditioning; reserve {RESERVE_VRAM:.1f} GiB")
+            log(f"  VRAM policy -> keep Stock H3 + selected LoRAs resident when possible; GPU-swap {TEXT_ENCODER_FILE} for conditioning; reserve {RESERVE_VRAM:.1f} GiB")
 
     def _preload_default_gpu_stack():
         PROG["stage"] = "startup preload"
@@ -4526,36 +4555,27 @@ if _CU130_CHILD:
 
     # ── 6. UI ──────────────────────────────────────────────────────────────────
     app = Flask(__name__)
-    # SFW-only policy: adult checkpoints/catalogs are not part of this build.
+    # Flask UI configuration.
     app.config["SECRET_KEY"] = os.environ.get("H3_SESSION_SECRET") or os.urandom(32)
     app.config["SESSION_COOKIE_HTTPONLY"] = True
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
-    _SFW_BLOCK_RE = re.compile(
-        r"(?i)(?:\bnsfw\b|\bporn(?:ographic|ography)?\b|\berotic(?:a|ally)?\b|"
-        r"\bnud(?:e|ity)\b|\bnaked\b(?!\s+eye\b)|\bsexual(?:ly)?\b|\bsex\s+scene\b|"
-        r"\bintercourse\b|\bblow\s*job\b|\bhand\s*job\b|\bdeep\s*throat\b|"
-        r"\boral\s+sex\b|\banal\s+sex\b|\bmasturbat\w*\b|\borgasm\w*\b|"
-        r"\bejaculat\w*\b|\bfetish\b|\bbdsm\b|\bgenitals?\b)"
-    )
-    _SFW_BLOCKED_ASSET_RE = re.compile(
-        r"(?i)(naughtytimes|eros[_ -]?max|redmix.*h3|deepthroat|doggy[_ -]?style[_ -]?sex|blackedraw|(?:^|[_ -])nsfw(?:[_ .-]|$))"
-    )
-
+    # Content-neutral local generation path. The studio performs technical/file
+    # validation only; it does not classify or block prompts, checkpoints, or LoRAs.
     def _adult_access_ok():
+        return True
+
+    def _prompt_requests_adult(_text):
         return False
 
-    def _prompt_requests_adult(text):
-        return bool(_SFW_BLOCK_RE.search(str(text or "")))
+    def _asset_blocked(_name):
+        return False
 
-    def _sfw_asset_blocked(name):
-        return bool(_SFW_BLOCKED_ASSET_RE.search(os.path.basename(str(name or ""))))
+    def _is_adult_lora_name(_name):
+        return False
 
-    def _is_adult_lora_name(name):
-        return _sfw_asset_blocked(name)
-
-    def _is_adult_unet_name(name):
-        return _sfw_asset_blocked(name)
+    def _is_adult_unet_name(_name):
+        return False
 
     def _profile_from_unet(_unet_name):
         return "stock_quality"
@@ -4574,7 +4594,7 @@ if _CU130_CHILD:
     def _known_lora_compatible(name, unet_name, mode):
         base=os.path.basename(str(name or ""))
         if not base or base=="none": return True,""
-        if _sfw_asset_blocked(base): return False,"SFW-only build"
+        if _asset_blocked(base): return False,"incompatible with current model/mode"
         info=_lora_compatibility_map().get(base)
         if not info: return True,""
         if "stock_quality" not in info["profiles"] or str(mode or "fl2va") not in info["modes"]:
@@ -4584,26 +4604,19 @@ if _CU130_CHILD:
     def _adult_catalog():
         return []
 
-    def _adult_request_from_generate_form(form):
-        if _prompt_requests_adult(form.get("prompt")): return True
-        if _sfw_asset_blocked(form.get("unet")): return True
-        names=[form.get("lora")]+[form.get(f"extra_lora_{i}") for i in range(1,5)]
-        try:
-            names += [x.get("file") for x in json.loads(form.get("lora_stack_json") or "[]") if isinstance(x,dict)]
-        except Exception: pass
-        return any(_sfw_asset_blocked(x) for x in names if x)
+    def _adult_request_from_generate_form(_form):
+        return False
 
     def _adult_gate_response():
-        return jsonify(error="This is the SFW-only build. Adult/explicit prompts, models, and LoRAs are disabled.",
-                       code="sfw_only"), 400
+        return jsonify(ok=True, legacy=True), 200
 
     @app.post("/api/adult/ack")
     def api_adult_ack():
-        return jsonify(error="The SFW-only build has no 18+ mode.", code="sfw_only"), 404
+        return jsonify(ok=True, legacy=True), 200
 
     @app.post("/api/adult/exit")
     def api_adult_exit():
-        return jsonify(ok=True, adult_enabled=False)
+        return jsonify(ok=True, legacy=True), 200
 
     @app.before_request
     def _missinglink_ui_gate():
@@ -4631,20 +4644,297 @@ if _CU130_CHILD:
             status=401, mimetype="text/html"
         )
 
+    # ── User-provided Hugging Face base models ─────────────────────────────────
+    # Custom checkpoints are explicit user choices. The studio validates transport/file
+    # integrity and loader compatibility, but does not make content-policy decisions.
+    CUSTOM_MODEL_REGISTRY_FILE = os.path.join(MODELS, ".h3_custom_base_models.json")
+    CUSTOM_MODEL_DOWNLOADS = {}
+    CUSTOM_MODEL_DOWNLOAD_LOCK = threading.Lock()
+
+    def _hf_token():
+        tok = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN") or "").strip()
+        if tok:
+            return tok
+        try:
+            from google.colab import userdata
+            tok = (userdata.get("HF_TOKEN") or "").strip()
+        except Exception:
+            tok = ""
+        if tok:
+            os.environ["HF_TOKEN"] = tok
+        return tok
+
+    def _custom_model_load_registry():
+        try:
+            raw = json.load(open(CUSTOM_MODEL_REGISTRY_FILE, "r", encoding="utf-8"))
+            if not isinstance(raw, list):
+                return []
+        except Exception:
+            return []
+        rows = []
+        for row in raw:
+            if not isinstance(row, dict):
+                continue
+            local_name = os.path.basename(str(row.get("local_name") or ""))
+            fmt = str(row.get("format") or "safetensors").lower()
+            if not local_name:
+                continue
+            if fmt == "gguf":
+                paths = folder_paths.get_folder_paths("unet_gguf") if "unet_gguf" in getattr(folder_paths, "folder_names_and_paths", {}) else []
+                exists = any(os.path.exists(os.path.join(p, local_name)) for p in paths)
+            else:
+                exists = os.path.exists(os.path.join(MODELS, "diffusion_models", local_name))
+            if exists:
+                row = dict(row)
+                row["local_name"] = local_name
+                rows.append(row)
+        return rows
+
+    def _custom_model_save_registry(rows):
+        tmp = CUSTOM_MODEL_REGISTRY_FILE + ".tmp"
+        os.makedirs(os.path.dirname(CUSTOM_MODEL_REGISTRY_FILE), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(list(rows), fh, indent=2)
+        os.replace(tmp, CUSTOM_MODEL_REGISTRY_FILE)
+
+    def _custom_model_public_rows():
+        out = []
+        for row in _custom_model_load_registry():
+            out.append({
+                "profile": "custom:" + row["local_name"],
+                "label": row.get("label") or row.get("repo_id") or row["local_name"],
+                "repo_id": row.get("repo_id") or "",
+                "revision": row.get("revision") or "main",
+                "filename": row.get("filename") or row["local_name"],
+                "local_name": row["local_name"],
+                "mode": row.get("mode") or "both",
+                "format": row.get("format") or "safetensors",
+                "size": int(row.get("size") or 0),
+            })
+        return out
+
+    def _hf_repo_candidates(repo_id, revision="main"):
+        repo_id = str(repo_id or "").strip().strip("/")
+        revision = str(revision or "main").strip() or "main"
+        if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo_id):
+            raise ValueError("HF repo must look like owner/repository.")
+        info = HfApi(token=_hf_token() or None).model_info(repo_id, revision=revision, files_metadata=True)
+        rows = []
+        for sib in getattr(info, "siblings", []) or []:
+            name = str(getattr(sib, "rfilename", "") or "")
+            low = name.lower()
+            if not low.endswith((".safetensors", ".gguf")):
+                continue
+            size = int(getattr(sib, "size", 0) or 0)
+            if not size:
+                lfs = getattr(sib, "lfs", None)
+                try:
+                    size = int((lfs or {}).get("size") or 0) if isinstance(lfs, dict) else int(getattr(lfs, "size", 0) or 0)
+                except Exception:
+                    size = 0
+            rows.append({"filename": name, "size": size, "format": "gguf" if low.endswith(".gguf") else "safetensors"})
+        rows.sort(key=lambda x: (x["size"], x["filename"]), reverse=True)
+        return rows
+
+    def _custom_model_destination(repo_id, remote_filename, fmt):
+        base = os.path.basename(remote_filename)
+        if not base:
+            raise ValueError("The selected Hugging Face file has no filename.")
+        if fmt == "gguf":
+            if "UnetLoaderGGUF" not in N and "UnetLoaderGGUFDynamicVRAM" not in N:
+                raise RuntimeError("This runtime has no GGUF UNet loader. Choose a .safetensors H3 checkpoint or enable ComfyUI-GGUF.")
+            try:
+                roots = folder_paths.get_folder_paths("unet_gguf")
+            except Exception:
+                roots = []
+            if not roots:
+                raise RuntimeError("ComfyUI has no unet_gguf model folder in this runtime.")
+            root = roots[0]
+        else:
+            root = os.path.join(MODELS, "diffusion_models")
+        os.makedirs(root, exist_ok=True)
+
+        existing = _custom_model_load_registry()
+        for row in existing:
+            if row.get("repo_id") == repo_id and row.get("filename") == remote_filename:
+                return os.path.join(root, row["local_name"]), row["local_name"]
+        dest = os.path.join(root, base)
+        if os.path.exists(dest):
+            slug = re.sub(r"[^A-Za-z0-9._-]+", "_", repo_id.replace("/", "__"))
+            base = slug + "__" + base
+            dest = os.path.join(root, base)
+        return dest, base
+
+    def _format_bytes(n):
+        n = float(n or 0)
+        for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+            if n < 1024.0 or unit == "TiB":
+                return f"{n:.2f} {unit}"
+            n /= 1024.0
+
+    def _custom_model_download_worker(download_id, repo_id, revision, filename, mode, expected_size):
+        started = time.time()
+        fmt = "gguf" if filename.lower().endswith(".gguf") else "safetensors"
+        try:
+            dest, local_name = _custom_model_destination(repo_id, filename, fmt)
+            part = dest + f".{download_id}.part"
+            url = hf_hub_url(repo_id=repo_id, filename=filename, revision=revision)
+            headers = {"User-Agent": "MissingLink-H3-CustomModel/1"}
+            token = _hf_token()
+            if token:
+                headers["Authorization"] = "Bearer " + token
+            req = urllib.request.Request(url, headers=headers)
+            downloaded = 0
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                content_length = int(resp.headers.get("Content-Length") or 0)
+                total = int(expected_size or content_length or 0)
+                with CUSTOM_MODEL_DOWNLOAD_LOCK:
+                    CUSTOM_MODEL_DOWNLOADS[download_id].update(total_bytes=total, local_name=local_name, stage="downloading")
+                with open(part, "wb") as fh:
+                    while True:
+                        chunk = resp.read(8 * 1024 * 1024)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                        downloaded += len(chunk)
+                        elapsed = max(0.001, time.time() - started)
+                        with CUSTOM_MODEL_DOWNLOAD_LOCK:
+                            job = CUSTOM_MODEL_DOWNLOADS[download_id]
+                            job.update(
+                                downloaded_bytes=downloaded,
+                                total_bytes=max(int(job.get("total_bytes") or 0), total),
+                                speed_bps=downloaded / elapsed,
+                                stage="downloading",
+                            )
+            if expected_size and downloaded != int(expected_size):
+                raise RuntimeError(f"Download size mismatch: expected {_format_bytes(expected_size)}, got {_format_bytes(downloaded)}.")
+            if fmt == "safetensors":
+                ok, err = _validate_safetensors_file(part)
+                if not ok:
+                    raise RuntimeError("Downloaded checkpoint failed safetensors validation: " + err)
+            else:
+                with open(part, "rb") as fh:
+                    if fh.read(4) != b"GGUF":
+                        raise RuntimeError("Downloaded .gguf file does not have a GGUF header.")
+            os.replace(part, dest)
+            rows = _custom_model_load_registry()
+            rows = [r for r in rows if r.get("local_name") != local_name]
+            rows.append({
+                "repo_id": repo_id,
+                "revision": revision,
+                "filename": filename,
+                "local_name": local_name,
+                "label": f"{repo_id} · {os.path.basename(filename)}",
+                "mode": mode if mode in {"fl2va", "ref2va", "both"} else "both",
+                "format": fmt,
+                "size": downloaded,
+                "installed_at": time.time(),
+            })
+            _custom_model_save_registry(rows)
+            folder_paths.cache_helper.clear()
+            with CUSTOM_MODEL_DOWNLOAD_LOCK:
+                CUSTOM_MODEL_DOWNLOADS[download_id].update(
+                    status="done", stage="done", downloaded_bytes=downloaded,
+                    total_bytes=downloaded, speed_bps=0.0, local_name=local_name,
+                    profile="custom:" + local_name,
+                )
+            log(f"  ✓ custom HF base model installed: {repo_id} / {filename} -> {local_name}")
+        except Exception as e:
+            try:
+                if 'part' in locals() and os.path.exists(part):
+                    os.remove(part)
+            except Exception:
+                pass
+            with CUSTOM_MODEL_DOWNLOAD_LOCK:
+                CUSTOM_MODEL_DOWNLOADS[download_id].update(status="error", stage="error", error=str(e))
+            log(f"  ⚠ custom HF base model install failed: {repo_id} / {filename}: {e}")
+
+    @app.post("/api/models/hf/inspect")
+    def api_hf_model_inspect():
+        body = request.get_json(silent=True) or {}
+        repo_id = str(body.get("repo_id") or "").strip()
+        revision = str(body.get("revision") or "main").strip() or "main"
+        try:
+            rows = _hf_repo_candidates(repo_id, revision)
+            if not rows:
+                return jsonify(error="No .safetensors or .gguf files were found in that repo/revision."), 404
+            return jsonify(ok=True, repo_id=repo_id, revision=revision, candidates=rows)
+        except Exception as e:
+            return jsonify(error=str(e)), 400
+
+    @app.post("/api/models/hf/install")
+    def api_hf_model_install():
+        body = request.get_json(silent=True) or {}
+        repo_id = str(body.get("repo_id") or "").strip().strip("/")
+        revision = str(body.get("revision") or "main").strip() or "main"
+        filename = str(body.get("filename") or "").strip().lstrip("/")
+        mode = str(body.get("mode") or "both").strip().lower()
+        if mode not in {"fl2va", "ref2va", "both"}:
+            mode = "both"
+        try:
+            candidates = _hf_repo_candidates(repo_id, revision)
+            by_name = {r["filename"]: r for r in candidates}
+            if filename not in by_name:
+                return jsonify(error="Choose a model file returned by CHECK REPO."), 400
+            selected = by_name[filename]
+            free_bytes = shutil.disk_usage("/content").free
+            if selected["size"] and free_bytes < selected["size"] + 2 * 1024**3:
+                return jsonify(error=f"Not enough disk space. Need about {_format_bytes(selected['size'] + 2 * 1024**3)}, have {_format_bytes(free_bytes)}."), 400
+            did = uuid.uuid4().hex[:12]
+            with CUSTOM_MODEL_DOWNLOAD_LOCK:
+                CUSTOM_MODEL_DOWNLOADS[did] = {
+                    "id": did, "status": "queued", "stage": "queued", "error": "",
+                    "repo_id": repo_id, "revision": revision, "filename": filename,
+                    "mode": mode, "downloaded_bytes": 0, "total_bytes": int(selected["size"] or 0),
+                    "speed_bps": 0.0, "started": time.time(), "local_name": "",
+                }
+            threading.Thread(
+                target=_custom_model_download_worker,
+                args=(did, repo_id, revision, filename, mode, int(selected["size"] or 0)),
+                daemon=True, name=f"hf-model-{did}",
+            ).start()
+            return jsonify(ok=True, id=did)
+        except Exception as e:
+            return jsonify(error=str(e)), 400
+
+    @app.get("/api/models/hf/progress/<download_id>")
+    def api_hf_model_progress(download_id):
+        with CUSTOM_MODEL_DOWNLOAD_LOCK:
+            job = dict(CUSTOM_MODEL_DOWNLOADS.get(download_id) or {})
+        if not job:
+            return jsonify(error="Unknown model download."), 404
+        total = int(job.get("total_bytes") or 0)
+        done = int(job.get("downloaded_bytes") or 0)
+        job["pct"] = round((100.0 * done / total), 2) if total > 0 else None
+        job["downloaded_text"] = _format_bytes(done)
+        job["total_text"] = _format_bytes(total) if total else "unknown"
+        job["speed_text"] = _format_bytes(job.get("speed_bps") or 0) + "/s" if job.get("speed_bps") else ""
+        return jsonify(job)
+
     @app.get("/api/meta")
     def meta():
         folder_paths.cache_helper.clear()
         all_loras = list(folder_paths.get_filename_list("loras"))
         hidden_accelerators = {LIGHTNING_FILE, REF2VA_LIGHTNING_FILE}
-        visible_loras = [x for x in all_loras if x not in hidden_accelerators and not _sfw_asset_blocked(x)]
-        all_unets = sorted(set(folder_paths.get_filename_list("diffusion_models") +
-                               (folder_paths.get_filename_list("unet_gguf") if LOWVRAM_T4_PROFILE else [])))
-        allowed_unets = {FALLBACK_DIT_FILE, REF2VA_DIT_FILE, T4_DIT_FILE}
+        visible_loras = [x for x in all_loras if x not in hidden_accelerators]
+        try:
+            gguf_unets = folder_paths.get_filename_list("unet_gguf")
+        except Exception:
+            gguf_unets = []
+        all_unets = sorted(set(folder_paths.get_filename_list("diffusion_models") + gguf_unets))
+        custom_models = _custom_model_public_rows()
+        allowed_unets = {FALLBACK_DIT_FILE, REF2VA_DIT_FILE, T4_DIT_FILE} | {x["local_name"] for x in custom_models}
         visible_unets = [x for x in all_unets if os.path.basename(str(x)) in allowed_unets]
+        # A freshly-installed file may be present before folder_paths refreshes it; keep
+        # registry entries visible and let the normal loader provide the technical error.
+        for _cm in custom_models:
+            if _cm["local_name"] not in visible_unets:
+                visible_unets.append(_cm["local_name"])
+        visible_unets = sorted(set(visible_unets))
         compat = _lora_compatibility_map()
         profile_state = _model_profile_state()
         return jsonify(
-            samplers=SAMPLERS, schedulers=SCHEDULERS, loras=["none"]+visible_loras,
+            samplers=SAMPLERS, schedulers=SCHEDULERS, loras=["none"]+visible_loras, custom_models=custom_models,
             lora_default="none", lora_strength_default=0.0,
             lora_compatibility={k:v for k,v in compat.items() if k in visible_loras or k in hidden_accelerators or k==MOTION8_FILE},
             lora_catalog=[], lora_source_map=_lora_source_map(), adult_enabled=False, adult_ack_version="", adult_model_profiles=[],
@@ -4674,7 +4964,7 @@ if _CU130_CHILD:
             quality_shift_video=12.0, quality_shift_audio=7.0, fast_sampler="lcm", fast_scheduler="simple", fast_steps=6,
             fast_shift_video=1.0, fast_shift_audio=1.0, ref2va_max_images=9, ref2va_max_videos=3, ref2va_max_audios=3,
             unets=visible_unets, unet_default=DIT_FILE, using_redmix=False, using_eros_max=False,
-            model_mode=("T4 LOW-VRAM · Q4_0 GGUF · Dynamic VRAM" if LOWVRAM_T4_PROFILE else "STOCK H3 · SFW"),
+            model_mode=("T4 LOW-VRAM · Q4_0 GGUF · Dynamic VRAM" if LOWVRAM_T4_PROFILE else "MINIMAX H3 STUDIO"),
             fallback_notice="", recommended_steps=20, recommended_sampler="res_multistep", recommended_scheduler="simple",
         )
 
@@ -4754,7 +5044,7 @@ Follow MiniMax H3's documented prompt grammar:
 9. Dialogue belongs in integrated_multimodal_description. Preserve user-provided dialogue verbatim. For speaking subjects use stable IDs like (S1) and H3 dialogue tags such as <d>[English] exact words</d> when appropriate.
 10. overall_soundscape is 1-4 sentences of ambience, physical sounds, and non-verbal human sounds; do not duplicate dialogue. Use N/A only if the user explicitly wants complete silence.
 11. non_diegetic_music is 1-3 sentences describing instrumentation, tempo/rhythm, and dynamics, or N/A when no background score is wanted.
-12. Keep the result SFW. Do not introduce nudity, sexual acts, fetish content, or pornographic framing. Preserve harmless romance or affection without sexualizing the scene.
+12. Follow the user's creative direction faithfully; do not add unrelated content or change the requested tone.
 13. Keep the prompt precise enough to control H3 but concise enough that the main movement and camera path remain dominant.
 
 Additional user Auto Prompt instructions:
@@ -4774,8 +5064,6 @@ Additional user Auto Prompt instructions:
         if not re.fullmatch(r"[A-Za-z0-9._:-]{2,120}", model):
             return jsonify(error="Invalid OpenAI model id."), 400
         rough = (request.form.get("rough_prompt") or "").strip()
-        if _prompt_requests_adult(rough) and not _adult_access_ok():
-            return _adult_gate_response()
         extra = (request.form.get("extra_instructions") or "").strip()[:8000]
         try:
             duration = max(0.21, min(149.7, float(request.form.get("duration") or 7.0)))
@@ -4873,8 +5161,6 @@ Additional user Auto Prompt instructions:
     def api_gen():
         if not ML_OK:
             return jsonify(error="MissingLink token not validated."), 402
-        if _adult_request_from_generate_form(request.form) and not _adult_access_ok():
-            return _adult_gate_response()
         jid = uuid.uuid4().hex[:8]
         p = {k: request.form.get(k) for k in
              ("prompt","width","height","duration","frames","length_mode",
@@ -4887,10 +5173,10 @@ Additional user Auto Prompt instructions:
         if input_mode not in {"fl2va", "ref2va"}:
             input_mode = "fl2va"
         p["input_mode"] = input_mode
-        _allowed_unets = {FALLBACK_DIT_FILE, REF2VA_DIT_FILE, T4_DIT_FILE}
+        _allowed_unets = {FALLBACK_DIT_FILE, REF2VA_DIT_FILE, T4_DIT_FILE} | {x["local_name"] for x in _custom_model_public_rows()}
         requested_unet = os.path.basename(str(p.get("unet") or DIT_FILE))
         if requested_unet not in _allowed_unets:
-            return jsonify(error="Only official Stock MiniMax H3 checkpoints are allowed in the SFW-only build."), 400
+            return jsonify(error="That base model is not installed through the studio. Add it with + HF BASE MODEL first."), 400
         p["unet"] = requested_unet
         # Normal GENERATE is raw/local: it never invokes OpenAI Auto Prompt.
         p["prompt_source"] = "raw_local"
@@ -4912,8 +5198,6 @@ Additional user Auto Prompt instructions:
                     continue
                 if name not in installed_loras:
                     return jsonify(error=f"LoRA is not installed: {name}"), 400
-                if _is_adult_lora_name(name) and not _adult_access_ok():
-                    return _adult_gate_response()
                 try:
                     strength = float(item.get("strength") or 0.0)
                 except Exception:
@@ -4996,7 +5280,7 @@ Additional user Auto Prompt instructions:
                 ), 400
 
         if input_mode == "ref2va":
-            # SFW-only Ref2VA uses the official MiniMax H3 reference checkpoint.
+            # studio Ref2VA uses the official MiniMax H3 reference checkpoint.
             if not p.get("unet"):
                 p["unet"] = REF2VA_DIT_FILE
             ref_images = []
@@ -5178,8 +5462,6 @@ Additional user Auto Prompt instructions:
         p = dict(last.get("params") or {})
         if not p:
             return jsonify(error="The last segment has no saved generation settings."), 400
-        if _adult_request_from_generate_form(p) and not _adult_access_ok():
-            return _adult_gate_response()
         retry_seed = int(uuid.uuid4().hex[:12], 16) % 2147483647
         p["seed"] = str(retry_seed)
         p["timeline_action"] = "retry"
@@ -5230,7 +5512,7 @@ Additional user Auto Prompt instructions:
         profile=str(body.get("profile") or "stock_quality").strip().lower()
         mode=str(body.get("mode") or "fl2va").strip().lower()
         if profile != "stock_quality":
-            return jsonify(error="Only the official Stock H3 profile is available in the SFW-only build."), 400
+            return jsonify(error="The built-in profile installer handles the bundled H3 model only. Use + HF BASE MODEL for custom checkpoints."), 400
         if mode not in {"fl2va","ref2va"}: mode="fl2va"
         try:
             if LOWVRAM_T4_PROFILE:
@@ -5243,14 +5525,14 @@ Additional user Auto Prompt instructions:
             folder_paths.cache_helper.clear()
             _allowed_unets={FALLBACK_DIT_FILE,REF2VA_DIT_FILE,T4_DIT_FILE}
             unets=[x for x in folder_paths.get_filename_list("diffusion_models") if os.path.basename(str(x)) in _allowed_unets]
-            loras=[x for x in folder_paths.get_filename_list("loras") if not _sfw_asset_blocked(x)]
+            loras=list(folder_paths.get_filename_list("loras"))
             return jsonify(ok=True,profile="stock_quality",mode=mode,state=_model_profile_state(),unets=unets,loras=["none"]+loras)
         except Exception as e:
             return jsonify(error=str(e),state=_model_profile_state()),400
 
     @app.post("/api/loras/catalog_install")
     def api_lora_catalog_install():
-        return jsonify(error="The built-in adult LoRA catalog was removed from the SFW-only build.", code="sfw_only"), 404
+        return jsonify(error="No built-in LoRA catalog is configured. Install LoRAs from Hugging Face or CivitAI.", code="studio_only"), 404
 
     @app.post("/api/loras/install")
     def api_lora_install():
@@ -5280,8 +5562,6 @@ Additional user Auto Prompt instructions:
                 base = os.path.basename(filename)
                 if not base.lower().endswith(".safetensors"):
                     raise ValueError("Only .safetensors LoRA files are accepted.")
-                if _sfw_asset_blocked(base):
-                    return _adult_gate_response()
                 token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN") or None
                 src_path = hf_hub_download(repo_id, filename=filename, revision=revision, token=token)
                 dest = os.path.join(lora_dir, base)
@@ -5303,8 +5583,6 @@ Additional user Auto Prompt instructions:
                 elif len(seg) >= 2 and seg[0] == "models":
                     model_id = int(seg[1].split("-")[0])
                     model = _civitai_json(f"https://civitai.com/api/v1/models/{model_id}", tok)
-                    if bool(model.get("nsfw")):
-                        return _adult_gate_response()
                     versions = model.get("modelVersions") or []
                     requested = (q.get("modelVersionId") or [None])[0]
                     if requested:
@@ -5323,8 +5601,6 @@ Additional user Auto Prompt instructions:
                 else:
                     raise ValueError("CivitAI URL must be a civitai.com/civitai.red model page or /api/download/models/<versionId> URL.")
 
-                if bool((version_obj or {}).get("nsfw")) or int((version_obj or {}).get("nsfwLevel") or 0) > 1:
-                    return _adult_gate_response()
                 if not _is_h3_version(version_obj):
                     raise ValueError(
                         f"CivitAI version {version_obj.get('id')} is labeled "
@@ -5336,8 +5612,6 @@ Additional user Auto Prompt instructions:
                 base = os.path.basename(str(fobj.get("name") or ""))
                 if not base.lower().endswith(".safetensors"):
                     raise ValueError("Only .safetensors LoRA files are accepted.")
-                if _sfw_asset_blocked(base):
-                    return _adult_gate_response()
                 dl = fobj.get("downloadUrl") or version_obj.get("downloadUrl")
                 if not dl:
                     raise ValueError("CivitAI returned no download URL.")
@@ -5543,7 +5817,7 @@ Additional user Auto Prompt instructions:
 
     PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
     <meta name=viewport content="width=device-width,initial-scale=1">
-    <title>MissingLink MiniMax Studio · SFW Fast</title>
+    <title>MissingLink MiniMax Studio · Fast</title>
     <link rel="icon" href="https://raw.githubusercontent.com/PotentiallyARobot/MissingLink-Extras/main/image-edit-studio/static/app_logo.png?v=2">
     <style>
     *{box-sizing:border-box}
@@ -5573,6 +5847,9 @@ Additional user Auto Prompt instructions:
     button{border:0;border-radius:7px;background:var(--accent);color:#111;padding:10px 11px;font:inherit;font-weight:800;cursor:pointer}
     button:disabled{background:#29292f;color:#666;cursor:not-allowed}.inlinebtn{background:#29292f;color:#ccc;padding:8px 9px;width:100%;margin-top:8px;font-size:10.5px}.inlinebtn.active{background:var(--accent);color:#111}
     .installed{color:#7cc38c}.missing{color:#d6a56d}
+    .preset3{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}
+    .hfmodelbox{margin-top:9px;padding:9px;border:1px solid #2b2c32;border-radius:8px;background:#0d0e11;display:none}
+    .hfmodelbox.show{display:block}.hfmodelgrid{display:grid;grid-template-columns:minmax(0,1fr) 92px;gap:7px}.hfmodelactions{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:7px}.hfmodelactions button{margin:0}.hfprogress{height:6px;background:#24252a;border-radius:999px;overflow:hidden;margin-top:9px}.hfprogress i{display:block;height:100%;width:0;background:var(--accent);transition:width .18s}.hfprogresstext{font-size:8px;color:#8e9099;margin-top:5px;min-height:12px}.hfmodelbox select,.hfmodelbox input{font-size:10px}
     .modelcardtitle{display:flex;align-items:center;justify-content:space-between;gap:10px}.modelcardtitle>span{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.adultmodebtn{position:relative;width:48px!important;height:23px!important;flex:0 0 48px;margin:0!important;padding:0 17px 0 7px!important;background:#17181c!important;color:#8b8e97!important;border:1px solid #303139!important;border-radius:999px!important;font-size:7px!important;letter-spacing:.35px!important;text-align:left!important}.adultmodebtn::after{content:'';position:absolute;right:6px;top:50%;width:7px;height:7px;border-radius:50%;background:#555862;transform:translateY(-50%);box-shadow:0 0 0 1px #16171a}.adultmodebtn:hover{border-color:#52545d!important;color:#c7c9cf!important}.adultmodebtn.on{background:#211d10!important;color:#edc44a!important;border-color:#66551d!important}.adultmodebtn.on::after{background:var(--accent);box-shadow:0 0 8px #e8a91766}.adultmodebtn:disabled{opacity:.45!important}
     #go{width:100%;font-size:13px;margin-top:4px;padding:12px}
     .autopromptrow{display:grid;grid-template-columns:minmax(0,1fr) 44px;gap:8px;margin-top:8px}.approfilerow{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:6px;align-items:center}.approfilerow button{width:auto;margin:0;padding:8px 9px;font-size:7.5px}.autopromptrow button{margin:0}.autopromptrow .gear{background:#29292f;color:#ddd;font-size:17px;padding:8px}.autopromptrow .gear:hover{color:var(--accent)}#auto_prompt_btn.working{background:#29292f;color:#aaa}.apmodal{display:none;position:fixed;inset:0;z-index:1600;background:rgba(0,0,0,.56);align-items:flex-start;justify-content:center;padding:72px 16px 16px}.apmodal.show{display:flex}.apdialog{width:min(520px,calc(100vw - 28px));background:#111114;border:1px solid #34353d;border-radius:12px;padding:13px;box-shadow:0 18px 60px rgba(0,0,0,.55)}.aphead{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}.aphead b{font-size:11px;letter-spacing:1px;color:#b8bac2}.apclose{width:auto;background:#29292f;color:#bbb;padding:6px 9px}.apdialog textarea{min-height:120px}.apactions{display:flex;justify-content:flex-end;gap:8px;margin-top:10px}.apactions button{width:auto}.apstatus{font-size:9.5px;color:#777982;margin-top:5px}.apstatus.ok{color:#65d78d}.apstatus.err{color:#ff8181}#ap_custom_wrap{display:none}
@@ -5599,12 +5876,20 @@ Additional user Auto Prompt instructions:
     <input id=input_mode type=hidden value=fl2va>
     <div class=modetabs><button id=tab_fl2va class="modetab active" type=button>CURRENT · KEYFRAMES</button><button id=tab_ref2va class=modetab type=button>REF2VA · REFERENCES</button></div>
 
-    <label>Model</label>
+    <label>Base model</label>
     <select id=model_profile_select>
-      <option value=stock_quality>STOCK H3 · MAX QUALITY</option>
+      <option value=stock_quality>BUILT-IN MINIMAX H3</option>
     </select>
+    <button id=hf_model_toggle class=inlinebtn type=button>+ HF BASE MODEL</button>
+    <div id=hf_model_box class=hfmodelbox>
+      <label>Hugging Face repo</label><input id=hf_model_repo type=text placeholder="owner/repository" autocomplete=off>
+      <div class=hfmodelgrid><div><label>Revision</label><input id=hf_model_revision type=text value="main" autocomplete=off></div><div><label>Mode</label><select id=hf_model_mode><option value=both selected>both</option><option value=fl2va>current</option><option value=ref2va>ref2va</option></select></div></div>
+      <label>Model file</label><select id=hf_model_file disabled><option value="">CHECK REPO first</option></select>
+      <div class=hfmodelactions><button id=hf_model_inspect class=inlinebtn type=button>CHECK REPO</button><button id=hf_model_install type=button disabled>DOWNLOAD + USE</button></div>
+      <div class=hfprogress><i id=hf_model_progress></i></div><div id=hf_model_progress_text class=hfprogresstext>Paste an HF repo, inspect it, then choose the checkpoint file.</div>
+    </div>
 
-    <div class=hint id=mode_hint>The tabs select the input / conditioning workflow. The Model menu selects the checkpoint profile.</div>
+    <div class=hint id=mode_hint>The tabs select the input / conditioning workflow. The Base model menu selects the checkpoint.</div>
     <div class=hint id=model_profile_hint>Stock H3 · matching files ready.</div>
     </div></div>
 
@@ -5674,7 +5959,7 @@ Additional user Auto Prompt instructions:
     </div></div>
 
     <div class=card><div class=cardtitle>Generation Presets</div><div class=cardbody>
-    <div class=g2><button id=fastpreset class="inlinebtn active">FAST</button><button id=qualitypreset class=inlinebtn>QUALITY</button></div>
+    <div class=preset3><button id=fastpreset class="inlinebtn active">FAST</button><button id=ultrafastpreset class=inlinebtn>ULTRA FAST</button><button id=qualitypreset class=inlinebtn>QUALITY</button></div>
     <div class=hint id=preset_hint>Preset recipe follows the model selected above.</div>
     <div class=hint id=modelhint>Model mode will be shown here after startup.</div>
     </div></div>
@@ -5690,7 +5975,7 @@ Additional user Auto Prompt instructions:
         <input id=sparse_percent type=number value=5 min=0 max=100 step=.5 style="width:92px;text-align:right">
       </div>
       <input id=sparse_slider type=range min=0 max=100 step=.5 value=5 style="width:100%;padding:0;margin-top:8px">
-      <div class=hint id=sparsehint><b>5% fast default.</b> 0% disables sparse attention and uses dense/max-quality attention.</div>
+      <div class=hint id=sparsehint><b>Ultra Fast uses 5% sparse attention.</b> Fast and Quality use dense attention by default; you can still override this manually.</div>
     </div>
     </div></details>
 
@@ -5832,8 +6117,13 @@ Additional user Auto Prompt instructions:
         $('continuity_hint').innerHTML='<b>LAST-FRAME CONTINUITY:</b> the next GENERATE will use the previous timeline clip\'s lossless final frame as its first-frame anchor. No latent state, overlap, or latent checkpoint is used.';
       }
     }
+    function customModelForProfile(profile=ACTIVE_MODEL_PROFILE,m=window.H3META||{}){
+      if(!String(profile||'').startsWith('custom:'))return null;
+      return (m.custom_models||[]).find(x=>x.profile===profile)||null;
+    }
     function activeModelLabel(){
-      return ACTIVE_MODEL_PROFILE==='eros' ? 'Eros Max β5' : (ACTIVE_MODEL_PROFILE==='redmix' ? 'REDMIX H3 Beta2' : 'Stock H3');
+      const c=customModelForProfile();
+      return c?(c.label||c.repo_id||c.local_name):'Built-in MiniMax H3';
     }
     function updateModeHint(){
       const m=window.H3META||{},mode=currentModelMode(),el=$('mode_hint'),name=activeModelLabel();
@@ -5858,8 +6148,15 @@ Additional user Auto Prompt instructions:
       localStorage.setItem(MODEL_MODE_STORE_KEY,mode);
 
       try{
-        // Eros is hybrid. REDMIX is kept as the optimized CURRENT/FL2VA checkpoint.
-        if(ACTIVE_MODEL_PROFILE==='eros'){
+        const customModel=customModelForProfile(ACTIVE_MODEL_PROFILE,m);
+        if(customModel){
+          if(customModel.local_name&&[...$('unet').options].some(x=>x.value===customModel.local_name)){
+            $('unet').value=customModel.local_name;
+          }else{
+            throw new Error('The selected custom base model is no longer installed.');
+          }
+        // Legacy profile branches retained for old browser state.
+        }else if(ACTIVE_MODEL_PROFILE==='eros'){
           if(m.eros_max_unet&&[...$('unet').options].some(x=>x.value===m.eros_max_unet)){
             $('unet').value=m.eros_max_unet;
           }
@@ -5910,44 +6207,41 @@ Additional user Auto Prompt instructions:
     let ACTIVE_PERF_PRESET='fast';
 
     function presetRecipe(profile=ACTIVE_MODEL_PROFILE,mode=currentModelMode(),kind=ACTIVE_PERF_PRESET){
-      if(profile==='eros'){
-        return kind==='fast'
-          ? {short:'EROS',label:'Eros Max β5',steps:6,summary:'LCM / Simple · 6 steps · integrated Turbo · identity shifts 1/1 · dense'}
-          : {short:'EROS',label:'Eros Max β5',steps:8,summary:'Euler / Simple · 8 steps · shifts 12/7 · dense'};
+      const label=activeModelLabel();
+      if(kind==='ultra'){
+        return {short:'ULTRA',label,steps:4,summary:(mode==='ref2va'?'Ref2VA':'FL2VA')+' · 4-step Lightning · Euler / Simple · sparse attention 5%'};
       }
-      if(profile==='redmix'){
-        return {short:'REDMIX',label:'REDMIX H3 Beta2',steps:6,summary:'INT8 ConvRot · integrated NaughtyTimes-derived tuning + Turbo · ER SDE / Beta · 6 steps'};
+      if(kind==='fast'){
+        return {short:'FAST',label,steps:4,summary:(mode==='ref2va'?'Ref2VA':'FL2VA')+' · 4-step Lightning · Euler / Simple · dense attention'};
       }
-      return kind==='fast'
-        ? {short:'STOCK',label:'Stock H3',steps:4,summary:(mode==='ref2va'?'Ref2VA Turbo · shifts 12/3':'FL2VA Turbo · shifts 6/3')+' · Euler / Simple · 4 steps · Sparse Sage 5%'}
-        : {short:'STOCK',label:'Stock H3',steps:20,summary:(mode==='ref2va'?'Ref2VA':'FL2VA')+' · RES Multistep / Simple · 20 steps · shifts 12/3 · dense'};
+      return {short:'QUALITY',label,steps:20,summary:(mode==='ref2va'?'Ref2VA':'FL2VA')+' · RES Multistep / Simple · 20 steps · dense attention'};
     }
 
     function syncSpecialLoraUI(){
-      // All creative LoRAs use the one unified named-card rack. FAST/QUALITY only
-      // manages the appropriate accelerator when the selected checkpoint needs one.
       if(typeof syncUnifiedLoraCompatibility==='function')syncUnifiedLoraCompatibility();
     }
 
     function syncPresetUI(){
       syncSpecialLoraUI();
       const fast=presetRecipe(ACTIVE_MODEL_PROFILE,currentModelMode(),'fast');
+      const ultra=presetRecipe(ACTIVE_MODEL_PROFILE,currentModelMode(),'ultra');
       const quality=presetRecipe(ACTIVE_MODEL_PROFILE,currentModelMode(),'quality');
-      const active=ACTIVE_PERF_PRESET==='fast'?fast:quality;
+      const active=ACTIVE_PERF_PRESET==='ultra'?ultra:(ACTIVE_PERF_PRESET==='quality'?quality:fast);
       $('fastpreset').classList.toggle('active',ACTIVE_PERF_PRESET==='fast');
+      $('ultrafastpreset').classList.toggle('active',ACTIVE_PERF_PRESET==='ultra');
       $('qualitypreset').classList.toggle('active',ACTIVE_PERF_PRESET==='quality');
-      $('fastpreset').textContent=`${fast.short} FAST · ${fast.steps}`;
-      $('qualitypreset').textContent=`${quality.short} QUALITY · ${quality.steps}`;
+      $('fastpreset').textContent=`FAST · ${fast.steps}`;
+      $('ultrafastpreset').textContent=`ULTRA FAST · ${ultra.steps}`;
+      $('qualitypreset').textContent=`QUALITY · ${quality.steps}`;
       $('preset_hint').innerHTML=
-        `<b>${active.label}</b> · ${currentModelMode()==='ref2va'?'REF2VA / REFERENCES':'CURRENT / KEYFRAMES'} · ${ACTIVE_PERF_PRESET.toUpperCase()}<br>`+
-        `${active.summary}<br><span style="color:#70737d">These recipes belong to the selected model. Changing model or input mode automatically updates the available recipe.</span>`;
+        `<b>${active.label}</b> · ${currentModelMode()==='ref2va'?'REF2VA / REFERENCES':'CURRENT / KEYFRAMES'} · ${ACTIVE_PERF_PRESET==='ultra'?'ULTRA FAST':ACTIVE_PERF_PRESET.toUpperCase()}<br>`+
+        `${active.summary}<br><span style="color:#70737d">FAST is the default. ULTRA FAST adds 5% sparse attention on top of the 4-step Lightning recipe.</span>`;
     }
 
     function _modelProfileState(){return (window.H3META||{}).model_profiles||{}}
     function _hasProfileFile(profile,mode=currentModelMode()){
       const s=_modelProfileState();
-      if(profile==='eros')return !!s.eros_installed;
-      if(profile==='redmix')return mode==='fl2va'&&!!s.redmix_installed;
+      if(String(profile||'').startsWith('custom:'))return !!customModelForProfile(profile);
       if(profile==='stock_quality')return mode==='ref2va'?!!s.stock_ref2va_installed:!!s.stock_fl2va_installed;
       return false;
     }
@@ -5957,12 +6251,9 @@ Additional user Auto Prompt instructions:
       const s=m.model_profiles||{};
       const mode=currentModelMode();
       const stockReady=mode==='ref2va'?!!s.stock_ref2va_installed:!!s.stock_fl2va_installed;
-      const rows=[{value:'stock_quality',label:'STOCK H3 · MAX QUALITY'+(stockReady?'':' · DOWNLOAD')}];
-      if(m.adult_enabled && !m.lowvram_t4){
-        for(const x of (m.adult_model_profiles||[])){
-          if(Array.isArray(x.modes)&&!x.modes.includes(mode))continue;
-          rows.push({value:x.value,label:(x.label||x.value)+(x.installed?'':' · DOWNLOAD')});
-        }
+      const rows=[{value:'stock_quality',label:'BUILT-IN MINIMAX H3'+(stockReady?'':' · DOWNLOAD')}];
+      for(const x of (m.custom_models||[])){
+        rows.push({value:x.profile,label:'HF · '+(x.repo_id||x.local_name)+' · '+(x.filename||x.local_name)});
       }
       sel.innerHTML=rows.map(x=>`<option value="${esc(x.value)}">${esc(x.label)}</option>`).join('');
       if(rows.some(x=>x.value===current))sel.value=current;
@@ -5973,10 +6264,11 @@ Additional user Auto Prompt instructions:
       const mode=currentModelMode(),sel=$('model_profile_select');
       syncModelProfileOptions(window.H3META||{});
       sel.value=ACTIVE_MODEL_PROFILE;
+      const cm=customModelForProfile(ACTIVE_MODEL_PROFILE);
       $('model_profile_hint').innerHTML=
         `Selected model: <b>${activeModelLabel()}</b> · `+
-        `${mode==='ref2va'?'Ref2VA transformer/reference conditioning':'FL2VA keyframe conditioning'} · `+
-        `matching files ${_hasProfileFile(ACTIVE_MODEL_PROFILE,mode)?'<span class="installed">ready</span>':'<span class="missing">download on use</span>'}.`;
+        `${cm?('user HF checkpoint · '+(cm.mode||'both')):(mode==='ref2va'?'Ref2VA transformer/reference conditioning':'FL2VA keyframe conditioning')} · `+
+        `${_hasProfileFile(ACTIVE_MODEL_PROFILE,mode)?'<span class="installed">ready</span>':'<span class="missing">download on use</span>'}.`;
 
       $('tab_fl2va').textContent='CURRENT · KEYFRAMES';
       $('tab_ref2va').textContent='REF2VA · REFERENCES';
@@ -5985,6 +6277,7 @@ Additional user Auto Prompt instructions:
       syncPresetUI();
     }
     async function _ensureProfile(profile,mode=currentModelMode()){
+      if(String(profile||'').startsWith('custom:'))return !!customModelForProfile(profile);
       if(_hasProfileFile(profile,mode))return true;
       say('downloading model profile…');
       const resp=await fetch('/api/model_profiles/install',{
@@ -6003,13 +6296,22 @@ Additional user Auto Prompt instructions:
     }
     async function applyModelProfile(profile,{install=true}={}){
       const mode=currentModelMode();
-      if(profile!=='stock_quality'){
-        await uiAlert('Only Stock MiniMax H3 is available in the SFW-only build.','SFW model selection');
+      const m=window.H3META||{};
+      const cm=customModelForProfile(profile,m);
+      if(cm){
+        if(![...$('unet').options].some(x=>x.value===cm.local_name)){
+          await loadMeta();
+        }
+        if(![...$('unet').options].some(x=>x.value===cm.local_name))throw new Error('Custom model file is not visible to ComfyUI.');
+        $('unet').value=cm.local_name;
+        ACTIVE_MODEL_PROFILE=profile;
+        await applyPerformancePreset(ACTIVE_PERF_PRESET||'fast');
+        syncModelProfileUI();
         return;
       }
       if(install && !(await _ensureProfile('stock_quality',mode)))return;
-      const m=window.H3META||{};
-      const target=mode==='ref2va'?m.stock_ref2va_unet:m.base_fl2va_unet;
+      const mm=window.H3META||{};
+      const target=mode==='ref2va'?mm.stock_ref2va_unet:mm.base_fl2va_unet;
       if(target&&[...$('unet').options].some(x=>x.value===target))$('unet').value=target;
       ACTIVE_MODEL_PROFILE='stock_quality';
       await applyPerformancePreset(ACTIVE_PERF_PRESET||'fast');
@@ -6031,6 +6333,55 @@ Additional user Auto Prompt instructions:
         sel.disabled=false;
         syncModelProfileUI();
       }
+    };
+
+
+    function _humanBytes(n){n=Number(n||0);const u=['B','KiB','MiB','GiB','TiB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return `${n.toFixed(i<2?1:2)} ${u[i]}`}
+    $('hf_model_toggle').onclick=e=>{e.preventDefault();$('hf_model_box').classList.toggle('show')};
+    $('hf_model_inspect').onclick=async e=>{
+      e.preventDefault();
+      const repo=$('hf_model_repo').value.trim(),revision=$('hf_model_revision').value.trim()||'main';
+      if(!repo){await uiAlert('Enter a Hugging Face repo such as owner/repository.','HF base model');return}
+      $('hf_model_inspect').disabled=true;$('hf_model_install').disabled=true;
+      $('hf_model_progress').style.width='0%';$('hf_model_progress_text').textContent='Inspecting repo…';
+      try{
+        const resp=await fetch('/api/models/hf/inspect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({repo_id:repo,revision})});
+        const r=await resp.json();if(!resp.ok||r.error)throw new Error(r.error||'Could not inspect repo.');
+        $('hf_model_file').innerHTML=(r.candidates||[]).map(x=>`<option value="${esc(x.filename)}">${esc(x.filename)} · ${x.size?_humanBytes(x.size):'size unknown'}</option>`).join('');
+        $('hf_model_file').disabled=!(r.candidates||[]).length;$('hf_model_install').disabled=!(r.candidates||[]).length;
+        $('hf_model_progress_text').textContent=`${(r.candidates||[]).length} checkpoint file(s) found. Choose one and download.`;
+      }catch(err){$('hf_model_progress_text').textContent=String(err.message||err);await uiAlert(String(err.message||err),'HF repo inspection failed')}
+      finally{$('hf_model_inspect').disabled=false}
+    };
+    async function pollHFModelDownload(id){
+      while(true){
+        const resp=await fetch('/api/models/hf/progress/'+encodeURIComponent(id),{cache:'no-store'});const r=await resp.json();
+        if(!resp.ok||r.error&&r.status!=='error')throw new Error(r.error||'Download status failed.');
+        const pct=r.pct==null?0:Math.max(0,Math.min(100,Number(r.pct)));
+        $('hf_model_progress').style.width=pct+'%';
+        $('hf_model_progress_text').textContent=`${r.stage||r.status} · ${r.downloaded_text||'0 B'} / ${r.total_text||'unknown'}${r.speed_text?' · '+r.speed_text:''}${r.pct==null?'':` · ${pct.toFixed(1)}%`}`;
+        if(r.status==='done')return r;
+        if(r.status==='error')throw new Error(r.error||'Model download failed.');
+        await new Promise(resolve=>setTimeout(resolve,500));
+      }
+    }
+    $('hf_model_install').onclick=async e=>{
+      e.preventDefault();
+      const repo=$('hf_model_repo').value.trim(),revision=$('hf_model_revision').value.trim()||'main',filename=$('hf_model_file').value,mode=$('hf_model_mode').value||'both';
+      if(!repo||!filename){await uiAlert('Check the repo and choose a model file first.','HF base model');return}
+      $('hf_model_install').disabled=true;$('hf_model_inspect').disabled=true;
+      try{
+        const resp=await fetch('/api/models/hf/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({repo_id:repo,revision,filename,mode})});
+        const r=await resp.json();if(!resp.ok||r.error)throw new Error(r.error||'Could not start model download.');
+        const done=await pollHFModelDownload(r.id);
+        await loadMeta();
+        ACTIVE_MODEL_PROFILE=done.profile||('custom:'+done.local_name);
+        syncModelProfileOptions(window.H3META||{});$('model_profile_select').value=ACTIVE_MODEL_PROFILE;
+        await applyModelProfile(ACTIVE_MODEL_PROFILE,{install:false});
+        $('hf_model_progress').style.width='100%';$('hf_model_progress_text').textContent=`Installed ${done.local_name}. Selected as the active base model.`;
+        say('HF base model installed · '+done.local_name);
+      }catch(err){$('hf_model_progress_text').textContent=String(err.message||err);await uiAlert(String(err.message||err),'HF base model download failed')}
+      finally{$('hf_model_install').disabled=false;$('hf_model_inspect').disabled=false}
     };
 
     $('gpu_overlay_toggle').onclick=()=>{
@@ -6162,7 +6513,7 @@ Additional user Auto Prompt instructions:
     }
     function _compatProfileForUI(m=window.H3META||{}){
       const unet=$('unet')?$('unet').value:'';
-      return unet&&m.eros_max_unet&&unet===m.eros_max_unet?'eros':'stock_quality';
+      return 'stock_quality';
     }
     function _loraFileCompatible(file,m=window.H3META||{}){
       if(!file)return true;
@@ -6777,7 +7128,7 @@ Additional user Auto Prompt instructions:
         renderNamedLoraRows(m);
 
         if(firstMeta){
-          // Safe startup: Stock H3, all creative LoRAs OFF. Adult catalog stays hidden.
+          // Startup defaults to the built-in model with creative LoRAs off.
           $('length_mode').value='seconds';
           ACTIVE_MODEL_PROFILE='stock_quality';
           $('model_profile_select').value='stock_quality';
@@ -6785,21 +7136,20 @@ Additional user Auto Prompt instructions:
           $('frames').value=m.lowvram_t4?124:175;
           if(m.lowvram_t4){
             $('width').value=640;$('height').value=480;$('short_edge').value=480;
-            $('model_profile_select').disabled=true;
           }
           LORA_CARD_STATE.clear();
           _setStrengthForKind('motion8',0,m);
           $('playback_speed').value=1.0;$('denoise').value=1.0;
           if(m.lowvram_t4){
             // T4 stays on its lean Q4 profile; the BF16 Lightning LoRA is intentionally unavailable there.
-            ACTIVE_PERF_PRESET='quality';
+            ACTIVE_PERF_PRESET='fast';
             _setStrengthForKind('lightning',0,m);
-            $('steps').value=m.stock_quality_steps||20;
-            if((m.samplers||[]).includes(m.stock_quality_sampler||'res_multistep'))$('sampler_name').value=m.stock_quality_sampler||'res_multistep';
-            if((m.schedulers||[]).includes(m.stock_quality_scheduler||'simple'))$('scheduler').value=m.stock_quality_scheduler||'simple';
-            $('shift_video').value=m.stock_quality_shift_video??12;
-            $('shift_audio').value=m.stock_quality_shift_audio??3;
-            say('ready · T4 LOW-VRAM · Stock H3');
+            $('steps').value=8;
+            if((m.samplers||[]).includes('euler'))$('sampler_name').value='euler';
+            if((m.schedulers||[]).includes('simple'))$('scheduler').value='simple';
+            $('shift_video').value=12;
+            $('shift_audio').value=3;
+            say('ready · T4 LOW-VRAM · FAST dense fallback');
           }else{
             // Default setting requested: use the matching Lightning/Turbo LoRA.
             ACTIVE_PERF_PRESET='fast';
@@ -6809,16 +7159,11 @@ Additional user Auto Prompt instructions:
             if((m.schedulers||[]).includes('simple'))$('scheduler').value='simple';
             $('shift_video').value=currentModelMode()==='ref2va'?12:6;
             $('shift_audio').value=3;
-            say('ready · Stock H3 · Lightning/Turbo default');
+            say('ready · FAST · 4-step Lightning · dense');
           }
           $('sparse_percent').value=0;$('sparse_slider').value=0;updateSparseUI('number');
           updateDur();
           firstMeta=false;
-        }else if(!m.adult_enabled&&['eros','redmix'].includes(ACTIVE_MODEL_PROFILE)){
-          // A restarted/expired browser session must fail closed back to the safe model.
-          ACTIVE_MODEL_PROFILE='stock_quality';
-          const target=currentModelMode()==='ref2va'?m.stock_ref2va_unet:m.base_fl2va_unet;
-          if(target&&(m.unets||[]).includes(target))$('unet').value=target;
         }
 
         $('tab_ref2va').disabled=!m.ref2va_available;
@@ -6834,7 +7179,7 @@ Additional user Auto Prompt instructions:
         const mh=$('modelhint');
         if(mh){
           const profileBlurb=m.lowvram_t4
-            ? '<b>T4 / 16GB LOW-VRAM STACK</b> · Q4_0 GGUF + Dynamic VRAM · Stock H3 only.'
+            ? '<b>T4 / 16GB LOW-VRAM STACK</b> · Q4_0 GGUF + Dynamic VRAM.'
             : (m.a100_80
               ? '<b>A100 80GB QUALITY STACK</b> · native SM80 quality path.'
               : (m.a100_40
@@ -7123,99 +7468,64 @@ Additional user Auto Prompt instructions:
       const m=window.H3META||{};
       const profile=ACTIVE_MODEL_PROFILE;
       const mode=currentModelMode();
-      const fast=kind==='fast';
+      const accelerated=(kind==='fast'||kind==='ultra');
 
-      if(fast && m.motion8_file && Math.abs(_strengthForKind('motion8',m))>1e-6){
-        await uiAlert('FAST uses the 4-step accelerator, while Motion Enhancer is an alternative acceleration LoRA. Turn Motion Enhancer OFF first. No LoRA selections were changed.','FAST preset conflict');
+      if(accelerated && m.motion8_file && Math.abs(_strengthForKind('motion8',m))>1e-6){
+        await uiAlert('FAST / ULTRA FAST use the 4-step Lightning accelerator, while Motion Enhancer is an alternative acceleration LoRA. Turn Motion Enhancer OFF first.','Preset conflict');
         return;
       }
 
-      // Performance presets configure the active model's sampler/accelerator.
-      // They do not activate optional specialty/style LoRAs.
       $('denoise').value=1.0;
       $('playback_speed').value=1.0;
 
-      if(profile==='eros'){
-        // Eros beta5 has its own merged Turbo. External Lightning stays OFF.
-        _setStrengthForKind('lightning',0,m);
-        if(m.eros_max_unet&&[...$('unet').options].some(x=>x.value===m.eros_max_unet))$('unet').value=m.eros_max_unet;
-
-        if(fast){
-          let sampler=m.fast_sampler||'lcm';
-          if(![...$('sampler_name').options].some(x=>x.value===sampler)){
-            sampler='euler';
-            $('steps').value=m.quality_steps||8;
-            $('shift_video').value=m.quality_shift_video??12;
-            $('shift_audio').value=m.quality_shift_audio??7;
-          }else{
-            $('steps').value=m.fast_steps||6;
-            $('shift_video').value=m.fast_shift_video??1;
-            $('shift_audio').value=m.fast_shift_audio??1;
-          }
-          $('sampler_name').value=sampler;
-          if([...$('scheduler').options].some(x=>x.value===(m.fast_scheduler||'simple')))$('scheduler').value=m.fast_scheduler||'simple';
-          $('sparse_percent').value=0;$('sparse_slider').value=0;updateSparseUI('number');
-        }else{
-          $('steps').value=m.quality_steps||8;
-          if([...$('sampler_name').options].some(x=>x.value===(m.quality_sampler||'euler')))$('sampler_name').value=m.quality_sampler||'euler';
-          if([...$('scheduler').options].some(x=>x.value===(m.quality_scheduler||'simple')))$('scheduler').value=m.quality_scheduler||'simple';
-          $('shift_video').value=m.quality_shift_video??12;$('shift_audio').value=m.quality_shift_audio??7;
-          $('sparse_percent').value=0;$('sparse_slider').value=0;updateSparseUI('number');
-          if(mode==='ref2va')$('ref_image_size').value='max';
-        }
-
-      }else if(profile==='redmix'){
-        // REDMIX Beta2 is already a merged INT8 ConvRot + Turbo checkpoint.
-        // Do not stack the external FAST accelerator on top of it.
-        _setStrengthForKind('lightning',0,m);
-        if(m.redmix_unet&&[...$('unet').options].some(x=>x.value===m.redmix_unet))$('unet').value=m.redmix_unet;
-        $('steps').value=m.redmix_steps||6;
-        const rs=(m.samplers||[]).includes(m.redmix_sampler||'er_sde')?(m.redmix_sampler||'er_sde'):'euler';
-        const rc=(m.schedulers||[]).includes(m.redmix_scheduler||'beta')?(m.redmix_scheduler||'beta'):'simple';
-        $('sampler_name').value=rs;$('scheduler').value=rc;
-        $('shift_video').value=m.redmix_shift_video??6;$('shift_audio').value=m.redmix_shift_audio??3;
-        $('sparse_percent').value=0;$('sparse_slider').value=0;updateSparseUI('number');
-
-      }else{
-        // Stock H3 sampler path. Creative LoRA choices are never changed by a
-        // performance preset; the single unified rack owns those choices.
+      const cm=customModelForProfile(profile,m);
+      if(cm&&cm.local_name&&[...$('unet').options].some(x=>x.value===cm.local_name))$('unet').value=cm.local_name;
+      else if(!cm){
         const target=mode==='ref2va'?m.stock_ref2va_unet:m.base_fl2va_unet;
         if(target&&[...$('unet').options].some(x=>x.value===target))$('unet').value=target;
+      }
 
-        if(fast){
-          if(mode==='ref2va'&&!m.ref2va_lightning_available){
-            await uiAlert('The matching Ref2VA 4-step accelerator is unavailable. Use QUALITY or check the startup log.','Fast mode unavailable');
-            return;
-          }
-          if(mode==='fl2va'&&!m.lightning_available){
-            await uiAlert('The matching FL2VA 4-step accelerator is unavailable. Use QUALITY or check the startup log.','Fast mode unavailable');
-            return;
-          }
+      if(accelerated){
+        const accelAvailable=mode==='ref2va'?m.ref2va_lightning_available:m.lightning_available;
+        if(!accelAvailable){
+          // Low-VRAM/T4 currently has no matching Lightning package. Keep FAST selected
+          // but use the best available dense base recipe instead of silently breaking.
+          _setStrengthForKind('lightning',0,m);
+          $('steps').value=8;
+          if([...$('sampler_name').options].some(x=>x.value==='euler'))$('sampler_name').value='euler';
+          if([...$('scheduler').options].some(x=>x.value==='simple'))$('scheduler').value='simple';
+          $('shift_video').value=12;$('shift_audio').value=3;
+          $('sparse_percent').value=0;$('sparse_slider').value=0;updateSparseUI('number');
+          if(kind==='ultra')await uiAlert('ULTRA FAST requires the 4-step Lightning LoRA, which is unavailable on this runtime. FAST dense fallback was applied instead.','Ultra Fast unavailable');
+          kind='fast';
+        }else{
           _setStrengthForKind('lightning',m.lightning_strength_default||1.0,m);
           $('steps').value=4;
           if([...$('sampler_name').options].some(x=>x.value==='euler'))$('sampler_name').value='euler';
           if([...$('scheduler').options].some(x=>x.value==='simple'))$('scheduler').value='simple';
           $('shift_video').value=mode==='ref2va'?12:6;
           $('shift_audio').value=3;
-          $('sparse_percent').value=0;$('sparse_slider').value=0;updateSparseUI('number');
-        }else{
-          _setStrengthForKind('lightning',0,m);
-          $('steps').value=m.stock_quality_steps||20;
-          if([...$('sampler_name').options].some(x=>x.value===(m.stock_quality_sampler||'res_multistep')))$('sampler_name').value=m.stock_quality_sampler||'res_multistep';
-          if([...$('scheduler').options].some(x=>x.value===(m.stock_quality_scheduler||'simple')))$('scheduler').value=m.stock_quality_scheduler||'simple';
-          $('shift_video').value=m.stock_quality_shift_video??12;$('shift_audio').value=m.stock_quality_shift_audio??3;
-          $('sparse_percent').value=0;$('sparse_slider').value=0;updateSparseUI('number');
-          if(mode==='ref2va')$('ref_image_size').value='max';
+          const sparse=kind==='ultra'?5:0;
+          $('sparse_percent').value=sparse;$('sparse_slider').value=sparse;updateSparseUI('number');
         }
+      }else{
+        _setStrengthForKind('lightning',0,m);
+        $('steps').value=m.stock_quality_steps||20;
+        if([...$('sampler_name').options].some(x=>x.value===(m.stock_quality_sampler||'res_multistep')))$('sampler_name').value=m.stock_quality_sampler||'res_multistep';
+        if([...$('scheduler').options].some(x=>x.value===(m.stock_quality_scheduler||'simple')))$('scheduler').value=m.stock_quality_scheduler||'simple';
+        $('shift_video').value=m.stock_quality_shift_video??12;$('shift_audio').value=m.stock_quality_shift_audio??3;
+        $('sparse_percent').value=0;$('sparse_slider').value=0;updateSparseUI('number');
+        if(mode==='ref2va')$('ref_image_size').value='max';
       }
 
       ACTIVE_PERF_PRESET=kind;
       updateDur();syncPresetUI();renderNamedLoraRows(window.H3META||{});
       const r=presetRecipe(profile,mode,kind);
-      say(`${r.label} · ${kind.toUpperCase()} · ${r.summary}`);
+      say(`${r.label} · ${kind==='ultra'?'ULTRA FAST':kind.toUpperCase()} · ${r.summary}`);
     }
 
     $('fastpreset').onclick=e=>{e.preventDefault();applyPerformancePreset('fast')};
+    $('ultrafastpreset').onclick=e=>{e.preventDefault();applyPerformancePreset('ultra')};
     $('qualitypreset').onclick=e=>{e.preventDefault();applyPerformancePreset('quality')};
 
     $('reset_loras').onclick=e=>{e.preventDefault();resetNamedLoras();say('LoRA rack reset')};
@@ -7416,7 +7726,7 @@ Additional user Auto Prompt instructions:
             log(f"  iframe failed: {e}")
         try:
             _co.serve_kernel_port_as_window(
-                UI_PORT, anchor_text="◤ Open MissingLink MiniMax Studio · SFW Fast in a new tab")
+                UI_PORT, anchor_text="◤ Open MissingLink MiniMax Studio · Fast in a new tab")
             mode = (mode or "") + "+window"
         except Exception as e:
             log(f"  window failed: {e}")
@@ -7446,7 +7756,7 @@ Additional user Auto Prompt instructions:
 
     log("="*74)
     if STARTUP_GPU_PRELOADED:
-        log(f"  ✓ Stock H3 SFW default preloaded; conditioning TE: {TEXT_ENCODER_FILE}.")
+        log(f"  ✓ Stock H3 default preloaded; conditioning TE: {TEXT_ENCODER_FILE}.")
     else:
         if LOWVRAM_T4_PROFILE:
             log(f"  ✓ T4/LOW-VRAM on-demand model: {T4_DIT_FILE} · Dynamic VRAM · no startup preload by design.")
