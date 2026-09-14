@@ -7,7 +7,7 @@
 # - Does NOT replace PyTorch inside a live Comfy runtime. If this cell reports CUDA <13,
 #   compare against a fresh cu130+ runtime rather than hot-swapping torch underneath Comfy.
 # - User-provided Hugging Face base models are supported with live download progress.
-# - Fast-start defaults defer optional accelerator downloads and GPU preload until first use.
+# - Fast-start defers optional accelerator downloads, but the active base model is preloaded to GPU before the UI opens.
 #
 #
 # Colab Secrets / optional integrations:
@@ -565,12 +565,39 @@ def _sha256_file(path):
             h.update(chunk)
     return h.hexdigest()
 
+def _activate_runtime_pythonpaths(rel_roots):
+    """Activate private dependency roots restored under /content.
+
+    A100/T4 snapshots can carry Python dependencies without replacing Colab's native
+    Torch/CUDA stack. The bundle manifest lists those private --target directories in
+    ``pythonpath_roots``; activate them before ComfyUI imports begin.
+    """
+    active = []
+    for rel in (rel_roots or []):
+        rel = str(rel or "").strip().strip("/")
+        if not rel or ".." in _pl.PurePosixPath(rel).parts:
+            continue
+        root = (_pl.Path("/content") / rel).resolve()
+        if not root.exists() or not root.is_dir():
+            continue
+        sr = str(root)
+        if sr not in _sys.path:
+            _sys.path.insert(0, sr)
+        active.append(sr)
+    if active:
+        old = _os.environ.get("PYTHONPATH", "")
+        merged = active + ([old] if old else [])
+        _os.environ["PYTHONPATH"] = ":".join(merged)
+        print("✓ restored runtime Python libs active -> " + ", ".join(active), flush=True)
+    return active
+
 def _restore_runtime_bundle():
     if _PARENT_IS_CHILD or not H3_RUNTIME_BUNDLE_ENABLED:
         return False
     if H3_RUNTIME_MARKER.exists() and _os.environ.get("H3_RUNTIME_FORCE_REFRESH", "0").strip().lower() not in {"1","true","yes","on"}:
         try:
             old = __import__("json").loads(H3_RUNTIME_MARKER.read_text())
+            _activate_runtime_pythonpaths(old.get("pythonpath_roots") or [])
             print(f"✓ prebuilt runtime already restored in this VM · build {old.get('build_id','unknown')}", flush=True)
             return True
         except Exception:
@@ -640,7 +667,7 @@ def _restore_runtime_bundle():
         if not roots:
             roots = [{"path": x, "mode": "replace"} for x in _os.listdir(staging)]
         for item in roots:
-            rel = str((item or {}).get("path") or "").strip().strip("/")
+            rel = str((item or {}).get("path") or (item or {}).get("local_name") or "").strip().strip("/")
             mode = str((item or {}).get("mode") or "replace")
             if not rel:
                 continue
@@ -661,9 +688,12 @@ def _restore_runtime_bundle():
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 _shutil.move(str(src), str(dst))
         _shutil.rmtree(staging, ignore_errors=True)
+        py_roots = [str(x) for x in (manifest.get("pythonpath_roots") or []) if str(x or "").strip()]
+        _activate_runtime_pythonpaths(py_roots)
         H3_RUNTIME_MARKER.write_text(_json.dumps({
             "build_id": manifest.get("build_id"), "profile": profile,
             "archive_sha256": expected_sha, "restored_at": _time.time(),
+            "pythonpath_roots": py_roots,
         }, indent=2))
         if _os.environ.get("H3_KEEP_RUNTIME_ARCHIVE", "0").strip().lower() not in {"1","true","yes","on"}:
             archive_local.unlink(missing_ok=True)
@@ -3410,19 +3440,20 @@ if _CU130_CHILD:
         variant_info = " | ".join(infos) or "none"
         return model, CACHE["clip"], CACHE["vae"], CACHE["avae"], variant_info
 
-    # Preload the default generation stack before the UI starts. Full-card Blackwell
-    # and A100-80 can keep the quality stack resident. A100-40 uses the smaller TE and
-    # the partitioned TE↔DiT handoff, while T4 stays on-demand DynamicVRAM.
-    # the remaining activation/workspace margin is too small at 1152x768. Keep the
-    # Keep the stock DiT resident when the VRAM budget permits; otherwise let Comfy
-    # smart-memory swap the text encoder and DiT between conditioning and sampling.
+    # Preload the active base model before the UI starts. FAST STARTUP still skips
+    # optional accelerator downloads / startup benchmarks, but it no longer means
+    # "cold model". Full-card profiles keep the entire stack resident; partitioned
+    # cards keep the DiT resident and greedily keep VAEs (and the TE only when there
+    # is genuinely enough headroom) so first GENERATE avoids an avoidable cold load.
+    STARTUP_PARTIAL_MIN_FREE_GIB = max(float(RESERVE_VRAM) + 4.0, 9.0)
+
     def _log_vram_budget():
         try:
             total = torch.cuda.get_device_properties(0).total_memory / 1024**3
         except Exception:
             total = 39.5
         dit_gib = T4_DIT_GIB if LOWVRAM_T4_PROFILE else 19.55
-        dit_label = "T4 Q4_0" if LOWVRAM_T4_PROFILE else "Stock H3 INT8"
+        dit_label = "T4 Q4_0" if LOWVRAM_T4_PROFILE else "H3 DiT"
         core = dit_gib + TEXT_ENCODER_GIB
         all_weights = core + VIDEO_VAE_GIB + AUDIO_VAE_GIB
         log(f"  VRAM budget -> {dit_label} ~{dit_gib:.2f} GiB + TE ~{TEXT_ENCODER_GIB:.2f} GiB = ~{core:.2f} GiB")
@@ -3434,44 +3465,106 @@ if _CU130_CHILD:
                 f"estimated requirement {_full_stack_required_gib:.1f} GiB"
             )
         else:
-            log(f"  VRAM policy -> keep Stock H3 + selected LoRAs resident when possible; GPU-swap {TEXT_ENCODER_FILE} for conditioning; reserve {RESERVE_VRAM:.1f} GiB")
-
-    def _preload_default_gpu_stack():
-        PROG["stage"] = "startup preload"
-        _log_vram_budget()
-        log("  ↳ preloading Stock H3 stack to GPU before UI launch")
-        try:
-            preload_lora = "none"
-            preload_lora_strength = 0.0
-            preload_lightning = False
-            model, clip, vae, avae, info = get_models(
-                "default", preload_lora, preload_lora_strength,
-                action=False, action_strength=ACTION_STRENGTH,
-                lightning=preload_lightning,
-                lightning_strength=LIGHTNING_STRENGTH,
-                unet=DIT_FILE,
+            log(
+                f"  VRAM policy -> preload DiT and keep as many auxiliary models resident as headroom permits; "
+                f"minimum free target {STARTUP_PARTIAL_MIN_FREE_GIB:.1f} GiB"
             )
-            # V86: if the measured Blackwell budget permits, keep the entire active
-            # stack resident. Otherwise preload only the DiT and use the proven
-            # partitioned-card TE↔DiT handoff.
-            if FULL_STACK_RESIDENCY:
-                _pin_persistent_stack(model, clip, vae, avae, reason="startup")
-            else:
-                if LOWVRAM_T4_PROFILE:
-                    mm.load_models_gpu([model])
-                else:
-                    try:
-                        mm.load_models_gpu([model], force_full_load=True)
-                    except TypeError:
-                        mm.load_models_gpu([model])
-                torch.cuda.synchronize()
+
+    def _resident_free_gib():
+        try:
+            return torch.cuda.mem_get_info()[0] / 1024**3
+        except Exception:
+            return 0.0
+
+    def _load_resident_patcher(obj, label, estimated_gib=0.0, *, mandatory=False):
+        """Load one Comfy patcher now while preserving real activation headroom."""
+        patcher = _patcher_from_obj(obj)
+        if patcher is None:
+            log(f"  ↳ resident preload skipped: {label} has no ModelPatcher")
+            return False
+
+        free_before = _resident_free_gib()
+        if (not mandatory and estimated_gib > 0 and
+                free_before - float(estimated_gib) < STARTUP_PARTIAL_MIN_FREE_GIB):
+            log(
+                f"  ↳ resident preload skip {label}: ~{estimated_gib:.2f} GiB would leave "
+                f"{max(0.0, free_before-estimated_gib):.1f} GiB free "
+                f"(< {STARTUP_PARTIAL_MIN_FREE_GIB:.1f} GiB target)"
+            )
+            return False
+
+        try:
+            with torch.no_grad():
+                try:
+                    mm.load_models_gpu([patcher], force_full_load=True)
+                except TypeError:
+                    mm.load_models_gpu([patcher])
+            torch.cuda.synchronize()
+            free_after = _resident_free_gib()
+            log(f"  ✓ resident preload {label}: {free_before:.1f} -> {free_after:.1f} GiB free")
+            return True
+        except Exception as exc:
+            log(f"  ⚠ resident preload {label} skipped: {exc}")
+            try:
+                mm.soft_empty_cache()
+            except Exception:
+                pass
+            return False
+
+    def _preload_model_residency(unet_name, *, reason="startup", estimated_dit_gib=None):
+        """Load the selected base model before use and maximize safe residency."""
+        if LOWVRAM_T4_PROFILE:
+            return False, "T4 DynamicVRAM stays demand-paged"
+
+        PROG["stage"] = "startup preload" if reason == "startup" else "loading model to GPU"
+        _log_vram_budget()
+        log(f"  ↳ {reason}: preloading base model to GPU -> {unet_name}")
+
+        model, clip, vae, avae, info = get_models(
+            "default", "none", 0.0,
+            action=False, action_strength=ACTION_STRENGTH,
+            lightning=False, lightning_strength=LIGHTNING_STRENGTH,
+            unet=unet_name,
+        )
+
+        if FULL_STACK_RESIDENCY:
+            ok = _pin_persistent_stack(model, clip, vae, avae, reason=reason)
             free_b, total_b = torch.cuda.mem_get_info()
             used = (total_b-free_b)/1024**3
             total = total_b/1024**3
-            log(f"  ✓ startup GPU preload complete: {used:.1f}/{total:.1f} GiB VRAM used · READY before UI launch")
-            log(f"  ✓ resident startup stack: {info}")
+            note = f"full stack resident · {used:.1f}/{total:.1f} GiB used"
+            if ok:
+                log(f"  ✓ {reason} residency complete: {note}")
+            return bool(ok), note
+
+        dit_est = float(estimated_dit_gib or 19.55)
+        loaded = []
+        if _load_resident_patcher(model, "DiT", dit_est, mandatory=True):
+            loaded.append("DiT")
+        else:
+            raise RuntimeError("Active H3 DiT could not be preloaded to GPU.")
+
+        if _load_resident_patcher(vae, "video VAE", VIDEO_VAE_GIB):
+            loaded.append("video VAE")
+        if _load_resident_patcher(avae, "audio VAE", AUDIO_VAE_GIB):
+            loaded.append("audio VAE")
+        if _load_resident_patcher(clip, "conditioning TE", TEXT_ENCODER_GIB):
+            loaded.append("TE")
+
+        free_b, total_b = torch.cuda.mem_get_info()
+        used = (total_b-free_b)/1024**3
+        total = total_b/1024**3
+        note = f"resident: {', '.join(loaded)} · {used:.1f}/{total:.1f} GiB used · {free_b/1024**3:.1f} GiB free"
+        log(f"  ✓ {reason} residency complete: {note}")
+        return True, note
+
+    def _preload_default_gpu_stack():
+        try:
+            ok, note = _preload_model_residency(DIT_FILE, reason="startup")
             PROG["stage"] = "ready"
-            return True
+            if ok:
+                log(f"  ✓ active base model is HOT before UI launch · {note}")
+            return bool(ok)
         except Exception as e:
             PROG["stage"] = "ready"
             log(f"  ⚠ startup GPU preload warning: {e}")
@@ -3481,13 +3574,11 @@ if _CU130_CHILD:
     if LOWVRAM_T4_PROFILE:
         STARTUP_GPU_PRELOADED = False
         PROG["stage"] = "ready"
-        log("✓ T4/LOW-VRAM startup: no force-full GPU preload; Q4_0 DiT loads/pages on first GENERATE")
-    elif FAST_STARTUP:
-        STARTUP_GPU_PRELOADED = False
-        PROG["stage"] = "ready"
-        log("✓ FAST STARTUP: GPU model preload deferred until first GENERATE")
+        log("✓ T4/LOW-VRAM startup: DynamicVRAM demand paging retained by design")
     else:
         STARTUP_GPU_PRELOADED = _preload_default_gpu_stack()
+        if FAST_STARTUP:
+            log("✓ FAST STARTUP: optional downloads/benchmarks deferred · base model preload ENABLED")
 
     def _prepare_frame(path, width, height, fit_mode="cover"):
         """Resize without accidental aspect distortion before H3 sees the frame.
@@ -5373,15 +5464,43 @@ if _CU130_CHILD:
             })
             _custom_model_save_registry(rows)
             folder_paths.cache_helper.clear()
+
+            residency_note = "installed · GPU busy, preload deferred until generation"
+            residency_ok = False
+            if not LOWVRAM_T4_PROFILE and GPU_LOCK.acquire(blocking=False):
+                try:
+                    with CUSTOM_MODEL_DOWNLOAD_LOCK:
+                        CUSTOM_MODEL_DOWNLOADS[download_id].update(stage="loading model to GPU")
+                    torch.cuda.synchronize()
+                    try:
+                        mm.unload_all_models()
+                    except Exception:
+                        pass
+                    gc.collect()
+                    try:
+                        mm.soft_empty_cache()
+                    except Exception:
+                        pass
+                    residency_ok, residency_note = _preload_model_residency(
+                        local_name, reason="custom model install",
+                        estimated_dit_gib=max(0.1, downloaded / 1024**3),
+                    )
+                except Exception as preload_exc:
+                    residency_note = f"installed · GPU preload warning: {preload_exc}"
+                    log("  ⚠ custom model GPU preload warning: " + str(preload_exc))
+                finally:
+                    GPU_LOCK.release()
+
             with CUSTOM_MODEL_DOWNLOAD_LOCK:
                 CUSTOM_MODEL_DOWNLOADS[download_id].update(
                     status="done", stage="done", downloaded_bytes=downloaded,
                     total_bytes=downloaded, speed_bps=0.0, local_name=local_name,
                     profile="custom:" + local_name, transport=xet_mode,
+                    residency_ok=bool(residency_ok), residency_note=residency_note,
                 )
             log(
                 f"  ✓ custom HF base model installed: {repo_id} / {filename} -> {local_name} "
-                f"· {downloaded / elapsed / 1024**2:.1f} MiB/s average"
+                f"· {downloaded / elapsed / 1024**2:.1f} MiB/s average · {residency_note}"
             )
         except Exception as e:
             with CUSTOM_MODEL_DOWNLOAD_LOCK:
@@ -7289,7 +7408,7 @@ Additional user Auto Prompt instructions:
         ACTIVE_MODEL_PROFILE=done.profile||('custom:'+done.local_name);
         syncModelProfileOptions(window.H3META||{});$('model_profile_select').value=ACTIVE_MODEL_PROFILE;
         await applyModelProfile(ACTIVE_MODEL_PROFILE,{install:false});
-        $('hf_model_progress').style.width='100%';$('hf_model_progress_text').textContent=`Installed ${done.local_name}. Selected as the active base model.`;
+        $('hf_model_progress').style.width='100%';$('hf_model_progress_text').textContent=`Installed ${done.local_name}. Selected as the active base model.${done.residency_note?' · '+done.residency_note:''}`;
         say('HF base model installed · '+done.local_name);
       }catch(err){$('hf_model_progress_text').textContent=String(err.message||err);await uiAlert(String(err.message||err),'HF base model download failed')}
       finally{$('hf_model_install').disabled=false;$('hf_model_inspect').disabled=false}
@@ -8746,17 +8865,15 @@ Additional user Auto Prompt instructions:
 
     log("="*74)
     if STARTUP_GPU_PRELOADED:
-        log(f"  ✓ Stock H3 default preloaded; conditioning TE: {TEXT_ENCODER_FILE}.")
+        log(f"  ✓ Active H3 base model preloaded before UI ready · GPU profile={GPU_PROFILE}.")
+        if FULL_STACK_RESIDENCY:
+            log("  ✓ Residency: full DiT + conditioning TE + video/audio VAEs kept warm.")
+        else:
+            log("  ✓ Residency: DiT kept hot; auxiliary models retained up to safe VRAM headroom.")
     else:
         if LOWVRAM_T4_PROFILE:
-            log(f"  ✓ T4/LOW-VRAM on-demand model: {T4_DIT_FILE} · Dynamic VRAM · no startup preload by design.")
-        elif FAST_STARTUP:
-            log(f"  ✓ FAST STARTUP active · {GPU_PROFILE.upper()} · model loading deferred until first GENERATE.")
-        elif A100_PROFILE:
-            log(f"  ✓ {GPU_PROFILE.upper()} active · native SM80 runtime · "
-                + ("full-card quality residency" if FULL_STACK_RESIDENCY else "safe TE↔DiT↔VAE handoff"))
-            log("  Startup preload did not complete; first GENERATE will retry model loading.")
+            log(f"  ✓ T4/LOW-VRAM model: {T4_DIT_FILE} · Dynamic VRAM demand paging by design.")
         else:
-            log("  Startup preload failed; first GENERATE will retry model loading.")
+            log("  ⚠ Startup preload did not complete; first GENERATE will retry model loading.")
     log("  Errors come back as a full traceback in the red panel.")
     log("="*74)
