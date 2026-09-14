@@ -7223,6 +7223,15 @@ Additional user Auto Prompt instructions:
 
 
     function _humanBytes(n){n=Number(n||0);const u=['B','KiB','MiB','GiB','TiB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return `${n.toFixed(i<2?1:2)} ${u[i]}`}
+    async function _readJsonResponse(resp,label='request'){
+      const text=await resp.text();
+      try{return text?JSON.parse(text):{}}
+      catch(parseErr){
+        const clean=String(text||'').replace(/\s+/g,' ').trim().slice(0,600);
+        const status=`HTTP ${resp.status}${resp.statusText?' '+resp.statusText:''}`;
+        throw new Error(`${label} returned ${status} instead of JSON${clean?` · ${clean}`:''}`);
+      }
+    }
     $('hf_model_toggle').onclick=e=>{e.preventDefault();$('hf_model_box').classList.toggle('show')};
     $('hf_model_inspect').onclick=async e=>{
       e.preventDefault();
@@ -7232,7 +7241,7 @@ Additional user Auto Prompt instructions:
       $('hf_model_progress').style.width='0%';$('hf_model_progress_text').textContent='Inspecting Hugging Face source…';
       try{
         const resp=await fetch('/api/models/hf/inspect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source,revision})});
-        const r=await resp.json();if(!resp.ok||r.error)throw new Error(r.error||'Could not inspect Hugging Face source.');
+        const r=await _readJsonResponse(resp,'HF source inspection');if(!resp.ok||r.error)throw new Error(r.error||'Could not inspect Hugging Face source.');
         $('hf_model_repo').value=r.repo_id||source;
         $('hf_model_revision').value=r.revision||revision;
         $('hf_model_file').innerHTML=(r.candidates||[]).map(x=>`<option value="${esc(x.filename)}">${esc(x.filename)} · ${x.size?_humanBytes(x.size):'size unknown'}</option>`).join('');
@@ -7243,15 +7252,27 @@ Additional user Auto Prompt instructions:
       finally{$('hf_model_inspect').disabled=false}
     };
     async function pollHFModelDownload(id){
+      let transientFailures=0;
       while(true){
-        const resp=await fetch('/api/models/hf/progress/'+encodeURIComponent(id),{cache:'no-store'});const r=await resp.json();
-        if(!resp.ok||r.error&&r.status!=='error')throw new Error(r.error||'Download status failed.');
+        let resp,r;
+        try{
+          resp=await fetch('/api/models/hf/progress/'+encodeURIComponent(id),{cache:'no-store'});
+          r=await _readJsonResponse(resp,'HF model progress');
+          if(!resp.ok||r.error&&r.status!=='error')throw new Error(r.error||`Download status failed (HTTP ${resp.status}).`);
+          transientFailures=0;
+        }catch(err){
+          transientFailures++;
+          if(transientFailures>=12)throw err;
+          $('hf_model_progress_text').textContent=`Download is still running · reconnecting status (${transientFailures}/12)…`;
+          await new Promise(resolve=>setTimeout(resolve,1000));
+          continue;
+        }
         const pct=r.pct==null?0:Math.max(0,Math.min(100,Number(r.pct)));
         $('hf_model_progress').style.width=pct+'%';
         $('hf_model_progress_text').textContent=`${r.stage||r.status} · ${r.downloaded_text||'0 B'} / ${r.total_text||'unknown'}${r.speed_text?' · '+r.speed_text:''}${r.pct==null?'':` · ${pct.toFixed(1)}%`}`;
         if(r.status==='done')return r;
         if(r.status==='error')throw new Error(r.error||'Model download failed.');
-        await new Promise(resolve=>setTimeout(resolve,500));
+        await new Promise(resolve=>setTimeout(resolve,750));
       }
     }
     $('hf_model_install').onclick=async e=>{
@@ -7261,7 +7282,7 @@ Additional user Auto Prompt instructions:
       $('hf_model_install').disabled=true;$('hf_model_inspect').disabled=true;
       try{
         const resp=await fetch('/api/models/hf/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source,revision,filename,mode})});
-        const r=await resp.json();if(!resp.ok||r.error)throw new Error(r.error||'Could not start model download.');
+        const r=await _readJsonResponse(resp,'HF model install');if(!resp.ok||r.error)throw new Error(r.error||'Could not start model download.');
         $('hf_model_repo').value=r.repo_id||source;$('hf_model_revision').value=r.revision||revision;
         const done=await pollHFModelDownload(r.id);
         await loadMeta();
@@ -8075,7 +8096,7 @@ Additional user Auto Prompt instructions:
     let firstMeta=true;
     function loadMeta(){
       const prevSampler=$('sampler_name').value,prevScheduler=$('scheduler').value,prevUnet=$('unet').value;
-      return fetch('/api/meta').then(r=>r.json()).then(m=>{
+      return fetch('/api/meta',{cache:'no-store'}).then(async r=>{const m=await _readJsonResponse(r,'Studio metadata');if(!r.ok||m.error)throw new Error(m.error||`Studio metadata failed (HTTP ${r.status}).`);return m}).then(m=>{
         window.H3META=m;
         window.ADULT_ENABLED=!!m.adult_enabled;
         syncAdultModeButton(m);
