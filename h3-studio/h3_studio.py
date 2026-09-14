@@ -5215,51 +5215,149 @@ if _CU130_CHILD:
                 return f"{n:.2f} {unit}"
             n /= 1024.0
 
+    class _SilentTqdmSink:
+        def write(self, value):
+            return len(str(value or ""))
+        def flush(self):
+            pass
+        def isatty(self):
+            return False
+
+    def _configure_hf_xet_downloads():
+        """Tune hf_xet for large model/LoRA transfers without requiring HF_TOKEN."""
+        try:
+            host_ram = int(os.sysconf("SC_PHYS_PAGES")) * int(os.sysconf("SC_PAGE_SIZE"))
+        except Exception:
+            host_ram = 0
+        try:
+            free_disk = shutil.disk_usage("/content").free
+        except Exception:
+            free_disk = 0
+
+        if host_ram >= 64 * 1024**3:
+            os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
+            mode = "Xet high-performance"
+        else:
+            concurrency = "16" if host_ram >= 24 * 1024**3 else "8"
+            os.environ.setdefault("HF_XET_FIXED_DOWNLOAD_CONCURRENCY", concurrency)
+            mode = f"Xet {concurrency}-stream"
+
+        if free_disk >= 16 * 1024**3:
+            os.environ.setdefault("HF_XET_CHUNK_CACHE_SIZE_BYTES", str(8 * 1024**3))
+        return mode
+
+    def _make_hf_progress_tqdm(download_id, jobs, lock, expected_size=0):
+        """Bridge huggingface_hub/hf_xet byte progress into the Studio polling UI."""
+        from tqdm.auto import tqdm as _TqdmBase
+
+        class _StudioHfTqdm(_TqdmBase):
+            def __init__(self, *args, **kwargs):
+                kwargs["file"] = _SilentTqdmSink()
+                kwargs.setdefault("mininterval", 0.15)
+                kwargs.setdefault("miniters", 1)
+                super().__init__(*args, **kwargs)
+                self._ml_started = time.time()
+                self._ml_last_push = 0.0
+                self._ml_push(force=True)
+
+            def _ml_push(self, force=False):
+                now = time.time()
+                if not force and now - self._ml_last_push < 0.15:
+                    return
+                done = max(0, int(float(getattr(self, "n", 0) or 0)))
+                total = max(0, int(float(getattr(self, "total", 0) or 0))) or int(expected_size or 0)
+                elapsed = max(0.001, now - self._ml_started)
+                rate = None
+                try:
+                    rate = (getattr(self, "format_dict", {}) or {}).get("rate")
+                except Exception:
+                    rate = None
+                speed = float(rate or (done / elapsed if done else 0.0))
+                with lock:
+                    job = jobs.get(download_id)
+                    if job is not None:
+                        job.update(
+                            downloaded_bytes=done,
+                            total_bytes=max(int(job.get("total_bytes") or 0), total),
+                            speed_bps=speed,
+                            stage="downloading",
+                        )
+                self._ml_last_push = now
+
+            def update(self, n=1):
+                result = super().update(n)
+                self._ml_push()
+                return result
+
+            def close(self):
+                try:
+                    self._ml_push(force=True)
+                finally:
+                    return super().close()
+
+        return _StudioHfTqdm
+
     def _custom_model_download_worker(download_id, repo_id, revision, filename, mode, expected_size):
         started = time.time()
         fmt = "gguf" if filename.lower().endswith(".gguf") else "safetensors"
+        temp_root = None
         try:
             dest, local_name = _custom_model_destination(repo_id, filename, fmt)
-            part = dest + f".{download_id}.part"
-            url = hf_hub_url(repo_id=repo_id, filename=filename, revision=revision)
-            headers = {"User-Agent": "MissingLink-H3-CustomModel/1"}
-            token = _hf_token()
-            if token:
-                headers["Authorization"] = "Bearer " + token
-            req = urllib.request.Request(url, headers=headers)
-            downloaded = 0
-            with urllib.request.urlopen(req, timeout=180) as resp:
-                content_length = int(resp.headers.get("Content-Length") or 0)
-                total = int(expected_size or content_length or 0)
-                with CUSTOM_MODEL_DOWNLOAD_LOCK:
-                    CUSTOM_MODEL_DOWNLOADS[download_id].update(total_bytes=total, local_name=local_name, stage="downloading")
-                with open(part, "wb") as fh:
-                    while True:
-                        chunk = resp.read(8 * 1024 * 1024)
-                        if not chunk:
-                            break
-                        fh.write(chunk)
-                        downloaded += len(chunk)
-                        elapsed = max(0.001, time.time() - started)
-                        with CUSTOM_MODEL_DOWNLOAD_LOCK:
-                            job = CUSTOM_MODEL_DOWNLOADS[download_id]
-                            job.update(
-                                downloaded_bytes=downloaded,
-                                total_bytes=max(int(job.get("total_bytes") or 0), total),
-                                speed_bps=downloaded / elapsed,
-                                stage="downloading",
-                            )
+            token = _hf_token() or None
+            xet_mode = _configure_hf_xet_downloads()
+            temp_root = os.path.join("/content", ".missinglink_hf_model_downloads", download_id)
+            shutil.rmtree(temp_root, ignore_errors=True)
+            os.makedirs(temp_root, exist_ok=True)
+
+            with CUSTOM_MODEL_DOWNLOAD_LOCK:
+                CUSTOM_MODEL_DOWNLOADS[download_id].update(
+                    total_bytes=int(expected_size or 0),
+                    local_name=local_name,
+                    stage="downloading",
+                    transport=xet_mode,
+                )
+
+            ProgressTqdm = _make_hf_progress_tqdm(
+                download_id, CUSTOM_MODEL_DOWNLOADS, CUSTOM_MODEL_DOWNLOAD_LOCK, expected_size
+            )
+            log(f"  ↓ custom HF base model · {xet_mode}: {repo_id}/{filename}")
+            src_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                revision=revision,
+                token=token,
+                local_dir=temp_root,
+                tqdm_class=ProgressTqdm,
+            )
+            downloaded = os.path.getsize(src_path)
+            elapsed = max(0.001, time.time() - started)
+            with CUSTOM_MODEL_DOWNLOAD_LOCK:
+                CUSTOM_MODEL_DOWNLOADS[download_id].update(
+                    downloaded_bytes=downloaded,
+                    total_bytes=downloaded,
+                    speed_bps=downloaded / elapsed,
+                    stage="validating",
+                )
+
             if expected_size and downloaded != int(expected_size):
-                raise RuntimeError(f"Download size mismatch: expected {_format_bytes(expected_size)}, got {_format_bytes(downloaded)}.")
+                note = (
+                    f"HF size metadata differed: expected {_format_bytes(expected_size)}, "
+                    f"received {_format_bytes(downloaded)}; validating file content instead."
+                )
+                log("  ↳ " + note)
+                if fmt == "gguf":
+                    raise RuntimeError(note)
+
             if fmt == "safetensors":
-                ok, err = _validate_safetensors_file(part)
+                ok, err = _validate_safetensors_file(src_path)
                 if not ok:
                     raise RuntimeError("Downloaded checkpoint failed safetensors validation: " + err)
             else:
-                with open(part, "rb") as fh:
+                with open(src_path, "rb") as fh:
                     if fh.read(4) != b"GGUF":
                         raise RuntimeError("Downloaded .gguf file does not have a GGUF header.")
-            os.replace(part, dest)
+
+            os.replace(src_path, dest)
             rows = _custom_model_load_registry()
             rows = [r for r in rows if r.get("local_name") != local_name]
             rows.append({
@@ -5279,18 +5377,20 @@ if _CU130_CHILD:
                 CUSTOM_MODEL_DOWNLOADS[download_id].update(
                     status="done", stage="done", downloaded_bytes=downloaded,
                     total_bytes=downloaded, speed_bps=0.0, local_name=local_name,
-                    profile="custom:" + local_name,
+                    profile="custom:" + local_name, transport=xet_mode,
                 )
-            log(f"  ✓ custom HF base model installed: {repo_id} / {filename} -> {local_name}")
+            log(
+                f"  ✓ custom HF base model installed: {repo_id} / {filename} -> {local_name} "
+                f"· {downloaded / elapsed / 1024**2:.1f} MiB/s average"
+            )
         except Exception as e:
-            try:
-                if 'part' in locals() and os.path.exists(part):
-                    os.remove(part)
-            except Exception:
-                pass
             with CUSTOM_MODEL_DOWNLOAD_LOCK:
                 CUSTOM_MODEL_DOWNLOADS[download_id].update(status="error", stage="error", error=str(e))
             log(f"  ⚠ custom HF base model install failed: {repo_id} / {filename}: {e}")
+        finally:
+            if temp_root:
+                shutil.rmtree(temp_root, ignore_errors=True)
+
 
     @app.post("/api/models/hf/inspect")
     def api_hf_model_inspect():
@@ -6150,6 +6250,7 @@ Additional user Auto Prompt instructions:
         from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
         started = time.time()
         part = None
+        temp_root = None
         try:
             inspected = _inspect_lora_source(source, revision_hint)
             selected = next(
@@ -6165,32 +6266,6 @@ Additional user Auto Prompt instructions:
             if not installed_name.lower().endswith(".safetensors"):
                 raise RuntimeError("LoRA installer currently accepts .safetensors files.")
             dest = os.path.join(lora_dir, installed_name)
-            part = dest + f".{download_id}.part"
-
-            headers = {
-                "User-Agent": "MissingLink-H3-LoRA/2",
-                "Accept": "application/octet-stream",
-            }
-            if selected["source_type"] == "hf":
-                url = hf_hub_url(
-                    repo_id=selected["repo_id"],
-                    filename=selected["filename"],
-                    revision=selected["revision"],
-                )
-                token = _hf_token()
-                if token:
-                    headers["Authorization"] = "Bearer " + token
-            else:
-                url = selected["download_url"]
-                token = _civitai_token()
-                if token:
-                    parsed = urlsplit(url)
-                    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-                    query["token"] = token
-                    url = urlunsplit(
-                        (parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment)
-                    )
-                    headers["Authorization"] = "Bearer " + token
 
             with LORA_DOWNLOAD_LOCK:
                 LORA_DOWNLOADS[download_id].update(
@@ -6200,59 +6275,111 @@ Additional user Auto Prompt instructions:
                     source_type=selected["source_type"],
                 )
 
-            req = urllib.request.Request(url, headers=headers)
-            downloaded = 0
-            try:
-                response = urllib.request.urlopen(req, timeout=180)
-            except urllib.error.HTTPError as e:
-                if selected["source_type"] == "civitai" and e.code in {401, 403} and not _civitai_token():
-                    raise RuntimeError(
-                        "This CivitAI file requires authentication. "
-                        "Add CIVITAI_API_KEY in Colab Secrets and retry this download."
-                    ) from e
-                if selected["source_type"] == "hf" and e.code in {401, 403} and not _hf_token():
-                    raise RuntimeError(
-                        "This Hugging Face file is private or gated. "
-                        "Add HF_TOKEN in Colab Secrets and retry this download."
-                    ) from e
-                raise
-
-            with response as resp, open(part, "wb") as fh:
-                content_length = int(resp.headers.get("Content-Length") or 0)
-                total = int(selected.get("size") or content_length or 0)
-                with LORA_DOWNLOAD_LOCK:
-                    LORA_DOWNLOADS[download_id]["total_bytes"] = total
-                while True:
-                    chunk = resp.read(4 * 1024 * 1024)
-                    if not chunk:
-                        break
-                    fh.write(chunk)
-                    downloaded += len(chunk)
-                    elapsed = max(0.001, time.time() - started)
-                    with LORA_DOWNLOAD_LOCK:
-                        LORA_DOWNLOADS[download_id].update(
-                            downloaded_bytes=downloaded,
-                            total_bytes=max(total, int(LORA_DOWNLOADS[download_id].get("total_bytes") or 0)),
-                            speed_bps=downloaded / elapsed,
-                            stage="downloading",
-                        )
-
-            expected = int(selected.get("size") or 0)
-            if expected and downloaded != expected:
-                log(
-                    f"  ↳ LoRA size metadata differed: expected {_format_bytes(expected)}, "
-                    f"received {_format_bytes(downloaded)}; validating file content."
+            if selected["source_type"] == "hf":
+                token = _hf_token() or None
+                xet_mode = _configure_hf_xet_downloads()
+                temp_root = os.path.join("/content", ".missinglink_hf_lora_downloads", download_id)
+                shutil.rmtree(temp_root, ignore_errors=True)
+                os.makedirs(temp_root, exist_ok=True)
+                expected = int(selected.get("size") or 0)
+                ProgressTqdm = _make_hf_progress_tqdm(
+                    download_id, LORA_DOWNLOADS, LORA_DOWNLOAD_LOCK, expected
                 )
+                with LORA_DOWNLOAD_LOCK:
+                    LORA_DOWNLOADS[download_id]["transport"] = xet_mode
+                log(f"  ↓ HF LoRA · {xet_mode}: {selected['repo_id']}/{selected['filename']}")
+                try:
+                    src_path = hf_hub_download(
+                        repo_id=selected["repo_id"],
+                        filename=selected["filename"],
+                        revision=selected["revision"],
+                        token=token,
+                        local_dir=temp_root,
+                        tqdm_class=ProgressTqdm,
+                    )
+                except Exception as e:
+                    low = str(e).lower()
+                    if not token and ("401" in low or "403" in low or "gated" in low or "private" in low):
+                        raise RuntimeError(
+                            "This Hugging Face file is private or gated. "
+                            "Add HF_TOKEN in Colab Secrets and retry this download."
+                        ) from e
+                    raise
+                downloaded = os.path.getsize(src_path)
+                if expected and downloaded != expected:
+                    log(
+                        f"  ↳ LoRA size metadata differed: expected {_format_bytes(expected)}, "
+                        f"received {_format_bytes(downloaded)}; validating file content."
+                    )
+                ok, err = _validate_safetensors_file(src_path)
+                if not ok:
+                    raise RuntimeError("Downloaded LoRA failed safetensors validation: " + err)
+                os.replace(src_path, dest)
 
-            ok, err = _validate_safetensors_file(part)
-            if not ok:
-                raise RuntimeError("Downloaded LoRA failed safetensors validation: " + err)
+            else:
+                part = dest + f".{download_id}.part"
+                url = selected["download_url"]
+                token = _civitai_token()
+                headers = {
+                    "User-Agent": "MissingLink-H3-LoRA/2",
+                    "Accept": "application/octet-stream",
+                }
+                if token:
+                    parsed = urlsplit(url)
+                    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+                    query["token"] = token
+                    url = urlunsplit(
+                        (parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment)
+                    )
+                    headers["Authorization"] = "Bearer " + token
 
-            os.replace(part, dest)
+                req = urllib.request.Request(url, headers=headers)
+                downloaded = 0
+                try:
+                    response = urllib.request.urlopen(req, timeout=180)
+                except urllib.error.HTTPError as e:
+                    if e.code in {401, 403} and not _civitai_token():
+                        raise RuntimeError(
+                            "This CivitAI file requires authentication. "
+                            "Add CIVITAI_API_KEY in Colab Secrets and retry this download."
+                        ) from e
+                    raise
+
+                with response as resp, open(part, "wb") as fh:
+                    content_length = int(resp.headers.get("Content-Length") or 0)
+                    total = int(selected.get("size") or content_length or 0)
+                    with LORA_DOWNLOAD_LOCK:
+                        LORA_DOWNLOADS[download_id]["total_bytes"] = total
+                    while True:
+                        chunk = resp.read(4 * 1024 * 1024)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                        downloaded += len(chunk)
+                        elapsed = max(0.001, time.time() - started)
+                        with LORA_DOWNLOAD_LOCK:
+                            LORA_DOWNLOADS[download_id].update(
+                                downloaded_bytes=downloaded,
+                                total_bytes=max(total, int(LORA_DOWNLOADS[download_id].get("total_bytes") or 0)),
+                                speed_bps=downloaded / elapsed,
+                                stage="downloading",
+                            )
+
+                expected = int(selected.get("size") or 0)
+                if expected and downloaded != expected:
+                    log(
+                        f"  ↳ LoRA size metadata differed: expected {_format_bytes(expected)}, "
+                        f"received {_format_bytes(downloaded)}; validating file content."
+                    )
+                ok, err = _validate_safetensors_file(part)
+                if not ok:
+                    raise RuntimeError("Downloaded LoRA failed safetensors validation: " + err)
+                os.replace(part, dest)
+
             folder_paths.cache_helper.clear()
             friendly = selected.get("friendly_source_url") or source
             _remember_lora_source(installed_name, friendly)
-
+            elapsed = max(0.001, time.time() - started)
             with LORA_DOWNLOAD_LOCK:
                 LORA_DOWNLOADS[download_id].update(
                     status="done",
@@ -6263,7 +6390,7 @@ Additional user Auto Prompt instructions:
                     file=installed_name,
                     source_url=friendly,
                 )
-            log(f"  ✓ user LoRA installed: {installed_name}")
+            log(f"  ✓ user LoRA installed: {installed_name} · {downloaded / elapsed / 1024**2:.1f} MiB/s average")
 
         except Exception as e:
             try:
@@ -6278,6 +6405,10 @@ Additional user Auto Prompt instructions:
                     error=str(e),
                 )
             log(f"  ⚠ user LoRA install failed: {e}")
+        finally:
+            if temp_root:
+                shutil.rmtree(temp_root, ignore_errors=True)
+
 
     @app.post("/api/loras/catalog_install")
     def api_lora_catalog_install():
