@@ -10,10 +10,11 @@
 # - Fast-start defaults defer optional accelerator downloads and GPU preload until first use.
 #
 #
-# Requires Colab Secrets:
+# Colab Secrets / optional integrations:
 #   MISSING_LINK_TOKEN - required; validated against MissingLink before the UI can start
-#   CIVITAI_API_KEY    - optional; only for user-requested CivitAI LoRA installs
-#   HF_TOKEN           - optional/used by Hugging Face model downloads where applicable
+#   HF_TOKEN           - optional; used for private/gated Hugging Face downloads where applicable
+#   CIVITAI_API_KEY    - optional; NEVER required for startup. Public CivitAI installs are attempted anonymously.
+#   OPENAI_API_KEY     - optional; used only when the user explicitly invokes Auto Prompt.
 # SageAttention is never built from source in this UI cell; Blackwell requires the MissingLink wheel.
 #
 # It auto-detects the GPU. Blackwell keeps the existing CU130/Sage resident path;
@@ -2267,13 +2268,23 @@ if _CU130_CHILD:
     ldir = os.path.join(MODELS, "loras")
     os.makedirs(ldir, exist_ok=True)
 
+    # CivitAI is an optional user-invoked integration, never a startup dependency.
+    # Do not probe/validate its token here; public resources work without one.
+
     def _civitai_token():
-        tok = (os.environ.get("CIVITAI_API_KEY") or "").strip()
+        """Return an optional CivitAI token. Missing/blocked secrets must never stop Studio startup."""
+        try:
+            tok = (os.environ.get("CIVITAI_API_KEY") or "").strip()
+        except Exception:
+            tok = ""
         if tok:
             return tok
         try:
             from google.colab import userdata
-            tok = (userdata.get("CIVITAI_API_KEY") or "").strip()
+            try:
+                tok = (userdata.get("CIVITAI_API_KEY") or "").strip()
+            except Exception:
+                tok = ""
         except Exception:
             tok = ""
         if tok:
@@ -2425,12 +2436,24 @@ if _CU130_CHILD:
     LORA_SOURCE_CACHE_FILE = os.path.join(ldir, ".h3_studio_lora_sources.json")
 
     def _civitai_json(url, token=""):
+        # CivitAI authentication is optional. Public API requests are made anonymously
+        # when CIVITAI_API_KEY is absent; only a resource that CivitAI itself gates may
+        # reject that specific user-requested install.
         headers = {"User-Agent":"Standalone-MiniMax-H3/1.0", "Accept":"application/json"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=45) as r:
-            return json.load(r)
+        try:
+            with urllib.request.urlopen(req, timeout=45) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            if not token and int(getattr(e, "code", 0) or 0) in (401, 403):
+                raise RuntimeError(
+                    "This specific CivitAI resource requires authentication. "
+                    "CIVITAI_API_KEY is optional and is not required to start or use MiniMax H3 Studio; "
+                    "only this protected CivitAI download needs it."
+                ) from e
+            raise
 
     def _is_h3_version(v):
         v = v or {}
