@@ -364,7 +364,24 @@ def _ensure_runtime_bucket_deps():
         "huggingface_hub>=1.5.0,<2", "zstandard>=0.22"
     ], check=True)
 
-def _bucket_download_progress(remote_path, local_path, *, label):
+def _human_bytes(n):
+    n = float(max(0, int(n or 0)))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024.0 or unit == "TiB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024.0
+
+
+def _bucket_download_progress(remote_path, local_path, *, label,
+                              expected_size=None, strict_size=False, resume=True):
+    """Download one HF Storage Bucket object with visible progress.
+
+    Bucket metadata is treated as a progress hint only. In practice `latest.json` can
+    be replaced atomically while an edge/cache still reports the previous object's
+    size for a short time. That must never make a valid runtime snapshot fall back to
+    the multi-GB bootstrap. Immutable archives can pass `expected_size` from their
+    manifest and are still verified by SHA256 after download.
+    """
     from huggingface_hub import HfFileSystem, get_bucket_file_metadata
     import time as _time
 
@@ -372,13 +389,25 @@ def _bucket_download_progress(remote_path, local_path, *, label):
     local_path = _pl.Path(local_path)
     local_path.parent.mkdir(parents=True, exist_ok=True)
     part = _pl.Path(str(local_path) + ".part")
-    meta = get_bucket_file_metadata(H3_RUNTIME_BUCKET, remote_path, token=token)
-    total = int(getattr(meta, "size", 0) or 0)
+
+    meta_size = 0
+    try:
+        meta = get_bucket_file_metadata(H3_RUNTIME_BUCKET, remote_path, token=token)
+        meta_size = int(getattr(meta, "size", 0) or 0)
+    except Exception as _meta_error:
+        print(f"  ↳ {label}: bucket size metadata unavailable ({_meta_error}); streaming anyway", flush=True)
+
+    expected_size = int(expected_size or 0)
+    total = expected_size or meta_size
     fs = HfFileSystem(token=token)
     hf_path = f"buckets/{H3_RUNTIME_BUCKET}/{remote_path}"
 
+    if part.exists() and not resume:
+        part.unlink(missing_ok=True)
     offset = part.stat().st_size if part.exists() else 0
-    if total and offset > total:
+    # Only an immutable manifest-provided size is authoritative enough to discard a
+    # partial download. Bucket metadata can briefly be stale after latest.json changes.
+    if expected_size and offset > expected_size:
         part.unlink(missing_ok=True); offset = 0
     mode = "ab" if offset else "wb"
     t0 = _time.time(); last = t0; last_bytes = offset
@@ -387,7 +416,7 @@ def _bucket_download_progress(remote_path, local_path, *, label):
         if offset:
             try:
                 src.seek(offset)
-                print(f"  ↻ resuming {label} at {offset/1024**3:.2f} GiB", flush=True)
+                print(f"  ↻ resuming {label} at {_human_bytes(offset)}", flush=True)
             except Exception:
                 part.unlink(missing_ok=True); offset = 0; mode = "wb"
                 src.seek(0)
@@ -401,19 +430,31 @@ def _bucket_download_progress(remote_path, local_path, *, label):
                 now = _time.time()
                 if now - last >= 0.45 or (total and done >= total):
                     speed = (done - last_bytes) / max(0.001, now - last)
-                    pct = (100.0 * done / total) if total else 0.0
                     if total:
-                        msg = (f"\r  ↓ {label}: {pct:6.2f}% · {done/1024**3:.2f}/{total/1024**3:.2f} GiB "
+                        pct = min(100.0, 100.0 * done / total)
+                        msg = (f"\r  ↓ {label}: {pct:6.2f}% · {_human_bytes(done)}/{_human_bytes(total)} "
                                f"· {speed/1024**2:.1f} MiB/s")
                     else:
-                        msg = f"\r  ↓ {label}: {done/1024**2:.1f} MiB · {speed/1024**2:.1f} MiB/s"
+                        msg = f"\r  ↓ {label}: {_human_bytes(done)} · {speed/1024**2:.1f} MiB/s"
                     print(msg, end="", flush=True)
                     last, last_bytes = now, done
     print(flush=True)
-    if total and part.stat().st_size != total:
-        raise RuntimeError(f"Bucket download size mismatch for {remote_path}: {part.stat().st_size} != {total}")
+
+    actual = part.stat().st_size if part.exists() else 0
+    if actual <= 0:
+        raise RuntimeError(f"Bucket download returned an empty object: {remote_path}")
+    if strict_size and expected_size and actual != expected_size:
+        raise RuntimeError(
+            f"Runtime archive size mismatch for {remote_path}: {actual} != {expected_size}"
+        )
+    if not expected_size and meta_size and actual != meta_size:
+        print(
+            f"  ↳ {label}: bucket metadata was stale ({_human_bytes(meta_size)} reported, "
+            f"{_human_bytes(actual)} received); using the current object.",
+            flush=True,
+        )
     _os.replace(part, local_path)
-    return total
+    return actual
 
 def _sha256_file(path):
     import hashlib as _hashlib
@@ -442,7 +483,7 @@ def _restore_runtime_bundle():
 
     try:
         _ensure_runtime_bucket_deps()
-        _bucket_download_progress(pointer_remote, pointer_local, label="runtime manifest")
+        _bucket_download_progress(pointer_remote, pointer_local, label="runtime manifest", resume=False)
         import json as _json, platform as _platform, tarfile as _tarfile, time as _time
         import zstandard as _zstd
         manifest = _json.loads(pointer_local.read_text())
@@ -462,7 +503,11 @@ def _restore_runtime_bundle():
 
         archive_local = H3_RUNTIME_CACHE_DIR / _pl.Path(archive_remote).name
         print(f"⚡ MissingLink runtime snapshot found · {profile} · build {manifest.get('build_id','?')}", flush=True)
-        _bucket_download_progress(archive_remote, archive_local, label="prebuilt runtime")
+        _bucket_download_progress(
+            archive_remote, archive_local, label="prebuilt runtime",
+            expected_size=int(manifest.get("archive_size") or 0) or None,
+            strict_size=bool(int(manifest.get("archive_size") or 0)), resume=True
+        )
         print("  ↳ verifying runtime SHA256…", flush=True)
         got_sha = _sha256_file(archive_local)
         if got_sha != expected_sha:
@@ -2091,7 +2136,7 @@ if _CU130_CHILD:
         DIT_FILE = FALLBACK_DIT_FILE
         LIGHTNING_DEFAULT = True
         log("!")
-        log("  ✓ SAFE DEFAULT selected: official Stock MiniMax H3 FL2VA")
+        log("  ✓ DEFAULT selected: official Stock MiniMax H3 FL2VA")
         log("  ↳ additional Hugging Face base models can be added from the Studio UI")
         log("  ↳ quality recipe: RES Multistep / Simple · 20 steps · video shift 12 · audio shift 3")
         log("!")
