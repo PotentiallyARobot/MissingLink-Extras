@@ -5104,17 +5104,68 @@ if _CU130_CHILD:
             })
         return out
 
-    def _hf_repo_candidates(repo_id, revision="main"):
+    def _parse_hf_source(value, revision_hint="main"):
+        """Accept owner/repo, a full HF repo URL, tree URL, or direct blob/resolve file URL."""
+        from urllib.parse import urlsplit, unquote
+
+        raw = str(value or "").strip()
+        revision_hint = str(revision_hint or "main").strip() or "main"
+        if not raw:
+            raise ValueError("Enter a Hugging Face repository or URL.")
+
+        # Plain owner/repo form.
+        if "://" not in raw:
+            repo_id = raw.strip().strip("/")
+            if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo_id):
+                raise ValueError(
+                    "Hugging Face input must be owner/repository or a huggingface.co URL."
+                )
+            return {
+                "repo_id": repo_id,
+                "revision": revision_hint,
+                "filename": "",
+                "source": raw,
+            }
+
+        parts = urlsplit(raw)
+        host = (parts.hostname or "").lower()
+        if host not in {"huggingface.co", "www.huggingface.co", "hf.co", "www.hf.co"}:
+            raise ValueError("That URL is not a Hugging Face URL.")
+
+        seg = [unquote(x) for x in parts.path.split("/") if x]
+        if len(seg) < 2:
+            raise ValueError("Hugging Face URL does not contain an owner/repository.")
+
+        repo_id = f"{seg[0]}/{seg[1]}"
+        if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo_id):
+            raise ValueError("Could not read a valid owner/repository from that Hugging Face URL.")
+
+        revision = revision_hint
+        filename = ""
+        if len(seg) >= 4 and seg[2] in {"tree", "blob", "resolve"}:
+            revision = seg[3] or revision_hint
+            if seg[2] in {"blob", "resolve"} and len(seg) >= 5:
+                filename = "/".join(seg[4:]).lstrip("/")
+
+        return {
+            "repo_id": repo_id,
+            "revision": revision,
+            "filename": filename,
+            "source": raw,
+        }
+
+    def _hf_repo_candidates(repo_id, revision="main", suffixes=(".safetensors", ".gguf")):
         repo_id = str(repo_id or "").strip().strip("/")
         revision = str(revision or "main").strip() or "main"
         if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo_id):
             raise ValueError("HF repo must look like owner/repository.")
         info = HfApi(token=_hf_token() or None).model_info(repo_id, revision=revision, files_metadata=True)
         rows = []
+        wanted = tuple(str(x).lower() for x in suffixes)
         for sib in getattr(info, "siblings", []) or []:
             name = str(getattr(sib, "rfilename", "") or "")
             low = name.lower()
-            if not low.endswith((".safetensors", ".gguf")):
+            if not low.endswith(wanted):
                 continue
             size = int(getattr(sib, "size", 0) or 0)
             if not size:
@@ -5123,7 +5174,8 @@ if _CU130_CHILD:
                     size = int((lfs or {}).get("size") or 0) if isinstance(lfs, dict) else int(getattr(lfs, "size", 0) or 0)
                 except Exception:
                     size = 0
-            rows.append({"filename": name, "size": size, "format": "gguf" if low.endswith(".gguf") else "safetensors"})
+            fmt = "gguf" if low.endswith(".gguf") else "safetensors"
+            rows.append({"filename": name, "size": size, "format": fmt})
         rows.sort(key=lambda x: (x["size"], x["filename"]), reverse=True)
         return rows
 
@@ -5243,26 +5295,43 @@ if _CU130_CHILD:
     @app.post("/api/models/hf/inspect")
     def api_hf_model_inspect():
         body = request.get_json(silent=True) or {}
-        repo_id = str(body.get("repo_id") or "").strip()
-        revision = str(body.get("revision") or "main").strip() or "main"
+        source = str(body.get("source") or body.get("repo_id") or "").strip()
+        revision_hint = str(body.get("revision") or "main").strip() or "main"
         try:
+            parsed = _parse_hf_source(source, revision_hint)
+            repo_id = parsed["repo_id"]
+            revision = parsed["revision"]
             rows = _hf_repo_candidates(repo_id, revision)
             if not rows:
                 return jsonify(error="No .safetensors or .gguf files were found in that repo/revision."), 404
-            return jsonify(ok=True, repo_id=repo_id, revision=revision, candidates=rows)
+            preferred = parsed.get("filename") or ""
+            if preferred and preferred not in {r["filename"] for r in rows}:
+                preferred = ""
+            return jsonify(
+                ok=True,
+                repo_id=repo_id,
+                revision=revision,
+                preferred_filename=preferred,
+                candidates=rows,
+            )
         except Exception as e:
             return jsonify(error=str(e)), 400
 
     @app.post("/api/models/hf/install")
     def api_hf_model_install():
         body = request.get_json(silent=True) or {}
-        repo_id = str(body.get("repo_id") or "").strip().strip("/")
-        revision = str(body.get("revision") or "main").strip() or "main"
+        source = str(body.get("source") or body.get("repo_id") or "").strip()
+        revision_hint = str(body.get("revision") or "main").strip() or "main"
         filename = str(body.get("filename") or "").strip().lstrip("/")
         mode = str(body.get("mode") or "both").strip().lower()
         if mode not in {"fl2va", "ref2va", "both"}:
             mode = "both"
         try:
+            parsed = _parse_hf_source(source, revision_hint)
+            repo_id = parsed["repo_id"]
+            revision = parsed["revision"]
+            if not filename and parsed.get("filename"):
+                filename = parsed["filename"]
             candidates = _hf_repo_candidates(repo_id, revision)
             by_name = {r["filename"]: r for r in candidates}
             if filename not in by_name:
@@ -5284,7 +5353,7 @@ if _CU130_CHILD:
                 args=(did, repo_id, revision, filename, mode, int(selected["size"] or 0)),
                 daemon=True, name=f"hf-model-{did}",
             ).start()
-            return jsonify(ok=True, id=did)
+            return jsonify(ok=True, id=did, repo_id=repo_id, revision=revision, filename=filename)
         except Exception as e:
             return jsonify(error=str(e)), 400
 
@@ -5921,109 +5990,387 @@ Additional user Auto Prompt instructions:
         except Exception as e:
             return jsonify(error=str(e),state=_model_profile_state()),400
 
+    LORA_DOWNLOADS = {}
+    LORA_DOWNLOAD_LOCK = threading.Lock()
+
+    def _lora_candidate_size(file_obj):
+        try:
+            size_kb = float((file_obj or {}).get("sizeKB") or 0)
+            if size_kb > 0:
+                return int(size_kb * 1024)
+        except Exception:
+            pass
+        try:
+            return int((file_obj or {}).get("size") or 0)
+        except Exception:
+            return 0
+
+    def _inspect_lora_source(source, revision_hint="main"):
+        """Accept flexible HF input or CivitAI model/version/download URLs."""
+        from urllib.parse import urlsplit, parse_qs
+
+        raw = str(source or "").strip()
+        revision_hint = str(revision_hint or "main").strip() or "main"
+        if not raw:
+            raise ValueError("Paste a Hugging Face or CivitAI source.")
+
+        # HF accepts owner/repo and normal browser URLs.
+        hf_like = (
+            "://" not in raw
+            or (urlsplit(raw).hostname or "").lower()
+            in {"huggingface.co", "www.huggingface.co", "hf.co", "www.hf.co"}
+        )
+        if hf_like:
+            parsed = _parse_hf_source(raw, revision_hint)
+            rows = _hf_repo_candidates(
+                parsed["repo_id"],
+                parsed["revision"],
+                suffixes=(".safetensors",),
+            )
+            candidates = []
+            for row in rows:
+                filename = row["filename"]
+                candidates.append({
+                    "key": "hf::" + filename,
+                    "source_type": "hf",
+                    "label": filename,
+                    "filename": filename,
+                    "size": int(row.get("size") or 0),
+                    "repo_id": parsed["repo_id"],
+                    "revision": parsed["revision"],
+                    "friendly_source_url": _hf_repo_url(parsed["repo_id"]),
+                })
+            preferred = parsed.get("filename") or ""
+            if preferred and preferred not in {x["filename"] for x in candidates}:
+                preferred = ""
+            return {
+                "source_type": "hf",
+                "normalized_source": parsed["repo_id"],
+                "revision": parsed["revision"],
+                "preferred_key": ("hf::" + preferred) if preferred else "",
+                "candidates": candidates,
+            }
+
+        parts = urlsplit(raw)
+        host = (parts.hostname or "").lower()
+        if host not in {"civitai.com", "www.civitai.com", "civitai.red", "www.civitai.red"}:
+            raise ValueError(
+                "Use a Hugging Face repo/URL or a CivitAI model/version/download URL."
+            )
+
+        q = parse_qs(parts.query)
+        seg = [x for x in parts.path.split("/") if x]
+        tok = _civitai_token()
+        versions = []
+        model_id = 0
+        preferred_version_id = 0
+
+        if len(seg) >= 4 and seg[:3] == ["api", "download", "models"]:
+            preferred_version_id = int(seg[3])
+            v = _civitai_json(
+                f"https://civitai.com/api/v1/model-versions/{preferred_version_id}",
+                tok,
+            )
+            versions = [v]
+            model_id = int(v.get("modelId") or 0)
+
+        elif len(seg) >= 2 and seg[0] == "models":
+            model_id = int(seg[1].split("-")[0])
+            model = _civitai_json(f"https://civitai.com/api/v1/models/{model_id}", tok)
+            versions = list(model.get("modelVersions") or [])
+            requested = (q.get("modelVersionId") or [None])[0]
+            if requested:
+                preferred_version_id = int(requested)
+                versions = [
+                    v for v in versions
+                    if int((v or {}).get("id") or 0) == preferred_version_id
+                ]
+                if not versions:
+                    raise ValueError(f"CivitAI modelVersionId {requested} was not found.")
+            else:
+                versions.sort(
+                    key=lambda v: (
+                        str((v or {}).get("createdAt") or ""),
+                        int((v or {}).get("id") or 0),
+                    ),
+                    reverse=True,
+                )
+        else:
+            raise ValueError(
+                "CivitAI source must be a model page or /api/download/models/<versionId> URL."
+            )
+
+        candidates = []
+        for v in versions:
+            version_id = int((v or {}).get("id") or 0)
+            version_name = str((v or {}).get("name") or f"Version {version_id}")
+            for fobj in (v or {}).get("files") or []:
+                filename = os.path.basename(str((fobj or {}).get("name") or ""))
+                if not filename.lower().endswith(".safetensors"):
+                    continue
+                download_url = (fobj or {}).get("downloadUrl") or (v or {}).get("downloadUrl")
+                if not download_url:
+                    continue
+                file_id = str((fobj or {}).get("id") or filename)
+                key = f"civitai::{version_id}::{file_id}"
+                candidates.append({
+                    "key": key,
+                    "source_type": "civitai",
+                    "label": f"{version_name} · {filename}",
+                    "filename": filename,
+                    "size": _lora_candidate_size(fobj),
+                    "version_id": version_id,
+                    "model_id": int((v or {}).get("modelId") or model_id or 0),
+                    "download_url": download_url,
+                    "friendly_source_url": (
+                        f"https://civitai.com/models/{int((v or {}).get('modelId') or model_id)}"
+                        f"?modelVersionId={version_id}"
+                    ),
+                })
+
+        if not candidates:
+            raise ValueError("No .safetensors files were found for that source.")
+
+        preferred_key = ""
+        if preferred_version_id:
+            for item in candidates:
+                if int(item.get("version_id") or 0) == preferred_version_id:
+                    preferred_key = item["key"]
+                    break
+
+        return {
+            "source_type": "civitai",
+            "normalized_source": raw,
+            "revision": "",
+            "preferred_key": preferred_key,
+            "candidates": candidates,
+        }
+
+    def _lora_download_worker(download_id, source, revision_hint, candidate_key):
+        from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+        started = time.time()
+        part = None
+        try:
+            inspected = _inspect_lora_source(source, revision_hint)
+            selected = next(
+                (x for x in inspected["candidates"] if x.get("key") == candidate_key),
+                None,
+            )
+            if selected is None:
+                raise RuntimeError("The selected LoRA file is no longer available from that source.")
+
+            lora_dir = folder_paths.get_folder_paths("loras")[0]
+            os.makedirs(lora_dir, exist_ok=True)
+            installed_name = os.path.basename(selected["filename"])
+            if not installed_name.lower().endswith(".safetensors"):
+                raise RuntimeError("LoRA installer currently accepts .safetensors files.")
+            dest = os.path.join(lora_dir, installed_name)
+            part = dest + f".{download_id}.part"
+
+            headers = {
+                "User-Agent": "MissingLink-H3-LoRA/2",
+                "Accept": "application/octet-stream",
+            }
+            if selected["source_type"] == "hf":
+                url = hf_hub_url(
+                    repo_id=selected["repo_id"],
+                    filename=selected["filename"],
+                    revision=selected["revision"],
+                )
+                token = _hf_token()
+                if token:
+                    headers["Authorization"] = "Bearer " + token
+            else:
+                url = selected["download_url"]
+                token = _civitai_token()
+                if token:
+                    parsed = urlsplit(url)
+                    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+                    query["token"] = token
+                    url = urlunsplit(
+                        (parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment)
+                    )
+                    headers["Authorization"] = "Bearer " + token
+
+            with LORA_DOWNLOAD_LOCK:
+                LORA_DOWNLOADS[download_id].update(
+                    stage="downloading",
+                    filename=installed_name,
+                    total_bytes=int(selected.get("size") or 0),
+                    source_type=selected["source_type"],
+                )
+
+            req = urllib.request.Request(url, headers=headers)
+            downloaded = 0
+            try:
+                response = urllib.request.urlopen(req, timeout=180)
+            except urllib.error.HTTPError as e:
+                if selected["source_type"] == "civitai" and e.code in {401, 403} and not _civitai_token():
+                    raise RuntimeError(
+                        "This CivitAI file requires authentication. "
+                        "Add CIVITAI_API_KEY in Colab Secrets and retry this download."
+                    ) from e
+                if selected["source_type"] == "hf" and e.code in {401, 403} and not _hf_token():
+                    raise RuntimeError(
+                        "This Hugging Face file is private or gated. "
+                        "Add HF_TOKEN in Colab Secrets and retry this download."
+                    ) from e
+                raise
+
+            with response as resp, open(part, "wb") as fh:
+                content_length = int(resp.headers.get("Content-Length") or 0)
+                total = int(selected.get("size") or content_length or 0)
+                with LORA_DOWNLOAD_LOCK:
+                    LORA_DOWNLOADS[download_id]["total_bytes"] = total
+                while True:
+                    chunk = resp.read(4 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    downloaded += len(chunk)
+                    elapsed = max(0.001, time.time() - started)
+                    with LORA_DOWNLOAD_LOCK:
+                        LORA_DOWNLOADS[download_id].update(
+                            downloaded_bytes=downloaded,
+                            total_bytes=max(total, int(LORA_DOWNLOADS[download_id].get("total_bytes") or 0)),
+                            speed_bps=downloaded / elapsed,
+                            stage="downloading",
+                        )
+
+            expected = int(selected.get("size") or 0)
+            if expected and downloaded != expected:
+                log(
+                    f"  ↳ LoRA size metadata differed: expected {_format_bytes(expected)}, "
+                    f"received {_format_bytes(downloaded)}; validating file content."
+                )
+
+            ok, err = _validate_safetensors_file(part)
+            if not ok:
+                raise RuntimeError("Downloaded LoRA failed safetensors validation: " + err)
+
+            os.replace(part, dest)
+            folder_paths.cache_helper.clear()
+            friendly = selected.get("friendly_source_url") or source
+            _remember_lora_source(installed_name, friendly)
+
+            with LORA_DOWNLOAD_LOCK:
+                LORA_DOWNLOADS[download_id].update(
+                    status="done",
+                    stage="done",
+                    downloaded_bytes=downloaded,
+                    total_bytes=downloaded,
+                    speed_bps=0.0,
+                    file=installed_name,
+                    source_url=friendly,
+                )
+            log(f"  ✓ user LoRA installed: {installed_name}")
+
+        except Exception as e:
+            try:
+                if part and os.path.exists(part):
+                    os.remove(part)
+            except Exception:
+                pass
+            with LORA_DOWNLOAD_LOCK:
+                LORA_DOWNLOADS[download_id].update(
+                    status="error",
+                    stage="error",
+                    error=str(e),
+                )
+            log(f"  ⚠ user LoRA install failed: {e}")
+
     @app.post("/api/loras/catalog_install")
     def api_lora_catalog_install():
-        return jsonify(error="No built-in LoRA catalog is configured. Install LoRAs from Hugging Face or CivitAI.", code="studio_only"), 404
+        return jsonify(
+            error="No built-in LoRA catalog is configured. Install LoRAs from Hugging Face or CivitAI.",
+            code="studio_only",
+        ), 404
+
+    @app.post("/api/loras/inspect")
+    def api_lora_inspect():
+        body = request.get_json(silent=True) or {}
+        source = str(body.get("source") or body.get("url") or "").strip()
+        revision = str(body.get("revision") or "main").strip() or "main"
+        try:
+            result = _inspect_lora_source(source, revision)
+            return jsonify(ok=True, **result)
+        except Exception as e:
+            return jsonify(error=str(e)), 400
 
     @app.post("/api/loras/install")
     def api_lora_install():
         body = request.get_json(silent=True) or {}
-        source_url = str(body.get("url") or "").strip()
-        if not source_url:
-            return jsonify(error="Paste a Hugging Face or CivitAI LoRA URL."), 400
-
-        from urllib.parse import urlsplit, parse_qs, unquote
-        parts = urlsplit(source_url)
-        host = (parts.hostname or "").lower()
-        lora_dir = folder_paths.get_folder_paths("loras")[0]
-        os.makedirs(lora_dir, exist_ok=True)
-
+        source = str(body.get("source") or body.get("url") or "").strip()
+        revision = str(body.get("revision") or "main").strip() or "main"
+        candidate_key = str(body.get("candidate_key") or "").strip()
         try:
-            friendly_source_url = ""
-            if host in ("huggingface.co", "www.huggingface.co"):
-                seg = [unquote(x) for x in parts.path.split("/") if x]
-                if len(seg) < 5 or seg[2] not in ("blob", "resolve"):
-                    raise ValueError(
-                        "Hugging Face URL must point directly to a .safetensors file "
-                        "(.../blob/<revision>/path/file.safetensors or .../resolve/<revision>/...)."
+            inspected = _inspect_lora_source(source, revision)
+            if not candidate_key:
+                candidate_key = inspected.get("preferred_key") or ""
+                if not candidate_key and len(inspected["candidates"]) == 1:
+                    candidate_key = inspected["candidates"][0]["key"]
+            selected = next(
+                (x for x in inspected["candidates"] if x.get("key") == candidate_key),
+                None,
+            )
+            if selected is None:
+                return jsonify(error="Choose a LoRA file returned by CHECK SOURCE."), 400
+
+            free_bytes = shutil.disk_usage("/content").free
+            size = int(selected.get("size") or 0)
+            if size and free_bytes < size + 512 * 1024**2:
+                return jsonify(
+                    error=(
+                        f"Not enough disk space. Need about {_format_bytes(size + 512 * 1024**2)}, "
+                        f"have {_format_bytes(free_bytes)}."
                     )
-                repo_id = f"{seg[0]}/{seg[1]}"
-                revision = seg[3]
-                filename = "/".join(seg[4:])
-                base = os.path.basename(filename)
-                if not base.lower().endswith(".safetensors"):
-                    raise ValueError("Only .safetensors LoRA files are accepted.")
-                token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN") or None
-                src_path = hf_hub_download(repo_id, filename=filename, revision=revision, token=token)
-                dest = os.path.join(lora_dir, base)
-                _atomic_copy_weight(src_path, dest)
-                installed_name = base
-                friendly_source_url = _hf_repo_url(repo_id)
+                ), 400
 
-            elif host in ("civitai.com", "www.civitai.com", "civitai.red", "www.civitai.red"):
-                tok = _civitai_token()
-                q = parse_qs(parts.query)
-                seg = [x for x in parts.path.split("/") if x]
-                version_obj = None
-                if len(seg) >= 4 and seg[:3] == ["api", "download", "models"]:
-                    version_id = int(seg[3])
-                    version_obj = _civitai_json(f"https://civitai.com/api/v1/model-versions/{version_id}", tok)
-                    model_id = int(version_obj.get("modelId") or 0)
-                    if model_id and version_id:
-                        friendly_source_url = f"https://civitai.red/models/{model_id}?modelVersionId={version_id}"
-                elif len(seg) >= 2 and seg[0] == "models":
-                    model_id = int(seg[1].split("-")[0])
-                    model = _civitai_json(f"https://civitai.com/api/v1/models/{model_id}", tok)
-                    versions = model.get("modelVersions") or []
-                    requested = (q.get("modelVersionId") or [None])[0]
-                    if requested:
-                        version_obj = next((v for v in versions if int(v.get("id") or 0) == int(requested)), None)
-                        if version_obj is None:
-                            raise ValueError(f"CivitAI modelVersionId {requested} was not found.")
-                    else:
-                        compatible = [v for v in versions if _is_h3_version(v) and _pick_model_file(v)]
-                        if not compatible:
-                            raise ValueError("No MiniMax-H3-compatible .safetensors version was found on that CivitAI model.")
-                        compatible.sort(key=lambda v: (str(v.get("createdAt") or ""), int(v.get("id") or 0)), reverse=True)
-                        version_obj = compatible[0]
-                    version_id = int(version_obj.get("id") or 0)
-                    if model_id and version_id:
-                        friendly_source_url = f"https://civitai.red/models/{model_id}?modelVersionId={version_id}"
-                else:
-                    raise ValueError("CivitAI URL must be a civitai.com/civitai.red model page or /api/download/models/<versionId> URL.")
+            did = uuid.uuid4().hex[:12]
+            with LORA_DOWNLOAD_LOCK:
+                LORA_DOWNLOADS[did] = {
+                    "id": did,
+                    "status": "queued",
+                    "stage": "queued",
+                    "error": "",
+                    "source": source,
+                    "revision": revision,
+                    "candidate_key": candidate_key,
+                    "filename": selected["filename"],
+                    "downloaded_bytes": 0,
+                    "total_bytes": size,
+                    "speed_bps": 0.0,
+                    "started": time.time(),
+                    "file": "",
+                }
 
-                if not _is_h3_version(version_obj):
-                    raise ValueError(
-                        f"CivitAI version {version_obj.get('id')} is labeled "
-                        f"{version_obj.get('baseModel') or version_obj.get('name') or 'non-H3'}; refusing to install it into MiniMax H3."
-                    )
-                fobj = _pick_model_file(version_obj)
-                if not fobj:
-                    raise ValueError("CivitAI version exposes no .safetensors model file.")
-                base = os.path.basename(str(fobj.get("name") or ""))
-                if not base.lower().endswith(".safetensors"):
-                    raise ValueError("Only .safetensors LoRA files are accepted.")
-                dl = fobj.get("downloadUrl") or version_obj.get("downloadUrl")
-                if not dl:
-                    raise ValueError("CivitAI returned no download URL.")
-                dest = os.path.join(lora_dir, base)
-                _curl_download(dl, dest, tok, base)
-                ok, err = _validate_safetensors_file(dest)
-                if not ok:
-                    try: os.remove(dest)
-                    except Exception: pass
-                    raise RuntimeError(f"Downloaded LoRA failed safetensors validation: {err}")
-                installed_name = base
-            else:
-                raise ValueError("Only huggingface.co and civitai.com/civitai.red LoRA URLs are accepted.")
-
-            folder_paths.cache_helper.clear()
-            _remember_lora_source(installed_name, friendly_source_url or source_url)
-            log(f"  ✓ user LoRA installed: {installed_name}")
-            return jsonify(ok=True, file=installed_name, source_url=(friendly_source_url or source_url))
+            threading.Thread(
+                target=_lora_download_worker,
+                args=(did, source, revision, candidate_key),
+                daemon=True,
+                name=f"lora-download-{did}",
+            ).start()
+            return jsonify(ok=True, id=did, filename=selected["filename"])
         except Exception as e:
-            log(f"  ⚠ user LoRA install failed: {e}")
             return jsonify(error=str(e)), 400
+
+    @app.get("/api/loras/progress/<download_id>")
+    def api_lora_progress(download_id):
+        with LORA_DOWNLOAD_LOCK:
+            job = dict(LORA_DOWNLOADS.get(download_id) or {})
+        if not job:
+            return jsonify(error="Unknown LoRA download."), 404
+        total = int(job.get("total_bytes") or 0)
+        done = int(job.get("downloaded_bytes") or 0)
+        speed = float(job.get("speed_bps") or 0.0)
+        pct = (done / total * 100.0) if total > 0 else None
+        job.update(
+            pct=pct,
+            downloaded_text=_format_bytes(done),
+            total_text=_format_bytes(total) if total else "unknown",
+            speed_text=(_format_bytes(speed) + "/s") if speed > 0 else "",
+        )
+        return jsonify(job)
 
     @app.get("/api/queue")
     def api_queue():
@@ -6273,11 +6620,11 @@ Additional user Auto Prompt instructions:
     </select>
     <button id=hf_model_toggle class=inlinebtn type=button>+ HF BASE MODEL</button>
     <div id=hf_model_box class=hfmodelbox>
-      <label>Hugging Face repo</label><input id=hf_model_repo type=text placeholder="owner/repository" autocomplete=off>
+      <label>Hugging Face source</label><input id=hf_model_repo type=text placeholder="owner/repo · repo URL · tree URL · direct model-file URL" autocomplete=off>
       <div class=hfmodelgrid><div><label>Revision</label><input id=hf_model_revision type=text value="main" autocomplete=off></div><div><label>Mode</label><select id=hf_model_mode><option value=both selected>both</option><option value=fl2va>current</option><option value=ref2va>ref2va</option></select></div></div>
       <label>Model file</label><select id=hf_model_file disabled><option value="">CHECK REPO first</option></select>
       <div class=hfmodelactions><button id=hf_model_inspect class=inlinebtn type=button>CHECK REPO</button><button id=hf_model_install type=button disabled>DOWNLOAD + USE</button></div>
-      <div class=hfprogress><i id=hf_model_progress></i></div><div id=hf_model_progress_text class=hfprogresstext>Paste an HF repo, inspect it, then choose the checkpoint file.</div>
+      <div class=hfprogress><i id=hf_model_progress></i></div><div id=hf_model_progress_text class=hfprogresstext>Paste whatever Hugging Face link you have. The Studio will normalize the repo, revision and direct file path when possible.</div>
     </div>
 
     <div class=hint id=mode_hint>The tabs select the input / conditioning workflow. The Base model menu selects the checkpoint.</div>
@@ -6375,8 +6722,8 @@ Additional user Auto Prompt instructions:
     <label>Weight dtype</label><select id=weight_dtype><option>default</option><option>fp8_e4m3fn</option><option>fp8_e4m3fn_fast</option><option>fp8_e5m2</option></select>
 
     <div id=unified_lora_rows class=lorarack></div>
-    <div class=loratools style="grid-template-columns:1fr 72px 42px"><button id=install_lora type=button>+ HF / CIVITAI</button><button id=reset_loras type=button>RESET</button><button id=refresh type=button>↻</button></div>
-    <div class=hint>Each compatible LoRA has one card. OFF = 0.00 · ON = 1.00 · every slider is 0.00–5.00. The numeric field accepts any finite strength and the slider pins visually to its 0–5 range. Incompatible LoRAs are greyed out.</div>
+    <div class=loratools style="grid-template-columns:1fr 72px 42px"><button id=install_lora type=button>+ ADD LORA</button><button id=reset_loras type=button>RESET</button><button id=refresh type=button>↻</button></div>
+    <div class=hint>Paste an HF repo, full HF URL, direct .safetensors URL, or CivitAI model/version URL. The Studio discovers the files, shows download progress, then adds the LoRA as a card. OFF = 0.00 · ON = 1.00; numeric strength remains fully editable.</div>
     </div></details>
 
     <button id=go>+ ADD GENERATION TO QUEUE</button>
@@ -6466,6 +6813,23 @@ Additional user Auto Prompt instructions:
         <div id=ap_key_status class=apstatus>Checking OPENAI_API_KEY…</div>
         <div class=hint>The generated text follows MiniMax H3's timeline + soundscape + music format and visually inspects attached first/last frames. Your API key is read server-side and is never sent to the browser.</div>
         <div class=apactions><button id=ap_cancel class=inlinebtn type=button>Cancel</button><button id=ap_save type=button>Save settings</button></div>
+      </div>
+    </div>
+    <div id=lora_install_modal class=apmodal role=dialog aria-modal=true aria-labelledby=lora_install_title>
+      <div class=apdialog>
+        <div class=aphead><b id=lora_install_title>ADD LORA</b><button id=lora_install_close class=apclose type=button>✕</button></div>
+        <label>Source</label>
+        <input id=lora_source type=text placeholder="HF owner/repo · full HF URL · direct .safetensors URL · CivitAI model/version URL" autocomplete=off>
+        <div class=g2>
+          <div><label>HF revision</label><input id=lora_revision type=text value="main" autocomplete=off></div>
+          <div><label>Detected source</label><input id=lora_source_type type=text value="not checked" readonly></div>
+        </div>
+        <label>LoRA file</label>
+        <select id=lora_candidate disabled><option value="">CHECK SOURCE first</option></select>
+        <div class=hfmodelactions><button id=lora_check_source class=inlinebtn type=button>CHECK SOURCE</button><button id=lora_download_btn type=button disabled>DOWNLOAD + ADD</button></div>
+        <div class=hfprogress><i id=lora_download_progress></i></div>
+        <div id=lora_download_text class=hfprogresstext>Paste whatever source link you have. Direct HF file links and CivitAI version links are preselected automatically when possible.</div>
+        <div class=hint>HF_TOKEN is only needed for private/gated Hugging Face files. CIVITAI_API_KEY is optional and is only needed when CivitAI itself requires authentication for the selected file.</div>
       </div>
     </div>
     <div id=ui_modal class=uimodal role=dialog aria-modal=true aria-labelledby=ui_modal_title>
@@ -6731,17 +7095,20 @@ Additional user Auto Prompt instructions:
     $('hf_model_toggle').onclick=e=>{e.preventDefault();$('hf_model_box').classList.toggle('show')};
     $('hf_model_inspect').onclick=async e=>{
       e.preventDefault();
-      const repo=$('hf_model_repo').value.trim(),revision=$('hf_model_revision').value.trim()||'main';
-      if(!repo){await uiAlert('Enter a Hugging Face repo such as owner/repository.','HF base model');return}
+      const source=$('hf_model_repo').value.trim(),revision=$('hf_model_revision').value.trim()||'main';
+      if(!source){await uiAlert('Paste an HF repo, repo URL, tree URL, or direct model-file URL.','HF base model');return}
       $('hf_model_inspect').disabled=true;$('hf_model_install').disabled=true;
-      $('hf_model_progress').style.width='0%';$('hf_model_progress_text').textContent='Inspecting repo…';
+      $('hf_model_progress').style.width='0%';$('hf_model_progress_text').textContent='Inspecting Hugging Face source…';
       try{
-        const resp=await fetch('/api/models/hf/inspect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({repo_id:repo,revision})});
-        const r=await resp.json();if(!resp.ok||r.error)throw new Error(r.error||'Could not inspect repo.');
+        const resp=await fetch('/api/models/hf/inspect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source,revision})});
+        const r=await resp.json();if(!resp.ok||r.error)throw new Error(r.error||'Could not inspect Hugging Face source.');
+        $('hf_model_repo').value=r.repo_id||source;
+        $('hf_model_revision').value=r.revision||revision;
         $('hf_model_file').innerHTML=(r.candidates||[]).map(x=>`<option value="${esc(x.filename)}">${esc(x.filename)} · ${x.size?_humanBytes(x.size):'size unknown'}</option>`).join('');
+        if(r.preferred_filename&&[...$('hf_model_file').options].some(x=>x.value===r.preferred_filename))$('hf_model_file').value=r.preferred_filename;
         $('hf_model_file').disabled=!(r.candidates||[]).length;$('hf_model_install').disabled=!(r.candidates||[]).length;
-        $('hf_model_progress_text').textContent=`${(r.candidates||[]).length} checkpoint file(s) found. Choose one and download.`;
-      }catch(err){$('hf_model_progress_text').textContent=String(err.message||err);await uiAlert(String(err.message||err),'HF repo inspection failed')}
+        $('hf_model_progress_text').textContent=`${(r.candidates||[]).length} checkpoint file(s) found in ${r.repo_id}@${r.revision}.${r.preferred_filename?' Direct file selected from your link.':' Choose one and download.'}`;
+      }catch(err){$('hf_model_progress_text').textContent=String(err.message||err);await uiAlert(String(err.message||err),'HF source inspection failed')}
       finally{$('hf_model_inspect').disabled=false}
     };
     async function pollHFModelDownload(id){
@@ -6758,12 +7125,13 @@ Additional user Auto Prompt instructions:
     }
     $('hf_model_install').onclick=async e=>{
       e.preventDefault();
-      const repo=$('hf_model_repo').value.trim(),revision=$('hf_model_revision').value.trim()||'main',filename=$('hf_model_file').value,mode=$('hf_model_mode').value||'both';
-      if(!repo||!filename){await uiAlert('Check the repo and choose a model file first.','HF base model');return}
+      const source=$('hf_model_repo').value.trim(),revision=$('hf_model_revision').value.trim()||'main',filename=$('hf_model_file').value,mode=$('hf_model_mode').value||'both';
+      if(!source||!filename){await uiAlert('Check the source and choose a model file first.','HF base model');return}
       $('hf_model_install').disabled=true;$('hf_model_inspect').disabled=true;
       try{
-        const resp=await fetch('/api/models/hf/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({repo_id:repo,revision,filename,mode})});
+        const resp=await fetch('/api/models/hf/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source,revision,filename,mode})});
         const r=await resp.json();if(!resp.ok||r.error)throw new Error(r.error||'Could not start model download.');
+        $('hf_model_repo').value=r.repo_id||source;$('hf_model_revision').value=r.revision||revision;
         const done=await pollHFModelDownload(r.id);
         await loadMeta();
         ACTIVE_MODEL_PROFILE=done.profile||('custom:'+done.local_name);
@@ -6774,6 +7142,7 @@ Additional user Auto Prompt instructions:
       }catch(err){$('hf_model_progress_text').textContent=String(err.message||err);await uiAlert(String(err.message||err),'HF base model download failed')}
       finally{$('hf_model_install').disabled=false;$('hf_model_inspect').disabled=false}
     };
+
 
     $('gpu_overlay_toggle').onclick=()=>{
       const p=$('gpu_overlay');
@@ -7088,30 +7457,108 @@ Additional user Auto Prompt instructions:
       LORA_CARD_STATE.clear();renderNamedLoraRows(window.H3META||{});
     }
 
-    async function _installUserLoraUrl(url){
-      let resp=await fetch('/api/loras/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
-      let r=await resp.json();
-      if(r.adult_ack_required){
-        const ok=await requestAdultAcknowledgement();
-        if(!ok)return null;
-        resp=await fetch('/api/loras/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
-        r=await resp.json();
-      }
-      if(r.error){await uiAlert(r.error,'LoRA install failed');return null}
-      return r;
+    function openLoraInstallModal(){
+      $('lora_install_modal').classList.add('show');
+      $('lora_source').focus();
     }
-    $('install_lora').onclick=async()=>{
-      const url=await uiPrompt('Paste a direct Hugging Face .safetensors file URL or a MiniMax-H3 CivitAI model/version URL.','',{title:'Install LoRA',confirmLabel:'Install'});
-      if(!url)return;
-      say('installing LoRA…');$('install_lora').disabled=true;
+    function closeLoraInstallModal(){
+      $('lora_install_modal').classList.remove('show');
+    }
+    $('install_lora').onclick=e=>{e.preventDefault();openLoraInstallModal()};
+    $('lora_install_close').onclick=()=>closeLoraInstallModal();
+    $('lora_install_modal').addEventListener('click',e=>{if(e.target===$('lora_install_modal'))closeLoraInstallModal()});
+
+    $('lora_check_source').onclick=async e=>{
+      e.preventDefault();
+      const source=$('lora_source').value.trim();
+      const revision=$('lora_revision').value.trim()||'main';
+      if(!source){await uiAlert('Paste a Hugging Face or CivitAI source first.','Add LoRA');return}
+      $('lora_check_source').disabled=true;
+      $('lora_download_btn').disabled=true;
+      $('lora_candidate').disabled=true;
+      $('lora_download_progress').style.width='0%';
+      $('lora_download_text').textContent='Inspecting source…';
+      $('lora_source_type').value='checking…';
       try{
-        const r=await _installUserLoraUrl(url);if(!r)return;
-        await loadMeta();
-        LORA_CARD_STATE.set('file:'+r.file,{strength:1});
-        renderNamedLoraRows(window.H3META||{});
-        say('LoRA installed · '+r.file);
-      }catch(e){await uiAlert(String(e),'LoRA install failed')}finally{$('install_lora').disabled=false}
+        const resp=await fetch('/api/loras/inspect',{
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({source,revision})
+        });
+        const r=await resp.json();
+        if(!resp.ok||r.error)throw new Error(r.error||'Could not inspect LoRA source.');
+        $('lora_source_type').value=(r.source_type||'unknown').toUpperCase();
+        if(r.source_type==='hf'&&r.revision)$('lora_revision').value=r.revision;
+        $('lora_candidate').innerHTML=(r.candidates||[]).map(x=>
+          `<option value="${esc(x.key)}">${esc(x.label||x.filename)} · ${x.size?_humanBytes(x.size):'size unknown'}</option>`
+        ).join('');
+        if(r.preferred_key&&[...$('lora_candidate').options].some(x=>x.value===r.preferred_key))$('lora_candidate').value=r.preferred_key;
+        const count=(r.candidates||[]).length;
+        $('lora_candidate').disabled=!count;
+        $('lora_download_btn').disabled=!count;
+        $('lora_download_text').textContent=
+          `${count} .safetensors file${count===1?'':'s'} found${r.preferred_key?' · best match preselected':''}.`;
+      }catch(err){
+        $('lora_source_type').value='error';
+        $('lora_download_text').textContent=String(err.message||err);
+        await uiAlert(String(err.message||err),'LoRA source inspection failed');
+      }finally{
+        $('lora_check_source').disabled=false;
+      }
     };
+
+    async function pollLoraDownload(id){
+      while(true){
+        const resp=await fetch('/api/loras/progress/'+encodeURIComponent(id),{cache:'no-store'});
+        const r=await resp.json();
+        if(!resp.ok)throw new Error(r.error||'LoRA download status failed.');
+        const pct=r.pct==null?0:Math.max(0,Math.min(100,Number(r.pct)));
+        $('lora_download_progress').style.width=pct+'%';
+        $('lora_download_text').textContent=
+          `${r.stage||r.status} · ${r.downloaded_text||'0 B'} / ${r.total_text||'unknown'}${r.speed_text?' · '+r.speed_text:''}${r.pct==null?'':` · ${pct.toFixed(1)}%`}`;
+        if(r.status==='done')return r;
+        if(r.status==='error')throw new Error(r.error||'LoRA download failed.');
+        await new Promise(resolve=>setTimeout(resolve,400));
+      }
+    }
+
+    $('lora_download_btn').onclick=async e=>{
+      e.preventDefault();
+      const source=$('lora_source').value.trim();
+      const revision=$('lora_revision').value.trim()||'main';
+      const candidate_key=$('lora_candidate').value;
+      if(!source||!candidate_key){await uiAlert('Check the source and choose a LoRA file first.','Add LoRA');return}
+      $('lora_download_btn').disabled=true;
+      $('lora_check_source').disabled=true;
+      say('downloading LoRA…');
+      try{
+        const resp=await fetch('/api/loras/install',{
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({source,revision,candidate_key})
+        });
+        const r=await resp.json();
+        if(!resp.ok||r.error)throw new Error(r.error||'Could not start LoRA download.');
+        const done=await pollLoraDownload(r.id);
+        await loadMeta();
+        LORA_CARD_STATE.set('file:'+done.file,{strength:1});
+        renderNamedLoraRows(window.H3META||{});
+        $('lora_download_progress').style.width='100%';
+        $('lora_download_text').textContent=`Installed ${done.file} · added to the rack at strength 1.00.`;
+        say('LoRA installed · '+done.file);
+      }catch(err){
+        $('lora_download_text').textContent=String(err.message||err);
+        await uiAlert(String(err.message||err),'LoRA download failed');
+      }finally{
+        $('lora_download_btn').disabled=false;
+        $('lora_check_source').disabled=false;
+      }
+    };
+
+    $('lora_source').addEventListener('keydown',e=>{
+      if(e.key==='Enter'){e.preventDefault();$('lora_check_source').click()}
+    });
+
 
     function syncMotionPace(){$('motion_pace_value').textContent=Number($('playback_speed').value||1).toFixed(2)+'×'}
     $('playback_speed').addEventListener('input',syncMotionPace);syncMotionPace();
