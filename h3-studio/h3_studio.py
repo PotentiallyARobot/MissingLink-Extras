@@ -5120,6 +5120,7 @@ if _CU130_CHILD:
             MOTION8_FILE:_compat_record(profiles=["stock_quality"],modes=["fl2va"],label="Motion 8-Step Enhancer · Stock H3 FL2VA only"),
             LIGHTNING_FILE:_compat_record(profiles=["stock_quality"],modes=["fl2va"],label="FL2VA Turbo accelerator · managed by FAST preset"),
             REF2VA_LIGHTNING_FILE:_compat_record(profiles=["stock_quality"],modes=["ref2va"],label="Ref2VA Turbo accelerator · managed by FAST preset"),
+            TAOMATE_FILE:_compat_record(profiles=["stock_quality"],modes=["fl2va"],label="TaoMate-H3 3-Step accelerator · managed by TAOMATE preset"),
         }
 
     def _known_lora_compatible(name, unet_name, mode):
@@ -5643,7 +5644,7 @@ if _CU130_CHILD:
     def meta():
         folder_paths.cache_helper.clear()
         all_loras = list(folder_paths.get_filename_list("loras"))
-        hidden_accelerators = {LIGHTNING_FILE, REF2VA_LIGHTNING_FILE}
+        hidden_accelerators = {LIGHTNING_FILE, REF2VA_LIGHTNING_FILE, TAOMATE_FILE}
         visible_loras = [x for x in all_loras if x not in hidden_accelerators]
         try:
             gguf_unets = folder_paths.get_filename_list("unet_gguf")
@@ -5671,6 +5672,7 @@ if _CU130_CHILD:
             t4_default_unet=(T4_DIT_FILE if LOWVRAM_T4_PROFILE else ""), specialty_loras=[],
             lightning_file=LIGHTNING_FILE, lightning_available=bool(not LOWVRAM_T4_PROFILE),
             ref2va_lightning_file=REF2VA_LIGHTNING_FILE, ref2va_lightning_available=bool(not LOWVRAM_T4_PROFILE),
+            taomate_file=TAOMATE_FILE, taomate_available=bool(TAOMATE_AVAILABLE), taomate_strength_default=TAOMATE_STRENGTH,
             lightning_default=bool(not LOWVRAM_T4_PROFILE), lightning_strength_default=LIGHTNING_STRENGTH,
             action_label=ACTION_LABEL, action_model_id=0, action_linked_version=0, action_available=False, action_file=None,
             action_strength_default=0.0, action_requested_version_id=0, action_version_id=None, action_source_page="",
@@ -5895,7 +5897,7 @@ Additional user Auto Prompt instructions:
               "playback_speed","image_fit","steps","seed","denoise",
               "shift_video","shift_audio","sparse_percent","sampler_name","scheduler",
               "weight_dtype","lora","lora_strength","motion8","motion8_strength","action","action_strength","lightning",
-              "lightning_strength","unet", "use_stage_last", "timeline_action",
+              "lightning_strength","taomate","taomate_strength","unet", "use_stage_last", "timeline_action",
               "input_mode", "ref_image_size")}
         input_mode = (p.get("input_mode") or "fl2va").strip().lower()
         if input_mode not in {"fl2va", "ref2va"}:
