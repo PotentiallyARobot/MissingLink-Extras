@@ -110,6 +110,14 @@ LIGHTNING_STEPS = 4
 LIGHTNING_SHIFT_VIDEO = 6.0
 LIGHTNING_SHIFT_AUDIO = 3.0
 
+# TaoMate-H3 3-step ComfyUI accelerator (converted from official TaoLiveAIGC adapter).
+TAOMATE_REPO = "Asirus/TaoMate_H3_3_Step_LoRA"
+TAOMATE_FILE = "taomate_h3_3step_MAXQUALITY_bf16.safetensors"
+TAOMATE_STRENGTH = 1.0
+TAOMATE_STEPS = 3
+TAOMATE_SHIFT_VIDEO = 10.0
+TAOMATE_SHIFT_AUDIO = 3.0
+
 # rzgar MiniMax-H3 FL2V 8-Step Motion Enhancer.
 MOTION8_REPO = "rzgar/minimax-h3_fl2v_8Step_motion_enhancer"
 MOTION8_FILE = "minimax-h3_fl2v_8Step_motion_enhancer.safetensors"
@@ -2606,6 +2614,32 @@ if _CU130_CHILD:
     else:
         MOTION8_AVAILABLE = _ensure_motion8_lora()
 
+    # ── Optional TaoMate-H3 3-step accelerator ───────────────────────────────
+    TAOMATE_PATH = os.path.join(ldir, TAOMATE_FILE)
+    def _ensure_taomate_lora():
+        try:
+            if os.path.exists(TAOMATE_PATH):
+                ok, err = _validate_safetensors_file(TAOMATE_PATH)
+                if ok:
+                    log(f"  ✓ TaoMate 3-Step: {TAOMATE_FILE}")
+                    return True
+                log(f"  ⚠ TaoMate file is corrupt: {err}; replacing it")
+                os.remove(TAOMATE_PATH)
+            log(f"  ↓ TaoMate-H3 3-Step LoRA: {TAOMATE_FILE} ({TAOMATE_REPO})")
+            src = hf_hub_download(TAOMATE_REPO, filename=TAOMATE_FILE)
+            _atomic_copy_weight(src, TAOMATE_PATH)
+            log(f"  ✓ TaoMate 3-Step: {TAOMATE_FILE}")
+            return True
+        except Exception as e:
+            log(f"  ⚠ TaoMate 3-Step unavailable: {e}")
+            return False
+
+    TAOMATE_AVAILABLE = False if LOWVRAM_T4_PROFILE else True
+    if not LOWVRAM_T4_PROFILE and not FAST_STARTUP:
+        TAOMATE_AVAILABLE = _ensure_taomate_lora()
+    elif not LOWVRAM_T4_PROFILE:
+        log("  ✓ FAST STARTUP: TaoMate 3-Step download deferred until first use")
+
     # ── User-installed LoRA metadata helpers ───────────────────────────────
     ACTION_AVAILABLE = False
     SPECIALTY_LORA_STATES = []
@@ -2682,6 +2716,7 @@ if _CU130_CHILD:
         if MOTION8_FILE: out[MOTION8_FILE] = _hf_repo_url(MOTION8_REPO)
         if LIGHTNING_FILE: out[LIGHTNING_FILE] = _hf_repo_url(LIGHTNING_REPO)
         if REF2VA_LIGHTNING_FILE: out[REF2VA_LIGHTNING_FILE] = _hf_repo_url(REF2VA_LIGHTNING_REPO)
+        if TAOMATE_FILE: out[TAOMATE_FILE] = _hf_repo_url(TAOMATE_REPO)
         for fn,url in dict(LORA_SOURCE_CACHE).items():
             if fn and url: out[fn]=url
         return out
@@ -3293,6 +3328,8 @@ if _CU130_CHILD:
             if not _ensure_lightning_lora(): raise RuntimeError("FL2VA Turbo accelerator could not be downloaded.")
         elif base == REF2VA_LIGHTNING_FILE and not os.path.exists(REF2VA_LIGHTNING_PATH):
             if not _ensure_ref2va_lightning_lora(): raise RuntimeError("Ref2VA Turbo accelerator could not be downloaded.")
+        elif base == TAOMATE_FILE and not os.path.exists(TAOMATE_PATH):
+            if not _ensure_taomate_lora(): raise RuntimeError("TaoMate-H3 3-Step accelerator could not be downloaded.")
 
     def _apply_lora_checked(model, name, strength, label):
         if not name or name == "none" or float(strength) == 0:
@@ -3312,8 +3349,8 @@ if _CU130_CHILD:
 
     def get_models(weight_dtype, lora, lora_strength, action=False,
                    action_strength=ACTION_STRENGTH, lightning=False,
-                   lightning_strength=LIGHTNING_STRENGTH, unet=None,
-                   extra_loras=None):
+                   lightning_strength=LIGHTNING_STRENGTH, taomate=False,
+                   taomate_strength=TAOMATE_STRENGTH, unet=None, extra_loras=None):
         """Cache the base H3 weights and stack generation LoRAs on a clone per job.
 
         Stack order: primary creative LoRA, up to four user rack LoRAs,
@@ -3360,6 +3397,9 @@ if _CU130_CHILD:
 
         use_action = str(action).lower() in ("1", "true", "yes", "on")
         use_lightning = str(lightning).lower() in ("1", "true", "yes", "on")
+        use_taomate = str(taomate).lower() in ("1", "true", "yes", "on")
+        if use_taomate and use_lightning:
+            raise RuntimeError("TaoMate 3-Step and Lightning/Turbo are alternative acceleration LoRAs; choose one.")
         norm_extra_loras = []
         for item in (extra_loras or []):
             try:
@@ -3435,6 +3475,14 @@ if _CU130_CHILD:
                 model, info = _apply_lora_checked(
                     model, lightning_file, lightning_strength,
                     "Ref2VA Turbo" if is_ref2va else "Lightning")
+                if info: infos.append(info)
+
+        if use_taomate:
+            if os.path.basename(str(unet)) != FALLBACK_DIT_FILE:
+                raise RuntimeError("TaoMate 3-Step preset currently targets the stock MiniMax H3 FL2VA checkpoint only.")
+            _ensure_optional_lora_selected(TAOMATE_FILE)
+            if TAOMATE_FILE not in already_applied:
+                model, info = _apply_lora_checked(model, TAOMATE_FILE, taomate_strength, "TaoMate 3-Step")
                 if info: infos.append(info)
 
         variant_info = " | ".join(infos) or "none"
@@ -4484,6 +4532,7 @@ if _CU130_CHILD:
                 action_strength=p.get("action_strength", ACTION_STRENGTH),
                 lightning=p.get("lightning", "0"),
                 lightning_strength=p.get("lightning_strength", LIGHTNING_STRENGTH),
+                taomate=p.get("taomate", "0"), taomate_strength=p.get("taomate_strength", TAOMATE_STRENGTH),
                 unet=p.get("unet") or DIT_FILE,
                 extra_loras=p.get("extra_loras"))
             j["lora_info"] = lora_info
@@ -5931,8 +5980,9 @@ Additional user Auto Prompt instructions:
                 _lightning_on = str(p.get("lightning") or "0").lower() in ("1", "true", "yes", "on") and abs(float(p.get("lightning_strength") or 0.0)) > 1e-6
             except Exception:
                 _lightning_on = False
-            if _lightning_on:
-                return jsonify(error="Motion Enhancer and Fast-Mode Accelerator are alternative LoRAs. Turn one OFF before generating; neither selection was changed."), 400
+            _taomate_on = str(p.get('taomate') or '0').lower() in ('1','true','yes','on')
+            if _lightning_on or _taomate_on:
+                return jsonify(error="Motion Enhancer and the selected acceleration preset are alternative LoRAs. Turn one OFF before generating; neither selection was changed."), 400
 
         _dedup = {}
         for _name, _strength in extra_loras:
@@ -6835,7 +6885,7 @@ Additional user Auto Prompt instructions:
     button{border:0;border-radius:7px;background:var(--accent);color:#111;padding:10px 11px;font:inherit;font-weight:800;cursor:pointer}
     button:disabled{background:#29292f;color:#666;cursor:not-allowed}.inlinebtn{background:#29292f;color:#ccc;padding:8px 9px;width:100%;margin-top:8px;font-size:10.5px}.inlinebtn.active{background:var(--accent);color:#111}
     .installed{color:#7cc38c}.missing{color:#d6a56d}
-    .preset3{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}
+    .preset3{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}
     .hfmodelbox{margin-top:9px;padding:9px;border:1px solid #2b2c32;border-radius:8px;background:#0d0e11;display:none}
     .hfmodelbox.show{display:block}.hfmodelgrid{display:grid;grid-template-columns:minmax(0,1fr) 92px;gap:7px}.hfmodelactions{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:7px}.hfmodelactions button{margin:0}.hfprogress{height:6px;background:#24252a;border-radius:999px;overflow:hidden;margin-top:9px}.hfprogress i{display:block;height:100%;width:0;background:var(--accent);transition:width .18s}.hfprogresstext{font-size:8px;color:#8e9099;margin-top:5px;min-height:12px}.hfmodelbox select,.hfmodelbox input{font-size:10px}
     .modelcardtitle{display:flex;align-items:center;justify-content:space-between;gap:10px}.modelcardtitle>span{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.adultmodebtn{position:relative;width:48px!important;height:23px!important;flex:0 0 48px;margin:0!important;padding:0 17px 0 7px!important;background:#17181c!important;color:#8b8e97!important;border:1px solid #303139!important;border-radius:999px!important;font-size:7px!important;letter-spacing:.35px!important;text-align:left!important}.adultmodebtn::after{content:'';position:absolute;right:6px;top:50%;width:7px;height:7px;border-radius:50%;background:#555862;transform:translateY(-50%);box-shadow:0 0 0 1px #16171a}.adultmodebtn:hover{border-color:#52545d!important;color:#c7c9cf!important}.adultmodebtn.on{background:#211d10!important;color:#edc44a!important;border-color:#66551d!important}.adultmodebtn.on::after{background:var(--accent);box-shadow:0 0 8px #e8a91766}.adultmodebtn:disabled{opacity:.45!important}
@@ -6947,7 +6997,7 @@ Additional user Auto Prompt instructions:
     </div></div>
 
     <div class=card><div class=cardtitle>Generation Presets</div><div class=cardbody>
-    <div class=preset3><button id=fastpreset class="inlinebtn active">FAST</button><button id=ultrafastpreset class=inlinebtn>ULTRA FAST</button><button id=qualitypreset class=inlinebtn>QUALITY</button></div>
+    <div class=preset3><button id=fastpreset class="inlinebtn active">FAST</button><button id=taomatepreset class=inlinebtn>TAOMATE · 3</button><button id=ultrafastpreset class=inlinebtn>ULTRA FAST</button><button id=qualitypreset class=inlinebtn>QUALITY</button></div>
     <div class=hint id=preset_hint>Preset recipe follows the model selected above.</div>
     <div class=hint id=modelhint>Model mode will be shown here after startup.</div>
     </div></div>
@@ -7213,6 +7263,9 @@ Additional user Auto Prompt instructions:
 
     function presetRecipe(profile=ACTIVE_MODEL_PROFILE,mode=currentModelMode(),kind=ACTIVE_PERF_PRESET){
       const label=activeModelLabel();
+      if(kind==='taomate'){
+        return {short:'TAOMATE',label,steps:3,summary:'FL2VA · TaoMate-H3 3-step · Euler / Simple · dense attention'};
+      }
       if(kind==='ultra'){
         return {short:'ULTRA',label,steps:4,summary:(mode==='ref2va'?'Ref2VA':'FL2VA')+' · 4-step Lightning · Euler / Simple · sparse attention 5%'};
       }
@@ -7229,13 +7282,16 @@ Additional user Auto Prompt instructions:
     function syncPresetUI(){
       syncSpecialLoraUI();
       const fast=presetRecipe(ACTIVE_MODEL_PROFILE,currentModelMode(),'fast');
+      const taomate=presetRecipe(ACTIVE_MODEL_PROFILE,currentModelMode(),'taomate');
       const ultra=presetRecipe(ACTIVE_MODEL_PROFILE,currentModelMode(),'ultra');
       const quality=presetRecipe(ACTIVE_MODEL_PROFILE,currentModelMode(),'quality');
-      const active=ACTIVE_PERF_PRESET==='ultra'?ultra:(ACTIVE_PERF_PRESET==='quality'?quality:fast);
+      const active=ACTIVE_PERF_PRESET==='taomate'?taomate:(ACTIVE_PERF_PRESET==='ultra'?ultra:(ACTIVE_PERF_PRESET==='quality'?quality:fast));
       $('fastpreset').classList.toggle('active',ACTIVE_PERF_PRESET==='fast');
+      $('taomatepreset').classList.toggle('active',ACTIVE_PERF_PRESET==='taomate');
       $('ultrafastpreset').classList.toggle('active',ACTIVE_PERF_PRESET==='ultra');
       $('qualitypreset').classList.toggle('active',ACTIVE_PERF_PRESET==='quality');
       $('fastpreset').textContent=`FAST · ${fast.steps}`;
+      $('taomatepreset').textContent=`TAOMATE · ${taomate.steps}`;
       $('ultrafastpreset').textContent=`ULTRA FAST · ${ultra.steps}`;
       $('qualitypreset').textContent=`QUALITY · ${quality.steps}`;
       $('preset_hint').innerHTML=
@@ -8578,6 +8634,7 @@ Additional user Auto Prompt instructions:
       const profile=ACTIVE_MODEL_PROFILE;
       const mode=currentModelMode();
       const accelerated=(kind==='fast'||kind==='ultra');
+      if(kind==='taomate' && m.motion8_file && Math.abs(_strengthForKind('motion8',m))>1e-6){ await uiAlert('TaoMate 3-Step and Motion Enhancer are alternative acceleration LoRAs. Turn Motion Enhancer OFF first.','Preset conflict'); return; }
 
       if(accelerated && m.motion8_file && Math.abs(_strengthForKind('motion8',m))>1e-6){
         await uiAlert('FAST / ULTRA FAST use the 4-step Lightning accelerator, while Motion Enhancer is an alternative acceleration LoRA. Turn Motion Enhancer OFF first.','Preset conflict');
@@ -8594,7 +8651,16 @@ Additional user Auto Prompt instructions:
         if(target&&[...$('unet').options].some(x=>x.value===target))$('unet').value=target;
       }
 
-      if(accelerated){
+      if(kind==='taomate'){
+        if(mode!=='fl2va'){ await uiAlert('TaoMate 3-Step preset currently targets CURRENT / KEYFRAMES (FL2VA).','TaoMate unavailable'); return; }
+        if(!m.taomate_available){ await uiAlert('TaoMate 3-Step is unavailable on this runtime.','TaoMate unavailable'); return; }
+        _setStrengthForKind('lightning',0,m);
+        $('steps').value=3;
+        if([...$('sampler_name').options].some(x=>x.value==='euler'))$('sampler_name').value='euler';
+        if([...$('scheduler').options].some(x=>x.value==='simple'))$('scheduler').value='simple';
+        $('shift_video').value=10;$('shift_audio').value=3;
+        $('sparse_percent').value=0;$('sparse_slider').value=0;updateSparseUI('number');
+      }else if(accelerated){
         const accelAvailable=mode==='ref2va'?m.ref2va_lightning_available:m.lightning_available;
         if(!accelAvailable){
           // Low-VRAM/T4 currently has no matching Lightning package. Keep FAST selected
@@ -8627,6 +8693,8 @@ Additional user Auto Prompt instructions:
         if(mode==='ref2va')$('ref_image_size').value='max';
       }
 
+      // Dedicated server-side TaoMate switch; all other presets clear it.
+      window.TAOMATE_PRESET_ACTIVE=(kind==='taomate');
       ACTIVE_PERF_PRESET=kind;
       updateDur();syncPresetUI();renderNamedLoraRows(window.H3META||{});
       const r=presetRecipe(profile,mode,kind);
@@ -8634,6 +8702,7 @@ Additional user Auto Prompt instructions:
     }
 
     $('fastpreset').onclick=e=>{e.preventDefault();applyPerformancePreset('fast')};
+    $('taomatepreset').onclick=e=>{e.preventDefault();applyPerformancePreset('taomate')};
     $('ultrafastpreset').onclick=e=>{e.preventDefault();applyPerformancePreset('ultra')};
     $('qualitypreset').onclick=e=>{e.preventDefault();applyPerformancePreset('quality')};
 
@@ -8657,6 +8726,7 @@ Additional user Auto Prompt instructions:
       }
 
       $('err').style.display='none';const fd=new FormData();
+      fd.append('taomate',window.TAOMATE_PRESET_ACTIVE?'1':'0'); fd.append('taomate_strength',String((window.H3META||{}).taomate_strength_default||1.0));
       for(const k of ['prompt','width','height','duration','frames','length_mode','playback_speed','image_fit','steps','seed','denoise','shift_video','shift_audio','sparse_percent','sampler_name','scheduler','weight_dtype','unet','use_stage_last'])fd.append(k,$(k).value);
       const motion8Submit=submittedSpecialStrength('motion8'),lightningSubmit=submittedSpecialStrength('lightning');
       fd.append('motion8_strength',String(motion8Submit));fd.append('lightning_strength',String(lightningSubmit));
