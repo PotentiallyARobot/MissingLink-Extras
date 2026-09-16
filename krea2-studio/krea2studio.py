@@ -68,14 +68,6 @@ OUTPUT_DIR = ROOT / "pornmaster_krea2_outputs"
 MODEL_BUCKET_ID = "MissingLinkBuilder/Models"
 MODEL_REMOTE_NAME = "krea2-def.safetensors"
 MODEL_FILENAME = "krea2-def.safetensors"
-LEGACY_MODEL_HF_REPO = "EllaPriest45/Krea2_Checkpoints"
-LEGACY_MODEL_HF_REPO_FILE = "PornMaster Turbo v2.0 FP8 - Krea2.safetensors"
-LEGACY_MODEL_FILENAME = "pornmasterKrea2_turboV2FP8.safetensors"
-MODEL_DOWNLOAD_URLS = [
-    f"https://huggingface.co/buckets/{MODEL_BUCKET_ID}/{MODEL_REMOTE_NAME}",
-    f"https://huggingface.co/buckets/{MODEL_BUCKET_ID}/resolve/main/{MODEL_REMOTE_NAME}",
-    f"https://hf.co/buckets/{MODEL_BUCKET_ID}/{MODEL_REMOTE_NAME}",
-]
 
 HF_REPO = "Comfy-Org/Krea-2"
 
@@ -431,7 +423,7 @@ subprocess.check_call([
     "tqdm",
     "Pillow",
     "numpy",
-    "huggingface_hub[hf_xet]",
+    "huggingface_hub[hf_xet]>=1.6.0",
     "comfy-kitchen",
 ])
 
@@ -459,80 +451,31 @@ for directory in [
 MODEL_PATH = DIFFUSION_DIR / MODEL_FILENAME
 
 # =====================================================================
-# RECOVER EXISTING MODEL
+# RECOVER EXISTING CANONICAL MODEL
 # =====================================================================
 
 if not MODEL_PATH.exists():
 
     old_locations = [
-        (
-            ROOT
-            / "pornmaster-krea2"
-            / "ComfyUI"
-            / "models"
-            / "diffusion_models"
-            / MODEL_FILENAME
-        ),
-        (
-            ROOT
-            / "pornmaster-krea2"
-            / "ComfyUI"
-            / "models"
-            / "unet"
-            / MODEL_FILENAME
-        ),
-        (
-            ROOT
-            / "pornmaster-krea2"
-            / "ComfyUI"
-            / "models"
-            / "diffusion_models"
-            / LEGACY_MODEL_FILENAME
-        ),
-        (
-            ROOT
-            / "pornmaster-krea2"
-            / "ComfyUI"
-            / "models"
-            / "unet"
-            / LEGACY_MODEL_FILENAME
-        ),
-        (
-            COMFY_DIR
-            / "models"
-            / "diffusion_models"
-            / LEGACY_MODEL_FILENAME
-        ),
-        (
-            COMFY_DIR
-            / "models"
-            / "unet"
-            / LEGACY_MODEL_FILENAME
-        ),
+        ROOT / "pornmaster-krea2" / "ComfyUI" / "models" / "diffusion_models" / MODEL_FILENAME,
+        ROOT / "pornmaster-krea2" / "ComfyUI" / "models" / "unet" / MODEL_FILENAME,
+        COMFY_DIR / "models" / "unet" / MODEL_FILENAME,
     ]
 
     for old_path in old_locations:
-
         if old_path.exists():
-
-            print("\nRecovering existing PornMaster checkpoint:")
+            print("\nRecovering existing krea2-def checkpoint:")
             print(old_path)
-
-            shutil.copy2(
-                old_path,
-                MODEL_PATH,
-            )
-
+            shutil.copy2(old_path, MODEL_PATH)
             break
 
 # =====================================================================
 # KREA2 DEFAULT MODEL — BUCKET / HUGGING FACE
 # =====================================================================
 
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
-from huggingface_hub import hf_hub_download
+from huggingface_hub import download_bucket_files, hf_hub_download
 from safetensors import safe_open
+import requests
 
 
 def validate_safetensors(path, minimum_size):
@@ -560,35 +503,15 @@ def validate_safetensors(path, minimum_size):
     return True, "ok"
 
 
-def _download_url_to_file(url, destination, token=None):
-    destination = Path(destination)
-    partial = destination.with_name(destination.name + ".part")
-    partial.unlink(missing_ok=True)
-    headers = {"User-Agent": "missinglink-krea2-studio/1.0"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    request = Request(url, headers=headers)
-    try:
-        with urlopen(request) as response, open(partial, "wb") as handle:
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                handle.write(chunk)
-        return partial
-    except (HTTPError, URLError, TimeoutError, OSError) as exc:
-        partial.unlink(missing_ok=True)
-        raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
-
-
 def ensure_model_safetensors(
     destination,
     minimum_size,
     label,
 ):
-    """Prefer the MissingLink bucket model, with a legacy repo fallback."""
+    """Download krea2-def from the public MissingLink Hugging Face Bucket."""
     destination = Path(destination)
     valid, reason = validate_safetensors(destination, minimum_size)
+
     if valid:
         print(f"✓ {label} already present and valid")
         print(destination)
@@ -598,36 +521,66 @@ def ensure_model_safetensors(
         print(f"! Replacing invalid {label}: {reason}")
         destination.unlink()
     else:
-        print(f"Downloading {label}...")
+        print(f"Downloading {label} from MissingLink public bucket...")
 
-    last_error = None
-    for url in MODEL_DOWNLOAD_URLS:
-        print(f"· Trying bucket source: {url}")
-        partial = destination.with_name(destination.name + ".part")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_name(destination.name + ".part")
+    partial.unlink(missing_ok=True)
+
+    print(f"Bucket : hf://buckets/{MODEL_BUCKET_ID}")
+    print(f"Object : {MODEL_REMOTE_NAME}")
+
+    # Hugging Face Buckets are NOT model repositories. The correct Python API is
+    # download_bucket_files(); do not use hf_hub_download() or /resolve/main.
+    # Public bucket access is deliberately anonymous (token=False).
+    try:
+        download_bucket_files(
+            MODEL_BUCKET_ID,
+            files=[(MODEL_REMOTE_NAME, str(partial))],
+            raise_on_missing_files=True,
+            token=False,
+        )
+    except Exception as bucket_exc:
+        # Robust public HTTP fallback. Bucket file URLs have no revision segment:
+        # /buckets/<namespace>/<bucket>/resolve/<path>
         partial.unlink(missing_ok=True)
+        public_url = (
+            f"https://huggingface.co/buckets/{MODEL_BUCKET_ID}/resolve/"
+            f"{MODEL_REMOTE_NAME}"
+        )
+        print(
+            "! Native bucket API failed; retrying the canonical public bucket URL:\n"
+            f"  {public_url}\n"
+            f"  API error: {type(bucket_exc).__name__}: {bucket_exc}"
+        )
+
         try:
-            downloaded = _download_url_to_file(url, destination, token=HF_TOKEN)
-            valid, reason = validate_safetensors(downloaded, minimum_size)
-            if not valid:
-                raise RuntimeError(f"downloaded file failed validation: {reason}")
-            os.replace(downloaded, destination)
-            print(f"✓ {label} downloaded from MissingLink bucket")
-            print(destination)
-            return
-        except Exception as exc:
-            last_error = exc
+            with requests.get(
+                public_url,
+                stream=True,
+                allow_redirects=True,
+                timeout=(30, 300),
+                headers={"User-Agent": "MissingLink-Krea2-Colab/1.0"},
+            ) as response:
+                response.raise_for_status()
+                with open(partial, "wb") as handle:
+                    for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
+                        if chunk:
+                            handle.write(chunk)
+        except Exception:
             partial.unlink(missing_ok=True)
-            print(f"  Bucket source failed: {exc}")
+            raise
 
-    print("· Falling back to legacy Hugging Face repo source...")
-    ensure_hf_safetensors(
-        LEGACY_MODEL_HF_REPO,
-        LEGACY_MODEL_HF_REPO_FILE,
-        destination,
-        minimum_size,
-        label,
-    )
+    valid, reason = validate_safetensors(partial, minimum_size)
+    if not valid:
+        partial.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Bucket download failed safetensors validation: {reason}"
+        )
 
+    os.replace(partial, destination)
+    print(f"✓ {label} downloaded from MissingLink public bucket")
+    print(destination)
 
 def ensure_hf_safetensors(
     repo_id,
@@ -2345,6 +2298,141 @@ def responses_create_custom(
         max_output_tokens=max_output_tokens,
         **kwargs,
     )
+
+# =====================================================================
+# AUTO PROMPT — optional single-prompt refinement for Krea2 tools.
+# =====================================================================
+
+AUTO_PROMPT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "prompt": {"type": "string"},
+    },
+    "required": ["prompt"],
+    "additionalProperties": False,
+}
+
+DEFAULT_AUTO_PROMPT_INSTRUCTIONS = """
+You are the Auto Prompt director for MissingLink Krea2 Studio.
+
+Rewrite the user's rough instruction into one strong, standalone prompt for a
+Krea2 Turbo image-generation model. Preserve the user's actual intent and all
+important requested details. Do not turn the request into a different concept.
+
+Krea2 responds well to clear natural-language visual direction. When useful,
+make subject appearance, pose/action, composition, framing, camera angle, lens
+feel, depth of field, environment, lighting, palette, materials, texture and
+rendering style concrete. Prefer coherent prose over bloated tag soup.
+
+For Image -> Image, treat an attached source image as visual context. Preserve
+identity, composition, wardrobe, objects or scene characteristics when the
+user's instruction implies they should stay. Describe the requested change
+clearly enough for img2img conditioning.
+
+For Inpaint, write the prompt for the replacement or repaired region while
+making it compatible with the surrounding image. Use the attached source image
+for lighting, perspective, material, texture and scene continuity. Do not waste
+words describing unrelated portions of the image.
+
+If no image is attached, work only from the user's text. Never claim to have
+seen an image that was not provided. Do not add explanations, labels, analysis,
+numbering or quotation marks. Return only one finished generation prompt in the
+required JSON field.
+""".strip()
+
+
+def create_auto_prompt(
+    prompt,
+    mode="text",
+    source_image=None,
+    extra_instructions="",
+    agent_model=None,
+):
+    prompt = str(prompt or "").strip()
+    mode = str(mode or "text").strip().lower()
+    extra_instructions = str(extra_instructions or "").strip()
+    agent_model = str(agent_model or OPENAI_MODEL).strip()
+
+    if not prompt and source_image is None:
+        raise ValueError("Enter a prompt or attach a source image first.")
+
+    mode_names = {
+        "text": "Text -> Image",
+        "image": "Image -> Image",
+        "inpaint": "Inpaint",
+    }
+    mode_name = mode_names.get(mode, "Text -> Image")
+
+    run_instructions = DEFAULT_AUTO_PROMPT_INSTRUCTIONS
+    if extra_instructions:
+        run_instructions += (
+            "\n\nUSER-SAVED AUTO PROMPT INSTRUCTIONS:\n"
+            + extra_instructions
+        )
+
+    user_text = (
+        f"KREA2 TOOL: {mode_name}\n\n"
+        "USER'S CURRENT PROMPT / INSTRUCTION:\n"
+        + (prompt if prompt else "[No text supplied — derive a useful Krea2 prompt from the attached image.]")
+        + "\n\nRewrite this into the final Krea2 generation prompt."
+    )
+
+    content = [
+        {
+            "type": "input_text",
+            "text": user_text,
+        }
+    ]
+
+    if source_image is not None:
+        content.extend([
+            {
+                "type": "input_text",
+                "text": (
+                    "SOURCE IMAGE: visually inspect this image and use it only as "
+                    "context for the requested Krea2 prompt."
+                ),
+            },
+            {
+                "type": "input_image",
+                "image_url": pil_to_data_url(source_image),
+                "detail": "high",
+            },
+        ])
+
+    response = responses_create_custom(
+        agent_model=agent_model,
+        reasoning_effort="medium",
+        reasoning_mode="standard",
+        max_output_tokens=4000,
+        instructions=run_instructions,
+        input=[
+            {
+                "role": "user",
+                "content": content,
+            }
+        ],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "krea2_auto_prompt",
+                "strict": True,
+                "schema": AUTO_PROMPT_SCHEMA,
+            }
+        },
+        store=False,
+    )
+
+    raw = str(response.output_text or "").strip()
+    if not raw:
+        raise RuntimeError("Auto Prompt returned no text.")
+
+    data = json.loads(raw)
+    result = str(data.get("prompt") or "").strip()
+    if not result:
+        raise RuntimeError("Auto Prompt returned an empty prompt.")
+
+    return result
 
 # =====================================================================
 # PROMPT TABLE HELPERS
@@ -4368,6 +4456,7 @@ def api_meta():
         scheduler=SCHEDULER, attention="PyTorch SDPA", max_batch=MAX_BATCH_IMAGES,
         key_valid=True, queue_max=JOB_MAX_ACTIVE, low_vram_mode=LOW_VRAM_MODE,
         missinglink_required=True, entitlement_mode="fail_closed",
+        openai_available=bool(OPENAI_API_KEY),
         gpu_profile=GPU_PROFILE,
         defaults={
             "text_width": DEFAULT_TEXT_WIDTH,
@@ -4379,6 +4468,23 @@ def api_meta():
         },
         lightning_lora=LIGHTNING_LORA_NAME,
     )
+
+
+@app.post("/api/auto_prompt")
+def api_auto_prompt():
+    try:
+        source = _pil_upload(request.files.get("source"))
+        result = create_auto_prompt(
+            prompt=request.form.get("prompt"),
+            mode=request.form.get("mode") or "text",
+            source_image=source,
+            extra_instructions=request.form.get("instructions") or "",
+            agent_model=request.form.get("agent_model") or OPENAI_MODEL,
+        )
+        return jsonify(ok=True, prompt=result)
+    except Exception as exc:
+        _traceback.print_exc()
+        return _json_error(exc, 500)
 
 
 @app.get("/api/jobs")
@@ -4950,6 +5056,25 @@ a{color:inherit}
 .inpaint-modal-canvas{min-height:0;overflow:auto;display:flex;align-items:center;justify-content:center;padding:12px;background:#050506}
 .inpaint-modal-canvas #inpaint_canvas{max-width:none;max-height:none}
 .inpaint-modal-foot{padding:8px 12px;border-top:1px solid var(--line);color:#777982;font-size:8px;font-family:var(--font-mono)}
+.auto-prompt-row{display:grid;grid-template-columns:minmax(0,1fr) 42px;gap:8px;margin:8px 0 2px}
+.auto-prompt-run{height:42px;font-family:var(--font-mono);font-size:10px;letter-spacing:.8px;text-transform:uppercase}
+.auto-prompt-settings{height:42px!important;padding:0!important;font-size:18px!important;display:flex;align-items:center;justify-content:center}
+.auto-prompt-run.busy{opacity:.7;pointer-events:none}
+.auto-modal{position:fixed;inset:0;z-index:5000;background:rgba(0,0,0,.78);backdrop-filter:blur(8px);padding:18px;display:flex;align-items:center;justify-content:center}
+.auto-modal.hidden{display:none!important}
+.auto-modal-shell{width:min(860px,calc(100vw - 36px));max-height:min(900px,calc(100vh - 36px));overflow:auto;background:#111115;border:1px solid #35363d;border-radius:14px;box-shadow:0 28px 100px rgba(0,0,0,.7)}
+.auto-modal-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:18px 22px 12px}
+.auto-modal-title{font-family:var(--font-mono);font-size:13px;font-weight:800;letter-spacing:1.5px;color:#c3c5cc;text-transform:uppercase}
+.auto-modal-close{width:42px!important;height:42px!important;padding:0!important;background:#292a30!important;color:#c9cad0!important;border:1px solid #34353d!important;font-size:23px!important;line-height:1}
+.auto-modal-body{padding:0 22px 22px}
+.auto-profile-row{display:grid;grid-template-columns:minmax(0,1fr) 122px 72px;gap:10px;align-items:end}
+.auto-profile-row button{height:44px;font-size:8px;font-family:var(--font-mono);letter-spacing:.5px}
+.auto-api-ok{margin-top:12px;color:var(--good);font-family:var(--font-mono);font-size:9px}
+.auto-api-bad{margin-top:12px;color:var(--bad);font-family:var(--font-mono);font-size:9px}
+.auto-modal-help{margin-top:8px;color:#777982;font-size:9px;line-height:1.55}
+.auto-modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:18px}
+.auto-modal-actions button{min-width:110px;height:46px}
+@media(max-width:700px){.auto-profile-row{grid-template-columns:1fr 1fr}.auto-profile-row .profile-name-wrap{grid-column:1/-1}}
 .minihint{font-size:8px;color:#696b74;margin-top:5px;line-height:1.4}
 .sectionhint{color:#777982;font-size:9px;line-height:1.55}
 .split{display:grid;grid-template-columns:1fr 1fr;gap:8px}
@@ -5104,6 +5229,10 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
             <div class="cardbody">
               <label>Prompt</label>
               <textarea id="t_prompt" placeholder="Describe the image..."></textarea>
+              <div class="auto-prompt-row">
+                <button type="button" class="auto-prompt-run" data-target="t_prompt" data-mode="text">✦ AUTO PROMPT</button>
+                <button type="button" class="secondary auto-prompt-settings" title="Auto Prompt settings">⚙</button>
+              </div>
               <label>Negative prompt</label>
               <textarea id="t_negative" placeholder="What should the model avoid?"></textarea>
               <div class="split">
@@ -5145,6 +5274,10 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
               <div id="i_preview" class="preview"><div class="empty">Choose a source image.</div></div>
               <label>Prompt</label>
               <textarea id="i_prompt"></textarea>
+              <div class="auto-prompt-row">
+                <button type="button" class="auto-prompt-run" data-target="i_prompt" data-mode="image" data-source="i_source">✦ AUTO PROMPT</button>
+                <button type="button" class="secondary auto-prompt-settings" title="Auto Prompt settings">⚙</button>
+              </div>
               <label>Negative prompt</label>
               <textarea id="i_negative" placeholder="What should the model avoid?"></textarea>
               <div class="split">
@@ -5203,6 +5336,10 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
               <div class="minihint">Paint what may change. Right-click temporarily erases. B = paint, E = erase, Ctrl/Cmd+Z = undo. Soft brush edges are preserved.</div>
               <label>Replacement prompt</label>
               <textarea id="in_prompt"></textarea>
+              <div class="auto-prompt-row">
+                <button type="button" class="auto-prompt-run" data-target="in_prompt" data-mode="inpaint" data-source="in_source">✦ AUTO PROMPT</button>
+                <button type="button" class="secondary auto-prompt-settings" title="Auto Prompt settings">⚙</button>
+              </div>
               <label>Negative prompt</label>
               <textarea id="in_negative" placeholder="What should the model avoid?"></textarea>
               <details open>
@@ -5370,6 +5507,42 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
   </div>
 </div>
 
+<div id="auto_prompt_modal" class="auto-modal hidden" aria-hidden="true">
+  <div class="auto-modal-shell">
+    <div class="auto-modal-head">
+      <span class="auto-modal-title">AUTO PROMPT SETTINGS</span>
+      <button id="ap_close" type="button" class="auto-modal-close">×</button>
+    </div>
+    <div class="auto-modal-body">
+      <label>Saved instruction profile</label>
+      <select id="ap_profile"></select>
+
+      <div class="auto-profile-row">
+        <div class="profile-name-wrap">
+          <label>Profile name</label>
+          <input id="ap_profile_name" placeholder="e.g. Editorial realism">
+        </div>
+        <button id="ap_profile_save" type="button">SAVE / UPDATE</button>
+        <button id="ap_profile_delete" type="button" class="secondary" disabled>DELETE</button>
+      </div>
+
+      <label>OpenAI model</label>
+      <input id="ap_model" value="gpt-5.6" placeholder="gpt-5.6">
+
+      <label>Additional Auto Prompt instructions</label>
+      <textarea id="ap_instructions" style="min-height:190px" placeholder="Examples: preserve wardrobe exactly; favor 35mm documentary photography; keep backgrounds minimal; use close framing..."></textarea>
+
+      <div id="ap_api_status" class="auto-api-ok">✓ OPENAI_API_KEY available to Auto Prompt.</div>
+      <div class="auto-modal-help">Auto Prompt rewrites only when you click it. Image → Image and Inpaint automatically send the attached source image for visual context. Your OpenAI API key stays server-side and is never sent to the browser.</div>
+
+      <div class="auto-modal-actions">
+        <button id="ap_cancel" type="button" class="secondary">Cancel</button>
+        <button id="ap_save_settings" type="button">Save settings</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div id="inpaint_modal" class="inpaint-modal hidden" aria-hidden="true">
   <div class="inpaint-modal-shell">
     <div class="inpaint-modal-head">
@@ -5450,6 +5623,152 @@ async function fetchJson(url,opts={}){
   }
   return d;
 }
+
+// ====================================================================
+// AUTO PROMPT
+// ====================================================================
+const AUTO_PROMPT_STORAGE='ml_krea2_auto_prompt_v1';
+let autoPromptState={
+  settings:{model:'gpt-5.6',instructions:''},
+  profiles:{},
+  selected:''
+};
+
+function loadAutoPromptState(){
+  try{
+    const saved=JSON.parse(localStorage.getItem(AUTO_PROMPT_STORAGE)||'null');
+    if(saved&&typeof saved==='object'){
+      autoPromptState.settings={
+        model:String(saved.settings?.model||'gpt-5.6'),
+        instructions:String(saved.settings?.instructions||'')
+      };
+      autoPromptState.profiles=(saved.profiles&&typeof saved.profiles==='object')?saved.profiles:{};
+      autoPromptState.selected=String(saved.selected||'');
+    }
+  }catch(_){ }
+}
+function saveAutoPromptState(){
+  try{localStorage.setItem(AUTO_PROMPT_STORAGE,JSON.stringify(autoPromptState))}catch(_){ }
+}
+function renderAutoPromptProfiles(){
+  const sel=$('ap_profile'); if(!sel)return;
+  const selected=autoPromptState.selected;
+  sel.innerHTML='';
+  const current=document.createElement('option');
+  current.value='';current.textContent='Current / unsaved';sel.appendChild(current);
+  Object.keys(autoPromptState.profiles).sort((a,b)=>a.localeCompare(b)).forEach(name=>{
+    const o=document.createElement('option');o.value=name;o.textContent=name;sel.appendChild(o);
+  });
+  sel.value=(selected&&autoPromptState.profiles[selected])?selected:'';
+  $('ap_profile_delete').disabled=!sel.value;
+}
+function syncAutoPromptControls(){
+  const selected=autoPromptState.selected;
+  const value=(selected&&autoPromptState.profiles[selected])?autoPromptState.profiles[selected]:autoPromptState.settings;
+  $('ap_model').value=String(value.model||'gpt-5.6');
+  $('ap_instructions').value=String(value.instructions||'');
+  $('ap_profile_name').value=selected||'';
+  renderAutoPromptProfiles();
+}
+function openAutoPromptSettings(){
+  syncAutoPromptControls();
+  $('auto_prompt_modal').classList.remove('hidden');
+  $('auto_prompt_modal').setAttribute('aria-hidden','false');
+}
+function closeAutoPromptSettings(){
+  $('auto_prompt_modal').classList.add('hidden');
+  $('auto_prompt_modal').setAttribute('aria-hidden','true');
+}
+function currentAutoPromptConfig(){
+  return {
+    model:String(autoPromptState.settings.model||'gpt-5.6'),
+    instructions:String(autoPromptState.settings.instructions||'')
+  };
+}
+async function runAutoPrompt(button){
+  const target=$(button.dataset.target);
+  if(!target)return;
+  const sourceId=button.dataset.source||'';
+  const source=sourceId&&$(sourceId)&&$(sourceId).files?$(sourceId).files[0]:null;
+  if(!String(target.value||'').trim()&&!source){
+    const statusId=button.dataset.mode==='image'?'i_status':button.dataset.mode==='inpaint'?'in_status':'t_status';
+    setStatus(statusId,'Enter a prompt or attach a source image first.','bad');
+    return;
+  }
+  const statusId=button.dataset.mode==='image'?'i_status':button.dataset.mode==='inpaint'?'in_status':'t_status';
+  const old=button.textContent;
+  button.classList.add('busy');button.disabled=true;button.textContent='✦ WRITING…';
+  setStatus(statusId,'Auto Prompt is refining the prompt…','');
+  try{
+    const cfg=currentAutoPromptConfig();
+    const fd=new FormData();
+    fd.append('prompt',target.value||'');
+    fd.append('mode',button.dataset.mode||'text');
+    fd.append('instructions',cfg.instructions||'');
+    fd.append('agent_model',cfg.model||'gpt-5.6');
+    if(source)fd.append('source',source);
+    const d=await fetchJson('/api/auto_prompt',{method:'POST',body:fd});
+    target.value=d.prompt||target.value;
+    target.dispatchEvent(new Event('input',{bubbles:true}));
+    setStatus(statusId,'Auto Prompt ready. Review or edit it, then generate.','good');
+  }catch(e){
+    setStatus(statusId,e.message,'bad');
+  }finally{
+    button.classList.remove('busy');button.disabled=false;button.textContent=old;
+  }
+}
+
+loadAutoPromptState();
+document.querySelectorAll('.auto-prompt-run').forEach(btn=>btn.addEventListener('click',()=>runAutoPrompt(btn)));
+document.querySelectorAll('.auto-prompt-settings').forEach(btn=>btn.addEventListener('click',openAutoPromptSettings));
+$('ap_close').onclick=closeAutoPromptSettings;
+$('ap_cancel').onclick=closeAutoPromptSettings;
+$('auto_prompt_modal').addEventListener('click',ev=>{if(ev.target===$('auto_prompt_modal'))closeAutoPromptSettings()});
+$('ap_profile').addEventListener('change',()=>{
+  const name=$('ap_profile').value;
+  autoPromptState.selected=name;
+  if(name&&autoPromptState.profiles[name]){
+    const p=autoPromptState.profiles[name];
+    $('ap_model').value=String(p.model||'gpt-5.6');
+    $('ap_instructions').value=String(p.instructions||'');
+    $('ap_profile_name').value=name;
+  }else{
+    $('ap_model').value=String(autoPromptState.settings.model||'gpt-5.6');
+    $('ap_instructions').value=String(autoPromptState.settings.instructions||'');
+    $('ap_profile_name').value='';
+  }
+  $('ap_profile_delete').disabled=!name;
+  saveAutoPromptState();
+});
+$('ap_profile_save').onclick=()=>{
+  const name=String($('ap_profile_name').value||'').trim();
+  if(!name)return;
+  autoPromptState.profiles[name]={
+    model:String($('ap_model').value||'gpt-5.6').trim(),
+    instructions:String($('ap_instructions').value||'')
+  };
+  autoPromptState.selected=name;
+  saveAutoPromptState();renderAutoPromptProfiles();$('ap_profile').value=name;$('ap_profile_delete').disabled=false;
+};
+$('ap_profile_delete').onclick=()=>{
+  const name=$('ap_profile').value;
+  if(!name)return;
+  delete autoPromptState.profiles[name];
+  autoPromptState.selected='';
+  saveAutoPromptState();syncAutoPromptControls();
+};
+$('ap_save_settings').onclick=()=>{
+  autoPromptState.settings={
+    model:String($('ap_model').value||'gpt-5.6').trim(),
+    instructions:String($('ap_instructions').value||'')
+  };
+  autoPromptState.selected='';
+  saveAutoPromptState();closeAutoPromptSettings();
+};
+document.addEventListener('keydown',ev=>{
+  if(ev.key==='Escape'&&!$('auto_prompt_modal').classList.contains('hidden'))closeAutoPromptSettings();
+});
+
 const STAGE_EMPTY_TEXT={
   t_result:'Generated image appears here.',
   i_result:'Generated image appears here.',
@@ -5646,6 +5965,11 @@ bindLightning('in_lightning','in_steps','in_cfg','in_sampler','in_scheduler');
 fetchJson('/api/meta').then(d=>{
   const profile=(d.gpu_profile||'auto').toUpperCase();
   $('gpu_chip').textContent=d.gpu+' · '+d.vram_gib.toFixed(1)+' GiB · '+profile;
+  const api=$('ap_api_status');
+  if(api){
+    api.textContent=d.openai_available?'✓ OPENAI_API_KEY available to Auto Prompt.':'✗ OPENAI_API_KEY unavailable — Auto Prompt is disabled.';
+    api.className=d.openai_available?'auto-api-ok':'auto-api-bad';
+  }
   const defs=d.defaults||{};
   if($("t_width") && defs.text_width) $("t_width").value=String(defs.text_width);
   if($("t_height") && defs.text_height) $("t_height").value=String(defs.text_height);
