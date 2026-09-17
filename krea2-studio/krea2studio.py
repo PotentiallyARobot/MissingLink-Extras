@@ -30,7 +30,7 @@
 #
 # GENERATION
 #   8 steps / CFG 1 / Euler / Simple
-#   Inpaint: masked-latent neutralization + focused crop/upscale + soft composite
+#   Inpaint: Krea2 Identity Edit v1.2 + grounded instruction edit + masked focus composite
 #
 # OPENAI
 #   User-selectable model, reasoning effort/mode, and token budget
@@ -85,6 +85,12 @@ VAE_FILENAME = "qwen_image_vae.safetensors"
 LIGHTNING_HF_REPO = "lvladikov/Krea2-Turbo-Distill-4step-LoRA"
 LIGHTNING_REPO_FILE = "krea2_turbo_4step_rank_64_lora_comfyui.safetensors"
 LIGHTNING_FILENAME = "krea2_turbo_4step_rank_64_lora_comfyui.safetensors"
+
+KREA2_EDIT_NODE_REPO = "https://github.com/lbouaraba/comfyui-krea2edit"
+KREA2_EDIT_HF_REPO = "conradlocke/krea2-identity-edit"
+KREA2_EDIT_FILE_FULL = "krea2_identity_edit_v1_2.safetensors"
+KREA2_EDIT_FILE_R128 = "krea2_identity_edit_v1_2_r128.safetensors"
+KREA2_EDIT_FILE_R64 = "krea2_identity_edit_v1_2_r64.safetensors"
 
 # =====================================================================
 # COLAB SECRETS
@@ -304,6 +310,16 @@ print("Auto profile:", GPU_PROFILE.upper())
 print("Text encoder:", CLIP_FILENAME, "(low-VRAM mode)" if LOW_VRAM_MODE else "(quality mode)")
 print("Default canvas:", f'{DEFAULTS["text_width"]}x{DEFAULTS["text_height"]}')
 
+if GPU_PROFILE == "t4":
+    KREA2_EDIT_REPO_FILE = KREA2_EDIT_FILE_R64
+elif LOW_VRAM_MODE:
+    KREA2_EDIT_REPO_FILE = KREA2_EDIT_FILE_R128
+else:
+    KREA2_EDIT_REPO_FILE = KREA2_EDIT_FILE_R128
+
+KREA2_EDIT_FILENAME = Path(KREA2_EDIT_REPO_FILE).name
+print("Identity edit LoRA:", KREA2_EDIT_FILENAME)
+
 # =====================================================================
 # COMFYUI
 # =====================================================================
@@ -433,12 +449,15 @@ DIFFUSION_DIR = COMFY_DIR / "models" / "diffusion_models"
 TEXT_ENCODER_DIR = COMFY_DIR / "models" / "text_encoders"
 VAE_DIR = COMFY_DIR / "models" / "vae"
 LORA_DIR = COMFY_DIR / "models" / "loras"
+CUSTOM_NODES_DIR = COMFY_DIR / "custom_nodes"
+KREA2_EDIT_NODE_DIR = CUSTOM_NODES_DIR / "comfyui-krea2edit"
 
 for directory in [
     DIFFUSION_DIR,
     TEXT_ENCODER_DIR,
     VAE_DIR,
     LORA_DIR,
+    CUSTOM_NODES_DIR,
     OUTPUT_DIR,
 ]:
     directory.mkdir(
@@ -578,6 +597,39 @@ def ensure_model_safetensors(
     print(f"✓ {label} downloaded from MissingLink public bucket")
     print(destination)
 
+def ensure_git_checkout(repo_url, destination):
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    if (destination / ".git").exists():
+        print(f"Updating {destination.name} custom nodes...")
+        subprocess.run(["git", "-C", str(destination), "fetch", "--depth", "1", "origin", "main"], check=False)
+        reset = subprocess.run(
+            ["git", "-C", str(destination), "reset", "--hard", "origin/main"],
+            text=True,
+            capture_output=True,
+        )
+        if reset.returncode != 0:
+            raise RuntimeError(
+                f"Could not update {destination.name}: {reset.stderr or reset.stdout}"
+            )
+        return
+
+    if destination.exists():
+        shutil.rmtree(destination, ignore_errors=True)
+
+    print(f"Cloning {destination.name} custom nodes...")
+    clone = subprocess.run(
+        ["git", "clone", "--depth", "1", repo_url, str(destination)],
+        text=True,
+        capture_output=True,
+    )
+    if clone.returncode != 0:
+        raise RuntimeError(
+            f"Could not clone {repo_url}: {clone.stderr or clone.stdout}"
+        )
+
+
 def ensure_hf_safetensors(
     repo_id,
     repo_file,
@@ -661,6 +713,13 @@ def ensure_hf_safetensors(
 
 
 print()
+print("Installing/updating ComfyUI-Krea2Edit custom nodes...")
+ensure_git_checkout(
+    KREA2_EDIT_NODE_REPO,
+    KREA2_EDIT_NODE_DIR,
+)
+
+print()
 print("=" * 72)
 print("VALIDATING MODEL FILES")
 print("=" * 72)
@@ -693,6 +752,14 @@ ensure_hf_safetensors(
     LORA_DIR / LIGHTNING_FILENAME,
     10_000_000,
     "Krea2 Turbo 4-step acceleration LoRA",
+)
+
+ensure_hf_safetensors(
+    KREA2_EDIT_HF_REPO,
+    KREA2_EDIT_REPO_FILE,
+    LORA_DIR / KREA2_EDIT_FILENAME,
+    100_000_000,
+    "Krea2 Identity Edit v1.2 LoRA",
 )
 
 # =====================================================================
@@ -791,27 +858,42 @@ print("=" * 76)
 # COMFYUI
 # =====================================================================
 
+import asyncio
+import execution
+import server
+import nodes
 import folder_paths
 import comfy.model_management as model_management
 
-from nodes import (
-    UNETLoader,
-    CLIPLoader,
-    VAELoader,
-    CLIPTextEncode,
-    ConditioningZeroOut,
-    EmptyLatentImage,
-    VAEEncode,
-    SetLatentNoiseMask,
-    KSampler,
-    VAEDecode,
-    LoraLoaderModelOnly,
-)
+_async_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(_async_loop)
+PROMPT_SERVER = server.PromptServer(_async_loop)
+PROMPT_QUEUE = execution.PromptQueue(PROMPT_SERVER)
+nodes.init_extra_nodes(init_custom_nodes=True)
+
+UNETLoader = nodes.UNETLoader
+CLIPLoader = nodes.CLIPLoader
+VAELoader = nodes.VAELoader
+CLIPTextEncode = nodes.CLIPTextEncode
+ConditioningZeroOut = nodes.ConditioningZeroOut
+EmptyLatentImage = nodes.EmptyLatentImage
+VAEEncode = nodes.VAEEncode
+SetLatentNoiseMask = nodes.SetLatentNoiseMask
+KSampler = nodes.KSampler
+VAEDecode = nodes.VAEDecode
+LoraLoaderModelOnly = nodes.LoraLoaderModelOnly
+
+if "Krea2EditModelPatch" not in nodes.NODE_CLASS_MAPPINGS or "Krea2EditGroundedEncode" not in nodes.NODE_CLASS_MAPPINGS:
+    raise RuntimeError(
+        "ComfyUI-Krea2Edit custom nodes did not load. "
+        "Ensure ComfyUI/custom_nodes/comfyui-krea2edit is present and restart the app."
+    )
 
 MODEL_NAME = "krea2-def.safetensors"
 CLIP_NAME = "__CLIP_FILENAME__"
 VAE_NAME = "qwen_image_vae.safetensors"
 LIGHTNING_LORA_NAME = "krea2_turbo_4step_rank_64_lora_comfyui.safetensors"
+EDIT_LORA_NAME = "__EDIT_LORA_FILENAME__"
 LOW_VRAM_MODE = __LOW_VRAM_MODE__
 GPU_PROFILE = "__GPU_PROFILE__"
 DEFAULT_TEXT_WIDTH = __DEFAULT_TEXT_WIDTH__
@@ -826,6 +908,7 @@ for category, filename in [
     ("text_encoders", CLIP_NAME),
     ("vae", VAE_NAME),
     ("loras", LIGHTNING_LORA_NAME),
+    ("loras", EDIT_LORA_NAME),
 ]:
 
     resolved = folder_paths.get_full_path_or_raise(
@@ -879,6 +962,9 @@ NOISE_MASK = SetLatentNoiseMask()
 SAMPLER = KSampler()
 VAE_DECODER = VAEDecode()
 LIGHTNING_LOADER = LoraLoaderModelOnly()
+EDIT_LOADER = LoraLoaderModelOnly()
+KREA2_EDIT_PATCH = nodes.NODE_CLASS_MAPPINGS["Krea2EditModelPatch"]()
+KREA2_EDIT_GROUNDED = nodes.NODE_CLASS_MAPPINGS["Krea2EditGroundedEncode"]()
 
 STEPS = 8
 CFG = 1.0
@@ -889,6 +975,20 @@ def generation_model(lightning_enabled=False, lightning_strength=1.0):
     strength = max(0.0, min(1.5, float(lightning_strength)))
     return LIGHTNING_LOADER.load_lora_model_only(
         UNET, LIGHTNING_LORA_NAME, strength
+    )[0]
+
+
+def identity_edit_model(
+    lightning_enabled=False,
+    lightning_strength=1.0,
+    edit_lora_strength=1.0,
+):
+    base_model = generation_model(lightning_enabled, lightning_strength)
+    strength = max(0.0, min(1.5, float(edit_lora_strength)))
+    return EDIT_LOADER.load_lora_model_only(
+        base_model,
+        EDIT_LORA_NAME,
+        strength,
     )[0]
 
 SAMPLER_NAME = "euler"
@@ -1460,6 +1560,51 @@ def encode_prompt(prompt, negative_prompt=None):
     _emit_progress("Prompt ready", pct=14)
     return positive, negative
 
+
+@torch.inference_mode()
+def encode_grounded_edit_prompt(
+    prompt,
+    source_image,
+    negative_prompt="",
+    grounding_px=768,
+    ground_negative=False,
+):
+
+    prompt = str(prompt or "").strip()
+    negative_prompt = str(negative_prompt or "").strip()
+
+    if not prompt:
+        raise ValueError("Enter an edit instruction.")
+
+    check_stop()
+    _emit_progress("Encoding grounded edit prompt", pct=8)
+
+    source_tensor = pil_to_tensor(source_image)
+    grounding_px = max(0, int(grounding_px or 0))
+
+    positive = KREA2_EDIT_GROUNDED.encode(
+        clip=CLIP,
+        prompt=prompt,
+        image=source_tensor,
+        grounding_px=grounding_px,
+    )[0]
+
+    if ground_negative or negative_prompt:
+        negative = KREA2_EDIT_GROUNDED.encode(
+            clip=CLIP,
+            prompt=negative_prompt,
+            image=source_tensor,
+            grounding_px=grounding_px,
+        )[0]
+    else:
+        negative = ZERO_OUT.zero_out(
+            conditioning=positive,
+        )[0]
+
+    check_stop()
+    _emit_progress("Grounded prompt ready", pct=14)
+    return positive, negative
+
 # =====================================================================
 # VAE
 # =====================================================================
@@ -1888,6 +2033,133 @@ def image_to_image(
         history_files,
     )
 
+def instruction_edit(
+    source,
+    prompt,
+    max_side,
+    seed,
+    negative_prompt="",
+    steps=STEPS,
+    cfg=CFG,
+    sampler_name=SAMPLER_NAME,
+    scheduler=SCHEDULER,
+    lightning_enabled=False,
+    lightning_strength=1.0,
+    edit_lora_strength=1.0,
+    ref_boost=4.5,
+    grounding_px=768,
+    fit_mode="fit",
+    ground_negative=False,
+):
+
+    source = resize_image(source, max_side)
+
+    steps = int(steps)
+    cfg = float(cfg)
+    sampler_name = str(sampler_name or SAMPLER_NAME)
+    scheduler = str(scheduler or SCHEDULER)
+    lightning_enabled = bool(lightning_enabled)
+    lightning_strength = max(0.0, min(1.5, float(lightning_strength)))
+    edit_lora_strength = max(0.0, min(1.5, float(edit_lora_strength)))
+    ref_boost = max(0.0, min(1000.0, float(ref_boost)))
+    grounding_px = max(0, int(grounding_px or 0))
+    fit_mode = "crop (legacy)" if str(fit_mode or "fit").lower().startswith("crop") else "fit"
+    ground_negative = bool(ground_negative or cfg > 1.0 or str(negative_prompt or "").strip())
+
+    raw_prompt = str(prompt or "").strip()
+    if not raw_prompt:
+        raise ValueError("Enter an edit instruction.")
+
+    effective_prompt = (
+        "Edit the source image according to the instruction while preserving the same "
+        "subject identity where applicable, scene layout, perspective, lighting, colour, "
+        "materials and camera feel unless the instruction clearly asks for a broader change. "
+        "Keep the result cohesive and photorealistic. Edit instruction: "
+        + raw_prompt
+    )
+
+    positive, negative = encode_grounded_edit_prompt(
+        effective_prompt,
+        source,
+        negative_prompt=negative_prompt,
+        grounding_px=grounding_px,
+        ground_negative=ground_negative,
+    )
+
+    source_latent = vae_encode(source)
+    target_latent = EMPTY_LATENT.generate(
+        width=round16(source.width),
+        height=round16(source.height),
+        batch_size=1,
+    )[0]
+
+    patched_model = KREA2_EDIT_PATCH.patch(
+        model=identity_edit_model(
+            lightning_enabled=lightning_enabled,
+            lightning_strength=lightning_strength,
+            edit_lora_strength=edit_lora_strength,
+        ),
+        source_latent=source_latent,
+        ref_boost=ref_boost,
+        fit_mode=fit_mode,
+        vae=VAE,
+        source_image=pil_to_tensor(source),
+        target_latent=target_latent,
+    )[0]
+
+    sampled, seed, sample_time = sample_latent(
+        target_latent,
+        positive,
+        negative,
+        seed,
+        1.0,
+        steps=steps,
+        cfg=cfg,
+        sampler_name=sampler_name,
+        scheduler=scheduler,
+        model=patched_model,
+    )
+
+    generated = vae_decode(sampled)
+    if generated.size != source.size:
+        generated = generated.resize(source.size, Image.Resampling.LANCZOS)
+
+    path = save_image(
+        generated,
+        "instruction_edit",
+        prompt,
+        seed,
+        {
+            "negative_prompt": str(negative_prompt or ""),
+            "effective_prompt": effective_prompt,
+            "edit_engine": "krea2_identity_edit_v1_2",
+            "edit_lora": EDIT_LORA_NAME,
+            "edit_lora_strength": float(edit_lora_strength),
+            "ref_boost": float(ref_boost),
+            "grounding_px": int(grounding_px),
+            "fit_mode": fit_mode,
+            "ground_negative": bool(ground_negative),
+            "steps": steps,
+            "cfg": cfg,
+            "sampler": sampler_name,
+            "scheduler": scheduler,
+            "acceleration": "krea2-turbo-4step-lora" if lightning_enabled else "stock-turbo",
+            "acceleration_strength": lightning_strength if lightning_enabled else 0.0,
+            "sample_time": sample_time,
+        },
+    )
+
+    history_gallery, history_files = history_snapshot()
+    return (
+        path,
+        seed,
+        f"seed={seed} | Instruction Edit | ref_boost={ref_boost:g} | grounding={grounding_px or max(source.size)}",
+        path,
+        history_gallery,
+        history_files,
+    )
+
+
 # =====================================================================
 # INPAINT
 # =====================================================================
@@ -2223,6 +2495,11 @@ def inpaint(
     scheduler=SCHEDULER,
     lightning_enabled=False,
     lightning_strength=1.0,
+    edit_lora_strength=1.0,
+    ref_boost=4.0,
+    grounding_px=768,
+    fit_mode="fit",
+    ground_negative=False,
 ):
 
     steps = int(steps)
@@ -2231,9 +2508,11 @@ def inpaint(
     scheduler = str(scheduler or SCHEDULER)
     lightning_enabled = bool(lightning_enabled)
     lightning_strength = max(0.0, min(1.5, float(lightning_strength)))
-    if lightning_enabled:
-        steps, cfg, sampler_name, scheduler = 4, 1.0, "euler", "simple"
-    active_model = generation_model(lightning_enabled, lightning_strength)
+    edit_lora_strength = max(0.0, min(1.5, float(edit_lora_strength)))
+    ref_boost = max(0.0, min(1000.0, float(ref_boost)))
+    grounding_px = max(0, int(grounding_px or 0))
+    fit_mode = "crop (legacy)" if str(fit_mode or "fit").lower().startswith("crop") else "fit"
+    ground_negative = bool(ground_negative or cfg > 1.0 or str(negative_prompt or "").strip())
 
     original, mask = editor_to_image_mask(editor)
     original, mask = resize_image_mask(original, mask, max_side)
@@ -2252,38 +2531,16 @@ def inpaint(
     if focus_box is not None:
         fx0, fy0, fx1, fy1 = focus_box
         focus_area = max(1, (fx1 - fx0) * (fy1 - fy0))
-        # Avoid needless crop/resize when the edit already occupies most of frame.
-        use_focus = focus_area < full_area * 0.88
+        use_focus = focus_area < full_area * 0.95
 
     if use_focus:
         x0, y0, x1, y1 = focus_box
         native_source = original.crop((x0, y0, x1, y1))
         native_mask = mask.crop((x0, y0, x1, y1))
-
         work_source, work_mask, focus_scale = _resize_focus_pair(
             native_source,
             native_mask,
             max_side,
-        )
-
-        # Keep mask-control distances approximately constant in source-image
-        # pixels after the crop is enlarged for generation.
-        work_expand = int(round(float(expand) * focus_scale))
-        work_feather = int(round(float(feather) * focus_scale))
-        work_context = int(round(float(context_padding) * focus_scale))
-        work_latent_feather = int(round(float(latent_feather) * focus_scale))
-
-        # Krea2 is not a native inpaint model. Denoise the entire focused crop
-        # instead of freezing every pixel outside a latent noise mask. The model
-        # core is erased more generously than the final visible composite.
-        model_core = _morph_mask(
-            work_mask,
-            max(-96, min(96, work_expand + work_context)),
-        ).point(lambda x: 255 if x > 6 else 0)
-
-        latent = vae_encode_inpaint(
-            work_source,
-            model_core,
         )
     else:
         native_source = original
@@ -2291,54 +2548,68 @@ def inpaint(
         work_source = original
         work_mask = mask
         focus_scale = 1.0
-        _, _, blend_mask = prepare_inpaint_masks(
-            work_mask,
-            expand,
-            feather,
-            context_padding,
-            latent_feather,
-        )
-        model_core = _morph_mask(
-            work_mask,
-            max(-96, min(96, int(expand) + int(context_padding))),
-        ).point(lambda x: 255 if x > 6 else 0)
-        latent = vae_encode_inpaint(
-            work_source,
-            model_core,
-        )
+
+    _, _, blend_mask = prepare_inpaint_masks(
+        work_mask,
+        expand,
+        feather,
+        context_padding,
+        latent_feather,
+    )
 
     raw_prompt = str(prompt or "").strip()
     if not raw_prompt:
-        raise ValueError("Enter a replacement prompt.")
+        raise ValueError("Enter an edit instruction.")
 
-    # Krea2 denoises the whole focused crop, so prompt for continuity as well
-    # as the local edit. The requested change is still the dominant instruction.
     effective_prompt = (
-        "Preserve the same source scene, subject identity where applicable, "
-        "pose, camera viewpoint, perspective, lighting, colour palette, scale, "
-        "materials and surrounding environment. Make a seamless local edit "
-        "that matches the source. Requested change in the editable region: "
+        "Edit the source image according to the instruction while preserving the same "
+        "scene, identity where applicable, pose, perspective, scale, lighting, colour, "
+        "materials and camera feel unless the instruction clearly asks for a broader change. "
+        "Apply the requested change primarily within the painted region and keep nearby "
+        "boundaries coherent. Edit instruction: "
         + raw_prompt
-        + ". The edited content must be coherent with nearby anatomy or object "
-          "geometry, contact, occlusion, shadows, texture and focus."
     )
 
-    positive, negative = encode_prompt(
+    positive, negative = encode_grounded_edit_prompt(
         effective_prompt,
-        negative_prompt,
+        work_source,
+        negative_prompt=negative_prompt,
+        grounding_px=grounding_px,
+        ground_negative=ground_negative,
     )
+
+    source_latent = vae_encode(work_source)
+    target_latent = EMPTY_LATENT.generate(
+        width=round16(work_source.width),
+        height=round16(work_source.height),
+        batch_size=1,
+    )[0]
+
+    patched_model = KREA2_EDIT_PATCH.patch(
+        model=identity_edit_model(
+            lightning_enabled=lightning_enabled,
+            lightning_strength=lightning_strength,
+            edit_lora_strength=edit_lora_strength,
+        ),
+        source_latent=source_latent,
+        ref_boost=ref_boost,
+        fit_mode=fit_mode,
+        vae=VAE,
+        source_image=pil_to_tensor(work_source),
+        target_latent=target_latent,
+    )[0]
 
     sampled, seed, sample_time = sample_latent(
-        latent,
+        target_latent,
         positive,
         negative,
         seed,
-        float(denoise),
+        1.0,
         steps=steps,
         cfg=cfg,
         sampler_name=sampler_name,
         scheduler=scheduler,
-        model=active_model,
+        model=patched_model,
     )
 
     generated = vae_decode(sampled)
@@ -2353,9 +2624,6 @@ def inpaint(
             native_source.size,
             Image.Resampling.LANCZOS,
         )
-
-        # Blend at native image resolution so the focus upscale does not soften
-        # untouched pixels in the crop when it is pasted back into the source.
         _, _, native_blend_mask = prepare_inpaint_masks(
             native_mask,
             expand,
@@ -2387,8 +2655,13 @@ def inpaint(
         {
             "negative_prompt": str(negative_prompt or ""),
             "effective_prompt": effective_prompt,
-            "inpaint_engine": "contextual_crop_img2img",
-            "denoise": float(denoise),
+            "inpaint_engine": "krea2_identity_edit_v1_2",
+            "edit_lora": EDIT_LORA_NAME,
+            "edit_lora_strength": float(edit_lora_strength),
+            "ref_boost": float(ref_boost),
+            "grounding_px": int(grounding_px),
+            "fit_mode": fit_mode,
+            "ground_negative": bool(ground_negative),
             "mask_expand": int(expand),
             "feather": int(feather),
             "context_padding": int(context_padding),
@@ -2397,7 +2670,6 @@ def inpaint(
             "focus_used": bool(use_focus),
             "focus_padding": float(focus_padding),
             "focus_scale": float(focus_scale),
-            "whole_crop_denoise": True,
             "focus_box": focus_box_meta,
             "steps": steps,
             "cfg": cfg,
@@ -2421,7 +2693,7 @@ def inpaint(
         path,
         seed,
         (
-            f"seed={seed} | denoise={float(denoise):.2f}"
+            f"seed={seed} | Krea2Edit | ref_boost={ref_boost:g} | grounding={grounding_px or max(work_source.size)}"
             + focus_status
         ),
         path,
@@ -2606,6 +2878,7 @@ def create_auto_prompt(
     mode_names = {
         "text": "Text -> Image",
         "image": "Image -> Image",
+        "edit": "Instruction Edit",
         "inpaint": "Inpaint",
     }
     mode_name = mode_names.get(mode, "Text -> Image")
@@ -4553,6 +4826,30 @@ def _execute_job(jid):
         return {"image": _output_url(path), "seed": seed, "status": status,
                 "download": _output_url(download_path)}
 
+    if kind == "edit":
+        source = _load_job_image(params["source_path"])
+        result = instruction_edit(
+            source=source,
+            prompt=params["prompt"],
+            max_side=params["max_side"],
+            seed=params["seed"],
+            negative_prompt=params.get("negative_prompt", ""),
+            edit_lora_strength=params.get("edit_lora_strength", 1.0),
+            ref_boost=params.get("ref_boost", 4.5),
+            grounding_px=params.get("grounding_px", 768),
+            fit_mode=params.get("fit_mode", "fit"),
+            ground_negative=params.get("ground_negative", False),
+            steps=params.get("steps", STEPS),
+            cfg=params.get("cfg", CFG),
+            sampler_name=params.get("sampler", SAMPLER_NAME),
+            scheduler=params.get("scheduler", SCHEDULER),
+            lightning_enabled=params.get("lightning_enabled", False),
+            lightning_strength=params.get("lightning_strength", 1.0),
+        )
+        path, seed, status, download_path, _, _ = result
+        return {"image": _output_url(path), "seed": seed, "status": status,
+                "download": _output_url(download_path)}
+
     if kind == "inpaint":
         source = _load_job_image(params["source_path"])
         mask = _load_job_image(params["mask_path"], mode="L")
@@ -4570,6 +4867,11 @@ def _execute_job(jid):
             focus_enabled=params.get("focus_enabled", True),
             focus_padding=params.get("focus_padding", 70),
             negative_prompt=params.get("negative_prompt", ""),
+            edit_lora_strength=params.get("edit_lora_strength", 1.0),
+            ref_boost=params.get("ref_boost", 4.0),
+            grounding_px=params.get("grounding_px", 768),
+            fit_mode=params.get("fit_mode", "fit"),
+            ground_negative=params.get("ground_negative", False),
             steps=params.get("steps", STEPS),
             cfg=params.get("cfg", CFG),
             sampler_name=params.get("sampler", SAMPLER_NAME),
@@ -4881,6 +5183,40 @@ def api_image_to_image():
         return _json_error(exc, 409 if "Queue is full" in str(exc) else 400)
 
 
+@app.post("/api/instruction_edit")
+def api_instruction_edit():
+    source = _pil_upload(request.files.get("source"))
+    if source is None:
+        return _json_error("Upload a source image.")
+    source_path = _save_job_image(source, "instruction_edit_source")
+    try:
+        jid = _submit_job(
+            "edit",
+            {
+                "source_path": source_path,
+                "prompt": request.form.get("prompt"),
+                "negative_prompt": request.form.get("negative_prompt", ""),
+                "edit_lora_strength": _float_value(request.form.get("edit_lora_strength"), 1.0, 0.0, 1.5),
+                "ref_boost": _float_value(request.form.get("ref_boost"), 4.5, 0.0, 1000.0),
+                "grounding_px": _int_value(request.form.get("grounding_px"), 768, 0, 4096),
+                "fit_mode": str(request.form.get("fit_mode") or "fit"),
+                "ground_negative": str(request.form.get("ground_negative") or "0").lower() in {"1","true","yes","on"},
+                "max_side": _int_value(request.form.get("max_side"), DEFAULT_IMAGE_MAX_SIDE, 256, 2048),
+                "seed": _int_value(request.form.get("seed"), -1),
+                "steps": _int_value(request.form.get("steps"), 10, 1, 80),
+                "cfg": _float_value(request.form.get("cfg"), 1.2, 0.0, 30.0),
+                "sampler": str(request.form.get("sampler") or SAMPLER_NAME),
+                "scheduler": str(request.form.get("scheduler") or SCHEDULER),
+                "lightning_enabled": str(request.form.get("lightning_enabled") or "").lower() in {"1","true","yes","on"},
+                "lightning_strength": _float_value(request.form.get("lightning_strength"), 1.0, 0.0, 1.5),
+            },
+            label="Instruction Edit", mode="edit", thumb=_input_url(source_path),
+        )
+        return jsonify(ok=True, id=jid, queued=True), 202
+    except Exception as exc:
+        return _json_error(exc, 409 if "Queue is full" in str(exc) else 400)
+
+
 @app.post("/api/inpaint")
 def api_inpaint():
     source = _pil_upload(request.files.get("source"))
@@ -4898,7 +5234,12 @@ def api_inpaint():
                 "source_path": source_path, "mask_path": mask_path,
                 "prompt": request.form.get("prompt"),
                 "negative_prompt": request.form.get("negative_prompt", ""),
-                "denoise": _float_value(request.form.get("denoise"), 0.88, 0.1, 1.0),
+                "denoise": _float_value(request.form.get("denoise"), 1.0, 0.0, 1.0),
+                "edit_lora_strength": _float_value(request.form.get("edit_lora_strength"), _float_value(request.form.get("denoise"), 1.0, 0.0, 1.5), 0.0, 1.5),
+                "ref_boost": _float_value(request.form.get("ref_boost"), 4.0, 0.0, 1000.0),
+                "grounding_px": _int_value(request.form.get("grounding_px"), 768, 0, 4096),
+                "fit_mode": str(request.form.get("fit_mode") or "fit"),
+                "ground_negative": str(request.form.get("ground_negative") or "0").lower() in {"1","true","yes","on"},
                 "max_side": _int_value(request.form.get("max_side"), DEFAULT_INPAINT_MAX_SIDE, 256, 2048),
                 "expand": _int_value(request.form.get("expand"), 24, -96, 96),
                 "feather": _int_value(request.form.get("feather"), 8, 0, 96),
@@ -5502,6 +5843,7 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
       <nav class="mode-tabs">
         <button class="tab active" data-tab="text">TEXT → IMAGE</button>
         <button class="tab" data-tab="image">IMAGE → IMAGE</button>
+        <button class="tab" data-tab="edit">INSTRUCTION EDIT</button>
         <button class="tab" data-tab="inpaint">INPAINT</button>
         <button class="tab" data-tab="batch">ADAPTIVE BATCH</button>
         <button class="tab" data-tab="history">HISTORY</button>
@@ -5591,6 +5933,62 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
           </div>
         </section>
 
+        <section id="panel_edit" class="controlpanel">
+          <div class="card">
+            <div class="cardtitle">Instruction Edit</div>
+            <div class="cardbody">
+              <label>Source image</label>
+              <input id="e_source" class="nativefile" type="file" accept="image/*">
+              <div class="uploadrow">
+                <button id="e_source_pick" class="filepick" type="button"><span class="filepickicon">＋</span><span>Choose image</span></button>
+                <span id="e_source_name" class="filemeta">No image selected</span>
+              </div>
+              <div id="e_preview" class="preview"><div class="empty">Choose a source image.</div></div>
+              <label>Edit instruction</label>
+              <textarea id="e_prompt" placeholder="Examples: change the outfit to a black latex catsuit; remove the object on the table; make the room look more luxurious; replace the hairstyle with a platinum bob."></textarea>
+              <div class="auto-prompt-row">
+                <button type="button" class="auto-prompt-run" data-target="e_prompt" data-mode="edit" data-source="e_source">✦ AUTO PROMPT</button>
+                <button type="button" class="secondary auto-prompt-settings" title="Auto Prompt settings">⚙</button>
+              </div>
+              <label>Negative prompt</label>
+              <textarea id="e_negative" placeholder="Optional: what should the model avoid?"></textarea>
+              <details open>
+                <summary>Identity Edit controls</summary>
+                <div class="inside">
+                  <div class="grid2compact">
+                    <div><label>Edit LoRA strength</label><input id="e_edit_lora_strength" type="number" min="0" max="1.5" step=".05" value="1.0"></div>
+                    <div><label>Reference fidelity (ref_boost)</label><input id="e_ref_boost" type="number" min="0" max="20" step=".25" value="4.5"></div>
+                    <div><label>Grounding resolution</label><input id="e_grounding_px" type="number" min="0" max="2048" step="64" value="768"></div>
+                    <div><label>Fit mode</label><select id="e_fit_mode"><option value="fit" selected>fit</option><option value="crop">crop (legacy)</option></select></div>
+                  </div>
+                  <label><input id="e_ground_negative" type="checkbox" style="width:auto"> Ground the negative conditioning too (useful for removals or CFG above 1)</label>
+                  <div class="minihint"><b>Tuned defaults:</b> this tab is for whole-image instruction following without painting a mask. The defaults are aimed at reliable subject-preserving edits. For stronger removals, try CFG 2.0–3.0 and enable grounded negative conditioning.</div>
+                </div>
+              </details>
+              <div class="split">
+                <div><label>Maximum side</label><select id="e_max"></select></div>
+                <div><label>Seed (-1 = random)</label><input id="e_seed" type="number" value="-1"></div>
+              </div>
+              <details>
+                <summary>Sampler + generation settings</summary>
+                <div class="inside">
+                  <div class="grid3">
+                    <div><label>Steps</label><input id="e_steps" type="number" min="1" max="80" value="10"></div>
+                    <div><label>CFG</label><input id="e_cfg" type="number" min="0" max="30" step="0.1" value="1.2"></div>
+                    <div><label>Sampler</label><select id="e_sampler"></select></div>
+                  </div>
+                  <label>Scheduler</label><select id="e_scheduler"></select>
+                  <label><input id="e_lightning" type="checkbox" style="width:auto"> 4-step acceleration LoRA (advanced, may reduce edit fidelity)</label>
+                  <label>Acceleration strength</label><input id="e_lightning_strength" type="number" min="0" max="1.5" step=".05" value="1.0">
+                </div>
+              </details>
+              <div class="actions"><button id="e_generate">INSTRUCTION EDIT</button></div>
+              <div id="e_status" class="status">Ready.</div>
+              <a id="e_download" class="hidden" target="_blank"></a>
+            </div>
+          </div>
+        </section>
+
         <section id="panel_inpaint" class="controlpanel">
           <div class="card">
             <div class="cardtitle">Inpaint</div>
@@ -5618,8 +6016,8 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
                 <button id="in_expand_editor" type="button" class="secondary">LARGE EDITOR</button>
               </div>
               <div id="inpaint_canvas_home" class="paintbox"><canvas id="inpaint_canvas" width="720" height="420"></canvas></div>
-              <div class="minihint">Paint what may change. Right-click temporarily erases. B = paint, E = erase, Ctrl/Cmd+Z = undo. Soft brush edges are preserved.</div>
-              <label>Replacement prompt</label>
+              <div class="minihint">Paint what may change. Krea2 Identity Edit will follow the instruction on the painted area while preserving the surrounding scene. Right-click temporarily erases. B = paint, E = erase, Ctrl/Cmd+Z = undo.</div>
+              <label>Edit instruction</label>
               <textarea id="in_prompt"></textarea>
               <div class="auto-prompt-row">
                 <button type="button" class="auto-prompt-run" data-target="in_prompt" data-mode="inpaint" data-source="in_source">✦ AUTO PROMPT</button>
@@ -5631,14 +6029,17 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
                 <summary>Blend + context controls</summary>
                 <div class="inside">
                   <div class="grid2compact">
-                    <div><label>Denoise</label><input id="in_denoise" type="number" min=".1" max="1" step=".05" value=".88"></div>
-                    <div><label>Output mask grow / shrink</label><input id="in_expand" type="number" min="-96" max="96" value="24"></div>
-                    <div><label>Final blend feather</label><input id="in_feather" type="number" min="0" max="96" value="8"></div>
-                    <div><label>Erased-core padding</label><input id="in_context" type="number" min="0" max="128" value="12"></div>
-                    <div><label>Legacy latent feather</label><input id="in_latent_feather" type="number" min="0" max="48" value="0"></div>
-                    <div><label>Focus crop padding %</label><input id="in_focus_padding" type="number" min="0" max="150" step="5" value="70"></div>
+                    <div><label>Edit LoRA strength</label><input id="in_edit_lora_strength" type="number" min="0" max="1.5" step=".05" value="1.0"></div>
+                    <div><label>Reference fidelity (ref_boost)</label><input id="in_ref_boost" type="number" min="0" max="20" step=".25" value="5.0"></div>
+                    <div><label>Grounding resolution</label><input id="in_grounding_px" type="number" min="0" max="2048" step="64" value="768"></div>
+                    <div><label>Output mask grow / shrink</label><input id="in_expand" type="number" min="-96" max="96" value="32"></div>
+                    <div><label>Final blend feather</label><input id="in_feather" type="number" min="0" max="96" value="10"></div>
+                    <div><label>Scene continuity padding</label><input id="in_context" type="number" min="0" max="128" value="20"></div>
+                    <div><label>Fit mode</label><select id="in_fit_mode"><option value="fit" selected>fit</option><option value="crop">crop (legacy)</option></select></div>
+                    <div><label>Focus crop padding %</label><input id="in_focus_padding" type="number" min="0" max="150" step="5" value="80"></div>
                   </div>
                   <label><input id="in_focus" type="checkbox" style="width:auto" checked> Auto-focus small masks for higher edit resolution</label>
+                  <label><input id="in_ground_negative" type="checkbox" style="width:auto" checked> Ground the negative conditioning too (recommended for CFG > 1 / removals)</label>
                   <div class="minihint"><b>Important:</b> paint the full footprint where new content may appear — anything outside the grown output mask is discarded. Krea2 now denoises the whole focused crop as contextual img2img instead of freezing everything outside a latent noise mask; only the final edit region is pasted back. For large structural insertions, increase Output mask grow and keep Denoise around .80–.92.</div>
                 </div>
               </details>
@@ -5650,16 +6051,16 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
                 <summary>Sampler + generation settings</summary>
                 <div class="inside">
                   <div class="grid3">
-                    <div><label>Steps</label><input id="in_steps" type="number" min="1" max="80" value="8"></div>
-                    <div><label>CFG</label><input id="in_cfg" type="number" min="0" max="30" step="0.1" value="1"></div>
+                    <div><label>Steps</label><input id="in_steps" type="number" min="1" max="80" value="10"></div>
+                    <div><label>CFG</label><input id="in_cfg" type="number" min="0" max="30" step="0.1" value="1.2"></div>
                     <div><label>Sampler</label><select id="in_sampler"></select></div>
                   </div>
                   <label>Scheduler</label><select id="in_scheduler"></select>
-                  <label><input id="in_lightning" type="checkbox" style="width:auto"> 4-step acceleration LoRA</label>
+                  <label><input id="in_lightning" type="checkbox" style="width:auto"> 4-step acceleration LoRA (advanced, may reduce edit fidelity)</label>
                   <label>Acceleration strength</label><input id="in_lightning_strength" type="number" min="0" max="1.5" step=".05" value="1.0">
                 </div>
               </details>
-              <div class="actions"><button id="in_generate">INPAINT</button></div>
+              <div class="actions"><button id="in_generate">EDIT / INPAINT</button></div>
               <div id="in_status" class="status">Ready.</div>
               <a id="in_download" class="hidden" target="_blank"></a>
             </div>
@@ -5786,7 +6187,8 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
       <div class="stage-canvas">
         <div id="t_result" class="stageview single stagepanel active"><div class="empty">Generated image appears here.</div></div>
         <div id="i_result" class="stageview single stagepanel"><div class="empty">Generated image appears here.</div></div>
-        <div id="in_result" class="stageview single stagepanel"><div class="empty">Inpaint result appears here.</div></div>
+        <div id="e_result" class="stageview single stagepanel"><div class="empty">Instruction edit result appears here.</div></div>
+        <div id="in_result" class="stageview single stagepanel"><div class="empty">Edit / inpaint result appears here.</div></div>
         <div id="b_gallery" class="stageview gallerymode stagepanel"><div class="empty">Completed batch images stream here.</div></div>
         <div id="history_stage" class="stageview gallerymode stagepanel"><div class="empty">History images appear here.</div></div>
       </div>
@@ -5886,6 +6288,7 @@ function fillSelect(id, values, selected){
 fillSelect('t_width', dims, __DEFAULT_TEXT_WIDTH__);
 fillSelect('t_height', dims, __DEFAULT_TEXT_HEIGHT__);
 fillSelect('i_max', dims, __DEFAULT_IMAGE_MAX_SIDE__);
+fillSelect('e_max', dims, __DEFAULT_IMAGE_MAX_SIDE__);
 fillSelect('in_max', dims, __DEFAULT_INPAINT_MAX_SIDE__);
 fillSelect('b_width', dims, __DEFAULT_BATCH_WIDTH__);
 fillSelect('b_height', dims, __DEFAULT_BATCH_HEIGHT__);
@@ -5895,8 +6298,8 @@ function fillNamedSelect(id, values, selected){
   const el=$(id); if(!el) return; el.innerHTML='';
   values.forEach(v=>{const o=document.createElement('option'); o.value=v; o.textContent=v; if(v===selected)o.selected=true; el.appendChild(o);});
 }
-['t_sampler','i_sampler','in_sampler'].forEach(id=>fillNamedSelect(id,samplerOptions,'euler'));
-['t_scheduler','i_scheduler','in_scheduler'].forEach(id=>fillNamedSelect(id,schedulerOptions,'simple'));
+['t_sampler','i_sampler','e_sampler','in_sampler'].forEach(id=>fillNamedSelect(id,samplerOptions,'euler'));
+['t_scheduler','i_scheduler','e_scheduler','in_scheduler'].forEach(id=>fillNamedSelect(id,schedulerOptions,'simple'));
 
 function setStatus(id,text,kind=''){
   const el=$(id); el.textContent=text||''; el.className='status'+(kind?' '+kind:'');
@@ -5978,11 +6381,11 @@ async function runAutoPrompt(button){
   const sourceId=button.dataset.source||'';
   const source=sourceId&&$(sourceId)&&$(sourceId).files?$(sourceId).files[0]:null;
   if(!String(target.value||'').trim()&&!source){
-    const statusId=button.dataset.mode==='image'?'i_status':button.dataset.mode==='inpaint'?'in_status':'t_status';
+    const statusId=button.dataset.mode==='image'?'i_status':button.dataset.mode==='edit'?'e_status':button.dataset.mode==='inpaint'?'in_status':'t_status';
     setStatus(statusId,'Enter a prompt or attach a source image first.','bad');
     return;
   }
-  const statusId=button.dataset.mode==='image'?'i_status':button.dataset.mode==='inpaint'?'in_status':'t_status';
+  const statusId=button.dataset.mode==='image'?'i_status':button.dataset.mode==='edit'?'e_status':button.dataset.mode==='inpaint'?'in_status':'t_status';
   const old=button.textContent;
   button.classList.add('busy');button.disabled=true;button.textContent='✦ WRITING…';
   setStatus(statusId,'Auto Prompt is refining the prompt…','');
@@ -6063,14 +6466,15 @@ document.addEventListener('keydown',ev=>{
 const STAGE_EMPTY_TEXT={
   t_result:'Generated image appears here.',
   i_result:'Generated image appears here.',
-  in_result:'Inpaint result appears here.',
+  e_result:'Instruction edit result appears here.',
+  in_result:'Edit / inpaint result appears here.',
   b_gallery:'Completed batch images stream here.',
   history_stage:'History images appear here.'
 };
 const stageState={};
 function ensureStageState(id){ if(!stageState[id]) stageState[id]={mode:'empty',items:[],selected:0}; return stageState[id]; }
-const SINGLE_STAGE_IDS=['t_result','i_result','in_result'];
-const SINGLE_STAGE_DOWNLOADS={t_result:'t_download',i_result:'i_download',in_result:'in_download'};
+const SINGLE_STAGE_IDS=['t_result','i_result','e_result','in_result'];
+const SINGLE_STAGE_DOWNLOADS={t_result:'t_download',i_result:'i_download',e_result:'e_download',in_result:'in_download'};
 function _setSingleStageImage(id,url){
   const wrap=$(id);
   wrap.classList.remove('gallerymode');
@@ -6087,7 +6491,7 @@ function _setSingleStageImage(id,url){
 function setSharedSingleImage(url){
   if(!url) return;
   SINGLE_STAGE_IDS.forEach(id=>_setSingleStageImage(id,url));
-  if(['text','image','inpaint'].includes(activeStudioTab)) syncStageToolbar();
+  if(['text','image','edit','inpaint'].includes(activeStudioTab)) syncStageToolbar();
 }
 function clearSharedSingleStage(){
   SINGLE_STAGE_IDS.forEach(id=>setStageEmpty(id, SINGLE_STAGE_DOWNLOADS[id]));
@@ -6162,6 +6566,7 @@ async function assignImageUrlToEditors(url){
   const blob=await resp.blob();
   const file=new File([blob], 'missinglink-staged.png', {type: blob.type || 'image/png'});
   const dt1=new DataTransfer(); dt1.items.add(file); $('i_source').files=dt1.files; $('i_source').dispatchEvent(new Event('change'));
+  const dtEdit=new DataTransfer(); dtEdit.items.add(file); $('e_source').files=dtEdit.files; $('e_source').dispatchEvent(new Event('change'));
   const dt2=new DataTransfer(); dt2.items.add(file); $('in_source').files=dt2.files; $('in_source').dispatchEvent(new Event('change'));
 }
 function currentStageUrl(id){
@@ -6171,8 +6576,8 @@ function currentStageUrl(id){
   const img=$(id).querySelector('img');
   return img ? (img.dataset.rawUrl || img.src.split('?')[0]) : '';
 }
-const STAGE_BY_TAB={text:'t_result',image:'i_result',inpaint:'in_result',batch:'b_gallery',history:'history_stage'};
-const STAGE_LABELS={text:'TEXT → IMAGE',image:'IMAGE → IMAGE',inpaint:'INPAINT',batch:'ADAPTIVE BATCH',history:'IMAGE HISTORY'};
+const STAGE_BY_TAB={text:'t_result',image:'i_result',edit:'e_result',inpaint:'in_result',batch:'b_gallery',history:'history_stage'};
+const STAGE_LABELS={text:'TEXT → IMAGE',image:'IMAGE → IMAGE',edit:'INSTRUCTION EDIT',inpaint:'INPAINT',batch:'ADAPTIVE BATCH',history:'IMAGE HISTORY'};
 let activeStageId='t_result';
 let activeStudioTab='text';
 function syncStageToolbar(){
@@ -6199,7 +6604,7 @@ function switchStudioTab(tab){
   if(tab==='history') refreshHistory(true);
 }
 $('stage_clear').onclick=()=>{
-  if(['text','image','inpaint'].includes(activeStudioTab)) clearSharedSingleStage();
+  if(['text','image','edit','inpaint'].includes(activeStudioTab)) clearSharedSingleStage();
   else setStageEmpty(activeStageId);
   syncStageToolbar();
 };
@@ -6208,9 +6613,11 @@ $('stage_assign').onclick=async()=>{
     const url=currentStageUrl(activeStageId);
     await assignImageUrlToEditors(url);
     switchStudioTab('image');
-    setStatus('i_status','Staged image assigned as the Image → Image input.','good');
+    setStatus('i_status','Staged image assigned to the edit inputs.','good');
+    setStatus('e_status','Staged image assigned to the edit inputs.','good');
+    setStatus('in_status','Staged image assigned to the edit inputs.','good');
   }catch(e){
-    const statusId=activeStudioTab==='text'?'t_status':activeStudioTab==='image'?'i_status':activeStudioTab==='inpaint'?'in_status':activeStudioTab==='batch'?'b_status':null;
+    const statusId=activeStudioTab==='text'?'t_status':activeStudioTab==='image'?'i_status':activeStudioTab==='edit'?'e_status':activeStudioTab==='inpaint'?'in_status':activeStudioTab==='batch'?'b_status':null;
     if(statusId)setStatus(statusId,e.message,'bad');
   }
 };
@@ -6230,6 +6637,7 @@ function bindFilePicker(inputId,buttonId,nameId,{previewId=null,emptyText='Choos
   });
 }
 bindFilePicker('i_source','i_source_pick','i_source_name',{previewId:'i_preview',emptyText:'Choose a source image.'});
+bindFilePicker('e_source','e_source_pick','e_source_name',{previewId:'e_preview',emptyText:'Choose a source image.'});
 bindFilePicker('in_source','in_source_pick','in_source_name');
 bindFilePicker('b_reference','b_reference_pick','b_reference_name');
 
@@ -6251,6 +6659,7 @@ function bindLightning(toggleId,stepsId,cfgId,samplerId,schedulerId){
 }
 bindLightning('t_lightning','t_steps','t_cfg','t_sampler','t_scheduler');
 bindLightning('i_lightning','i_steps','i_cfg','i_sampler','i_scheduler');
+bindLightning('e_lightning','e_steps','e_cfg','e_sampler','e_scheduler');
 bindLightning('in_lightning','in_steps','in_cfg','in_sampler','in_scheduler');
 
 fetchJson('/api/meta').then(d=>{
@@ -6265,6 +6674,7 @@ fetchJson('/api/meta').then(d=>{
   if($("t_width") && defs.text_width) $("t_width").value=String(defs.text_width);
   if($("t_height") && defs.text_height) $("t_height").value=String(defs.text_height);
   if($("i_max") && defs.image_max_side) $("i_max").value=String(defs.image_max_side);
+  if($("e_max") && defs.image_max_side) $("e_max").value=String(defs.image_max_side);
   if($("in_max") && defs.inpaint_max_side) $("in_max").value=String(defs.inpaint_max_side);
   if($("b_width") && defs.batch_width) $("b_width").value=String(defs.batch_width);
   if($("b_height") && defs.batch_height) $("b_height").value=String(defs.batch_height);
@@ -6318,6 +6728,33 @@ $('i_generate').onclick=async()=>{
     setStatus('i_status','Queued · '+d.id+' · you can submit another job now.','');
     pollJobs();
   }catch(e){setStatus('i_status',e.message,'bad')}
+};
+
+$('e_generate').onclick=async()=>{
+  const file=$('e_source').files[0];
+  if(!file){setStatus('e_status','Upload a source image.','bad');return}
+  const fd=new FormData();
+  fd.append('source',file);
+  fd.append('prompt',$('e_prompt').value);
+  fd.append('negative_prompt',$('e_negative').value);
+  fd.append('edit_lora_strength',$('e_edit_lora_strength').value);
+  fd.append('ref_boost',$('e_ref_boost').value);
+  fd.append('grounding_px',$('e_grounding_px').value);
+  fd.append('fit_mode',$('e_fit_mode').value);
+  fd.append('ground_negative',$('e_ground_negative').checked?'1':'0');
+  fd.append('max_side',$('e_max').value);
+  fd.append('seed',$('e_seed').value);
+  fd.append('steps',$('e_steps').value);
+  fd.append('cfg',$('e_cfg').value);
+  fd.append('sampler',$('e_sampler').value);
+  fd.append('scheduler',$('e_scheduler').value);
+  fd.append('lightning_enabled',$('e_lightning').checked?'1':'0');
+  fd.append('lightning_strength',$('e_lightning_strength').value);
+  try{
+    const d=await fetchJson('/api/instruction_edit',{method:'POST',body:fd});
+    setStatus('e_status','Queued · '+d.id+' · you can submit another job now.','');
+    pollJobs();
+  }catch(e){setStatus('e_status',e.message,'bad')}
 };
 
 // Inpaint canvas — soft brush, erase, undo/redo, large editor and soft-mask export.
@@ -6506,9 +6943,11 @@ $('in_generate').onclick=async()=>{
     const fd=new FormData();
     fd.append('source',source);fd.append('mask',maskBlob,'mask.png');
     fd.append('prompt',$('in_prompt').value);fd.append('negative_prompt',$('in_negative').value);
-    fd.append('denoise',$('in_denoise').value);fd.append('max_side',$('in_max').value);
+    fd.append('edit_lora_strength',$('in_edit_lora_strength').value);fd.append('denoise',$('in_edit_lora_strength').value);
+    fd.append('ref_boost',$('in_ref_boost').value);fd.append('grounding_px',$('in_grounding_px').value);fd.append('fit_mode',$('in_fit_mode').value);
+    fd.append('ground_negative',$('in_ground_negative').checked?'1':'0');fd.append('max_side',$('in_max').value);
     fd.append('expand',$('in_expand').value);fd.append('feather',$('in_feather').value);
-    fd.append('context_padding',$('in_context').value);fd.append('latent_feather',$('in_latent_feather').value);
+    fd.append('context_padding',$('in_context').value);fd.append('latent_feather',0);
     fd.append('focus_enabled',$('in_focus').checked?'1':'0');fd.append('focus_padding',$('in_focus_padding').value);
     fd.append('seed',$('in_seed').value);fd.append('steps',$('in_steps').value);fd.append('cfg',$('in_cfg').value);
     fd.append('sampler',$('in_sampler').value);fd.append('scheduler',$('in_scheduler').value);
@@ -6945,6 +7384,9 @@ function applyFinishedJob(job){
   }else if(job.kind==='image'){
     if(job.status==='done'&&r.image){setSharedSingleImage(r.image)}
     setStatus('i_status',message,bad?'bad':(job.status==='done'?'good':''));
+  }else if(job.kind==='edit'){
+    if(job.status==='done'&&r.image){setSharedSingleImage(r.image)}
+    setStatus('e_status',message,bad?'bad':(job.status==='done'?'good':''));
   }else if(job.kind==='inpaint'){
     if(job.status==='done'&&r.image){setSharedSingleImage(r.image)}
     setStatus('in_status',message,bad?'bad':(job.status==='done'?'good':''));
@@ -7040,6 +7482,7 @@ app.run(
 
 # Fill notebook-selected hardware/model placeholders before writing the child app.
 APP_CODE = APP_CODE.replace("__CLIP_FILENAME__", CLIP_FILENAME)
+APP_CODE = APP_CODE.replace("__EDIT_LORA_FILENAME__", KREA2_EDIT_FILENAME)
 APP_CODE = APP_CODE.replace("__LOW_VRAM_MODE__", "True" if LOW_VRAM_MODE else "False")
 APP_CODE = APP_CODE.replace("__GPU_PROFILE__", GPU_PROFILE)
 APP_CODE = APP_CODE.replace("__DEFAULT_TEXT_WIDTH__", str(DEFAULTS["text_width"]))
