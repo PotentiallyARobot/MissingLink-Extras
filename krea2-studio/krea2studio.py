@@ -1491,48 +1491,51 @@ def vae_encode(image):
 
 
 @torch.inference_mode()
-def vae_encode_inpaint(image, core_mask, noise_mask):
-    """Encode an inpaint source after neutralizing pixels that may be replaced.
+def vae_encode_inpaint(image, core_mask, noise_mask=None):
+    """Encode a contextual pseudo-inpaint crop for a non-inpaint Krea2 model.
 
-    The previous pipeline encoded the untouched source and only attached a noise
-    mask. That leaves a strong latent representation of the object being removed.
-    This follows the useful part of ComfyUI's VAEEncodeForInpaint behavior while
-    preserving our independently feathered sampling mask.
+    Krea2 is not natively mask-conditioned. Restricting KSampler with a latent
+    noise mask can collapse structural edits into smooth/blurred patches. This
+    path erases detail inside the replaceable core, denoises the entire focused
+    crop as img2img, then composites only the requested output region back.
+
+    ``noise_mask`` is accepted for backward compatibility but is deliberately
+    not attached to the latent.
     """
     check_stop()
-    _emit_progress("Encoding masked source", pct=7)
+    _emit_progress("Encoding contextual edit crop", pct=7)
     unload_models()
-    gpu_stats("VAE inpaint encode")
+    gpu_stats("VAE contextual inpaint encode")
 
     start = time.time()
-    pixels = pil_to_tensor(image)
+    image = image.convert("RGB")
+    core_mask = core_mask.convert("L")
+    if core_mask.size != image.size:
+        core_mask = core_mask.resize(image.size, Image.Resampling.BILINEAR)
 
-    core = mask_to_tensor(core_mask)
-    core = (core > 0.5).to(dtype=pixels.dtype, device=pixels.device).unsqueeze(-1)
-    noise = mask_to_tensor(noise_mask)
+    # Remove high-frequency evidence of the old object while retaining local
+    # colour/illumination cues. A blurred local fill gives a normal img2img
+    # model more useful context than a flat grey hole.
+    blur_radius = max(10.0, min(image.size) / 28.0)
+    local_fill = image.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    neutral = Image.new("RGB", image.size, (127, 127, 127))
+    local_fill = Image.blend(local_fill, neutral, 0.28)
 
-    # Neutral VAE-space input in the replaceable core. 0.5 avoids leaving the
-    # original object's color/texture encoded in the latent while remaining in
-    # the normal image range expected by the VAE.
-    masked_pixels = pixels * (1.0 - core) + 0.5 * core
+    hard_core = core_mask.point(lambda x: 255 if x > 8 else 0)
+    masked_source = Image.composite(local_fill, image, hard_core)
 
     latent = VAE_ENCODER.encode(
-        pixels=masked_pixels,
+        pixels=pil_to_tensor(masked_source),
         vae=VAE,
     )[0]
 
-    latent = NOISE_MASK.set_mask(
-        samples=latent,
-        mask=noise,
-    )[0]
-
     print(
-        f"[VAE] inpaint encode {time.time()-start:.2f}s",
+        f"[VAE] contextual inpaint encode {time.time()-start:.2f}s",
         flush=True,
     )
 
     check_stop()
-    _emit_progress("Masked source encoded", pct=15)
+    _emit_progress("Contextual edit crop encoded", pct=15)
     return latent
 
 
@@ -2209,10 +2212,10 @@ def inpaint(
     expand,
     feather,
     seed,
-    context_padding=40,
-    latent_feather=8,
+    context_padding=12,
+    latent_feather=0,
     focus_enabled=True,
-    focus_padding=45,
+    focus_padding=70,
     negative_prompt="",
     steps=STEPS,
     cfg=CFG,
@@ -2270,18 +2273,17 @@ def inpaint(
         work_context = int(round(float(context_padding) * focus_scale))
         work_latent_feather = int(round(float(latent_feather) * focus_scale))
 
-        sample_core, sampling_mask, _ = prepare_inpaint_masks(
+        # Krea2 is not a native inpaint model. Denoise the entire focused crop
+        # instead of freezing every pixel outside a latent noise mask. The model
+        # core is erased more generously than the final visible composite.
+        model_core = _morph_mask(
             work_mask,
-            work_expand,
-            work_feather,
-            work_context,
-            work_latent_feather,
-        )
+            max(-96, min(96, work_expand + work_context)),
+        ).point(lambda x: 255 if x > 6 else 0)
 
         latent = vae_encode_inpaint(
             work_source,
-            sample_core,
-            sampling_mask,
+            model_core,
         )
     else:
         native_source = original
@@ -2289,21 +2291,40 @@ def inpaint(
         work_source = original
         work_mask = mask
         focus_scale = 1.0
-        sample_core, sampling_mask, blend_mask = prepare_inpaint_masks(
+        _, _, blend_mask = prepare_inpaint_masks(
             work_mask,
             expand,
             feather,
             context_padding,
             latent_feather,
         )
+        model_core = _morph_mask(
+            work_mask,
+            max(-96, min(96, int(expand) + int(context_padding))),
+        ).point(lambda x: 255 if x > 6 else 0)
         latent = vae_encode_inpaint(
             work_source,
-            sample_core,
-            sampling_mask,
+            model_core,
         )
 
+    raw_prompt = str(prompt or "").strip()
+    if not raw_prompt:
+        raise ValueError("Enter a replacement prompt.")
+
+    # Krea2 denoises the whole focused crop, so prompt for continuity as well
+    # as the local edit. The requested change is still the dominant instruction.
+    effective_prompt = (
+        "Preserve the same source scene, subject identity where applicable, "
+        "pose, camera viewpoint, perspective, lighting, colour palette, scale, "
+        "materials and surrounding environment. Make a seamless local edit "
+        "that matches the source. Requested change in the editable region: "
+        + raw_prompt
+        + ". The edited content must be coherent with nearby anatomy or object "
+          "geometry, contact, occlusion, shadows, texture and focus."
+    )
+
     positive, negative = encode_prompt(
-        prompt,
+        effective_prompt,
         negative_prompt,
     )
 
@@ -2365,6 +2386,8 @@ def inpaint(
         seed,
         {
             "negative_prompt": str(negative_prompt or ""),
+            "effective_prompt": effective_prompt,
+            "inpaint_engine": "contextual_crop_img2img",
             "denoise": float(denoise),
             "mask_expand": int(expand),
             "feather": int(feather),
@@ -2374,6 +2397,7 @@ def inpaint(
             "focus_used": bool(use_focus),
             "focus_padding": float(focus_padding),
             "focus_scale": float(focus_scale),
+            "whole_crop_denoise": True,
             "focus_box": focus_box_meta,
             "steps": steps,
             "cfg": cfg,
@@ -2545,14 +2569,16 @@ user's instruction implies they should stay. Describe the requested change
 clearly enough for img2img conditioning. For allowed adult NSFW edits, preserve
 explicit requested anatomy/action instead of toning it down.
 
-For Inpaint, write the prompt for the replacement or repaired region while
-making it compatible with the surrounding image. When an edit-region overlay is
-provided, the RED area is exactly what will be regenerated; concentrate the
-prompt on what should exist there. Use the attached source for lighting,
-perspective, scale, material, texture, occlusion and scene continuity. For
-allowed adult NSFW inpainting, describe the explicit replacement region plainly
-and anatomically rather than avoiding it. Do not waste words describing
-unrelated portions of the image.
+For Inpaint, Krea2 uses a focused crop as contextual img2img rather than a
+native mask-conditioned inpaint model. Write a concise prompt for the whole local
+scene/crop: preserve the visible source subject, pose, camera, perspective,
+lighting, materials and environment, then state the requested replacement very
+clearly and emphasize seamless geometry, contact, occlusion, shadow and texture.
+The red mask overlay shows where the visible edit will be composited back. The new
+content must fit inside that editable footprint unless the user has painted a
+larger area. For allowed adult NSFW inpainting, preserve the user's explicit
+requested adult anatomy/action instead of sanitizing it. Do not waste words on
+distant or unrelated parts of the source image.
 
 If no image is attached, work only from the user's text. Never claim to have
 seen an image that was not provided. Do not add explanations, labels, analysis,
@@ -4539,10 +4565,10 @@ def _execute_job(jid):
             editor=editor, prompt=params["prompt"], denoise=params["denoise"],
             max_side=params["max_side"], expand=params["expand"],
             feather=params["feather"], seed=params["seed"],
-            context_padding=params.get("context_padding", 40),
-            latent_feather=params.get("latent_feather", 8),
+            context_padding=params.get("context_padding", 12),
+            latent_feather=params.get("latent_feather", 0),
             focus_enabled=params.get("focus_enabled", True),
-            focus_padding=params.get("focus_padding", 45),
+            focus_padding=params.get("focus_padding", 70),
             negative_prompt=params.get("negative_prompt", ""),
             steps=params.get("steps", STEPS),
             cfg=params.get("cfg", CFG),
@@ -4872,14 +4898,14 @@ def api_inpaint():
                 "source_path": source_path, "mask_path": mask_path,
                 "prompt": request.form.get("prompt"),
                 "negative_prompt": request.form.get("negative_prompt", ""),
-                "denoise": _float_value(request.form.get("denoise"), 1.0, 0.1, 1.0),
+                "denoise": _float_value(request.form.get("denoise"), 0.88, 0.1, 1.0),
                 "max_side": _int_value(request.form.get("max_side"), DEFAULT_INPAINT_MAX_SIDE, 256, 2048),
-                "expand": _int_value(request.form.get("expand"), 8, -96, 96),
-                "feather": _int_value(request.form.get("feather"), 12, 0, 96),
-                "context_padding": _int_value(request.form.get("context_padding"), 40, 0, 128),
-                "latent_feather": _int_value(request.form.get("latent_feather"), 8, 0, 48),
+                "expand": _int_value(request.form.get("expand"), 24, -96, 96),
+                "feather": _int_value(request.form.get("feather"), 8, 0, 96),
+                "context_padding": _int_value(request.form.get("context_padding"), 12, 0, 128),
+                "latent_feather": _int_value(request.form.get("latent_feather"), 0, 0, 48),
                 "focus_enabled": str(request.form.get("focus_enabled") or "1").lower() in {"1","true","yes","on"},
-                "focus_padding": _float_value(request.form.get("focus_padding"), 45, 0, 150),
+                "focus_padding": _float_value(request.form.get("focus_padding"), 70, 0, 150),
                 "seed": _int_value(request.form.get("seed"), -1),
                 "steps": _int_value(request.form.get("steps"), STEPS, 1, 80),
                 "cfg": _float_value(request.form.get("cfg"), CFG, 0.0, 30.0),
@@ -5605,15 +5631,15 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
                 <summary>Blend + context controls</summary>
                 <div class="inside">
                   <div class="grid2compact">
-                    <div><label>Denoise</label><input id="in_denoise" type="number" min=".1" max="1" step=".05" value="1.0"></div>
-                    <div><label>Mask grow / shrink</label><input id="in_expand" type="number" min="-96" max="96" value="8"></div>
-                    <div><label>Final blend feather</label><input id="in_feather" type="number" min="0" max="96" value="12"></div>
-                    <div><label>Sampling context</label><input id="in_context" type="number" min="0" max="128" value="40"></div>
-                    <div><label>Latent edge feather</label><input id="in_latent_feather" type="number" min="0" max="48" value="8"></div>
-                    <div><label>Focus padding %</label><input id="in_focus_padding" type="number" min="0" max="150" step="5" value="45"></div>
+                    <div><label>Denoise</label><input id="in_denoise" type="number" min=".1" max="1" step=".05" value=".88"></div>
+                    <div><label>Output mask grow / shrink</label><input id="in_expand" type="number" min="-96" max="96" value="24"></div>
+                    <div><label>Final blend feather</label><input id="in_feather" type="number" min="0" max="96" value="8"></div>
+                    <div><label>Erased-core padding</label><input id="in_context" type="number" min="0" max="128" value="12"></div>
+                    <div><label>Legacy latent feather</label><input id="in_latent_feather" type="number" min="0" max="48" value="0"></div>
+                    <div><label>Focus crop padding %</label><input id="in_focus_padding" type="number" min="0" max="150" step="5" value="70"></div>
                   </div>
                   <label><input id="in_focus" type="checkbox" style="width:auto" checked> Auto-focus small masks for higher edit resolution</label>
-                  <div class="minihint">The masked pixels are neutralized before VAE encoding so replacement prompts do not fight the old object. Auto-focus crops around small masks, enlarges that crop for generation, then blends it back at native resolution. Disable focus for very large/global edits.</div>
+                  <div class="minihint"><b>Important:</b> paint the full footprint where new content may appear — anything outside the grown output mask is discarded. Krea2 now denoises the whole focused crop as contextual img2img instead of freezing everything outside a latent noise mask; only the final edit region is pasted back. For large structural insertions, increase Output mask grow and keep Denoise around .80–.92.</div>
                 </div>
               </details>
               <div class="split">
