@@ -5890,6 +5890,143 @@ Additional user Auto Prompt instructions:
         with open(path, "wb") as fh:
             shutil.copyfileobj(storage.stream, fh)
 
+    # ── Optional Google Drive studio preferences ────────────────────────────────
+    # When Colab Drive is already mounted, persist only lightweight UI configuration
+    # (last model/mode/preset + LoRA card strengths). The Studio never mounts Drive on
+    # the user's behalf and never treats Drive availability as a startup requirement.
+    STUDIO_CONFIG_SCHEMA = 1
+    STUDIO_CONFIG_RELATIVE = os.path.join("MissingLink", "MiniMax_H3_Studio", "studio_config.json")
+    STUDIO_CONFIG_LOCK = threading.Lock()
+
+    def _studio_drive_config_path():
+        override = (os.environ.get("H3_DRIVE_CONFIG_DIR") or "").strip()
+        if override:
+            base = os.path.abspath(os.path.expanduser(override))
+            parent = base if os.path.isdir(base) else os.path.dirname(base)
+            if os.path.isdir(parent):
+                return os.path.join(base, "studio_config.json") if os.path.isdir(base) else base
+
+        # Colab's normal Google Drive mount. Do not call drive.mount() here: if the
+        # user has not connected Drive, persistence simply remains disabled.
+        for root in ("/content/drive/MyDrive", "/content/drive/My Drive"):
+            if os.path.isdir(root):
+                return os.path.join(root, STUDIO_CONFIG_RELATIVE)
+        return None
+
+    def _sanitize_studio_config(raw):
+        raw = raw if isinstance(raw, dict) else {}
+        profile = str(raw.get("model_profile") or "stock_quality").strip()
+        if profile != "stock_quality" and not profile.startswith("custom:"):
+            profile = "stock_quality"
+        mode = str(raw.get("input_mode") or "fl2va").strip().lower()
+        if mode not in {"fl2va", "ref2va"}:
+            mode = "fl2va"
+        preset = str(raw.get("performance_preset") or "fast").strip().lower()
+        if preset not in {"fast", "ultra", "quality", "taomate"}:
+            preset = "fast"
+        unet = os.path.basename(str(raw.get("unet") or "").strip())
+
+        lora_state = {}
+        source_state = raw.get("lora_state") or {}
+        if isinstance(source_state, dict):
+            for key, value in list(source_state.items())[:512]:
+                key = str(key or "").strip()[:512]
+                if not key or not (key.startswith("file:") or key.startswith("catalog:")):
+                    continue
+                try:
+                    strength = float(value)
+                except Exception:
+                    continue
+                if not np.isfinite(strength):
+                    continue
+                lora_state[key] = strength
+
+        return {
+            "schema": STUDIO_CONFIG_SCHEMA,
+            "model_profile": profile,
+            "unet": unet,
+            "input_mode": mode,
+            "performance_preset": preset,
+            "lora_state": lora_state,
+        }
+
+    def _read_studio_drive_config():
+        path = _studio_drive_config_path()
+        if not path:
+            return {"drive_connected": False, "exists": False, "config": None, "path": ""}
+        if not os.path.isfile(path):
+            return {"drive_connected": True, "exists": False, "config": None, "path": path}
+        try:
+            with STUDIO_CONFIG_LOCK:
+                with open(path, "r", encoding="utf-8") as fh:
+                    raw = json.load(fh)
+            return {
+                "drive_connected": True,
+                "exists": True,
+                "config": _sanitize_studio_config(raw),
+                "path": path,
+            }
+        except Exception as e:
+            log(f"  ⚠ Drive Studio config read failed; using defaults: {e}")
+            return {
+                "drive_connected": True,
+                "exists": False,
+                "config": None,
+                "path": path,
+                "error": str(e),
+            }
+
+    def _write_studio_drive_config(raw, reason="ui"):
+        path = _studio_drive_config_path()
+        if not path:
+            return {"drive_connected": False, "saved": False, "path": ""}
+        payload = _sanitize_studio_config(raw)
+        payload.update(updated_at=time.time(), save_reason=str(reason or "ui")[:80])
+        tmp = path + f".{os.getpid()}.tmp"
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with STUDIO_CONFIG_LOCK:
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(payload, fh, indent=2, sort_keys=True)
+                    fh.flush()
+                    try:
+                        os.fsync(fh.fileno())
+                    except Exception:
+                        pass
+                os.replace(tmp, path)
+            return {"drive_connected": True, "saved": True, "path": path, "config": payload}
+        except Exception as e:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            log(f"  ⚠ Drive Studio config write failed ({reason}): {e}")
+            return {"drive_connected": True, "saved": False, "path": path, "error": str(e)}
+
+    @app.get("/api/studio_config")
+    def api_studio_config_get():
+        state = _read_studio_drive_config()
+        # Never expose the user's absolute Drive path to the browser; only availability.
+        return jsonify(
+            ok=True,
+            drive_connected=bool(state.get("drive_connected")),
+            exists=bool(state.get("exists")),
+            config=state.get("config"),
+            error=state.get("error", ""),
+        )
+
+    @app.post("/api/studio_config")
+    def api_studio_config_save():
+        body = request.get_json(silent=True) or {}
+        result = _write_studio_drive_config(body, reason="explicit_ui_save")
+        return jsonify(
+            ok=True,
+            drive_connected=bool(result.get("drive_connected")),
+            saved=bool(result.get("saved")),
+            error=result.get("error", ""),
+        )
+
     @app.post("/api/generate")
     def api_gen():
         if not ML_OK:
@@ -6013,6 +6150,24 @@ Additional user Auto Prompt instructions:
                     error=f"LoRA '{lname}' is known to be incompatible with the selected model/mode ({label})."
                 ), 400
 
+        # Generation is the durable preference boundary. The browser submits its
+        # current model + full LoRA-card state; if Drive is mounted, write it atomically.
+        # Persistence failure never blocks a render.
+        _config_save_result = {"drive_connected": False, "saved": False}
+        _raw_studio_config = request.form.get("studio_config_json") or ""
+        if _raw_studio_config:
+            try:
+                _config_payload = json.loads(_raw_studio_config)
+                if isinstance(_config_payload, dict):
+                    # Trust the server-validated request values for model/mode.
+                    _config_payload["unet"] = p.get("unet") or ""
+                    _config_payload["input_mode"] = input_mode
+                    _config_save_result = _write_studio_drive_config(
+                        _config_payload, reason="generation_submit"
+                    )
+            except Exception as _config_exc:
+                log(f"  ⚠ Drive Studio config save skipped for generation: {_config_exc}")
+
         if input_mode == "ref2va":
             # studio Ref2VA uses the official MiniMax H3 reference checkpoint.
             if not p.get("unet"):
@@ -6083,7 +6238,12 @@ Additional user Auto Prompt instructions:
             "stage":"queued", "stage_started":_now, "last_activity":_now, "cur":0, "total":0,
         }
         _enqueue_generation(jid, p)
-        return jsonify(id=jid, queued=True)
+        return jsonify(
+            id=jid, queued=True,
+            drive_config_connected=bool(_config_save_result.get("drive_connected")),
+            drive_config_saved=bool(_config_save_result.get("saved")),
+            drive_config_error=_config_save_result.get("error", ""),
+        )
 
     @app.get("/api/timeline")
     def api_timeline():
@@ -7045,7 +7205,7 @@ Additional user Auto Prompt instructions:
     .hiddenfile{display:none!important}
     .g2{display:grid;grid-template-columns:1fr 1fr;gap:8px}.g3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
     .hint{font-size:9.5px;color:#686a73;margin-top:5px;line-height:1.4}#meta{margin:0;padding:3px 2px 0;font-size:7.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}#meta:empty{display:none}.hint b{color:#a6a7ae}
-    .switchrow{display:flex;gap:8px;align-items:center;margin-top:8px}.switchrow input{width:auto;accent-color:var(--accent)}.switchrow label{margin:0;font-size:10.5px;color:#aaa}.sliderline{display:grid;grid-template-columns:minmax(0,1fr) 72px;gap:8px;align-items:center}.sliderline input[type=range]{padding:0;height:24px;accent-color:var(--accent);border:0;background:transparent}.slidervalue{font:10px ui-monospace,Menlo,monospace;color:#d7d8de;text-align:right}.loranumber{width:72px!important;height:29px!important;padding:4px 6px!important;border:1px solid #303139!important;border-radius:6px!important;background:#151519!important;color:#e7e8ec!important;text-align:right!important;-moz-appearance:textfield!important;appearance:textfield!important}.loranumber::-webkit-outer-spin-button,.loranumber::-webkit-inner-spin-button{-webkit-appearance:none!important;margin:0!important}.loranumber:focus{border-color:var(--accent)!important}.loranumber:disabled{opacity:.5;cursor:not-allowed}.lorarack{display:grid;gap:7px;margin-top:8px}.lorarow{border:1px solid #292a30;border-radius:8px;background:#101115;padding:8px}.lorarowhead{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}.lorarowtitle{font-size:8.5px;letter-spacing:.7px;color:#bfc1c9;font-weight:800;text-transform:uppercase}.loratitlelink{color:inherit;text-decoration:none}.loratitlelink:hover{color:#8ab4ff;text-decoration:underline}.lorarowmeta{font-size:7.5px;color:#696c76}.lorarowgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(120px,.7fr);gap:8px;align-items:center}.lorarowgrid select{height:32px;padding:5px 7px}.loraslot{display:block}.lorarow.incompatible{opacity:.48}.lorarow.incompatible input{cursor:not-allowed}.lorarow.incompatible .lorarowtitle{color:#70727a}.lorarow.incompatible .lorarowmeta{color:#555861}.loratoggle{width:38px!important;height:21px!important;padding:0!important;margin:0!important;border-radius:999px!important;background:#25262c!important;color:#8b8e97!important;border:1px solid #3a3b43!important;font-size:7px!important;line-height:19px!important}.loratoggle.on{background:var(--accent)!important;color:#111!important;border-color:var(--accent)!important}.loratoggle:disabled{opacity:.42!important}.lorarow select option:disabled{color:#595c65}.loratools{display:grid;grid-template-columns:1fr 1fr 72px 42px;gap:7px;margin-top:8px}.loratools button{margin:0;padding:8px 7px;background:#29292f;color:#ccc;font-size:8px}.motionline{display:grid;grid-template-columns:minmax(0,1fr) 54px;gap:8px;align-items:center}.motionline input[type=range]{padding:0;height:26px;accent-color:var(--accent);border:0;background:transparent}.modetabs{display:grid;grid-template-columns:1fr 1fr;gap:8px}.modetab{margin:0;background:#202126;color:#c8c9cf;border:1px solid #303139}.modetab.active{background:var(--accent);border-color:var(--accent);color:#111}.modetab:disabled{background:#17181c;color:#5a5d66;border-color:#25262b;cursor:not-allowed}.modepanel{display:none}.modepanel.active{display:block}.refimageslots{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:2px}.refslot{height:96px}.reffilelist{display:grid;gap:8px;margin-top:10px}.reffilerow{border:1px solid #2a2b31;border-radius:8px;background:#101116;padding:8px}.reffilerowhead{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}.reffilerowtitle{font-size:8px;color:#cfd0d5;font-weight:800;letter-spacing:.7px;text-transform:uppercase}.reffilename{flex:1;min-width:0;font-size:8px;color:#8b8d96;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.reffileactions{display:flex;gap:6px;align-items:center}.reffileactions button{width:auto;margin:0;padding:6px 8px;font-size:7px}.refclear{background:#221617;color:#d99595;border:1px solid #573032}.refclear:disabled{background:#17181c;color:#53565f;border-color:#25262b}.refmodehint{margin-top:8px}.refslot .slotbadge{font-size:7px}
+    .switchrow{display:flex;gap:8px;align-items:center;margin-top:8px}.switchrow input{width:auto;accent-color:var(--accent)}.switchrow label{margin:0;font-size:10.5px;color:#aaa}.sliderline{display:grid;grid-template-columns:minmax(0,1fr) 72px;gap:8px;align-items:center}.sliderline input[type=range]{padding:0;height:24px;accent-color:var(--accent);border:0;background:transparent}.slidervalue{font:10px ui-monospace,Menlo,monospace;color:#d7d8de;text-align:right}.loranumber{width:72px!important;height:29px!important;padding:4px 6px!important;border:1px solid #303139!important;border-radius:6px!important;background:#151519!important;color:#e7e8ec!important;text-align:right!important;-moz-appearance:textfield!important;appearance:textfield!important}.loranumber::-webkit-outer-spin-button,.loranumber::-webkit-inner-spin-button{-webkit-appearance:none!important;margin:0!important}.loranumber:focus{border-color:var(--accent)!important}.loranumber:disabled{opacity:.5;cursor:not-allowed}.lorarack{display:grid;gap:7px;margin-top:8px}.lorarow{border:1px solid #292a30;border-radius:8px;background:#101115;padding:8px}.lorarowhead{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}.lorarowtitle{font-size:8.5px;letter-spacing:.7px;color:#bfc1c9;font-weight:800;text-transform:uppercase}.loratitlelink{color:inherit;text-decoration:none}.loratitlelink:hover{color:#8ab4ff;text-decoration:underline}.lorarowmeta{font-size:7.5px;color:#696c76}.lorarowgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(120px,.7fr);gap:8px;align-items:center}.lorarowgrid select{height:32px;padding:5px 7px}.loraslot{display:block}.lorarow.incompatible{opacity:.48}.lorarow.incompatible input{cursor:not-allowed}.lorarow.incompatible .lorarowtitle{color:#70727a}.lorarow.incompatible .lorarowmeta{color:#555861}.loratoggle{width:38px!important;height:21px!important;padding:0!important;margin:0!important;border-radius:999px!important;background:#25262c!important;color:#8b8e97!important;border:1px solid #3a3b43!important;font-size:7px!important;line-height:19px!important}.loratoggle.on{background:var(--accent)!important;color:#111!important;border-color:var(--accent)!important}.loratoggle:disabled{opacity:.42!important}.lorarow select option:disabled{color:#595c65}.loratools{display:grid;grid-template-columns:1fr 1fr 72px 42px;gap:7px;margin-top:8px}.loratools button{margin:0;padding:8px 7px;background:#29292f;color:#ccc;font-size:8px}.motionline{display:grid;grid-template-columns:minmax(0,1fr) 54px;gap:8px;align-items:center}.motionline input[type=range]{padding:0;height:26px;accent-color:var(--accent);border:0;background:transparent}.modetabs{display:grid;grid-template-columns:1fr 1fr;gap:8px}.modetab{margin:0;background:#202126;color:#c8c9cf;border:1px solid #303139}.modetab.active{background:var(--accent);border-color:var(--accent);color:#111}.modetab:disabled{background:#17181c;color:#5a5d66;border-color:#25262b;cursor:not-allowed}.modepanel{display:none}.modepanel.active{display:block}.refimageslots{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:2px}.refslot{height:96px}.reffilelist{display:grid;gap:8px;margin-top:10px}.reffilerow{border:1px solid #2a2b31;border-radius:8px;background:#101116;padding:8px}.reffilerowhead{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}.reffilerowtitle{font-size:8px;color:#cfd0d5;font-weight:800;letter-spacing:.7px;text-transform:uppercase}.reffilename{flex:1;min-width:0;font-size:8px;color:#8b8d96;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.reffileactions{display:flex;gap:6px;align-items:center}.reffileactions button{width:auto;margin:0;padding:6px 8px;font-size:7px}.refvideopreviewwrap{display:none;position:relative;width:100%;aspect-ratio:16/9;max-height:180px;margin:0 0 8px;border:1px solid #292a30;border-radius:7px;overflow:hidden;background:#050506}.refvideopreviewwrap.show{display:block}.refvideopreview{display:block;width:100%;height:100%;object-fit:contain;background:#000}.refclear{background:#221617;color:#d99595;border:1px solid #573032}.refclear:disabled{background:#17181c;color:#53565f;border-color:#25262b}.refmodehint{margin-top:8px}.refslot .slotbadge{font-size:7px}
     button{border:0;border-radius:7px;background:var(--accent);color:#111;padding:10px 11px;font:inherit;font-weight:800;cursor:pointer}
     button:disabled{background:#29292f;color:#666;cursor:not-allowed}.inlinebtn{background:#29292f;color:#ccc;padding:8px 9px;width:100%;margin-top:8px;font-size:10.5px}.inlinebtn.active{background:var(--accent);color:#111}
     .installed{color:#7cc38c}.missing{color:#d6a56d}
@@ -7136,9 +7296,9 @@ Additional user Auto Prompt instructions:
       </div>
       <div class=g2><div><label>Ref image size</label><select id=ref_image_size><option value=match selected>match</option><option value=max>max fidelity</option></select></div><div><label>Reference budget</label><div class=hint style="margin-top:9px">Up to 9 images, 3 videos, 3 audio clips.</div></div></div>
       <div class=reffilelist>
-        <div class=reffilerow><div class=reffilerowhead><div class=reffilerowtitle>Reference Video 1</div><div class=reffilename id=ref_video_name_1>No video selected</div></div><div class=reffileactions><button id=ref_video_pick_1 class=inlinebtn type=button>CHOOSE</button><button id=ref_video_clear_1 class="inlinebtn refclear" type=button>⌫ CLEAR</button></div></div>
-        <div class=reffilerow><div class=reffilerowhead><div class=reffilerowtitle>Reference Video 2</div><div class=reffilename id=ref_video_name_2>No video selected</div></div><div class=reffileactions><button id=ref_video_pick_2 class=inlinebtn type=button>CHOOSE</button><button id=ref_video_clear_2 class="inlinebtn refclear" type=button>⌫ CLEAR</button></div></div>
-        <div class=reffilerow><div class=reffilerowhead><div class=reffilerowtitle>Reference Video 3</div><div class=reffilename id=ref_video_name_3>No video selected</div></div><div class=reffileactions><button id=ref_video_pick_3 class=inlinebtn type=button>CHOOSE</button><button id=ref_video_clear_3 class="inlinebtn refclear" type=button>⌫ CLEAR</button></div></div>
+        <div class=reffilerow><div class=reffilerowhead><div class=reffilerowtitle>Reference Video 1</div><div class=reffilename id=ref_video_name_1>No video selected</div></div><div id=ref_video_preview_wrap_1 class=refvideopreviewwrap><video id=ref_video_preview_1 class=refvideopreview controls playsinline preload=metadata></video></div><div class=reffileactions><button id=ref_video_pick_1 class=inlinebtn type=button>CHOOSE</button><button id=ref_video_clear_1 class="inlinebtn refclear" type=button>⌫ CLEAR</button></div></div>
+        <div class=reffilerow><div class=reffilerowhead><div class=reffilerowtitle>Reference Video 2</div><div class=reffilename id=ref_video_name_2>No video selected</div></div><div id=ref_video_preview_wrap_2 class=refvideopreviewwrap><video id=ref_video_preview_2 class=refvideopreview controls playsinline preload=metadata></video></div><div class=reffileactions><button id=ref_video_pick_2 class=inlinebtn type=button>CHOOSE</button><button id=ref_video_clear_2 class="inlinebtn refclear" type=button>⌫ CLEAR</button></div></div>
+        <div class=reffilerow><div class=reffilerowhead><div class=reffilerowtitle>Reference Video 3</div><div class=reffilename id=ref_video_name_3>No video selected</div></div><div id=ref_video_preview_wrap_3 class=refvideopreviewwrap><video id=ref_video_preview_3 class=refvideopreview controls playsinline preload=metadata></video></div><div class=reffileactions><button id=ref_video_pick_3 class=inlinebtn type=button>CHOOSE</button><button id=ref_video_clear_3 class="inlinebtn refclear" type=button>⌫ CLEAR</button></div></div>
         <div class=reffilerow><div class=reffilerowhead><div class=reffilerowtitle>Reference Audio 1</div><div class=reffilename id=ref_audio_name_1>No audio selected</div></div><div class=reffileactions><button id=ref_audio_pick_1 class=inlinebtn type=button>CHOOSE</button><button id=ref_audio_clear_1 class="inlinebtn refclear" type=button>⌫ CLEAR</button></div></div>
         <div class=reffilerow><div class=reffilerowhead><div class=reffilerowtitle>Reference Audio 2</div><div class=reffilename id=ref_audio_name_2>No audio selected</div></div><div class=reffileactions><button id=ref_audio_pick_2 class=inlinebtn type=button>CHOOSE</button><button id=ref_audio_clear_2 class="inlinebtn refclear" type=button>⌫ CLEAR</button></div></div>
         <div class=reffilerow><div class=reffilerowhead><div class=reffilerowtitle>Reference Audio 3</div><div class=reffilename id=ref_audio_name_3>No audio selected</div></div><div class=reffileactions><button id=ref_audio_pick_3 class=inlinebtn type=button>CHOOSE</button><button id=ref_audio_clear_3 class="inlinebtn refclear" type=button>⌫ CLEAR</button></div></div>
@@ -7324,7 +7484,99 @@ Additional user Auto Prompt instructions:
     const say=t=>$('stxt').textContent=t;
 
     const MODEL_MODE_STORE_KEY='h3_model_mode_v86';
+    const STUDIO_CONFIG_SCHEMA=1;
+    let DRIVE_CONFIG_STATUS={drive_connected:false,exists:false,config:null,error:''};
+
     function currentModelMode(){return $('input_mode').value||localStorage.getItem(MODEL_MODE_STORE_KEY)||'fl2va'}
+
+    function studioLoraStateSnapshot(){
+      const out={};
+      try{
+        for(const [key,state] of LORA_CARD_STATE.entries()){
+          const n=Number(state&&state.strength);
+          if(Number.isFinite(n))out[String(key)]=n;
+        }
+      }catch(_){ }
+      return out;
+    }
+    function buildStudioConfig(){
+      return {
+        schema:STUDIO_CONFIG_SCHEMA,
+        model_profile:ACTIVE_MODEL_PROFILE||'stock_quality',
+        unet:$('unet')?$('unet').value:'',
+        input_mode:currentModelMode(),
+        performance_preset:ACTIVE_PERF_PRESET||'fast',
+        lora_state:studioLoraStateSnapshot(),
+      };
+    }
+    async function loadDriveStudioConfig(){
+      const resp=await fetch('/api/studio_config',{cache:'no-store'});
+      const data=await _readJsonResponse(resp,'Drive Studio config');
+      if(!resp.ok||data.error&&!data.ok)throw new Error(data.error||`Drive config failed (HTTP ${resp.status}).`);
+      DRIVE_CONFIG_STATUS={drive_connected:!!data.drive_connected,exists:!!data.exists,config:data.config||null,error:data.error||''};
+      return DRIVE_CONFIG_STATUS;
+    }
+    function restoreLoraStateFromConfig(raw){
+      LORA_CARD_STATE.clear();
+      if(raw&&typeof raw==='object'){
+        for(const [key,value] of Object.entries(raw)){
+          const n=Number(value);
+          if(Number.isFinite(n)&&(String(key).startsWith('file:')||String(key).startsWith('catalog:'))){
+            LORA_CARD_STATE.set(String(key),{strength:n});
+          }
+        }
+      }
+      renderNamedLoraRows(window.H3META||{});
+    }
+    async function restoreStudioConfig(cfg,m=window.H3META||{}){
+      if(!cfg||typeof cfg!=='object')return false;
+      let mode=(cfg.input_mode==='ref2va'?'ref2va':'fl2va');
+      let profile=String(cfg.model_profile||'stock_quality');
+      let cm=(m.custom_models||[]).find(x=>x.profile===profile)||null;
+
+      // A saved custom checkpoint is only restored when it is actually installed in
+      // this runtime. Otherwise the built-in model remains the safe startup default.
+      if(profile!=='stock_quality'&&!cm){profile='stock_quality';cm=null}
+      if(cm&&cm.mode==='fl2va')mode='fl2va';
+      if(cm&&cm.mode==='ref2va')mode='ref2va';
+      if(mode==='ref2va'&&m.ref2va_available===false)mode='fl2va';
+
+      $('input_mode').value=mode;
+      localStorage.setItem(MODEL_MODE_STORE_KEY,mode);
+      ACTIVE_MODEL_PROFILE=profile;
+      syncModelModeUI();
+      syncModelProfileOptions(m);
+      $('model_profile_select').value=profile;
+
+      let target='';
+      if(cm)target=cm.local_name||'';
+      else target=mode==='ref2va'?m.stock_ref2va_unet:m.base_fl2va_unet;
+      const targetAvailable=!!target&&[...$('unet').options].some(x=>x.value===target);
+      if(!targetAvailable){
+        // The preference file can outlive ephemeral Colab model storage. Never leave
+        // the UI in a saved mode whose transformer is absent; fall back to the normal
+        // built-in FL2VA default until that model is installed again.
+        profile='stock_quality';cm=null;mode='fl2va';
+        ACTIVE_MODEL_PROFILE='stock_quality';
+        $('input_mode').value='fl2va';localStorage.setItem(MODEL_MODE_STORE_KEY,'fl2va');
+        syncModelModeUI();syncModelProfileOptions(m);$('model_profile_select').value='stock_quality';
+        target=m.base_fl2va_unet||m.unet_default||'';
+      }
+      if(target&&[...$('unet').options].some(x=>x.value===target))$('unet').value=target;
+
+      let preset=String(cfg.performance_preset||'fast').toLowerCase();
+      if(!['fast','ultra','quality','taomate'].includes(preset))preset='fast';
+      if(preset==='taomate'&&mode!=='fl2va')preset='fast';
+      await applyPerformancePreset(preset);
+
+      // Preset application establishes coherent sampler/step defaults first; the
+      // persisted LoRA card map is authoritative afterwards, including OFF states.
+      restoreLoraStateFromConfig(cfg.lora_state||{});
+      syncModelProfileUI();
+      syncUnifiedLoraCompatibility();
+      say(`restored Drive config · ${activeModelLabel()} · ${mode==='ref2va'?'Ref2VA':'Current'} · ${preset.toUpperCase()}`);
+      return true;
+    }
     function updateContinuityAvailability(){
       const fl=currentModelMode()==='fl2va';
       const toggle=$('continuity_enabled');
@@ -8497,8 +8749,26 @@ Additional user Auto Prompt instructions:
     function clearRefImageSlot(index){const input=$('ref_image_'+index),img=$('ref_image_preview_'+index),slot=$('ref_image_slot_'+index);releaseSlotObjectURL(img);input.value='';img.removeAttribute('src');slot.classList.remove('has-image');delete slot.dataset.source}
     function bindRefImageSlot(index){const input=$('ref_image_'+index),img=$('ref_image_preview_'+index),slot=$('ref_image_slot_'+index),trash=$('ref_image_trash_'+index);function openOrPick(){if(slot.classList.contains('has-image')&&img.src)showImageModal(img.src);else input.click()}slot.addEventListener('click',e=>{if(e.target.closest('.slottrash'))return;openOrPick()});slot.addEventListener('keydown',e=>{if((e.key==='Enter'||e.key===' ')&&!e.target.closest('.slottrash')){e.preventDefault();openOrPick()}});trash.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();clearRefImageSlot(index);say('reference image '+index+' cleared')});input.addEventListener('change',()=>{const f=input.files[0];if(!f){clearRefImageSlot(index);return}releaseSlotObjectURL(img);const u=URL.createObjectURL(f);img.dataset.objectUrl=u;img.onload=()=>{slot.classList.add('has-image');slot.dataset.source='upload'};img.src=u})}
     function bindNamedFileInput(prefix,index,emptyLabel){const input=$(prefix+'_'+index),pick=$(prefix+'_pick_'+index),clear=$(prefix+'_clear_'+index),name=$(prefix+'_name_'+index);const sync=()=>{const f=input.files[0];name.textContent=f?f.name:emptyLabel;clear.disabled=!f};pick.onclick=e=>{e.preventDefault();input.click()};clear.onclick=e=>{e.preventDefault();input.value='';sync();say(prefix.replace('_',' ')+' '+index+' cleared')};input.addEventListener('change',sync);sync()}
+    function releaseRefVideoURL(video){const u=video&&video.dataset?video.dataset.objectUrl:'';if(u){try{URL.revokeObjectURL(u)}catch(e){}delete video.dataset.objectUrl}}
+    function bindRefVideoInput(index){
+      const input=$('ref_video_'+index),pick=$('ref_video_pick_'+index),clear=$('ref_video_clear_'+index),name=$('ref_video_name_'+index),preview=$('ref_video_preview_'+index),wrap=$('ref_video_preview_wrap_'+index);
+      const clearPreview=()=>{try{preview.pause()}catch(e){}releaseRefVideoURL(preview);preview.removeAttribute('src');try{preview.load()}catch(e){}wrap.classList.remove('show')};
+      const sync=()=>{
+        const f=input.files[0];name.textContent=f?f.name:'No video selected';clear.disabled=!f;
+        clearPreview();
+        if(!f)return;
+        const u=URL.createObjectURL(f);preview.dataset.objectUrl=u;preview.src=u;wrap.classList.add('show');
+        preview.onloadedmetadata=()=>{try{if(Number.isFinite(preview.duration)&&preview.duration>0.06)preview.currentTime=Math.min(0.08,preview.duration*0.02)}catch(e){}};
+        preview.onerror=()=>{name.textContent=f.name+' · preview unavailable';};
+        try{preview.load()}catch(e){}
+      };
+      pick.onclick=e=>{e.preventDefault();input.click()};
+      clear.onclick=e=>{e.preventDefault();input.value='';sync();say('reference video '+index+' cleared')};
+      input.addEventListener('change',sync);sync();
+    }
     for(let i=1;i<=9;i++)bindRefImageSlot(i);
-    for(let i=1;i<=3;i++){bindNamedFileInput('ref_video',i,'No video selected');bindNamedFileInput('ref_audio',i,'No audio selected')}
+    for(let i=1;i<=3;i++){bindRefVideoInput(i);bindNamedFileInput('ref_audio',i,'No audio selected')}
+    window.addEventListener('beforeunload',()=>{for(let i=1;i<=3;i++){const v=$('ref_video_preview_'+i);if(v)releaseRefVideoURL(v)}});
     function clearFirstPreview(){clearImageSlot('first',{keepContinuation:true})}
     function stageButtonActive(on){$('use_stage_last').value=on?'1':'0'}
     async function refreshStageState(quiet=false){
@@ -8597,8 +8867,32 @@ Additional user Auto Prompt instructions:
         return m;
       });
     }
-    syncModelModeUI();
-    loadMeta();
+    async function initializeStudio(){
+      try{
+        const persisted=await loadDriveStudioConfig();
+        // Set the saved mode before the first metadata pass so mode-dependent LoRA
+        // cards and stock transformer defaults are built for the right workflow.
+        if(persisted.exists&&persisted.config){
+          const savedMode=persisted.config.input_mode==='ref2va'?'ref2va':'fl2va';
+          $('input_mode').value=savedMode;
+          localStorage.setItem(MODEL_MODE_STORE_KEY,savedMode);
+        }
+      }catch(e){
+        DRIVE_CONFIG_STATUS={drive_connected:false,exists:false,config:null,error:String(e)};
+        console.warn('Drive Studio config unavailable:',e);
+      }
+
+      syncModelModeUI();
+      const m=await loadMeta();
+      if(DRIVE_CONFIG_STATUS.exists&&DRIVE_CONFIG_STATUS.config){
+        await restoreStudioConfig(DRIVE_CONFIG_STATUS.config,m);
+      }else if(DRIVE_CONFIG_STATUS.drive_connected){
+        // Per design, absence of the Drive file keeps the normal built-in defaults.
+        // The first generation submission will create it with the current choices.
+        say('ready · Drive connected · default config · first generation will save preferences');
+      }
+    }
+    initializeStudio().catch(e=>{console.error(e);fail(String(e&&e.message?e.message:e))});
     refreshStageState(true);
     refreshTimeline(true);
     $('project_menu_btn').onclick=()=>{$('project_popover').classList.toggle('show')};
@@ -8968,6 +9262,7 @@ Additional user Auto Prompt instructions:
       const motion8Submit=submittedSpecialStrength('motion8'),lightningSubmit=submittedSpecialStrength('lightning');
       fd.append('motion8_strength',String(motion8Submit));fd.append('lightning_strength',String(lightningSubmit));
       fd.append('lora','none');fd.append('lora_strength','0');fd.append('lora_stack_json',JSON.stringify(activeCreativeLoraStack()));
+      fd.append('studio_config_json',JSON.stringify(buildStudioConfig()));
       fd.append('timeline_action',timelineAction);fd.append('input_mode',mode);fd.append('ref_image_size',$('ref_image_size').value);fd.append('action','0');fd.append('action_strength','0');fd.append('lightning',Math.abs(lightningSubmit)>1e-6?'1':'0');
       if(mode==='ref2va'){
         for(let i=1;i<=9;i++) if($('ref_image_'+i).files[0]) fd.append('ref_image_'+i,$('ref_image_'+i).files[0]);
