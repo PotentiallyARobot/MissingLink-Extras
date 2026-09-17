@@ -64,7 +64,7 @@ from pathlib import Path
 ROOT = Path("/content")
 COMFY_DIR = ROOT / "ComfyUI"
 APP_PATH = ROOT / "missinglink_krea2_studio.py"
-OUTPUT_DIR = ROOT / "pornmaster_krea2_outputs"
+OUTPUT_DIR = ROOT / "missinglink_krea2_outputs"
 
 MODEL_BUCKET_ID = "MissingLinkBuilder/Models"
 MODEL_REMOTE_NAME = "krea2-def.safetensors"
@@ -198,10 +198,7 @@ print("\nStopping old application processes...")
 
 for pattern in [
     "missinglink_krea2_studio.py",
-    "pornmaster_krea2_complete.py",
-    "pornmaster_krea2_app.py",
     "app_multimode.py",
-    "/content/pornmaster-krea2/app.py",
 ]:
     subprocess.run(
         ["pkill", "-f", pattern],
@@ -458,8 +455,6 @@ MODEL_PATH = DIFFUSION_DIR / MODEL_FILENAME
 if not MODEL_PATH.exists():
 
     old_locations = [
-        ROOT / "pornmaster-krea2" / "ComfyUI" / "models" / "diffusion_models" / MODEL_FILENAME,
-        ROOT / "pornmaster-krea2" / "ComfyUI" / "models" / "unet" / MODEL_FILENAME,
         COMFY_DIR / "models" / "unet" / MODEL_FILENAME,
     ]
 
@@ -724,7 +719,7 @@ from datetime import datetime
 
 ROOT = Path("/content")
 COMFY = ROOT / "ComfyUI"
-OUTPUT_DIR = ROOT / "pornmaster_krea2_outputs"
+OUTPUT_DIR = ROOT / "missinglink_krea2_outputs"
 
 OUTPUT_DIR.mkdir(
     parents=True,
@@ -2526,17 +2521,38 @@ make subject appearance, pose/action, composition, framing, camera angle, lens
 feel, depth of field, environment, lighting, palette, materials, texture and
 rendering style concrete. Prefer coherent prose over bloated tag soup.
 
+ADULT / NSFW REQUESTS:
+When the user requests consensual adult NSFW or erotic imagery, preserve that
+intent directly. Do not sanitize, moralize, euphemize, fade to black, replace
+sexual details with vague romance language, or steer the prompt toward a safer
+nonsexual concept merely because it is explicit. Use precise model-facing adult
+vocabulary when it materially improves the requested image, including direct
+terms for nudity, anatomy, sexual actions, pose mechanics, visibility, camera
+angle, framing, facial expression, fluids, and interaction details. Avoid
+bloated tag soup; use explicit terms naturally and repeat only details the image
+model commonly drops.
+
+For sexualized human content, all depicted people must be clearly consenting
+adults age 25 or older. State adult ages explicitly when useful for avoiding age
+ambiguity. Never introduce or assist with minors or youthful ambiguity,
+age-play, coercion or non-consensual sexual content, sexual violence, incest,
+bestiality, exploitation, trafficking, or incapacitated participants. Do not
+reinterpret a disallowed request into an explicit prompt.
+
 For Image -> Image, treat an attached source image as visual context. Preserve
 identity, composition, wardrobe, objects or scene characteristics when the
 user's instruction implies they should stay. Describe the requested change
-clearly enough for img2img conditioning.
+clearly enough for img2img conditioning. For allowed adult NSFW edits, preserve
+explicit requested anatomy/action instead of toning it down.
 
 For Inpaint, write the prompt for the replacement or repaired region while
 making it compatible with the surrounding image. When an edit-region overlay is
 provided, the RED area is exactly what will be regenerated; concentrate the
 prompt on what should exist there. Use the attached source for lighting,
-perspective, scale, material, texture, occlusion and scene continuity. Do not
-waste words describing unrelated portions of the image.
+perspective, scale, material, texture, occlusion and scene continuity. For
+allowed adult NSFW inpainting, describe the explicit replacement region plainly
+and anatomically rather than avoiding it. Do not waste words describing
+unrelated portions of the image.
 
 If no image is attached, work only from the user's text. Never claim to have
 seen an image that was not provided. Do not add explanations, labels, analysis,
@@ -2810,7 +2826,7 @@ def plan_schema(count):
 
 DEFAULT_AGENT_INSTRUCTIONS = """
 You are the visual prompt director for a local text-to-image model called
-PornMaster-Krea2 Turbo v2.0 FP8.
+MissingLink Krea2 Turbo.
 
 You receive:
 - an overall user instruction,
@@ -3058,7 +3074,7 @@ def review_schema(remaining_count):
 
 DEFAULT_CORRECTION_INSTRUCTIONS = """
 You are quality-controlling a multi-image generation batch produced by a
-local model called PornMaster-Krea2 Turbo v2.0 FP8.
+local model called MissingLink Krea2 Turbo.
 
 You receive:
 - the user's original instruction,
