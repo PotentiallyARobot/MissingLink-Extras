@@ -42,6 +42,7 @@
 #
 # OPTIONAL
 #   HF_TOKEN
+#   CIVITAI_TOKEN
 #
 # GPU
 #   Auto-configures for NVIDIA T4 or L4
@@ -122,16 +123,36 @@ try:
 except Exception:
     HF_TOKEN = None
 
+try:
+    CIVITAI_TOKEN = userdata.get("CIVITAI_TOKEN")
+except Exception:
+    CIVITAI_TOKEN = None
+
 print("✓ MISSING_LINK_TOKEN loaded")
 print("✓ OPENAI_API_KEY loaded")
 
 if HF_TOKEN:
     print("✓ HF_TOKEN loaded")
+if CIVITAI_TOKEN:
+    print("✓ CIVITAI_TOKEN loaded")
 
 
 # =====================================================================
 # MISSINGLINK ACCESS GATE · FAIL CLOSED BEFORE CUDA / MODEL DOWNLOADS
 # =====================================================================
+# ACCESS-CONTROL INVARIANT — DO NOT REMOVE, BYPASS, CACHE-FOREVER, OR "SIMPLIFY".
+# This is product entitlement enforcement, not optional telemetry or UI polish.
+# Any refactor must preserve ALL enforcement layers below and remain fail-closed:
+#   1) notebook startup validation before expensive/model work,
+#   2) child-process startup validation,
+#   3) forced validation on initial UI/API metadata load,
+#   4) forced validation on job submission and GPU execution,
+#   5) periodic entitlement watchdog that cancels active/queued work,
+#   6) final validation immediately before Colab exposes the UI port.
+# If validation cannot be completed, access MUST be denied.
+# =====================================================================
+
+MISSINGLINK_ACCESS_CONTROL_SENTINEL = "ML-ENTITLEMENT-V1-FAIL-CLOSED"
 
 import urllib.request as _ml_urlreq
 import urllib.error as _ml_urlerr
@@ -141,6 +162,37 @@ MISSING_LINK_AUTH_URL = (
     or "https://missinglink.build/api/cache-token"
 ).strip()
 MISSING_LINK_TRIAL_URL = "https://www.missinglink.build/pricing.html"
+
+
+def _missinglink_entitlement_active(data):
+    """Treat explicit inactive subscription/access signals as a hard denial."""
+    if not isinstance(data, dict) or data.get("ok") is not True:
+        return False
+
+    for key in (
+        "active",
+        "subscription_active",
+        "access_active",
+        "entitled",
+        "subscription_valid",
+    ):
+        if key in data and data.get(key) is not True:
+            return False
+
+    status = str(
+        data.get("subscription_status")
+        or data.get("access_status")
+        or data.get("entitlement_status")
+        or ""
+    ).strip().lower()
+
+    if status in {
+        "inactive", "expired", "cancelled", "canceled", "revoked",
+        "disabled", "past_due", "unpaid", "suspended", "none",
+    }:
+        return False
+
+    return True
 
 
 def validate_missinglink_access(token):
@@ -166,7 +218,7 @@ def validate_missinglink_access(token):
         except Exception:
             data = {}
 
-        if 200 <= status < 300 and data.get("ok") is True:
+        if 200 <= status < 300 and _missinglink_entitlement_active(data):
             return True, ""
 
         return False, f"MissingLink rejected this API key (HTTP {status})."
@@ -182,13 +234,16 @@ def validate_missinglink_access(token):
         )
 
 
+# SECURITY / LICENSING CHECKPOINT A — REQUIRED.
+# Do not replace this with a cached/local-only check. It intentionally validates
+# entitlement before CUDA/model initialization so inactive accounts cannot launch.
 _ml_ok, _ml_error = validate_missinglink_access(
     MISSING_LINK_TOKEN
 )
 
 if not _ml_ok:
     raise RuntimeError(
-        "MissingLink access is required before this notebook can run.\n"
+        "An active MissingLink subscription is required before this notebook can run.\n"
         + _ml_error
         + "\nStart a trial / get access: "
         + MISSING_LINK_TRIAL_URL
@@ -780,10 +835,16 @@ import random
 import zipfile
 import threading
 import queue
+import shutil
 from collections import deque
 
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import urlparse
+
+import requests
+from huggingface_hub import hf_hub_download
+from safetensors import safe_open
 
 # =====================================================================
 # BROWSER CONSOLE CAPTURE
@@ -1045,27 +1106,147 @@ KREA2_EDIT_GROUNDED = nodes.NODE_CLASS_MAPPINGS["Krea2EditGroundedEncode"]()
 STEPS = 8
 CFG = 1.0
 
-def generation_model(lightning_enabled=False, lightning_strength=1.0):
-    if not lightning_enabled:
-        return UNET
-    strength = max(0.0, min(1.5, float(lightning_strength)))
-    return LIGHTNING_LOADER.load_lora_model_only(
-        UNET, LIGHTNING_LORA_NAME, strength
-    )[0]
+# =====================================================================
+# USER LoRA LIBRARY / STACK
+# =====================================================================
+# Only SafeTensors files are accepted. Pickle/checkpoint formats are rejected.
+# The active stack is snapshotted into each submitted job so queued jobs keep
+# the LoRA configuration they were created with even if the user changes the
+# global stack later.
+LORA_DIR_RUNTIME = COMFY / "models" / "loras"
+LORA_DIR_RUNTIME.mkdir(parents=True, exist_ok=True)
+RESERVED_LORAS = {LIGHTNING_LORA_NAME, EDIT_LORA_NAME}
+MAX_USER_LORAS_PER_JOB = 4
+MAX_USER_LORA_BYTES = 4 * 1024**3
+_EXTRA_LORA_LOCK = threading.RLock()
+ACTIVE_EXTRA_LORAS = []
+
+
+def _safe_lora_name(value):
+    name = Path(str(value or "")).name
+    if not name or name in {".", ".."}:
+        raise ValueError("Invalid LoRA filename.")
+    if not name.lower().endswith(".safetensors"):
+        raise ValueError("Only .safetensors LoRAs are supported.")
+    return name
+
+
+def _validate_user_lora_file(path):
+    path = Path(path)
+    if not path.is_file():
+        return False, "file is missing"
+    if path.suffix.lower() != ".safetensors":
+        return False, "only .safetensors files are allowed"
+    size = path.stat().st_size
+    if size < 4096:
+        return False, "file is unexpectedly small"
+    if size > MAX_USER_LORA_BYTES:
+        return False, "file is larger than the 4 GiB Studio limit"
+    try:
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            if not list(handle.keys()):
+                return False, "SafeTensors file contains no tensors"
+    except Exception as exc:
+        return False, f"invalid SafeTensors file: {exc}"
+    return True, "ok"
+
+
+def _installed_user_loras():
+    rows = []
+    with _EXTRA_LORA_LOCK:
+        active = {str(item.get("name")): float(item.get("strength", 1.0)) for item in ACTIVE_EXTRA_LORAS}
+    for path in sorted(LORA_DIR_RUNTIME.glob("*.safetensors"), key=lambda x: x.name.lower()):
+        valid, reason = _validate_user_lora_file(path)
+        rows.append({
+            "name": path.name,
+            "bytes": path.stat().st_size if path.exists() else 0,
+            "reserved": path.name in RESERVED_LORAS,
+            "valid": bool(valid),
+            "validation": reason,
+            "active": path.name in active,
+            "strength": active.get(path.name, 1.0),
+        })
+    return rows
+
+
+def _normalize_extra_loras(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            value = []
+    if not isinstance(value, (list, tuple)):
+        return []
+    out = []
+    seen = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        try:
+            name = _safe_lora_name(item.get("name"))
+        except Exception:
+            continue
+        if name in RESERVED_LORAS or name in seen:
+            continue
+        path = LORA_DIR_RUNTIME / name
+        valid, _ = _validate_user_lora_file(path)
+        if not valid:
+            continue
+        try:
+            strength = float(item.get("strength", 1.0))
+        except Exception:
+            strength = 1.0
+        strength = max(-2.0, min(2.0, strength))
+        out.append({"name": name, "strength": strength})
+        seen.add(name)
+        if len(out) >= MAX_USER_LORAS_PER_JOB:
+            break
+    return out
+
+
+def _apply_extra_loras(model, extra_loras=None):
+    active = _normalize_extra_loras(extra_loras)
+    for item in active:
+        print(f"[LORA] applying {item['name']} @ {item['strength']:g}", flush=True)
+        model = LIGHTNING_LOADER.load_lora_model_only(
+            model,
+            item["name"],
+            item["strength"],
+        )[0]
+    return model
+
+
+def generation_model(lightning_enabled=False, lightning_strength=1.0, extra_loras=None):
+    model = UNET
+    if lightning_enabled:
+        strength = max(0.0, min(1.5, float(lightning_strength)))
+        model = LIGHTNING_LOADER.load_lora_model_only(
+            model, LIGHTNING_LORA_NAME, strength
+        )[0]
+    return _apply_extra_loras(model, extra_loras)
 
 
 def identity_edit_model(
     lightning_enabled=False,
     lightning_strength=1.0,
     edit_lora_strength=1.0,
+    extra_loras=None,
 ):
-    base_model = generation_model(lightning_enabled, lightning_strength)
-    strength = max(0.0, min(1.5, float(edit_lora_strength)))
-    return EDIT_LOADER.load_lora_model_only(
-        base_model,
+    model = UNET
+    if lightning_enabled:
+        strength = max(0.0, min(1.5, float(lightning_strength)))
+        model = LIGHTNING_LOADER.load_lora_model_only(
+            model, LIGHTNING_LORA_NAME, strength
+        )[0]
+    edit_strength = max(0.0, min(1.5, float(edit_lora_strength)))
+    model = EDIT_LOADER.load_lora_model_only(
+        model,
         EDIT_LORA_NAME,
-        strength,
+        edit_strength,
     )[0]
+    return _apply_extra_loras(model, extra_loras)
 
 SAMPLER_NAME = "euler"
 SCHEDULER = "simple"
@@ -1890,6 +2071,7 @@ def text_to_image_core(
     scheduler=SCHEDULER,
     lightning_enabled=False,
     lightning_strength=1.0,
+    extra_loras=None,
 ):
 
     width = round16(width)
@@ -1902,7 +2084,7 @@ def text_to_image_core(
     lightning_strength = max(0.0, min(1.5, float(lightning_strength)))
     if lightning_enabled:
         steps, cfg, sampler_name, scheduler = 4, 1.0, "euler", "simple"
-    active_model = generation_model(lightning_enabled, lightning_strength)
+    active_model = generation_model(lightning_enabled, lightning_strength, extra_loras)
 
     total_start = time.time()
 
@@ -1953,6 +2135,7 @@ def text_to_image_core(
             "scheduler": scheduler,
             "acceleration": "krea2-turbo-4step-lora" if lightning_enabled else "stock-turbo",
             "acceleration_strength": lightning_strength if lightning_enabled else 0.0,
+            "extra_loras": _normalize_extra_loras(extra_loras),
             "sample_time": sample_time,
             "total_time": total_time,
         },
@@ -1983,6 +2166,7 @@ def text_to_image(
     scheduler=SCHEDULER,
     lightning_enabled=False,
     lightning_strength=1.0,
+    extra_loras=None,
 ):
 
     path, seed, status = (
@@ -1999,6 +2183,7 @@ def text_to_image(
             scheduler=scheduler,
             lightning_enabled=lightning_enabled,
             lightning_strength=lightning_strength,
+            extra_loras=extra_loras,
         )
     )
 
@@ -2033,6 +2218,7 @@ def image_to_image(
     scheduler=SCHEDULER,
     lightning_enabled=False,
     lightning_strength=1.0,
+    extra_loras=None,
 ):
 
     source = resize_image(
@@ -2048,7 +2234,7 @@ def image_to_image(
     lightning_strength = max(0.0, min(1.5, float(lightning_strength)))
     if lightning_enabled:
         steps, cfg, sampler_name, scheduler = 4, 1.0, "euler", "simple"
-    active_model = generation_model(lightning_enabled, lightning_strength)
+    active_model = generation_model(lightning_enabled, lightning_strength, extra_loras)
 
     start = time.time()
 
@@ -2096,6 +2282,7 @@ def image_to_image(
             "scheduler": scheduler,
             "acceleration": "krea2-turbo-4step-lora" if lightning_enabled else "stock-turbo",
             "acceleration_strength": lightning_strength if lightning_enabled else 0.0,
+            "extra_loras": _normalize_extra_loras(extra_loras),
             "sample_time": sample_time,
             "total_time": total,
         },
@@ -2139,6 +2326,7 @@ def instruction_edit(
     grounding_px=768,
     fit_mode="fit",
     ground_negative=False,
+    extra_loras=None,
 ):
 
     source = resize_image(source, max_side)
@@ -2187,6 +2375,7 @@ def instruction_edit(
             lightning_enabled=lightning_enabled,
             lightning_strength=lightning_strength,
             edit_lora_strength=edit_lora_strength,
+            extra_loras=extra_loras,
         ),
         source_latent=source_latent,
         ref_boost=ref_boost,
@@ -2228,6 +2417,7 @@ def instruction_edit(
             "grounding_px": int(grounding_px),
             "fit_mode": fit_mode,
             "ground_negative": bool(ground_negative),
+            "extra_loras": _normalize_extra_loras(extra_loras),
             "steps": steps,
             "cfg": cfg,
             "sampler": sampler_name,
@@ -2589,6 +2779,7 @@ def inpaint(
     grounding_px=768,
     fit_mode="fit",
     ground_negative=False,
+    extra_loras=None,
 ):
 
     steps = int(steps)
@@ -2679,6 +2870,7 @@ def inpaint(
             lightning_enabled=lightning_enabled,
             lightning_strength=lightning_strength,
             edit_lora_strength=edit_lora_strength,
+            extra_loras=extra_loras,
         ),
         source_latent=source_latent,
         ref_boost=ref_boost,
@@ -2751,6 +2943,7 @@ def inpaint(
             "grounding_px": int(grounding_px),
             "fit_mode": fit_mode,
             "ground_negative": bool(ground_negative),
+            "extra_loras": _normalize_extra_loras(extra_loras),
             "mask_expand": int(expand),
             "feather": int(feather),
             "context_padding": int(context_padding),
@@ -4015,6 +4208,7 @@ def generate_adaptive_batch(
     max_output_tokens,
     lightning_enabled=False,
     lightning_strength=1.0,
+    extra_loras=None,
 ):
 
     reset_stop()
@@ -4102,6 +4296,7 @@ def generate_adaptive_batch(
         "correction_instructions": str(correction_instructions),
         "lightning_enabled": bool(lightning_enabled),
         "lightning_strength": float(lightning_strength),
+        "extra_loras": _normalize_extra_loras(extra_loras),
     }
 
     def correction_due(completed, used):
@@ -4267,6 +4462,7 @@ def generate_adaptive_batch(
                     mode=f"batch_{index+1:02d}",
                     lightning_enabled=lightning_enabled,
                     lightning_strength=lightning_strength,
+                    extra_loras=extra_loras,
                 )
             )
 
@@ -4516,6 +4712,13 @@ MISSING_LINK_AUTH_URL = (
 MISSING_LINK_TRIAL_URL = "https://www.missinglink.build/pricing.html"
 MISSING_LINK_AUTH_TTL_SEC = 30.0
 MISSING_LINK_WATCHDOG_SEC = 45.0
+
+# ACCESS-CONTROL INVARIANT — REQUIRED PRODUCT ENFORCEMENT.
+# Do not remove or collapse the entitlement layers in this child process. The UI,
+# request API, queue, GPU worker, and watchdog intentionally re-check access at
+# different times to remain fail-closed if entitlement changes during a session.
+MISSINGLINK_ACCESS_CONTROL_SENTINEL = "ML-ENTITLEMENT-V1-FAIL-CLOSED"
+
 _ML_ACCESS_REVOKED = threading.Event()
 _ML_AUTH_STATE = {
     "ok": False,
@@ -4526,6 +4729,37 @@ _ML_AUTH_STATE = {
 
 def _missinglink_token():
     return (os.environ.get("MISSING_LINK_TOKEN") or "").strip()
+
+
+def _missinglink_entitlement_active(data):
+    """Fail closed on explicit inactive subscription/access state."""
+    if not isinstance(data, dict) or data.get("ok") is not True:
+        return False
+
+    for key in (
+        "active",
+        "subscription_active",
+        "access_active",
+        "entitled",
+        "subscription_valid",
+    ):
+        if key in data and data.get(key) is not True:
+            return False
+
+    status = str(
+        data.get("subscription_status")
+        or data.get("access_status")
+        or data.get("entitlement_status")
+        or ""
+    ).strip().lower()
+
+    if status in {
+        "inactive", "expired", "cancelled", "canceled", "revoked",
+        "disabled", "past_due", "unpaid", "suspended", "none",
+    }:
+        return False
+
+    return True
 
 
 def _validate_missinglink_token(force=False):
@@ -4576,7 +4810,7 @@ def _validate_missinglink_token(force=False):
         except Exception:
             data = {}
 
-        if 200 <= status < 300 and data.get("ok") is True:
+        if 200 <= status < 300 and _missinglink_entitlement_active(data):
             _ML_AUTH_STATE.update(
                 ok=True,
                 checked=now,
@@ -4605,11 +4839,14 @@ def _validate_missinglink_token(force=False):
     return False, msg
 
 
+# SECURITY / LICENSING CHECKPOINT B — REQUIRED CHILD STARTUP VALIDATION.
+# This must remain a forced remote entitlement check. Failure means the Flask
+# Studio must not start serving a usable application.
 _ml_ok, _ml_error = _validate_missinglink_token(force=True)
 
 if not _ml_ok:
     raise RuntimeError(
-        "MissingLink access is required before the Studio can start.\n"
+        "An active MissingLink subscription is required before the Studio can start.\n"
         + _ml_error
         + "\nGet access: "
         + MISSING_LINK_TRIAL_URL
@@ -4617,11 +4854,16 @@ if not _ml_ok:
 
 
 def _require_missinglink_access(context="Studio operation", force=True):
-    """Fail closed unless MissingLink confirms current entitlement."""
+    """Fail closed unless MissingLink confirms current entitlement.
+
+    ACCESS-CONTROL INVARIANT: callers protecting paid operations must keep
+    ``force=True`` unless a deliberately short-lived request cache is sufficient.
+    Do not convert failures into warnings or best-effort continuation.
+    """
     ok, error = _validate_missinglink_token(force=force)
     if not ok:
         raise RuntimeError(
-            f"MissingLink subscription/access is required for {context}. "
+            f"An active MissingLink subscription is required for {context}. "
             + (error or "Access validation failed.")
             + " Get access: "
             + MISSING_LINK_TRIAL_URL
@@ -4632,13 +4874,43 @@ def _require_missinglink_access(context="Studio operation", force=True):
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 128 * 1024 * 1024
 
+# =====================================================================
+# REQUIRED USER TERMS / RESPONSIBLE-USE ACKNOWLEDGEMENT
+# =====================================================================
+# This acknowledgement is deliberately enforced server-side for content/model
+# actions, not only as a cosmetic browser modal. Acceptance is scoped to the
+# current Studio process and must be renewed after a restart.
+TERMS_VERSION = "2026-09-17-v5-membership-and-controls"
+TERMS_COOKIE_NAME = "ml_krea2_terms"
+TERMS_ACCEPT_TOKEN = uuid.uuid4().hex
+TERMS_PROTECTED_PREFIXES = (
+    "/api/text_to_image",
+    "/api/image_to_image",
+    "/api/instruction_edit",
+    "/api/inpaint",
+    "/api/auto_prompt",
+    "/api/batch/analyze",
+    "/api/batch/start",
+    "/api/captions/start",
+    "/api/loras/",
+)
+
+
+def _terms_cookie_value():
+    return f"{TERMS_VERSION}:{TERMS_ACCEPT_TOKEN}"
+
+
+def _terms_accepted():
+    return request.cookies.get(TERMS_COOKIE_NAME, "") == _terms_cookie_value()
+
+
 JOB_LOCK = threading.RLock()
 BATCH_STATE_LOCK = JOB_LOCK  # compatibility alias for caption-state helpers
 JOBS = {}
 JOB_PARAMS = {}
 CAPTION_JOBS = {}
 JOB_QUEUE = queue.Queue()
-JOB_MAX_ACTIVE = 12
+JOB_MAX_ACTIVE = 24
 ACTIVE_JOB_ID = None
 JOB_INPUT_DIR = ROOT / "missinglink_krea2_job_inputs"
 JOB_INPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -4673,6 +4945,115 @@ def _int_value(value, default, minimum=None, maximum=None):
     if maximum is not None:
         result = min(int(maximum), result)
     return result
+
+
+def _atomic_copy_validated_lora(source_path, destination_name):
+    source_path = Path(source_path)
+    destination_name = _safe_lora_name(destination_name)
+    destination = LORA_DIR_RUNTIME / destination_name
+    partial = destination.with_name(destination.name + ".part")
+    partial.unlink(missing_ok=True)
+    shutil.copy2(source_path, partial)
+    valid, reason = _validate_user_lora_file(partial)
+    if not valid:
+        partial.unlink(missing_ok=True)
+        raise RuntimeError(f"Downloaded LoRA failed validation: {reason}")
+    os.replace(partial, destination)
+    return destination
+
+
+def _install_huggingface_lora(repo_id, filename, revision=""):
+    repo_id = str(repo_id or "").strip()
+    filename = str(filename or "").strip()
+    revision = str(revision or "").strip() or None
+    if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo_id):
+        raise ValueError("Enter a Hugging Face repo id like owner/repository.")
+    if not filename.lower().endswith(".safetensors"):
+        raise ValueError("Hugging Face LoRA filename must end in .safetensors.")
+    token = (os.environ.get("HF_TOKEN") or "").strip() or None
+    downloaded = Path(hf_hub_download(
+        repo_id=repo_id,
+        filename=filename,
+        revision=revision,
+        token=token,
+    ))
+    return _atomic_copy_validated_lora(downloaded, Path(filename).name)
+
+
+def _civitai_headers(token=""):
+    headers = {"User-Agent": "MissingLink-Krea2-Studio/1.0", "Accept": "application/json"}
+    token = str(token or "").strip() or (os.environ.get("CIVITAI_TOKEN") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _install_civitai_lora(version_id, token=""):
+    try:
+        version_id = int(version_id)
+    except Exception:
+        raise ValueError("Enter a numeric Civitai model version ID.")
+    if version_id <= 0:
+        raise ValueError("Civitai model version ID must be positive.")
+
+    headers = _civitai_headers(token)
+    meta_url = f"https://civitai.com/api/v1/model-versions/{version_id}"
+    meta_resp = requests.get(meta_url, headers=headers, timeout=(20, 60))
+    meta_resp.raise_for_status()
+    data = meta_resp.json()
+
+    model_type = str((data.get("model") or {}).get("type") or "").upper()
+    if model_type and model_type not in {"LORA", "LOCON"}:
+        raise ValueError(f"Civitai resource is {model_type}, not a LoRA.")
+
+    files = data.get("files") or []
+    safe_files = []
+    for item in files:
+        name = str(item.get("name") or "")
+        fmt = str((item.get("metadata") or {}).get("format") or item.get("format") or "")
+        pickle_scan = str(item.get("pickleScanResult") or "").lower()
+        virus_scan = str(item.get("virusScanResult") or "").lower()
+        if name.lower().endswith(".safetensors") or fmt.lower() == "safetensor":
+            if pickle_scan in {"danger", "error"} or virus_scan in {"danger", "error"}:
+                continue
+            safe_files.append(item)
+    if not safe_files:
+        raise RuntimeError("This Civitai version has no downloadable SafeTensors LoRA file.")
+
+    selected = next((x for x in safe_files if x.get("primary") is True), safe_files[0])
+    filename = _safe_lora_name(selected.get("name") or f"civitai_{version_id}.safetensors")
+    download_url = str(selected.get("downloadUrl") or data.get("downloadUrl") or "").strip()
+    if not download_url:
+        download_url = f"https://civitai.com/api/download/models/{version_id}"
+
+    destination = LORA_DIR_RUNTIME / filename
+    partial = destination.with_name(destination.name + ".part")
+    partial.unlink(missing_ok=True)
+    total = 0
+    try:
+        with requests.get(download_url, headers=headers, stream=True, allow_redirects=True, timeout=(30, 300)) as response:
+            response.raise_for_status()
+            try:
+                announced = int(response.headers.get("Content-Length") or 0)
+            except Exception:
+                announced = 0
+            if announced and announced > MAX_USER_LORA_BYTES:
+                raise RuntimeError("Civitai LoRA exceeds the 4 GiB Studio limit.")
+            with open(partial, "wb") as handle:
+                for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > MAX_USER_LORA_BYTES:
+                        raise RuntimeError("Civitai LoRA exceeds the 4 GiB Studio limit.")
+                    handle.write(chunk)
+        valid, reason = _validate_user_lora_file(partial)
+        if not valid:
+            raise RuntimeError(f"Downloaded Civitai LoRA failed validation: {reason}")
+        os.replace(partial, destination)
+    finally:
+        partial.unlink(missing_ok=True)
+    return destination
 
 
 def _pil_upload(storage, mode="RGB"):
@@ -4747,7 +5128,12 @@ def _active_job_count():
 
 
 def _submit_job(kind, params, *, label, mode, thumb=None, batch_total=0):
+    # SECURITY / LICENSING CHECKPOINT C — REQUIRED BEFORE ANY QUEUED PAID WORK.
+    # Keep this forced check even though request middleware also validates access.
     _require_missinglink_access("job submission", force=True)
+    params = dict(params or {})
+    with _EXTRA_LORA_LOCK:
+        params["extra_loras"] = [dict(item) for item in ACTIVE_EXTRA_LORAS]
     with JOB_LOCK:
         if _active_job_count() >= JOB_MAX_ACTIVE:
             raise RuntimeError(
@@ -4826,6 +5212,7 @@ def _run_batch_job(jid, params):
         max_output_tokens=params["max_output_tokens"],
         lightning_enabled=params.get("lightning_enabled", False),
         lightning_strength=params.get("lightning_strength", 1.0),
+        extra_loras=params.get("extra_loras", []),
     )
 
     for update in generator:
@@ -4866,6 +5253,8 @@ def _run_batch_job(jid, params):
 
 def _execute_job(jid):
     global CURRENT_JOB_ID
+    # SECURITY / LICENSING CHECKPOINT D — REQUIRED AT ACTUAL GPU EXECUTION TIME.
+    # A queued job may wait long enough for entitlement to change after submission.
     _require_missinglink_access("GPU execution", force=True)
     with JOB_LOCK:
         job = JOBS[jid]
@@ -4893,6 +5282,7 @@ def _execute_job(jid):
             scheduler=params.get("scheduler", SCHEDULER),
             lightning_enabled=params.get("lightning_enabled", False),
             lightning_strength=params.get("lightning_strength", 1.0),
+            extra_loras=params.get("extra_loras", []),
         )
         path, seed, status, download_path, _, _ = result
         return {"image": _output_url(path), "seed": seed, "status": status,
@@ -4910,6 +5300,7 @@ def _execute_job(jid):
             scheduler=params.get("scheduler", SCHEDULER),
             lightning_enabled=params.get("lightning_enabled", False),
             lightning_strength=params.get("lightning_strength", 1.0),
+            extra_loras=params.get("extra_loras", []),
         )
         path, seed, status, download_path, _, _ = result
         return {"image": _output_url(path), "seed": seed, "status": status,
@@ -4934,6 +5325,7 @@ def _execute_job(jid):
             scheduler=params.get("scheduler", SCHEDULER),
             lightning_enabled=params.get("lightning_enabled", False),
             lightning_strength=params.get("lightning_strength", 1.0),
+            extra_loras=params.get("extra_loras", []),
         )
         path, seed, status, download_path, _, _ = result
         return {"image": _output_url(path), "seed": seed, "status": status,
@@ -4967,6 +5359,7 @@ def _execute_job(jid):
             scheduler=params.get("scheduler", SCHEDULER),
             lightning_enabled=params.get("lightning_enabled", False),
             lightning_strength=params.get("lightning_strength", 1.0),
+            extra_loras=params.get("extra_loras", []),
         )
         path, seed, status, download_path, _, _ = result
         return {"image": _output_url(path), "seed": seed, "status": status,
@@ -5049,7 +5442,12 @@ threading.Thread(
 
 
 def _missinglink_entitlement_watchdog():
-    """Stop active/queued work if entitlement disappears or cannot be verified."""
+    """Stop active/queued work if entitlement disappears or cannot be verified.
+
+    SECURITY / LICENSING CHECKPOINT E — REQUIRED CONTINUOUS ENFORCEMENT.
+    This intentionally treats validation failure as loss of access and cancels
+    work. Do not downgrade it to logging-only behavior.
+    """
     while True:
         time.sleep(MISSING_LINK_WATCHDOG_SEC)
         ok, error = _validate_missinglink_token(force=True)
@@ -5089,7 +5487,12 @@ threading.Thread(
 
 @app.before_request
 def _missinglink_request_gate():
-    ok, error = _validate_missinglink_token(force=False)
+    # SECURITY / LICENSING CHECKPOINT F — REQUIRED REQUEST GATE.
+    # Every browser/API request passes through here. The initial HTML/UI load and
+    # startup metadata handshake always revalidate
+    # entitlement instead of relying on the short-lived cache.
+    force = request.path in {"/", "/api/meta"}
+    ok, error = _validate_missinglink_token(force=force)
     if ok:
         return None
     if request.path.startswith("/api/"):
@@ -5111,6 +5514,56 @@ def _missinglink_request_gate():
         status=401,
         mimetype="text/html",
     )
+
+
+@app.before_request
+def _terms_request_gate():
+    path = request.path or ""
+    if request.method == "POST" and any(path.startswith(prefix) for prefix in TERMS_PROTECTED_PREFIXES):
+        if not _terms_accepted():
+            return jsonify(
+                ok=False,
+                error="You must certify that you are 18 or older and accept the Studio legal, consent, responsible-use, and output-responsibility terms before using generation, prompt, caption, or LoRA-install actions.",
+                code="terms_acceptance_required",
+                terms_version=TERMS_VERSION,
+            ), 428
+    return None
+
+
+@app.get("/api/terms/status")
+def api_terms_status():
+    return jsonify(
+        ok=True,
+        accepted=_terms_accepted(),
+        version=TERMS_VERSION,
+    )
+
+
+@app.post("/api/terms/accept")
+def api_terms_accept():
+    body = request.get_json(silent=True) or {}
+    if body.get("age_18_or_older") is not True:
+        return _json_error("You must certify that you are 18 years of age or older to use this Studio.", 400)
+    if body.get("legal_compliance") is not True:
+        return _json_error("You must agree to comply with all applicable laws, regulations, licenses, platform rules, privacy requirements, and consent requirements.", 400)
+    if body.get("consent_compliance") is not True:
+        return _json_error("You must agree not to create or distribute non-consensual intimate imagery and to obtain any legally required age and consent documentation.", 400)
+    if body.get("output_responsibility") is not True:
+        return _json_error("You must acknowledge that MissingLink is the execution/orchestration layer and that you are responsible for your prompts, model choices, output review, and use of generated results.", 400)
+    if body.get("membership_and_controls") is not True:
+        return _json_error("You must acknowledge that continued use requires an active MissingLink membership and that membership, entitlement, access-control, responsible-use, and safety mechanisms may not be bypassed, disabled, removed, altered, or interfered with.", 400)
+    if body.get("agree") is not True:
+        return _json_error("You must explicitly agree to the responsible-use terms.", 400)
+    response = jsonify(ok=True, accepted=True, version=TERMS_VERSION)
+    response.set_cookie(
+        TERMS_COOKIE_NAME,
+        _terms_cookie_value(),
+        httponly=True,
+        samesite="Lax",
+        max_age=60 * 60 * 24,
+        path="/",
+    )
+    return response
 
 
 @app.get("/api/console")
@@ -5152,6 +5605,70 @@ def api_meta():
         },
         lightning_lora=LIGHTNING_LORA_NAME,
     )
+
+
+@app.get("/api/loras")
+def api_loras():
+    return jsonify(
+        ok=True,
+        max_active=MAX_USER_LORAS_PER_JOB,
+        items=_installed_user_loras(),
+    )
+
+
+@app.post("/api/loras/active")
+def api_loras_active():
+    body = request.get_json(silent=True) or {}
+    stack = _normalize_extra_loras(body.get("loras"))
+    with _EXTRA_LORA_LOCK:
+        ACTIVE_EXTRA_LORAS[:] = [dict(item) for item in stack]
+    return jsonify(ok=True, active=stack, items=_installed_user_loras())
+
+
+@app.post("/api/loras/install/huggingface")
+def api_loras_install_huggingface():
+    body = request.get_json(silent=True) or {}
+    try:
+        path = _install_huggingface_lora(
+            body.get("repo_id"),
+            body.get("filename"),
+            body.get("revision") or "",
+        )
+        return jsonify(ok=True, name=path.name, items=_installed_user_loras())
+    except Exception as exc:
+        _traceback.print_exc()
+        return _json_error(exc, 400)
+
+
+@app.post("/api/loras/install/civitai")
+def api_loras_install_civitai():
+    body = request.get_json(silent=True) or {}
+    try:
+        path = _install_civitai_lora(
+            body.get("version_id"),
+            body.get("token") or "",
+        )
+        return jsonify(ok=True, name=path.name, items=_installed_user_loras())
+    except Exception as exc:
+        _traceback.print_exc()
+        return _json_error(exc, 400)
+
+
+@app.post("/api/loras/delete")
+def api_loras_delete():
+    body = request.get_json(silent=True) or {}
+    try:
+        name = _safe_lora_name(body.get("name"))
+        if name in RESERVED_LORAS:
+            raise ValueError("Built-in Studio LoRAs cannot be deleted here.")
+        path = LORA_DIR_RUNTIME / name
+        if path.exists():
+            path.unlink()
+        with _EXTRA_LORA_LOCK:
+            ACTIVE_EXTRA_LORAS[:] = [item for item in ACTIVE_EXTRA_LORAS if item.get("name") != name]
+        return jsonify(ok=True, items=_installed_user_loras())
+    except Exception as exc:
+        return _json_error(exc, 400)
 
 
 @app.post("/api/auto_prompt")
@@ -5851,6 +6368,10 @@ details .inside{padding:0 10px 10px}
 .console-stage.active{display:block!important}
 .console-stage::-webkit-scrollbar{width:9px;height:9px}.console-stage::-webkit-scrollbar-track{background:#09090b}.console-stage::-webkit-scrollbar-thumb{background:#34353d;border-radius:8px}
 .console-toolbar-note{font-family:var(--font-mono);font-size:8px;color:#777982;line-height:1.5}
+.lora-list{display:flex;flex-direction:column;gap:6px;margin-top:8px}
+.lora-row{display:grid;grid-template-columns:24px minmax(0,1fr) 82px 54px;gap:7px;align-items:center;padding:7px;border:1px solid #2a2b31;border-radius:7px;background:#0d0d10}
+.lora-row.reserved{opacity:.62}.lora-name{min-width:0;font-family:var(--font-mono);font-size:8.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.lora-meta{font-size:7.5px;color:#70727b;margin-top:2px}.lora-strength{height:32px!important;padding:5px 6px!important}.lora-delete{height:30px!important;padding:0 7px!important;font-size:8px!important}.lora-stage{display:none!important;padding:28px!important;align-items:flex-start!important;justify-content:flex-start!important;overflow:auto!important}.lora-stage.active{display:block!important}.lora-stage h2{font:700 15px var(--font-mono);letter-spacing:1px;color:#d4d5db;margin:0 0 10px}.lora-stage p{max-width:760px;color:#83858e;font-size:11px;line-height:1.6}.lora-pill{display:inline-block;border:1px solid #33343b;border-radius:999px;padding:4px 7px;margin:3px 4px 3px 0;font:8px var(--font-mono);color:#b8bac2;background:#111217}
+.terms-modal{position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,.94);display:flex;align-items:center;justify-content:center;padding:18px}.terms-modal.hidden{display:none!important}.terms-shell{width:min(720px,calc(100vw - 36px));max-height:calc(100vh - 36px);overflow:auto;background:#111115;border:1px solid #3a3b43;border-radius:12px;box-shadow:0 30px 100px rgba(0,0,0,.7);padding:20px}.terms-title{font:700 15px var(--font-display);letter-spacing:1px;color:var(--accent);margin-bottom:10px}.terms-copy{color:#b5b7bf;line-height:1.6;font-size:12px}.terms-copy strong{color:#ededf0}.terms-agree{margin-top:14px;padding:12px;border:1px solid #31323a;border-radius:8px;background:#0b0b0d}.terms-actions{display:flex;justify-content:flex-end;margin-top:14px}.terms-actions button{min-width:180px;height:40px}
 /* ===== MissingLink Studio-style split layout ===== */
 html,body{height:100%;overflow:hidden}
 .app-shell{height:100vh;display:grid;grid-template-rows:52px minmax(0,1fr);background:var(--bg)}
@@ -5958,6 +6479,7 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
         <button class="tab" data-tab="inpaint">INPAINT</button>
         <button class="tab" data-tab="batch">ADAPTIVE BATCH</button>
         <button class="tab" data-tab="history">HISTORY</button>
+        <button class="tab" data-tab="loras">LORAS</button>
         <button class="tab" data-tab="console">CONSOLE</button>
       </nav>
 
@@ -6094,7 +6616,7 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
                   <label>Acceleration strength</label><input id="e_lightning_strength" type="number" min="0" max="1.5" step=".05" value="1.0">
                 </div>
               </details>
-              <div class="actions"><button id="e_generate">INSTRUCTION EDIT</button></div>
+              <div class="actions"><button id="e_generate">GENERATE</button></div>
               <div id="e_status" class="status">Ready.</div>
               <a id="e_download" class="hidden" target="_blank"></a>
             </div>
@@ -6269,6 +6791,46 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
           </div>
         </section>
 
+        <section id="panel_loras" class="controlpanel">
+          <div class="card">
+            <div class="cardtitle">LoRA Manager</div>
+            <div class="cardbody">
+              <div class="sectionhint">Install additional Krea-compatible LoRAs from Hugging Face or Civitai. Only <b>.safetensors</b> files are accepted. Up to four user LoRAs can be active per queued job. The active stack is snapshotted when you submit a job.</div>
+              <details open>
+                <summary>Hugging Face</summary>
+                <div class="inside">
+                  <label>Repository ID</label><input id="l_hf_repo" placeholder="owner/repository">
+                  <label>SafeTensors filename</label><input id="l_hf_file" placeholder="my_lora.safetensors">
+                  <label>Revision · optional</label><input id="l_hf_revision" placeholder="main, tag, branch, or commit">
+                  <div class="minihint">Uses the notebook's HF_TOKEN when available, including gated/private repos you are authorized to access.</div>
+                  <div class="actions"><button id="l_hf_install" type="button">INSTALL FROM HUGGING FACE</button></div>
+                </div>
+              </details>
+              <details>
+                <summary>Civitai</summary>
+                <div class="inside">
+                  <label>Model version ID</label><input id="l_civitai_version" type="number" min="1" placeholder="e.g. 2514310">
+                  <label>Civitai API token · optional</label><input id="l_civitai_token" type="password" autocomplete="off" placeholder="Uses CIVITAI_TOKEN secret if left blank">
+                  <div class="minihint">The Studio queries the model-version API, selects a SafeTensors LoRA file, and rejects dangerous/error scan results or non-SafeTensors formats.</div>
+                  <div class="actions"><button id="l_civitai_install" type="button">INSTALL FROM CIVITAI</button></div>
+                </div>
+              </details>
+              <div id="l_status" class="status">Loading LoRA library…</div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="cardtitle">Installed LoRAs · Active Stack</div>
+            <div class="cardbody">
+              <div class="sectionhint">Check a LoRA to activate it for <b>newly submitted</b> jobs and set its model strength. Built-in acceleration/edit LoRAs are managed by their existing controls and cannot be deleted here.</div>
+              <div id="lora_list" class="lora-list"><div class="empty">Loading…</div></div>
+              <div class="actions">
+                <button id="l_save_stack" type="button">SAVE ACTIVE STACK</button>
+                <button id="l_refresh" class="secondary" type="button">REFRESH</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
         <section id="panel_console" class="controlpanel">
           <div class="card">
             <div class="cardtitle">Console</div>
@@ -6318,9 +6880,38 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
         <div id="in_result" class="stageview single stagepanel"><div class="empty">Edit / inpaint result appears here.</div></div>
         <div id="b_gallery" class="stageview gallerymode stagepanel"><div class="empty">Completed batch images stream here.</div></div>
         <div id="history_stage" class="stageview gallerymode stagepanel"><div class="empty">History images appear here.</div></div>
+        <div id="lora_stage" class="stageview lora-stage stagepanel"><h2>USER LoRA STACK</h2><p>Additional LoRAs installed from Hugging Face or Civitai are applied to new queued jobs. Keep stacks small on T4-class GPUs: every LoRA adds model patches and can increase memory pressure and generation time.</p><div id="lora_stage_active"></div></div>
         <pre id="console_stage" class="stageview console-stage stagepanel">Console output will appear here.</pre>
       </div>
     </main>
+  </div>
+</div>
+
+<div id="terms_modal" class="terms-modal hidden" aria-hidden="true">
+  <div class="terms-shell" role="dialog" aria-modal="true" aria-labelledby="terms_title">
+    <div id="terms_title" class="terms-title">RESPONSIBLE USE AGREEMENT</div>
+    <div class="terms-copy">
+      <p>Before using MissingLink Krea2 Studio, you must certify that you are <strong>18 years of age or older</strong> and agree to the requirements below.</p>
+      <p><strong>You must comply with all applicable federal, state, local, and international laws and regulations, as well as platform rules, model/file licenses, privacy rights, publicity rights, intellectual-property rights, and consent requirements.</strong> You are responsible for having the rights and permissions needed for every image, reference, LoRA, prompt, and other material you provide.</p>
+      <p><strong>No minors.</strong> You may not create, possess, solicit, facilitate, or distribute sexual or exploitative content involving anyone under 18, or anyone whose age is ambiguous in a sexual context.</p>
+      <p><strong>No non-consensual intimate imagery or sexual deepfakes.</strong> You may not create or distribute intimate or sexually explicit imagery of an identifiable real person without all consent required by law. If an identifiable real person appears in sexual or intimate content, you are responsible for confirming that person was 18 or older and for obtaining and retaining any legally required written consent, age verification, distribution permission, records, or other documentation.</p>
+      <p>If you publish or distribute outputs outside this private Studio session, you are solely responsible for any additional verification, recordkeeping, notice, removal, takedown, or platform obligations that apply to that publication or distribution. This includes laws governing non-consensual intimate imagery, synthetic/deepfake intimate imagery, and age/consent verification where applicable.</p>
+      <p>You agree not to use the Studio to create, facilitate, promote, or distribute illegal, abusive, exploitative, deceptive, fraudulent, harassing, threatening, defamatory, privacy-invasive, impersonating, or otherwise harmful content, or to facilitate trafficking, coercion, extortion, stalking, fraud, or other unlawful conduct.</p>
+      <p><strong>MissingLink is an execution and orchestration layer, not the developer of the underlying generative models.</strong> MissingLink provides software, configuration, dependencies, workflow logic, interfaces, and infrastructure that allow compatible third-party or locally supplied models and LoRAs to run. MissingLink does not train, author, control, or determine the behavior of those underlying model weights, and it does not select the content of a user's prompts or model-generated outputs. <strong>Outputs are produced by the underlying models and may be inaccurate, unexpected, offensive, unlawful, or infringing.</strong> You are responsible for the prompts, source materials, model and LoRA choices, review of generated results, and any possession, storage, publication, distribution, or other use of those results. MissingLink does not assume responsibility for content generated by third-party models or for a user's use of that content. Nothing in this agreement changes any rights, duties, or remedies that apply under applicable law.</p>
+      <p>Third-party LoRAs and models may have their own licenses and restrictions. Installing or using a model file does not grant rights that its creator or rights holder did not provide.</p>
+      <p><strong>Continued use of this notebook and Studio requires an active MissingLink membership.</strong> The membership, entitlement, access-control, responsible-use, and safety mechanisms included with the Studio are material conditions of access and may not be bypassed, disabled, removed, altered, or interfered with. <strong>Attempting to circumvent or remove those mechanisms is prohibited and may result in immediate suspension or revocation of access and legal action, including a lawsuit, injunctive relief, and claims for damages where available.</strong> Nothing in this paragraph guarantees that any particular legal action will be filed; enforcement will depend on the facts and applicable law.</p>
+      <p>This agreement sets minimum conditions for using the Studio. It does not replace your obligation to understand and follow laws that apply to you, your location, your content, or your downstream use.</p>
+    </div>
+    <div class="terms-agree">
+      <label style="text-transform:none;letter-spacing:0;font-size:11px;color:#d3d4da;margin:0 0 10px"><input id="terms_age_checkbox" type="checkbox" style="width:auto;margin-right:8px"><strong>I certify that I am 18 years of age or older.</strong></label>
+      <label style="text-transform:none;letter-spacing:0;font-size:11px;color:#d3d4da;margin:0 0 10px"><input id="terms_legal_checkbox" type="checkbox" style="width:auto;margin-right:8px">I agree to comply with all applicable laws, regulations, licenses, platform rules, privacy requirements, and consent requirements.</label>
+      <label style="text-transform:none;letter-spacing:0;font-size:11px;color:#d3d4da;margin:0 0 10px"><input id="terms_consent_checkbox" type="checkbox" style="width:auto;margin-right:8px">I will not create or distribute non-consensual intimate imagery, sexual deepfakes of identifiable people without legally required consent, or sexual content involving minors, and I will obtain any legally required age/consent documentation.</label>
+      <label style="text-transform:none;letter-spacing:0;font-size:11px;color:#d3d4da;margin:0 0 10px"><input id="terms_output_checkbox" type="checkbox" style="width:auto;margin-right:8px">I understand that MissingLink provides the execution/orchestration stack and does not develop, train, or control the underlying third-party models or LoRAs. I am responsible for my prompts, model/LoRA choices, review of generated results, and my use of those results.</label>
+      <label style="text-transform:none;letter-spacing:0;font-size:11px;color:#d3d4da;margin:0 0 10px"><input id="terms_membership_checkbox" type="checkbox" style="width:auto;margin-right:8px">I understand that continued use requires an active MissingLink membership and that I may not bypass, disable, remove, alter, or interfere with membership, entitlement, access-control, responsible-use, or safety mechanisms. I understand that violations may result in suspension or revocation of access and legal action, including a lawsuit where appropriate.</label>
+      <label style="text-transform:none;letter-spacing:0;font-size:11px;color:#d3d4da;margin:0"><input id="terms_checkbox" type="checkbox" style="width:auto;margin-right:8px">I understand and agree to follow all of these requirements.</label>
+    </div>
+    <div id="terms_status" class="status">You must certify that you are 18+ and accept all legal, consent, membership/access-control, responsible-use, and output-responsibility terms before generation or LoRA installation.</div>
+    <div class="terms-actions"><button id="terms_accept" type="button" disabled>AGREE & CONTINUE</button></div>
   </div>
 </div>
 
@@ -6437,10 +7028,123 @@ async function fetchJson(url,opts={}){
   let d={};
   try{d=await r.json()}catch(_){}
   if(!r.ok || d.ok===false){
+    if(r.status===428 && d.code==='terms_acceptance_required') showTermsModal();
     throw new Error(d.error||('HTTP '+r.status));
   }
   return d;
 }
+
+// ====================================================================
+// REQUIRED RESPONSIBLE-USE AGREEMENT
+// ====================================================================
+function showTermsModal(){
+  const m=$('terms_modal'); if(!m)return;
+  m.classList.remove('hidden');m.setAttribute('aria-hidden','false');
+}
+function hideTermsModal(){
+  const m=$('terms_modal'); if(!m)return;
+  m.classList.add('hidden');m.setAttribute('aria-hidden','true');
+}
+async function refreshTermsStatus(){
+  try{
+    const d=await fetchJson('/api/terms/status');
+    if(d.accepted) hideTermsModal(); else showTermsModal();
+  }catch(_){showTermsModal()}
+}
+function syncTermsAcceptButton(){
+  $('terms_accept').disabled=!(
+    $('terms_age_checkbox').checked &&
+    $('terms_legal_checkbox').checked &&
+    $('terms_consent_checkbox').checked &&
+    $('terms_output_checkbox').checked &&
+    $('terms_membership_checkbox').checked &&
+    $('terms_checkbox').checked
+  );
+}
+['terms_age_checkbox','terms_legal_checkbox','terms_consent_checkbox','terms_output_checkbox','terms_membership_checkbox','terms_checkbox'].forEach(id=>$(id).addEventListener('change',syncTermsAcceptButton));
+$('terms_accept').onclick=async()=>{
+  if(!(
+    $('terms_age_checkbox').checked &&
+    $('terms_legal_checkbox').checked &&
+    $('terms_consent_checkbox').checked &&
+    $('terms_output_checkbox').checked &&
+    $('terms_membership_checkbox').checked &&
+    $('terms_checkbox').checked
+  ))return;
+  $('terms_accept').disabled=true;
+  setStatus('terms_status','Saving agreement…','');
+  try{
+    await fetchJson('/api/terms/accept',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agree:true,age_18_or_older:true,legal_compliance:true,consent_compliance:true,output_responsibility:true,membership_and_controls:true})});
+    setStatus('terms_status','Agreement accepted.','good');
+    hideTermsModal();
+  }catch(e){
+    setStatus('terms_status',e.message,'bad');
+    $('terms_accept').disabled=false;
+  }
+};
+
+// ====================================================================
+// USER LoRA MANAGER
+// ====================================================================
+let loraLibrary=[];
+function _fmtLoraBytes(bytes){
+  bytes=Math.max(0,+bytes||0);
+  if(bytes>=1024**3)return (bytes/1024**3).toFixed(2)+' GiB';
+  return (bytes/1024**2).toFixed(1)+' MiB';
+}
+function renderLoraLibrary(items,maxActive=4){
+  loraLibrary=items||[];
+  const root=$('lora_list'); if(!root)return;
+  root.innerHTML='';
+  if(!loraLibrary.length){root.innerHTML='<div class="empty">No LoRAs installed.</div>';return}
+  loraLibrary.forEach(item=>{
+    const row=document.createElement('div');row.className='lora-row'+(item.reserved?' reserved':'');
+    const check=document.createElement('input');check.type='checkbox';check.style.width='auto';check.checked=!!item.active;check.disabled=!!item.reserved||!item.valid;check.dataset.loraCheck=item.name;
+    const info=document.createElement('div');
+    const name=document.createElement('div');name.className='lora-name';name.textContent=item.name;
+    const meta=document.createElement('div');meta.className='lora-meta';meta.textContent=_fmtLoraBytes(item.bytes)+(item.reserved?' · built-in':'')+(item.valid?'':' · INVALID');
+    info.append(name,meta);
+    const strength=document.createElement('input');strength.className='lora-strength';strength.type='number';strength.min='-2';strength.max='2';strength.step='.05';strength.value=Number(item.strength??1).toFixed(2);strength.disabled=!!item.reserved||!item.valid;strength.dataset.loraStrength=item.name;
+    const del=document.createElement('button');del.type='button';del.className='secondary lora-delete';del.textContent=item.reserved?'BUILT-IN':'DELETE';del.disabled=!!item.reserved;del.onclick=async()=>{
+      if(item.reserved)return;
+      if(!confirm('Delete '+item.name+' from this runtime?'))return;
+      try{const d=await fetchJson('/api/loras/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:item.name})});renderLoraLibrary(d.items||[],maxActive);setStatus('l_status','Deleted '+item.name+'.','good')}catch(e){setStatus('l_status',e.message,'bad')}
+    };
+    row.append(check,info,strength,del);root.appendChild(row);
+  });
+  renderLoraStage();
+}
+function activeLoraStackFromUI(){
+  const out=[];
+  document.querySelectorAll('[data-lora-check]').forEach(check=>{
+    if(!check.checked||check.disabled)return;
+    const name=check.dataset.loraCheck;
+    const strengthEl=[...document.querySelectorAll('[data-lora-strength]')].find(x=>x.dataset.loraStrength===name);
+    let strength=Number(strengthEl?.value||1);if(!Number.isFinite(strength))strength=1;strength=Math.max(-2,Math.min(2,strength));
+    out.push({name,strength});
+  });
+  return out.slice(0,4);
+}
+function renderLoraStage(){
+  const root=$('lora_stage_active');if(!root)return;
+  const active=loraLibrary.filter(x=>x.active&&!x.reserved);
+  root.innerHTML=active.length?active.map(x=>'<span class="lora-pill">'+escapeHtml(x.name)+' @ '+Number(x.strength||1).toFixed(2)+'</span>').join(''):'<p>No user LoRAs are active.</p>';
+}
+async function refreshLoras(){
+  try{const d=await fetchJson('/api/loras');renderLoraLibrary(d.items||[],d.max_active||4);setStatus('l_status','LoRA library ready · up to '+(d.max_active||4)+' active per job.','good')}catch(e){setStatus('l_status',e.message,'bad')}
+}
+$('l_refresh').onclick=refreshLoras;
+$('l_save_stack').onclick=async()=>{
+  try{const stack=activeLoraStackFromUI();const d=await fetchJson('/api/loras/active',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({loras:stack})});renderLoraLibrary(d.items||[],4);setStatus('l_status','Active LoRA stack saved for new jobs.','good')}catch(e){setStatus('l_status',e.message,'bad')}
+};
+$('l_hf_install').onclick=async()=>{
+  const btn=$('l_hf_install');btn.disabled=true;setStatus('l_status','Downloading Hugging Face LoRA…','');
+  try{const d=await fetchJson('/api/loras/install/huggingface',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({repo_id:$('l_hf_repo').value,filename:$('l_hf_file').value,revision:$('l_hf_revision').value})});renderLoraLibrary(d.items||[],4);setStatus('l_status','Installed '+d.name+'.','good')}catch(e){setStatus('l_status',e.message,'bad')}finally{btn.disabled=false}
+};
+$('l_civitai_install').onclick=async()=>{
+  const btn=$('l_civitai_install');btn.disabled=true;setStatus('l_status','Downloading Civitai LoRA…','');
+  try{const d=await fetchJson('/api/loras/install/civitai',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version_id:$('l_civitai_version').value,token:$('l_civitai_token').value})});$('l_civitai_token').value='';renderLoraLibrary(d.items||[],4);setStatus('l_status','Installed '+d.name+'.','good')}catch(e){setStatus('l_status',e.message,'bad')}finally{btn.disabled=false}
+};
 
 // ====================================================================
 // AUTO PROMPT
@@ -6674,13 +7378,13 @@ function renderStageGallery(id,items){
     const cap=document.createElement('div'); cap.className='tilecap'; cap.textContent=item.caption||item.filename||'Generated image';
     const acts=document.createElement('div'); acts.className='tileactions';
     const a=document.createElement('a'); a.href=item.url+'?download=1'; a.textContent='DOWNLOAD'; a.target='_blank';
+    a.addEventListener('click',ev=>ev.stopPropagation());
     acts.appendChild(a); tile.append(img,cap,acts);
     tile.onclick=()=>{
       st.selected=idx;
       [...grid.querySelectorAll('.tile')].forEach((el,i)=>el.classList.toggle('selected', i===idx));
       if(id==='history_stage'){
-        setSharedSingleImage(item.url);
-        setStatus('t_status','Loaded image from History onto the stage.','good');
+        loadHistoryImageToStage(item);
       }
     };
     grid.appendChild(tile);
@@ -6705,19 +7409,37 @@ function currentStageUrl(id){
   const img=$(id).querySelector('img');
   return img ? (img.dataset.rawUrl || img.src.split('?')[0]) : '';
 }
-const STAGE_BY_TAB={text:'t_result',image:'i_result',edit:'e_result',inpaint:'in_result',batch:'b_gallery',history:'history_stage',console:'console_stage'};
-const STAGE_LABELS={text:'TEXT → IMAGE',image:'IMAGE → IMAGE',edit:'INSTRUCTION EDIT',inpaint:'INPAINT',batch:'ADAPTIVE BATCH',history:'IMAGE HISTORY',console:'CONSOLE'};
+const STAGE_BY_TAB={text:'t_result',image:'i_result',edit:'e_result',inpaint:'in_result',batch:'b_gallery',history:'history_stage',loras:'lora_stage',console:'console_stage'};
+const STAGE_LABELS={text:'TEXT → IMAGE',image:'IMAGE → IMAGE',edit:'INSTRUCTION EDIT',inpaint:'INPAINT',batch:'ADAPTIVE BATCH',history:'IMAGE HISTORY',loras:'LORA MANAGER',console:'CONSOLE'};
+const SINGLE_WORK_TABS=['text','image','edit','inpaint'];
+const STATUS_BY_TAB={text:'t_status',image:'i_status',edit:'e_status',inpaint:'in_status',batch:'b_status',loras:'l_status',console:'console_status'};
 let activeStageId='t_result';
 let activeStudioTab='text';
+let lastWorkTab='text';
 function syncStageToolbar(){
   const url=currentStageUrl(activeStageId);
   $('stage_mode_label').textContent=STAGE_LABELS[activeStudioTab]||activeStudioTab.toUpperCase();
   const dl=$('stage_download');
-  if(url){dl.href=url+'?download=1';dl.classList.remove('hidden');$('stage_assign').disabled=false;}
+  const nonImage=['loras','console'].includes(activeStudioTab);
+  if(url&&!nonImage){dl.href=url+'?download=1';dl.classList.remove('hidden');$('stage_assign').disabled=false;}
   else{dl.classList.add('hidden');dl.removeAttribute('href');$('stage_assign').disabled=true;}
+  $('stage_clear').disabled=nonImage;
+}
+function setStatusForTab(tab,message,kind='good'){
+  const id=STATUS_BY_TAB[tab];
+  if(id && $(id)) setStatus(id,message,kind);
+}
+function loadHistoryImageToStage(item){
+  if(!item || !item.url) return;
+  setSharedSingleImage(item.url);
+  if(!SINGLE_WORK_TABS.includes(activeStudioTab)){
+    switchStudioTab(lastWorkTab||'image');
+  }
+  setStatusForTab(activeStudioTab,'Loaded image from History onto the stage.','good');
 }
 function activateStage(tab){
   activeStudioTab=tab;
+  if(SINGLE_WORK_TABS.includes(tab)) lastWorkTab=tab;
   activeStageId=STAGE_BY_TAB[tab]||'t_result';
   document.querySelectorAll('.stagepanel').forEach(el=>el.classList.remove('active'));
   const stage=$(activeStageId); if(stage) stage.classList.add('active');
@@ -6731,6 +7453,7 @@ function switchStudioTab(tab){
   document.querySelectorAll('.controlpanel').forEach(x=>x.classList.toggle('active',x.id==='panel_'+tab));
   activateStage(tab);
   if(tab==='history') refreshHistory(true);
+  if(tab==='loras') refreshLoras();
   if(tab==='console') refreshConsole(true);
 }
 $('stage_clear').onclick=()=>{
@@ -6747,7 +7470,7 @@ $('stage_assign').onclick=async()=>{
     setStatus('e_status','Staged image assigned to the edit inputs.','good');
     setStatus('in_status','Staged image assigned to the edit inputs.','good');
   }catch(e){
-    const statusId=activeStudioTab==='text'?'t_status':activeStudioTab==='image'?'i_status':activeStudioTab==='edit'?'e_status':activeStudioTab==='inpaint'?'in_status':activeStudioTab==='batch'?'b_status':null;
+    const statusId=STATUS_BY_TAB[activeStudioTab];
     if(statusId)setStatus(statusId,e.message,'bad');
   }
 };
@@ -7334,7 +8057,7 @@ if($('console_clear')) $('console_clear').onclick=async()=>{
 // PERSISTENT FLOATING QUEUE + HISTORY
 // ====================================================================
 const appliedJobs=new Set();
-let queueMax=12;
+let queueMax=24;
 
 function escapeHtml(value){
   return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -7401,15 +8124,23 @@ function renderFloatingHistory(items){
   const root=$('qHistoryList');root.innerHTML='';
   if(!items||!items.length){root.innerHTML='<div class="q-empty">No generations yet.</div>';return}
   items.slice(0,6).forEach(item=>{
-    const tile=document.createElement('div');tile.className='q-hist-tile';tile.title='Open full History';
+    const tile=document.createElement('div');tile.className='q-hist-tile';tile.title='Load onto stage';
     const thumb=document.createElement('div');thumb.className='job-thumb';
     const img=document.createElement('img');img.src=item.url;img.loading='lazy';img.decoding='async';thumb.appendChild(img);
     const info=document.createElement('div');info.className='job-info';
     const st=document.createElement('div');st.className='job-status';st.textContent=item.filename||'Generation';
     const md=document.createElement('div');md.className='job-mode';md.textContent=(item.caption||'').split('\n')[0].slice(0,54)||'Krea2 output';
-    info.append(st,md);tile.append(thumb,info);tile.onclick=openFullHistory;root.appendChild(tile);
+    info.append(st,md);tile.append(thumb,info);
+    tile.addEventListener('click',ev=>{
+      ev.preventDefault();
+      ev.stopPropagation();
+      loadHistoryImageToStage(item);
+    });
+    root.appendChild(tile);
   });
 }
+// Only the explicit Expand button opens the History workspace. Thumbnail clicks
+// above are stage-load actions and never call this function.
 function openFullHistory(){switchStudioTab('history');}
 async function cancelJob(jid){
   try{await fetchJson('/api/jobs/'+jid+'/cancel',{method:'POST'});pollJobs()}catch(e){console.error(e)}
@@ -7576,6 +8307,8 @@ switchStudioTab('text');
 clearSharedSingleStage();
 setStageEmpty('b_gallery');
 setStageEmpty('history_stage');
+refreshTermsStatus();
+refreshLoras();
 refreshHistory(false);pollJobs();
 setInterval(pollJobs,700);
 setInterval(()=>refreshHistory(false),2500);
@@ -7616,6 +8349,35 @@ def index():
         mimetype="text/html",
     )
 
+
+def _assert_missinglink_access_control_integrity():
+    """Tripwire against accidental removal of required entitlement enforcement.
+
+    This is intentionally explicit rather than obfuscated: automated refactors
+    should fail loudly if they delete or rename critical access-control hooks.
+    """
+    required_callables = {
+        "_missinglink_entitlement_active": globals().get("_missinglink_entitlement_active"),
+        "_validate_missinglink_token": globals().get("_validate_missinglink_token"),
+        "_require_missinglink_access": globals().get("_require_missinglink_access"),
+        "_missinglink_request_gate": globals().get("_missinglink_request_gate"),
+        "_missinglink_entitlement_watchdog": globals().get("_missinglink_entitlement_watchdog"),
+    }
+    missing = [name for name, value in required_callables.items() if not callable(value)]
+    if MISSINGLINK_ACCESS_CONTROL_SENTINEL != "ML-ENTITLEMENT-V1-FAIL-CLOSED":
+        missing.append("MISSINGLINK_ACCESS_CONTROL_SENTINEL")
+    before_hooks = app.before_request_funcs.get(None, [])
+    if _missinglink_request_gate not in before_hooks:
+        missing.append("Flask before_request entitlement gate registration")
+    if missing:
+        raise RuntimeError(
+            "MissingLink access-control integrity check failed; refusing to launch: "
+            + ", ".join(missing)
+        )
+
+
+# SECURITY / LICENSING CHECKPOINT G — REQUIRED BOOT-TIME TAMPER TRIPWIRE.
+_assert_missinglink_access_control_integrity()
 
 print()
 print("=" * 76)
@@ -7699,6 +8461,8 @@ env["MISSINGLINK_UI_PORT"] = "7860"
 
 if HF_TOKEN:
     env["HF_TOKEN"] = HF_TOKEN
+if CIVITAI_TOKEN:
+    env["CIVITAI_TOKEN"] = CIVITAI_TOKEN
 
 env["PYTHONUNBUFFERED"] = "1"
 env["PYTHONFAULTHANDLER"] = "1"
@@ -7885,9 +8649,36 @@ print(
     flush=True,
 )
 
+# SECURITY / LICENSING CHECKPOINT H — FINAL UI-EXPOSURE GATE.
+# Revalidate immediately before exposing the port through Colab. A token that
+# became inactive during model/UI preload must never get a visible Studio UI.
+# DO NOT move this check after serve_kernel_port_as_iframe/window.
+if MISSINGLINK_ACCESS_CONTROL_SENTINEL != "ML-ENTITLEMENT-V1-FAIL-CLOSED":
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    raise RuntimeError("MissingLink access-control sentinel mismatch; refusing UI launch.")
+
+_launch_ok, _launch_error = validate_missinglink_access(MISSING_LINK_TOKEN)
+if not _launch_ok:
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    raise RuntimeError(
+        "An active MissingLink subscription is required to launch the Studio UI.\n"
+        + (_launch_error or "Entitlement validation failed.")
+        + "\nGet access: "
+        + MISSING_LINK_TRIAL_URL
+    )
+
+print("✓ Active MissingLink entitlement revalidated before UI launch", flush=True)
+
 try:
     from google.colab import output as _colab_output
 
+    # UI exposure is intentionally AFTER CHECKPOINT H above. Keep ordering.
     _colab_output.serve_kernel_port_as_iframe(
         UI_PORT,
         height="900",
