@@ -30,6 +30,7 @@
 #
 # GENERATION
 #   8 steps / CFG 1 / Euler / Simple
+#   Inpaint: masked-latent neutralization + focused crop/upscale + soft composite
 #
 # OPENAI
 #   User-selectable model, reasoning effort/mode, and token budget
@@ -1495,6 +1496,52 @@ def vae_encode(image):
 
 
 @torch.inference_mode()
+def vae_encode_inpaint(image, core_mask, noise_mask):
+    """Encode an inpaint source after neutralizing pixels that may be replaced.
+
+    The previous pipeline encoded the untouched source and only attached a noise
+    mask. That leaves a strong latent representation of the object being removed.
+    This follows the useful part of ComfyUI's VAEEncodeForInpaint behavior while
+    preserving our independently feathered sampling mask.
+    """
+    check_stop()
+    _emit_progress("Encoding masked source", pct=7)
+    unload_models()
+    gpu_stats("VAE inpaint encode")
+
+    start = time.time()
+    pixels = pil_to_tensor(image)
+
+    core = mask_to_tensor(core_mask)
+    core = (core > 0.5).to(dtype=pixels.dtype, device=pixels.device).unsqueeze(-1)
+    noise = mask_to_tensor(noise_mask)
+
+    # Neutral VAE-space input in the replaceable core. 0.5 avoids leaving the
+    # original object's color/texture encoded in the latent while remaining in
+    # the normal image range expected by the VAE.
+    masked_pixels = pixels * (1.0 - core) + 0.5 * core
+
+    latent = VAE_ENCODER.encode(
+        pixels=masked_pixels,
+        vae=VAE,
+    )[0]
+
+    latent = NOISE_MASK.set_mask(
+        samples=latent,
+        mask=noise,
+    )[0]
+
+    print(
+        f"[VAE] inpaint encode {time.time()-start:.2f}s",
+        flush=True,
+    )
+
+    check_stop()
+    _emit_progress("Masked source encoded", pct=15)
+    return latent
+
+
+@torch.inference_mode()
 def vae_decode(latent):
 
     check_stop()
@@ -2020,7 +2067,7 @@ def resize_image_mask(
 
 def _morph_mask(mask, amount):
     """Grow (positive) or shrink (negative) a grayscale mask."""
-    amount = max(-48, min(48, int(amount)))
+    amount = max(-96, min(96, int(amount)))
     if amount == 0:
         return mask
     size = abs(amount) * 2 + 1
@@ -2038,21 +2085,14 @@ def prepare_inpaint_masks(
     context_padding,
     latent_feather,
 ):
-    """
-    Build two deliberately different masks:
-      * sampling mask: wider + softly feathered so diffusion gets context
-      * blend mask: tighter user-facing mask used for the final composite
-
-    This avoids asking the model to solve a hard seam exactly at the final
-    composite boundary.
-    """
+    """Build separate masks for latent replacement, sampling and final blend."""
     base = mask.convert("L")
-    expand = max(-48, min(48, int(expand)))
-    feather = max(0, min(64, int(feather)))
-    context_padding = max(0, min(64, int(context_padding)))
-    latent_feather = max(0, min(32, int(latent_feather)))
+    expand = max(-96, min(96, int(expand)))
+    feather = max(0, min(96, int(feather)))
+    context_padding = max(0, min(128, int(context_padding)))
+    latent_feather = max(0, min(48, int(latent_feather)))
 
-    # Preserve soft brush edges for the final blend.
+    # Final visible region. Preserve soft brush edges for the composite.
     blend_region = _morph_mask(base, expand)
     blend_mask = blend_region
     if feather > 0:
@@ -2060,20 +2100,110 @@ def prepare_inpaint_masks(
             ImageFilter.GaussianBlur(radius=feather)
         )
 
-    # Sampling gets a clean core, then extra surrounding context.
-    sample_region = blend_region.point(
+    # The reconstruction core is binary and can extend beyond the final blend.
+    # This gives the model room to solve geometry/lighting without creating a
+    # hard diffusion boundary exactly where the final paste occurs.
+    sample_core = blend_region.point(
         lambda x: 255 if x > 6 else 0
     )
     if context_padding > 0:
-        sample_region = sample_region.filter(
+        sample_core = sample_core.filter(
             ImageFilter.MaxFilter(context_padding * 2 + 1)
         )
+
+    sampling_mask = sample_core
     if latent_feather > 0:
-        sample_region = sample_region.filter(
+        sampling_mask = sampling_mask.filter(
             ImageFilter.GaussianBlur(radius=latent_feather)
         )
 
-    return sample_region, blend_mask
+    return sample_core, sampling_mask, blend_mask
+
+
+def _mask_bbox(mask, threshold=8):
+    hard = mask.convert("L").point(
+        lambda x: 255 if x > int(threshold) else 0
+    )
+    return hard.getbbox()
+
+
+def _focus_crop_box(mask, padding_percent=45):
+    """Return a generous crop around the painted mask, or None for no mask."""
+    bbox = _mask_bbox(mask)
+    if bbox is None:
+        return None
+
+    width, height = mask.size
+    x0, y0, x1, y1 = bbox
+    bw = max(1, x1 - x0)
+    bh = max(1, y1 - y0)
+
+    padding_percent = max(0.0, min(150.0, float(padding_percent)))
+    pad = max(48, int(round(max(bw, bh) * padding_percent / 100.0)))
+
+    x0 = max(0, x0 - pad)
+    y0 = max(0, y0 - pad)
+    x1 = min(width, x1 + pad)
+    y1 = min(height, y1 + pad)
+
+    # Give the model enough scene context even for tiny brush strokes.
+    min_crop = min(384, max(width, height))
+    cw = x1 - x0
+    ch = y1 - y0
+    if cw < min_crop:
+        extra = min_crop - cw
+        left = extra // 2
+        right = extra - left
+        x0 = max(0, x0 - left)
+        x1 = min(width, x1 + right)
+        if x1 - x0 < min_crop:
+            x0 = max(0, x1 - min_crop)
+            x1 = min(width, x0 + min_crop)
+    if ch < min_crop:
+        extra = min_crop - ch
+        top = extra // 2
+        bottom = extra - top
+        y0 = max(0, y0 - top)
+        y1 = min(height, y1 + bottom)
+        if y1 - y0 < min_crop:
+            y0 = max(0, y1 - min_crop)
+            y1 = min(height, y0 + min_crop)
+
+    return int(x0), int(y0), int(x1), int(y1)
+
+
+def _resize_focus_pair(image, mask, target_side, max_upscale=4.0):
+    """Resize a focused crop to model-friendly resolution, including upscaling."""
+    image = image.convert("RGB")
+    mask = mask.convert("L")
+    width, height = image.size
+    target_side = max(256, int(target_side))
+
+    scale = target_side / max(width, height)
+    scale = min(float(max_upscale), scale)
+
+    out_w = round16(max(1, round(width * scale)))
+    out_h = round16(max(1, round(height * scale)))
+
+    return (
+        image.resize((out_w, out_h), Image.Resampling.LANCZOS),
+        mask.resize((out_w, out_h), Image.Resampling.BILINEAR),
+        max(out_w / max(1, width), out_h / max(1, height)),
+    )
+
+
+def _mask_overlay_image(source, mask):
+    """Create a source image with the editable area highlighted in red."""
+    source = source.convert("RGBA")
+    mask = mask.convert("L")
+    if mask.size != source.size:
+        mask = mask.resize(source.size, Image.Resampling.BILINEAR)
+
+    # Keep context readable while making the selected region unambiguous.
+    alpha = mask.point(lambda x: int(max(0, min(255, x)) * 0.68))
+    overlay = Image.new("RGBA", source.size, (255, 38, 50, 0))
+    overlay.putalpha(alpha)
+    return Image.alpha_composite(source, overlay).convert("RGB")
 
 
 def inpaint(
@@ -2084,8 +2214,10 @@ def inpaint(
     expand,
     feather,
     seed,
-    context_padding=24,
+    context_padding=40,
     latent_feather=8,
+    focus_enabled=True,
+    focus_padding=45,
     negative_prompt="",
     steps=STEPS,
     cfg=CFG,
@@ -2105,37 +2237,75 @@ def inpaint(
         steps, cfg, sampler_name, scheduler = 4, 1.0, "euler", "simple"
     active_model = generation_model(lightning_enabled, lightning_strength)
 
+    original, mask = editor_to_image_mask(editor)
+    original, mask = resize_image_mask(original, mask, max_side)
 
-    original, mask = (
-        editor_to_image_mask(
-            editor
+    bbox = _mask_bbox(mask)
+    if bbox is None:
+        raise ValueError("No painted mask detected.")
+
+    focus_enabled = bool(focus_enabled)
+    focus_padding = max(0.0, min(150.0, float(focus_padding)))
+    full_w, full_h = original.size
+    full_area = max(1, full_w * full_h)
+
+    focus_box = _focus_crop_box(mask, focus_padding) if focus_enabled else None
+    use_focus = False
+    if focus_box is not None:
+        fx0, fy0, fx1, fy1 = focus_box
+        focus_area = max(1, (fx1 - fx0) * (fy1 - fy0))
+        # Avoid needless crop/resize when the edit already occupies most of frame.
+        use_focus = focus_area < full_area * 0.88
+
+    if use_focus:
+        x0, y0, x1, y1 = focus_box
+        native_source = original.crop((x0, y0, x1, y1))
+        native_mask = mask.crop((x0, y0, x1, y1))
+
+        work_source, work_mask, focus_scale = _resize_focus_pair(
+            native_source,
+            native_mask,
+            max_side,
         )
-    )
 
-    original, mask = resize_image_mask(
-        original,
-        mask,
-        max_side,
-    )
+        # Keep mask-control distances approximately constant in source-image
+        # pixels after the crop is enlarged for generation.
+        work_expand = int(round(float(expand) * focus_scale))
+        work_feather = int(round(float(feather) * focus_scale))
+        work_context = int(round(float(context_padding) * focus_scale))
+        work_latent_feather = int(round(float(latent_feather) * focus_scale))
 
-    sampling_mask, blend_mask = prepare_inpaint_masks(
-        mask,
-        expand,
-        feather,
-        context_padding,
-        latent_feather,
-    )
+        sample_core, sampling_mask, _ = prepare_inpaint_masks(
+            work_mask,
+            work_expand,
+            work_feather,
+            work_context,
+            work_latent_feather,
+        )
 
-    latent = vae_encode(
-        original
-    )
-
-    latent = NOISE_MASK.set_mask(
-        samples=latent,
-        mask=mask_to_tensor(
-            sampling_mask
-        ),
-    )[0]
+        latent = vae_encode_inpaint(
+            work_source,
+            sample_core,
+            sampling_mask,
+        )
+    else:
+        native_source = original
+        native_mask = mask
+        work_source = original
+        work_mask = mask
+        focus_scale = 1.0
+        sample_core, sampling_mask, blend_mask = prepare_inpaint_masks(
+            work_mask,
+            expand,
+            feather,
+            context_padding,
+            latent_feather,
+        )
+        latent = vae_encode_inpaint(
+            work_source,
+            sample_core,
+            sampling_mask,
+        )
 
     positive, negative = encode_prompt(
         prompt,
@@ -2155,22 +2325,43 @@ def inpaint(
         model=active_model,
     )
 
-    generated = vae_decode(
-        sampled
-    )
-
-    if generated.size != original.size:
-
+    generated = vae_decode(sampled)
+    if generated.size != work_source.size:
         generated = generated.resize(
-            original.size,
+            work_source.size,
             Image.Resampling.LANCZOS,
         )
 
-    result = Image.composite(
-        generated,
-        original,
-        blend_mask,
-    )
+    if use_focus:
+        generated_native = generated.resize(
+            native_source.size,
+            Image.Resampling.LANCZOS,
+        )
+
+        # Blend at native image resolution so the focus upscale does not soften
+        # untouched pixels in the crop when it is pasted back into the source.
+        _, _, native_blend_mask = prepare_inpaint_masks(
+            native_mask,
+            expand,
+            feather,
+            0,
+            0,
+        )
+        patched_crop = Image.composite(
+            generated_native,
+            native_source,
+            native_blend_mask,
+        )
+        result = original.copy()
+        result.paste(patched_crop, (x0, y0))
+        focus_box_meta = [x0, y0, x1, y1]
+    else:
+        result = Image.composite(
+            generated,
+            original,
+            blend_mask,
+        )
+        focus_box_meta = None
 
     path = save_image(
         result,
@@ -2178,11 +2369,17 @@ def inpaint(
         prompt,
         seed,
         {
+            "negative_prompt": str(negative_prompt or ""),
             "denoise": float(denoise),
             "mask_expand": int(expand),
             "feather": int(feather),
             "context_padding": int(context_padding),
             "latent_feather": int(latent_feather),
+            "focus_enabled": bool(focus_enabled),
+            "focus_used": bool(use_focus),
+            "focus_padding": float(focus_padding),
+            "focus_scale": float(focus_scale),
+            "focus_box": focus_box_meta,
             "steps": steps,
             "cfg": cfg,
             "sampler": sampler_name,
@@ -2193,21 +2390,26 @@ def inpaint(
         },
     )
 
-    history_gallery, history_files = (
-        history_snapshot()
+    history_gallery, history_files = history_snapshot()
+
+    focus_status = (
+        f" | focus {native_source.width}x{native_source.height}→{work_source.width}x{work_source.height}"
+        if use_focus
+        else " | full-frame"
     )
 
     return (
         path,
         seed,
         (
-            f"seed={seed} | "
-            f"denoise={float(denoise):.2f}"
+            f"seed={seed} | denoise={float(denoise):.2f}"
+            + focus_status
         ),
         path,
         history_gallery,
         history_files,
     )
+
 
 # =====================================================================
 # OPENAI GPT-5.6 SOL
@@ -2330,9 +2532,11 @@ user's instruction implies they should stay. Describe the requested change
 clearly enough for img2img conditioning.
 
 For Inpaint, write the prompt for the replacement or repaired region while
-making it compatible with the surrounding image. Use the attached source image
-for lighting, perspective, material, texture and scene continuity. Do not waste
-words describing unrelated portions of the image.
+making it compatible with the surrounding image. When an edit-region overlay is
+provided, the RED area is exactly what will be regenerated; concentrate the
+prompt on what should exist there. Use the attached source for lighting,
+perspective, scale, material, texture, occlusion and scene continuity. Do not
+waste words describing unrelated portions of the image.
 
 If no image is attached, work only from the user's text. Never claim to have
 seen an image that was not provided. Do not add explanations, labels, analysis,
@@ -2345,6 +2549,7 @@ def create_auto_prompt(
     prompt,
     mode="text",
     source_image=None,
+    edit_mask=None,
     extra_instructions="",
     agent_model=None,
 ):
@@ -2389,7 +2594,7 @@ def create_auto_prompt(
             {
                 "type": "input_text",
                 "text": (
-                    "SOURCE IMAGE: visually inspect this image and use it only as "
+                    "SOURCE IMAGE: visually inspect this image and use it as "
                     "context for the requested Krea2 prompt."
                 ),
             },
@@ -2399,6 +2604,32 @@ def create_auto_prompt(
                 "detail": "high",
             },
         ])
+
+    if mode == "inpaint" and source_image is not None and edit_mask is not None:
+        try:
+            if _mask_bbox(edit_mask) is not None:
+                content.extend([
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "EDIT REGION: the next image is the source with the exact "
+                            "inpaint region highlighted in RED. Write the prompt for "
+                            "what should exist inside that red region. Match the "
+                            "surrounding perspective, lighting, material, texture, "
+                            "scale, occlusion and scene continuity. Do not waste prompt "
+                            "space redescribing unrelated parts of the image."
+                        ),
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": pil_to_data_url(
+                            _mask_overlay_image(source_image, edit_mask)
+                        ),
+                        "detail": "high",
+                    },
+                ])
+        except Exception as exc:
+            print("[AUTO PROMPT] inpaint mask overlay warning:", repr(exc), flush=True)
 
     response = responses_create_custom(
         agent_model=agent_model,
@@ -4292,8 +4523,10 @@ def _execute_job(jid):
             editor=editor, prompt=params["prompt"], denoise=params["denoise"],
             max_side=params["max_side"], expand=params["expand"],
             feather=params["feather"], seed=params["seed"],
-            context_padding=params.get("context_padding", 24),
+            context_padding=params.get("context_padding", 40),
             latent_feather=params.get("latent_feather", 8),
+            focus_enabled=params.get("focus_enabled", True),
+            focus_padding=params.get("focus_padding", 45),
             negative_prompt=params.get("negative_prompt", ""),
             steps=params.get("steps", STEPS),
             cfg=params.get("cfg", CFG),
@@ -4474,10 +4707,12 @@ def api_meta():
 def api_auto_prompt():
     try:
         source = _pil_upload(request.files.get("source"))
+        edit_mask = _pil_upload(request.files.get("mask"), mode="L")
         result = create_auto_prompt(
             prompt=request.form.get("prompt"),
             mode=request.form.get("mode") or "text",
             source_image=source,
+            edit_mask=edit_mask,
             extra_instructions=request.form.get("instructions") or "",
             agent_model=request.form.get("agent_model") or OPENAI_MODEL,
         )
@@ -4621,12 +4856,14 @@ def api_inpaint():
                 "source_path": source_path, "mask_path": mask_path,
                 "prompt": request.form.get("prompt"),
                 "negative_prompt": request.form.get("negative_prompt", ""),
-                "denoise": _float_value(request.form.get("denoise"), 0.82, 0.1, 1.0),
+                "denoise": _float_value(request.form.get("denoise"), 1.0, 0.1, 1.0),
                 "max_side": _int_value(request.form.get("max_side"), DEFAULT_INPAINT_MAX_SIDE, 256, 2048),
-                "expand": _int_value(request.form.get("expand"), 4, -48, 48),
-                "feather": _int_value(request.form.get("feather"), 16, 0, 64),
-                "context_padding": _int_value(request.form.get("context_padding"), 24, 0, 64),
-                "latent_feather": _int_value(request.form.get("latent_feather"), 8, 0, 32),
+                "expand": _int_value(request.form.get("expand"), 8, -96, 96),
+                "feather": _int_value(request.form.get("feather"), 12, 0, 96),
+                "context_padding": _int_value(request.form.get("context_padding"), 40, 0, 128),
+                "latent_feather": _int_value(request.form.get("latent_feather"), 8, 0, 48),
+                "focus_enabled": str(request.form.get("focus_enabled") or "1").lower() in {"1","true","yes","on"},
+                "focus_padding": _float_value(request.form.get("focus_padding"), 45, 0, 150),
                 "seed": _int_value(request.form.get("seed"), -1),
                 "steps": _int_value(request.form.get("steps"), STEPS, 1, 80),
                 "cfg": _float_value(request.form.get("cfg"), CFG, 0.0, 30.0),
@@ -5352,13 +5589,15 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
                 <summary>Blend + context controls</summary>
                 <div class="inside">
                   <div class="grid2compact">
-                    <div><label>Denoise</label><input id="in_denoise" type="number" min=".1" max="1" step=".05" value=".82"></div>
-                    <div><label>Mask grow / shrink</label><input id="in_expand" type="number" min="-48" max="48" value="4"></div>
-                    <div><label>Final blend feather</label><input id="in_feather" type="number" min="0" max="64" value="16"></div>
-                    <div><label>Sampling context</label><input id="in_context" type="number" min="0" max="64" value="24"></div>
-                    <div><label>Latent edge feather</label><input id="in_latent_feather" type="number" min="0" max="32" value="8"></div>
+                    <div><label>Denoise</label><input id="in_denoise" type="number" min=".1" max="1" step=".05" value="1.0"></div>
+                    <div><label>Mask grow / shrink</label><input id="in_expand" type="number" min="-96" max="96" value="8"></div>
+                    <div><label>Final blend feather</label><input id="in_feather" type="number" min="0" max="96" value="12"></div>
+                    <div><label>Sampling context</label><input id="in_context" type="number" min="0" max="128" value="40"></div>
+                    <div><label>Latent edge feather</label><input id="in_latent_feather" type="number" min="0" max="48" value="8"></div>
+                    <div><label>Focus padding %</label><input id="in_focus_padding" type="number" min="0" max="150" step="5" value="45"></div>
                   </div>
-                  <div class="minihint">Sampling context lets diffusion regenerate beyond the final paste boundary, then only the tighter feathered region is composited back. Increase context/feather for texture or lighting seams; reduce them for precise geometry.</div>
+                  <label><input id="in_focus" type="checkbox" style="width:auto" checked> Auto-focus small masks for higher edit resolution</label>
+                  <div class="minihint">The masked pixels are neutralized before VAE encoding so replacement prompts do not fight the old object. Auto-focus crops around small masks, enlarges that crop for generation, then blends it back at native resolution. Disable focus for very large/global edits.</div>
                 </div>
               </details>
               <div class="split">
@@ -5713,6 +5952,10 @@ async function runAutoPrompt(button){
     fd.append('instructions',cfg.instructions||'');
     fd.append('agent_model',cfg.model||'gpt-5.6');
     if(source)fd.append('source',source);
+    if(button.dataset.mode==='inpaint' && source && inSourceImage){
+      const maskBlob=await exportMaskBlob();
+      if(maskBlob)fd.append('mask',maskBlob,'mask.png');
+    }
     const d=await fetchJson('/api/auto_prompt',{method:'POST',body:fd});
     target.value=d.prompt||target.value;
     target.dispatchEvent(new Event('input',{bubbles:true}));
@@ -6224,6 +6467,7 @@ $('in_generate').onclick=async()=>{
     fd.append('denoise',$('in_denoise').value);fd.append('max_side',$('in_max').value);
     fd.append('expand',$('in_expand').value);fd.append('feather',$('in_feather').value);
     fd.append('context_padding',$('in_context').value);fd.append('latent_feather',$('in_latent_feather').value);
+    fd.append('focus_enabled',$('in_focus').checked?'1':'0');fd.append('focus_padding',$('in_focus_padding').value);
     fd.append('seed',$('in_seed').value);fd.append('steps',$('in_steps').value);fd.append('cfg',$('in_cfg').value);
     fd.append('sampler',$('in_sampler').value);fd.append('scheduler',$('in_scheduler').value);
     fd.append('lightning_enabled',$('in_lightning').checked?'1':'0');fd.append('lightning_strength',$('in_lightning_strength').value);
