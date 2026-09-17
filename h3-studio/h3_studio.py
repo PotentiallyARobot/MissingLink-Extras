@@ -2348,7 +2348,7 @@ if _CU130_CHILD:
                 raise RuntimeError(f"downloaded safetensors failed validation: {err}")
         os.replace(tmp, dest_path)
 
-    def _fetch_one(job):
+    def _fetch_one(job, *, tqdm_class=None):
         sub, fname, repo, remote_sub = job
         os.makedirs(os.path.join(MODELS, sub), exist_ok=True)
         dest = os.path.join(MODELS, sub, fname)
@@ -2383,12 +2383,15 @@ if _CU130_CHILD:
         last_err = None
         for attempt in range(2):
             try:
-                p = hf_hub_download(
-                    repo,
+                _hf_kwargs = dict(
+                    repo_id=repo,
                     filename=fname,
                     subfolder=remote_sub,
                     force_download=bool(force_download or attempt > 0),
                 )
+                if tqdm_class is not None:
+                    _hf_kwargs["tqdm_class"] = tqdm_class
+                p = hf_hub_download(**_hf_kwargs)
                 if os.path.abspath(p) == os.path.abspath(dest):
                     if fname.lower().endswith(".safetensors"):
                         ok, err = _validate_safetensors_file(dest)
@@ -6237,29 +6240,188 @@ Additional user Auto Prompt instructions:
             eros_installed=False, redmix_installed=False, naughty_installed=False,
         )
 
-    @app.post("/api/model_profiles/install")
-    def api_model_profile_install():
-        body=request.get_json(silent=True) or {}
-        profile=str(body.get("profile") or "stock_quality").strip().lower()
-        mode=str(body.get("mode") or "fl2va").strip().lower()
-        if profile != "stock_quality":
-            return jsonify(error="The built-in profile installer handles the bundled H3 model only. Use + HF BASE MODEL for custom checkpoints."), 400
-        if mode not in {"fl2va","ref2va"}: mode="fl2va"
+    # Built-in profile downloads can be tens of GiB. Do not keep the browser's
+    # /api/model_profiles/install request open for the whole Hugging Face transfer:
+    # Colab's iframe/window proxy can drop long-lived responses, which leaves the
+    # frontend with an empty body and `Response.json(): Unexpected end of JSON input`.
+    # Run the transfer in a background job and let the browser poll a short JSON route.
+    PROFILE_DOWNLOADS = {}
+    PROFILE_DOWNLOAD_LOCK = threading.Lock()
+    PROFILE_DOWNLOAD_ACTIVE = {}
+
+    def _profile_ready(mode):
+        state = _model_profile_state()
+        return bool(state.get("stock_ref2va_installed" if mode == "ref2va" else "stock_fl2va_installed"))
+
+    def _profile_download_worker(download_id, profile, mode):
+        key = f"{profile}:{mode}"
+        started = time.time()
+        with PROFILE_DOWNLOAD_LOCK:
+            job = PROFILE_DOWNLOADS.get(download_id)
+            if job is not None:
+                job.update(
+                    status="running", stage="connecting", started=started, error="",
+                    downloaded_bytes=0, total_bytes=0, speed_bps=0.0, pct=None,
+                )
         try:
             if LOWVRAM_T4_PROFILE:
-                if mode=="ref2va": return jsonify(error="Ref2VA is not enabled on the T4 low-VRAM profile."),400
-                _fetch_one(("unet",T4_DIT_FILE,T4_DIT_REPO,None))
-            elif mode=="ref2va":
-                _fetch_one(("diffusion_models",REF2VA_DIT_FILE,"Comfy-Org/MiniMax-H3","diffusion_models"))
+                if mode == "ref2va":
+                    raise RuntimeError("Ref2VA is not enabled on the T4 low-VRAM profile.")
+                target = ("unet", T4_DIT_FILE, T4_DIT_REPO, None)
+            elif mode == "ref2va":
+                target = ("diffusion_models", REF2VA_DIT_FILE,
+                          "Comfy-Org/MiniMax-H3", "diffusion_models")
             else:
-                _fetch_one(("diffusion_models",FALLBACK_DIT_FILE,"Comfy-Org/MiniMax-H3","diffusion_models"))
+                target = ("diffusion_models", FALLBACK_DIT_FILE,
+                          "Comfy-Org/MiniMax-H3", "diffusion_models")
+
+            _sub, _fname, _repo, _remote_sub = target
+            _expected_size = 0
+            try:
+                _wanted = f"{_remote_sub}/{_fname}" if _remote_sub else _fname
+                _info = HfApi(token=_hf_token() or None).model_info(
+                    _repo, files_metadata=True
+                )
+                for _sib in getattr(_info, "siblings", []) or []:
+                    if str(getattr(_sib, "rfilename", "") or "") != _wanted:
+                        continue
+                    _expected_size = int(getattr(_sib, "size", 0) or 0)
+                    if not _expected_size:
+                        _lfs = getattr(_sib, "lfs", None)
+                        if isinstance(_lfs, dict):
+                            _expected_size = int(_lfs.get("size") or 0)
+                        else:
+                            _expected_size = int(getattr(_lfs, "size", 0) or 0)
+                    break
+            except Exception as _meta_exc:
+                log(f"  ↳ model profile size metadata unavailable: {_meta_exc}")
+
+            with PROFILE_DOWNLOAD_LOCK:
+                job = PROFILE_DOWNLOADS.get(download_id)
+                if job is not None:
+                    job.update(
+                        filename=_fname, repo=_repo, stage="connecting",
+                        total_bytes=_expected_size,
+                    )
+
+            # Reuse the same Hugging Face/Xet tqdm bridge used by user-installed
+            # checkpoints. This makes the built-in Ref2VA/FL2VA mode-switch download
+            # expose live bytes, total size, transfer rate and percentage to the UI.
+            ProgressTqdm = _make_hf_progress_tqdm(
+                download_id, PROFILE_DOWNLOADS, PROFILE_DOWNLOAD_LOCK, _expected_size
+            )
+            _configure_hf_xet_downloads()
+            _fetch_one(target, tqdm_class=ProgressTqdm)
+
+            with PROFILE_DOWNLOAD_LOCK:
+                job = PROFILE_DOWNLOADS.get(download_id)
+                if job is not None:
+                    # Network transfer is complete. Keep 100% visible while Comfy's
+                    # folder cache refresh/validation finishes.
+                    total = int(job.get("total_bytes") or 0)
+                    if total > 0:
+                        job["downloaded_bytes"] = total
+                        job["pct"] = 100.0
+                    job.update(stage="validating", speed_bps=0.0)
+
             folder_paths.cache_helper.clear()
-            _allowed_unets={FALLBACK_DIT_FILE,REF2VA_DIT_FILE,T4_DIT_FILE}
-            unets=[x for x in folder_paths.get_filename_list("diffusion_models") if os.path.basename(str(x)) in _allowed_unets]
-            loras=list(folder_paths.get_filename_list("loras"))
-            return jsonify(ok=True,profile="stock_quality",mode=mode,state=_model_profile_state(),unets=unets,loras=["none"]+loras)
+            ready = _profile_ready(mode)
+            if not ready:
+                raise RuntimeError(
+                    f"The {mode.upper()} checkpoint download finished but ComfyUI still does not see the model file."
+                )
+            with PROFILE_DOWNLOAD_LOCK:
+                job = PROFILE_DOWNLOADS.get(download_id)
+                if job is not None:
+                    total = int(job.get("total_bytes") or 0)
+                    job.update(
+                        status="done", stage="done", ready=True,
+                        downloaded_bytes=(total or int(job.get("downloaded_bytes") or 0)),
+                        pct=100.0, speed_bps=0.0,
+                        elapsed=round(time.time() - started, 1),
+                        state=_model_profile_state(), error="",
+                    )
         except Exception as e:
-            return jsonify(error=str(e),state=_model_profile_state()),400
+            log(f"  ⚠ built-in model profile download failed ({profile}/{mode}): {e}")
+            with PROFILE_DOWNLOAD_LOCK:
+                job = PROFILE_DOWNLOADS.get(download_id)
+                if job is not None:
+                    job.update(
+                        status="error", stage="error", ready=False, speed_bps=0.0,
+                        elapsed=round(time.time() - started, 1),
+                        state=_model_profile_state(), error=str(e),
+                    )
+        finally:
+            with PROFILE_DOWNLOAD_LOCK:
+                if PROFILE_DOWNLOAD_ACTIVE.get(key) == download_id:
+                    PROFILE_DOWNLOAD_ACTIVE.pop(key, None)
+
+    @app.post("/api/model_profiles/install")
+    def api_model_profile_install():
+        body = request.get_json(silent=True) or {}
+        profile = str(body.get("profile") or "stock_quality").strip().lower()
+        mode = str(body.get("mode") or "fl2va").strip().lower()
+        if profile != "stock_quality":
+            return jsonify(error="The built-in profile installer handles the bundled H3 model only. Use + HF BASE MODEL for custom checkpoints."), 400
+        if mode not in {"fl2va", "ref2va"}:
+            mode = "fl2va"
+        if LOWVRAM_T4_PROFILE and mode == "ref2va":
+            return jsonify(error="Ref2VA is not enabled on the T4 low-VRAM profile."), 400
+
+        if _profile_ready(mode):
+            return jsonify(ok=True, ready=True, queued=False, profile=profile,
+                           mode=mode, state=_model_profile_state())
+
+        key = f"{profile}:{mode}"
+        with PROFILE_DOWNLOAD_LOCK:
+            existing_id = PROFILE_DOWNLOAD_ACTIVE.get(key)
+            existing = PROFILE_DOWNLOADS.get(existing_id) if existing_id else None
+            if existing and existing.get("status") in {"queued", "running"}:
+                return jsonify(ok=True, ready=False, queued=True, id=existing_id,
+                               profile=profile, mode=mode), 202
+
+            download_id = uuid.uuid4().hex[:12]
+            PROFILE_DOWNLOADS[download_id] = {
+                "id": download_id, "profile": profile, "mode": mode,
+                "status": "queued", "stage": "queued", "ready": False,
+                "error": "", "created": time.time(), "started": 0.0,
+                "elapsed": 0.0, "downloaded_bytes": 0, "total_bytes": 0,
+                "speed_bps": 0.0, "pct": None, "filename": "",
+            }
+            PROFILE_DOWNLOAD_ACTIVE[key] = download_id
+
+        threading.Thread(
+            target=_profile_download_worker,
+            args=(download_id, profile, mode),
+            daemon=True,
+            name=f"profile-download-{download_id}",
+        ).start()
+        return jsonify(ok=True, ready=False, queued=True, id=download_id,
+                       profile=profile, mode=mode), 202
+
+    @app.get("/api/model_profiles/progress/<download_id>")
+    def api_model_profile_progress(download_id):
+        with PROFILE_DOWNLOAD_LOCK:
+            job = dict(PROFILE_DOWNLOADS.get(download_id) or {})
+        if not job:
+            return jsonify(error="Unknown model profile download."), 404
+        started = float(job.get("started") or job.get("created") or time.time())
+        if job.get("status") in {"queued", "running"}:
+            job["elapsed"] = round(max(0.0, time.time() - started), 1)
+        total = int(job.get("total_bytes") or 0)
+        done = int(job.get("downloaded_bytes") or 0)
+        speed = float(job.get("speed_bps") or 0.0)
+        if job.get("status") == "done":
+            pct = 100.0
+        elif total > 0:
+            pct = max(0.0, min(100.0, 100.0 * done / total))
+        else:
+            pct = None
+        job["pct"] = round(pct, 2) if pct is not None else None
+        job["downloaded_text"] = _format_bytes(done)
+        job["total_text"] = _format_bytes(total) if total else "discovering size…"
+        job["speed_text"] = (_format_bytes(speed) + "/s") if speed > 0 else ""
+        return jsonify(job)
 
     LORA_DOWNLOADS = {}
     LORA_DOWNLOAD_LOCK = threading.Lock()
@@ -6931,6 +7093,10 @@ Additional user Auto Prompt instructions:
 
     <div class=hint id=mode_hint>The tabs select the input / conditioning workflow. The Base model menu selects the checkpoint.</div>
     <div class=hint id=model_profile_hint>Stock H3 · matching files ready.</div>
+    <div id=profile_download_wrap style="display:none;margin-top:8px">
+      <div class=hfprogress><i id=profile_download_progress></i></div>
+      <div id=profile_download_text class=hfprogresstext>Preparing model download…</div>
+    </div>
     </div></div>
 
     <div class=card><div class=cardtitle>Prompt</div><div class=cardbody>
@@ -7342,19 +7508,85 @@ Additional user Auto Prompt instructions:
     async function _ensureProfile(profile,mode=currentModelMode()){
       if(String(profile||'').startsWith('custom:'))return !!customModelForProfile(profile);
       if(_hasProfileFile(profile,mode))return true;
-      say('downloading model profile…');
+
+      const modeLabel=mode==='ref2va'?'Ref2VA':'FL2VA';
+      const progressWrap=$('profile_download_wrap'),progressBar=$('profile_download_progress'),progressText=$('profile_download_text');
+      const showProgress=(pct,text)=>{
+        if(progressWrap)progressWrap.style.display='block';
+        if(progressBar)progressBar.style.width=(pct==null?0:Math.max(0,Math.min(100,Number(pct))))+'%';
+        if(progressText)progressText.textContent=text||'';
+        if(pct!=null)$('pb').style.width=Math.max(0,Math.min(100,Number(pct)))+'%';
+      };
+      showProgress(0,`Preparing ${modeLabel} checkpoint…`);
+      dot('live');
+      say(`preparing ${modeLabel} model profile…`);
       const resp=await fetch('/api/model_profiles/install',{
         method:'POST',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({profile,mode})
       });
-      const r=await resp.json();
+      const r=await _readJsonResponse(resp,'Model profile install');
       if(r.adult_ack_required){
         const ok=await requestAdultAcknowledgement();
         return ok?_ensureProfile(profile,mode):false;
       }
-      if(r.error){await uiAlert(r.error,'Model profile download failed');return false}
+      if(!resp.ok||r.error){
+        showProgress(0,r.error||`Model profile install failed (HTTP ${resp.status}).`);
+        await uiAlert(r.error||`Model profile install failed (HTTP ${resp.status}).`,'Model profile download failed');
+        return false;
+      }
+
+      if(r.queued&&r.id){
+        let transientFailures=0;
+        while(true){
+          await new Promise(resolve=>setTimeout(resolve,700));
+          try{
+            const pr=await fetch('/api/model_profiles/progress/'+encodeURIComponent(r.id),{cache:'no-store'});
+            const pj=await _readJsonResponse(pr,'Model profile download status');
+            if(!pr.ok)throw new Error(pj.error||`Model profile status failed (HTTP ${pr.status}).`);
+            transientFailures=0;
+
+            const pct=pj.pct==null?null:Math.max(0,Math.min(100,Number(pj.pct)));
+            const bytes=`${pj.downloaded_text||'0 B'} / ${pj.total_text||'discovering size…'}`;
+            const speed=pj.speed_text?` · ${pj.speed_text}`:'';
+            const pctText=pct==null?'':` · ${pct.toFixed(1)}%`;
+            const stage=String(pj.stage||pj.status||'downloading');
+            const detail=`${modeLabel} · ${stage} · ${bytes}${speed}${pctText}`;
+            showProgress(pct,detail);
+            say(detail);
+
+            if(pj.status==='done'){
+              showProgress(100,`${modeLabel} checkpoint ready · ${pj.total_text||pj.downloaded_text||'download complete'}`);
+              $('pb').style.width='100%';
+              break;
+            }
+            if(pj.status==='error'){
+              showProgress(pct,pj.error||'The model profile download failed.');
+              await uiAlert(pj.error||'The model profile download failed.','Model profile download failed');
+              return false;
+            }
+          }catch(e){
+            transientFailures++;
+            if(transientFailures>=6)throw e;
+            const retryText=`${modeLabel} download still running · reconnecting status (${transientFailures}/6)…`;
+            if(progressText)progressText.textContent=retryText;
+            say(retryText);
+            await new Promise(resolve=>setTimeout(resolve,900));
+          }
+        }
+      }else if(r.ready){
+        showProgress(100,`${modeLabel} checkpoint already installed.`);
+      }
+
       await loadMeta();
+      if(!_hasProfileFile(profile,mode)){
+        const msg=`${modeLabel} download completed, but the checkpoint is not visible to ComfyUI. Check RAW CONSOLE for the model download/validation log.`;
+        if(progressText)progressText.textContent=msg;
+        await uiAlert(msg,'Model profile download failed');
+        return false;
+      }
+      if(progressText)progressText.textContent=`${modeLabel} checkpoint ready.`;
+      setTimeout(()=>{if(progressWrap)progressWrap.style.display='none';},1800);
       return true;
     }
     async function applyModelProfile(profile,{install=true}={}){
@@ -7402,10 +7634,13 @@ Additional user Auto Prompt instructions:
     function _humanBytes(n){n=Number(n||0);const u=['B','KiB','MiB','GiB','TiB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return `${n.toFixed(i<2?1:2)} ${u[i]}`}
     async function _readJsonResponse(resp,label='request'){
       const text=await resp.text();
-      try{return text?JSON.parse(text):{}}
+      const status=`HTTP ${resp.status}${resp.statusText?' '+resp.statusText:''}`;
+      if(!String(text||'').trim()){
+        throw new Error(`${label} returned ${status} with an empty response. The Studio server/proxy may have dropped the request.`);
+      }
+      try{return JSON.parse(text)}
       catch(parseErr){
         const clean=String(text||'').replace(/\s+/g,' ').trim().slice(0,600);
-        const status=`HTTP ${resp.status}${resp.statusText?' '+resp.statusText:''}`;
         throw new Error(`${label} returned ${status} instead of JSON${clean?` · ${clean}`:''}`);
       }
     }
