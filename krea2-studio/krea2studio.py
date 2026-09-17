@@ -4880,7 +4880,7 @@ app.config["MAX_CONTENT_LENGTH"] = 128 * 1024 * 1024
 # This acknowledgement is deliberately enforced server-side for content/model
 # actions, not only as a cosmetic browser modal. Acceptance is scoped to the
 # current Studio process and must be renewed after a restart.
-TERMS_VERSION = "2026-09-17-v5-membership-and-controls"
+TERMS_VERSION = "2026-09-17-v6-compact-single-agree"
 TERMS_COOKIE_NAME = "ml_krea2_terms"
 TERMS_ACCEPT_TOKEN = uuid.uuid4().hex
 TERMS_PROTECTED_PREFIXES = (
@@ -6371,7 +6371,7 @@ details .inside{padding:0 10px 10px}
 .lora-list{display:flex;flex-direction:column;gap:6px;margin-top:8px}
 .lora-row{display:grid;grid-template-columns:24px minmax(0,1fr) 82px 54px;gap:7px;align-items:center;padding:7px;border:1px solid #2a2b31;border-radius:7px;background:#0d0d10}
 .lora-row.reserved{opacity:.62}.lora-name{min-width:0;font-family:var(--font-mono);font-size:8.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.lora-meta{font-size:7.5px;color:#70727b;margin-top:2px}.lora-strength{height:32px!important;padding:5px 6px!important}.lora-delete{height:30px!important;padding:0 7px!important;font-size:8px!important}.lora-stage{display:none!important;padding:28px!important;align-items:flex-start!important;justify-content:flex-start!important;overflow:auto!important}.lora-stage.active{display:block!important}.lora-stage h2{font:700 15px var(--font-mono);letter-spacing:1px;color:#d4d5db;margin:0 0 10px}.lora-stage p{max-width:760px;color:#83858e;font-size:11px;line-height:1.6}.lora-pill{display:inline-block;border:1px solid #33343b;border-radius:999px;padding:4px 7px;margin:3px 4px 3px 0;font:8px var(--font-mono);color:#b8bac2;background:#111217}
-.terms-modal{position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,.94);display:flex;align-items:center;justify-content:center;padding:18px}.terms-modal.hidden{display:none!important}.terms-shell{width:min(720px,calc(100vw - 36px));max-height:calc(100vh - 36px);overflow:auto;background:#111115;border:1px solid #3a3b43;border-radius:12px;box-shadow:0 30px 100px rgba(0,0,0,.7);padding:20px}.terms-title{font:700 15px var(--font-display);letter-spacing:1px;color:var(--accent);margin-bottom:10px}.terms-copy{color:#b5b7bf;line-height:1.6;font-size:12px}.terms-copy strong{color:#ededf0}.terms-agree{margin-top:14px;padding:12px;border:1px solid #31323a;border-radius:8px;background:#0b0b0d}.terms-actions{display:flex;justify-content:flex-end;margin-top:14px}.terms-actions button{min-width:180px;height:40px}
+.terms-modal{position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,.94);display:flex;align-items:center;justify-content:center;padding:12px}.terms-modal.hidden{display:none!important}.terms-shell{width:min(780px,calc(100vw - 24px));overflow:hidden;background:#111115;border:1px solid #3a3b43;border-radius:12px;box-shadow:0 30px 100px rgba(0,0,0,.7);padding:18px 20px}.terms-title{font:700 15px var(--font-display);letter-spacing:1px;color:var(--accent);margin-bottom:5px}.terms-subtitle{color:#d7d8dd;font-size:11px;line-height:1.35;margin-bottom:10px}.terms-list{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:0}.terms-item{padding:9px 10px;border:1px solid #2d2e35;border-radius:8px;background:#0b0b0d;color:#b9bbc3;font-size:10.5px;line-height:1.38}.terms-item strong{color:#f0f0f2}.terms-foot{margin-top:9px;color:#7f818a;font-size:9.5px;line-height:1.35}.terms-actions{display:flex;align-items:center;gap:12px;justify-content:space-between;margin-top:12px}.terms-actions .status{flex:1;margin:0!important;min-height:0;padding:0!important;border:0!important;background:transparent!important;font-size:10px!important;line-height:1.3}.terms-actions button{flex:0 0 auto;min-width:270px;height:44px;padding:0 18px;font-weight:800}.terms-actions button:disabled{opacity:.62}@media(max-width:720px){.terms-shell{padding:14px}.terms-list{grid-template-columns:1fr;gap:6px}.terms-item{padding:7px 8px;font-size:9.5px}.terms-subtitle{font-size:10px}.terms-foot{font-size:8.5px}.terms-actions{display:block}.terms-actions button{width:100%;min-width:0;margin-top:9px;height:42px}}
 /* ===== MissingLink Studio-style split layout ===== */
 html,body{height:100%;overflow:hidden}
 .app-shell{height:100vh;display:grid;grid-template-rows:52px minmax(0,1fr);background:var(--bg)}
@@ -6889,29 +6889,24 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
 
 <div id="terms_modal" class="terms-modal hidden" aria-hidden="true">
   <div class="terms-shell" role="dialog" aria-modal="true" aria-labelledby="terms_title">
-    <div id="terms_title" class="terms-title">RESPONSIBLE USE AGREEMENT</div>
-    <div class="terms-copy">
-      <p>Before using MissingLink Krea2 Studio, you must certify that you are <strong>18 years of age or older</strong> and agree to the requirements below.</p>
-      <p><strong>You must comply with all applicable federal, state, local, and international laws and regulations, as well as platform rules, model/file licenses, privacy rights, publicity rights, intellectual-property rights, and consent requirements.</strong> You are responsible for having the rights and permissions needed for every image, reference, LoRA, prompt, and other material you provide.</p>
-      <p><strong>No minors.</strong> You may not create, possess, solicit, facilitate, or distribute sexual or exploitative content involving anyone under 18, or anyone whose age is ambiguous in a sexual context.</p>
-      <p><strong>No non-consensual intimate imagery or sexual deepfakes.</strong> You may not create or distribute intimate or sexually explicit imagery of an identifiable real person without all consent required by law. If an identifiable real person appears in sexual or intimate content, you are responsible for confirming that person was 18 or older and for obtaining and retaining any legally required written consent, age verification, distribution permission, records, or other documentation.</p>
-      <p>If you publish or distribute outputs outside this private Studio session, you are solely responsible for any additional verification, recordkeeping, notice, removal, takedown, or platform obligations that apply to that publication or distribution. This includes laws governing non-consensual intimate imagery, synthetic/deepfake intimate imagery, and age/consent verification where applicable.</p>
-      <p>You agree not to use the Studio to create, facilitate, promote, or distribute illegal, abusive, exploitative, deceptive, fraudulent, harassing, threatening, defamatory, privacy-invasive, impersonating, or otherwise harmful content, or to facilitate trafficking, coercion, extortion, stalking, fraud, or other unlawful conduct.</p>
-      <p><strong>MissingLink is an execution and orchestration layer, not the developer of the underlying generative models.</strong> MissingLink provides software, configuration, dependencies, workflow logic, interfaces, and infrastructure that allow compatible third-party or locally supplied models and LoRAs to run. MissingLink does not train, author, control, or determine the behavior of those underlying model weights, and it does not select the content of a user's prompts or model-generated outputs. <strong>Outputs are produced by the underlying models and may be inaccurate, unexpected, offensive, unlawful, or infringing.</strong> You are responsible for the prompts, source materials, model and LoRA choices, review of generated results, and any possession, storage, publication, distribution, or other use of those results. MissingLink does not assume responsibility for content generated by third-party models or for a user's use of that content. Nothing in this agreement changes any rights, duties, or remedies that apply under applicable law.</p>
-      <p>Third-party LoRAs and models may have their own licenses and restrictions. Installing or using a model file does not grant rights that its creator or rights holder did not provide.</p>
-      <p><strong>Continued use of this notebook and Studio requires an active MissingLink membership.</strong> The membership, entitlement, access-control, responsible-use, and safety mechanisms included with the Studio are material conditions of access and may not be bypassed, disabled, removed, altered, or interfered with. <strong>Attempting to circumvent or remove those mechanisms is prohibited and may result in immediate suspension or revocation of access and legal action, including a lawsuit, injunctive relief, and claims for damages where available.</strong> Nothing in this paragraph guarantees that any particular legal action will be filed; enforcement will depend on the facts and applicable law.</p>
-      <p>This agreement sets minimum conditions for using the Studio. It does not replace your obligation to understand and follow laws that apply to you, your location, your content, or your downstream use.</p>
+    <div id="terms_title" class="terms-title">18+ · RESPONSIBLE USE AGREEMENT</div>
+    <div class="terms-subtitle">By clicking <strong>AGREE TO ALL &amp; CONTINUE</strong>, you certify and agree to every condition below.</div>
+
+    <div class="terms-list">
+      <div class="terms-item"><strong>18+ only.</strong> I certify that I am at least 18 years old.</div>
+      <div class="terms-item"><strong>Lawful, authorized use.</strong> I will follow applicable laws, regulations, platform rules, model/LoRA licenses, privacy/publicity/IP rights, and consent requirements, and I have the rights needed for materials I provide.</div>
+      <div class="terms-item"><strong>No minors or non-consensual intimate content.</strong> I will not create, possess, solicit, facilitate, or distribute sexual/exploitative content involving minors or ambiguous-age persons, or non-consensual intimate imagery / sexual deepfakes of identifiable people. I will obtain any legally required age or consent documentation.</div>
+      <div class="terms-item"><strong>No harmful or illegal use.</strong> I will not use this Studio to facilitate abuse, exploitation, coercion, trafficking, extortion, stalking, fraud, threats, harassment, privacy invasion, unlawful impersonation, or other illegal conduct.</div>
+      <div class="terms-item"><strong>I am responsible for outputs and downstream use.</strong> MissingLink provides the execution/orchestration stack; it does not develop, train, or control the underlying third-party models or LoRAs. I am responsible for prompts, source materials, model/LoRA choices, reviewing results, and any use or distribution of those results.</div>
+      <div class="terms-item"><strong>Active MissingLink membership required.</strong> I will not bypass, disable, remove, alter, or interfere with membership, entitlement, access-control, responsible-use, or safety mechanisms. Violations may result in suspension/revocation and legal action where appropriate.</div>
     </div>
-    <div class="terms-agree">
-      <label style="text-transform:none;letter-spacing:0;font-size:11px;color:#d3d4da;margin:0 0 10px"><input id="terms_age_checkbox" type="checkbox" style="width:auto;margin-right:8px"><strong>I certify that I am 18 years of age or older.</strong></label>
-      <label style="text-transform:none;letter-spacing:0;font-size:11px;color:#d3d4da;margin:0 0 10px"><input id="terms_legal_checkbox" type="checkbox" style="width:auto;margin-right:8px">I agree to comply with all applicable laws, regulations, licenses, platform rules, privacy requirements, and consent requirements.</label>
-      <label style="text-transform:none;letter-spacing:0;font-size:11px;color:#d3d4da;margin:0 0 10px"><input id="terms_consent_checkbox" type="checkbox" style="width:auto;margin-right:8px">I will not create or distribute non-consensual intimate imagery, sexual deepfakes of identifiable people without legally required consent, or sexual content involving minors, and I will obtain any legally required age/consent documentation.</label>
-      <label style="text-transform:none;letter-spacing:0;font-size:11px;color:#d3d4da;margin:0 0 10px"><input id="terms_output_checkbox" type="checkbox" style="width:auto;margin-right:8px">I understand that MissingLink provides the execution/orchestration stack and does not develop, train, or control the underlying third-party models or LoRAs. I am responsible for my prompts, model/LoRA choices, review of generated results, and my use of those results.</label>
-      <label style="text-transform:none;letter-spacing:0;font-size:11px;color:#d3d4da;margin:0 0 10px"><input id="terms_membership_checkbox" type="checkbox" style="width:auto;margin-right:8px">I understand that continued use requires an active MissingLink membership and that I may not bypass, disable, remove, alter, or interfere with membership, entitlement, access-control, responsible-use, or safety mechanisms. I understand that violations may result in suspension or revocation of access and legal action, including a lawsuit where appropriate.</label>
-      <label style="text-transform:none;letter-spacing:0;font-size:11px;color:#d3d4da;margin:0"><input id="terms_checkbox" type="checkbox" style="width:auto;margin-right:8px">I understand and agree to follow all of these requirements.</label>
+
+    <div class="terms-foot">Third-party model and LoRA licenses still apply. These are minimum conditions; you remain responsible for any additional legal, recordkeeping, verification, notice, takedown, or distribution obligations that apply to you or your content.</div>
+
+    <div class="terms-actions">
+      <div id="terms_status" class="status"></div>
+      <button id="terms_accept" type="button">I AM 18+ · AGREE TO ALL &amp; CONTINUE</button>
     </div>
-    <div id="terms_status" class="status">You must certify that you are 18+ and accept all legal, consent, membership/access-control, responsible-use, and output-responsibility terms before generation or LoRA installation.</div>
-    <div class="terms-actions"><button id="terms_accept" type="button" disabled>AGREE & CONTINUE</button></div>
   </div>
 </div>
 
@@ -7051,35 +7046,30 @@ async function refreshTermsStatus(){
     if(d.accepted) hideTermsModal(); else showTermsModal();
   }catch(_){showTermsModal()}
 }
-function syncTermsAcceptButton(){
-  $('terms_accept').disabled=!(
-    $('terms_age_checkbox').checked &&
-    $('terms_legal_checkbox').checked &&
-    $('terms_consent_checkbox').checked &&
-    $('terms_output_checkbox').checked &&
-    $('terms_membership_checkbox').checked &&
-    $('terms_checkbox').checked
-  );
-}
-['terms_age_checkbox','terms_legal_checkbox','terms_consent_checkbox','terms_output_checkbox','terms_membership_checkbox','terms_checkbox'].forEach(id=>$(id).addEventListener('change',syncTermsAcceptButton));
 $('terms_accept').onclick=async()=>{
-  if(!(
-    $('terms_age_checkbox').checked &&
-    $('terms_legal_checkbox').checked &&
-    $('terms_consent_checkbox').checked &&
-    $('terms_output_checkbox').checked &&
-    $('terms_membership_checkbox').checked &&
-    $('terms_checkbox').checked
-  ))return;
-  $('terms_accept').disabled=true;
+  const button=$('terms_accept');
+  button.disabled=true;
+  button.textContent='SAVING AGREEMENT…';
   setStatus('terms_status','Saving agreement…','');
   try{
-    await fetchJson('/api/terms/accept',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agree:true,age_18_or_older:true,legal_compliance:true,consent_compliance:true,output_responsibility:true,membership_and_controls:true})});
+    await fetchJson('/api/terms/accept',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        agree:true,
+        age_18_or_older:true,
+        legal_compliance:true,
+        consent_compliance:true,
+        output_responsibility:true,
+        membership_and_controls:true
+      })
+    });
     setStatus('terms_status','Agreement accepted.','good');
     hideTermsModal();
   }catch(e){
     setStatus('terms_status',e.message,'bad');
-    $('terms_accept').disabled=false;
+    button.disabled=false;
+    button.textContent='I AM 18+ · AGREE TO ALL & CONTINUE';
   }
 };
 
