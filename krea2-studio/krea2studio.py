@@ -780,9 +780,67 @@ import random
 import zipfile
 import threading
 import queue
+from collections import deque
 
 from pathlib import Path
 from datetime import datetime
+
+# =====================================================================
+# BROWSER CONSOLE CAPTURE
+# =====================================================================
+# Tee stdout/stderr to their original process pipes AND a bounded in-memory
+# buffer exposed by /api/console. This captures ComfyUI/Krea2Edit diagnostics,
+# tracebacks, model load messages and our own generation logs without hiding
+# anything from the Colab cell output.
+_CONSOLE_LOCK = threading.RLock()
+_CONSOLE_CHUNKS = deque(maxlen=20000)
+
+
+class _ConsoleTee:
+    def __init__(self, base, stream_name):
+        self.base = base
+        self.stream_name = stream_name
+
+    def write(self, value):
+        value = str(value or "")
+        if not value:
+            return 0
+        try:
+            self.base.write(value)
+        except Exception:
+            pass
+        with _CONSOLE_LOCK:
+            _CONSOLE_CHUNKS.append(value)
+        return len(value)
+
+    def flush(self):
+        try:
+            self.base.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        try:
+            return self.base.isatty()
+        except Exception:
+            return False
+
+    @property
+    def encoding(self):
+        return getattr(self.base, "encoding", "utf-8")
+
+
+sys.stdout = _ConsoleTee(sys.stdout, "stdout")
+sys.stderr = _ConsoleTee(sys.stderr, "stderr")
+
+
+def _console_text(limit_chars=300000):
+    with _CONSOLE_LOCK:
+        value = "".join(_CONSOLE_CHUNKS)
+    if len(value) > int(limit_chars):
+        value = value[-int(limit_chars):]
+    return value
+
 
 ROOT = Path("/content")
 COMFY = ROOT / "ComfyUI"
@@ -1549,7 +1607,7 @@ def image_path_to_data_url(path):
 # =====================================================================
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def encode_prompt(prompt, negative_prompt=None):
 
     prompt = str(
@@ -1592,7 +1650,7 @@ def encode_prompt(prompt, negative_prompt=None):
     return positive, negative
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def encode_grounded_edit_prompt(
     prompt,
     source_image,
@@ -1641,7 +1699,7 @@ def encode_grounded_edit_prompt(
 # =====================================================================
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def vae_encode(image):
 
     check_stop()
@@ -1666,7 +1724,7 @@ def vae_encode(image):
     return latent
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def vae_encode_inpaint(image, core_mask, noise_mask=None):
     """Encode a contextual pseudo-inpaint crop for a non-inpaint Krea2 model.
 
@@ -1715,7 +1773,7 @@ def vae_encode_inpaint(image, core_mask, noise_mask=None):
     return latent
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def vae_decode(latent):
 
     check_stop()
@@ -1750,7 +1808,7 @@ def vae_decode(latent):
 # =====================================================================
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def sample_latent(
     latent,
     positive,
@@ -5055,6 +5113,24 @@ def _missinglink_request_gate():
     )
 
 
+@app.get("/api/console")
+def api_console():
+    return jsonify(
+        ok=True,
+        text=_console_text(),
+        active_job=ACTIVE_JOB_ID,
+        timestamp=time.time(),
+    )
+
+
+@app.post("/api/console/clear")
+def api_console_clear():
+    with _CONSOLE_LOCK:
+        _CONSOLE_CHUNKS.clear()
+    print("[CONSOLE] Browser console cleared.", flush=True)
+    return jsonify(ok=True)
+
+
 @app.get("/api/meta")
 def api_meta():
     return jsonify(
@@ -5771,6 +5847,10 @@ details .inside{padding:0 10px 10px}
 .stageview.gallerymode .tile.selected{border-color:var(--accent);box-shadow:0 0 0 1px rgba(232,169,23,.28) inset}
 .stagehint{margin-top:8px;color:#73757f;font-size:8px;line-height:1.5}
 @media(max-width:900px){.stageview{min-height:320px}.stageview.gallerymode .gallery{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.console-stage{display:none!important;margin:0;padding:18px 20px;background:#050506;color:#c8cad2;font:11px/1.55 var(--font-mono);white-space:pre-wrap;word-break:break-word;overflow:auto;align-items:initial!important;justify-content:initial!important;text-align:left;scrollbar-width:thin;scrollbar-color:#34353d #09090b}
+.console-stage.active{display:block!important}
+.console-stage::-webkit-scrollbar{width:9px;height:9px}.console-stage::-webkit-scrollbar-track{background:#09090b}.console-stage::-webkit-scrollbar-thumb{background:#34353d;border-radius:8px}
+.console-toolbar-note{font-family:var(--font-mono);font-size:8px;color:#777982;line-height:1.5}
 /* ===== MissingLink Studio-style split layout ===== */
 html,body{height:100%;overflow:hidden}
 .app-shell{height:100vh;display:grid;grid-template-rows:52px minmax(0,1fr);background:var(--bg)}
@@ -5878,6 +5958,7 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
         <button class="tab" data-tab="inpaint">INPAINT</button>
         <button class="tab" data-tab="batch">ADAPTIVE BATCH</button>
         <button class="tab" data-tab="history">HISTORY</button>
+        <button class="tab" data-tab="console">CONSOLE</button>
       </nav>
 
       <div class="sidebar-scroll">
@@ -6188,6 +6269,21 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
           </div>
         </section>
 
+        <section id="panel_console" class="controlpanel">
+          <div class="card">
+            <div class="cardtitle">Console</div>
+            <div class="cardbody">
+              <div class="sectionhint">Live stdout/stderr from the Studio process, including ComfyUI/Krea2Edit logs and Python tracebacks.</div>
+              <div class="actions">
+                <button id="console_refresh" class="secondary" type="button">REFRESH</button>
+                <button id="console_clear" class="secondary" type="button">CLEAR</button>
+              </div>
+              <label><input id="console_follow" type="checkbox" style="width:auto" checked> Auto-follow latest output</label>
+              <div id="console_status" class="status">Console is live.</div>
+            </div>
+          </div>
+        </section>
+
         <section id="panel_history" class="controlpanel">
           <div class="card">
             <div class="cardtitle">Image History</div>
@@ -6222,6 +6318,7 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
         <div id="in_result" class="stageview single stagepanel"><div class="empty">Edit / inpaint result appears here.</div></div>
         <div id="b_gallery" class="stageview gallerymode stagepanel"><div class="empty">Completed batch images stream here.</div></div>
         <div id="history_stage" class="stageview gallerymode stagepanel"><div class="empty">History images appear here.</div></div>
+        <pre id="console_stage" class="stageview console-stage stagepanel">Console output will appear here.</pre>
       </div>
     </main>
   </div>
@@ -6500,7 +6597,8 @@ const STAGE_EMPTY_TEXT={
   e_result:'Instruction edit result appears here.',
   in_result:'Edit / inpaint result appears here.',
   b_gallery:'Completed batch images stream here.',
-  history_stage:'History images appear here.'
+  history_stage:'History images appear here.',
+  console_stage:'Console output will appear here.'
 };
 const stageState={};
 function ensureStageState(id){ if(!stageState[id]) stageState[id]={mode:'empty',items:[],selected:0}; return stageState[id]; }
@@ -6607,8 +6705,8 @@ function currentStageUrl(id){
   const img=$(id).querySelector('img');
   return img ? (img.dataset.rawUrl || img.src.split('?')[0]) : '';
 }
-const STAGE_BY_TAB={text:'t_result',image:'i_result',edit:'e_result',inpaint:'in_result',batch:'b_gallery',history:'history_stage'};
-const STAGE_LABELS={text:'TEXT → IMAGE',image:'IMAGE → IMAGE',edit:'INSTRUCTION EDIT',inpaint:'INPAINT',batch:'ADAPTIVE BATCH',history:'IMAGE HISTORY'};
+const STAGE_BY_TAB={text:'t_result',image:'i_result',edit:'e_result',inpaint:'in_result',batch:'b_gallery',history:'history_stage',console:'console_stage'};
+const STAGE_LABELS={text:'TEXT → IMAGE',image:'IMAGE → IMAGE',edit:'INSTRUCTION EDIT',inpaint:'INPAINT',batch:'ADAPTIVE BATCH',history:'IMAGE HISTORY',console:'CONSOLE'};
 let activeStageId='t_result';
 let activeStudioTab='text';
 function syncStageToolbar(){
@@ -6633,6 +6731,7 @@ function switchStudioTab(tab){
   document.querySelectorAll('.controlpanel').forEach(x=>x.classList.toggle('active',x.id==='panel_'+tab));
   activateStage(tab);
   if(tab==='history') refreshHistory(true);
+  if(tab==='console') refreshConsole(true);
 }
 $('stage_clear').onclick=()=>{
   if(['text','image','edit','inpaint'].includes(activeStudioTab)) clearSharedSingleStage();
@@ -7200,6 +7299,38 @@ $('h_zip').onclick=async()=>{
 };
 
 // ====================================================================
+// LIVE CONSOLE
+// ====================================================================
+let lastConsoleText='';
+async function refreshConsole(force=false){
+  try{
+    const d=await fetchJson('/api/console');
+    const text=String(d.text||'');
+    if(force || text!==lastConsoleText){
+      lastConsoleText=text;
+      const pre=$('console_stage');
+      if(pre){
+        const follow=$('console_follow') ? $('console_follow').checked : true;
+        const wasNearBottom=(pre.scrollHeight-pre.scrollTop-pre.clientHeight)<80;
+        pre.textContent=text||'No console output yet.';
+        if(follow && (force || wasNearBottom)) pre.scrollTop=pre.scrollHeight;
+      }
+    }
+    if($('console_status')) setStatus('console_status', d.active_job ? ('Live · active job '+d.active_job) : 'Live · GPU queue idle.','good');
+  }catch(e){
+    if($('console_status')) setStatus('console_status',e.message,'bad');
+  }
+}
+if($('console_refresh')) $('console_refresh').onclick=()=>refreshConsole(true);
+if($('console_clear')) $('console_clear').onclick=async()=>{
+  try{
+    await fetchJson('/api/console/clear',{method:'POST'});
+    lastConsoleText='';
+    await refreshConsole(true);
+  }catch(e){setStatus('console_status',e.message,'bad')}
+};
+
+// ====================================================================
 // PERSISTENT FLOATING QUEUE + HISTORY
 // ====================================================================
 const appliedJobs=new Set();
@@ -7448,6 +7579,7 @@ setStageEmpty('history_stage');
 refreshHistory(false);pollJobs();
 setInterval(pollJobs,700);
 setInterval(()=>refreshHistory(false),2500);
+setInterval(()=>{if(activeStudioTab==='console')refreshConsole(false)},700);
 </script>
 </body>
 </html>
