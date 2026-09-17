@@ -859,17 +859,34 @@ print("=" * 76)
 # =====================================================================
 
 import asyncio
-import execution
-import server
+import inspect
 import nodes
 import folder_paths
 import comfy.model_management as model_management
 
+# Load only the Krea2Edit custom node package. The Studio uses ComfyUI as a
+# Python model/runtime library and does not run ComfyUI's own PromptServer.
+# This deliberately avoids PromptServer/AssetManager API churn across ComfyUI
+# releases while still registering Krea2EditModelPatch/GroundedEncode.
 _async_loop = asyncio.new_event_loop()
 asyncio.set_event_loop(_async_loop)
-PROMPT_SERVER = server.PromptServer(_async_loop)
-PROMPT_QUEUE = execution.PromptQueue(PROMPT_SERVER)
-nodes.init_extra_nodes(init_custom_nodes=True)
+_KREA2_EDIT_NODE_PATH = COMFY / "custom_nodes" / "comfyui-krea2edit"
+if not _KREA2_EDIT_NODE_PATH.is_dir():
+    raise RuntimeError(
+        "ComfyUI-Krea2Edit custom nodes are missing at "
+        + str(_KREA2_EDIT_NODE_PATH)
+    )
+_load_result = nodes.load_custom_node(
+    str(_KREA2_EDIT_NODE_PATH),
+    set(),
+    module_parent="custom_nodes",
+)
+if inspect.isawaitable(_load_result):
+    _krea2edit_loaded = bool(_async_loop.run_until_complete(_load_result))
+else:
+    _krea2edit_loaded = bool(_load_result)
+if not _krea2edit_loaded:
+    raise RuntimeError("ComfyUI-Krea2Edit custom nodes failed to import.")
 
 UNETLoader = nodes.UNETLoader
 CLIPLoader = nodes.CLIPLoader
@@ -888,6 +905,7 @@ if "Krea2EditModelPatch" not in nodes.NODE_CLASS_MAPPINGS or "Krea2EditGroundedE
         "ComfyUI-Krea2Edit custom nodes did not load. "
         "Ensure ComfyUI/custom_nodes/comfyui-krea2edit is present and restart the app."
     )
+print("[BOOT] ComfyUI-Krea2Edit nodes loaded", flush=True)
 
 MODEL_NAME = "krea2-def.safetensors"
 CLIP_NAME = "__CLIP_FILENAME__"
@@ -1430,6 +1448,19 @@ def mask_to_tensor(mask):
     return torch.from_numpy(
         array
     ).unsqueeze(0)
+
+
+def empty_krea2_latent(width, height, batch_size=1):
+    """Create the 16-channel empty latent used by Krea2/Qwen-image editing."""
+    width = round16(width)
+    height = round16(height)
+    return {
+        "samples": torch.zeros(
+            [int(batch_size), 16, height // 8, width // 8],
+            device=model_management.intermediate_device(),
+            dtype=model_management.intermediate_dtype(),
+        )
+    }
 
 
 def tensor_to_pil(tensor):
@@ -2087,11 +2118,11 @@ def instruction_edit(
     )
 
     source_latent = vae_encode(source)
-    target_latent = EMPTY_LATENT.generate(
-        width=round16(source.width),
-        height=round16(source.height),
+    target_latent = empty_krea2_latent(
+        source.width,
+        source.height,
         batch_size=1,
-    )[0]
+    )
 
     patched_model = KREA2_EDIT_PATCH.patch(
         model=identity_edit_model(
@@ -2579,11 +2610,11 @@ def inpaint(
     )
 
     source_latent = vae_encode(work_source)
-    target_latent = EMPTY_LATENT.generate(
-        width=round16(work_source.width),
-        height=round16(work_source.height),
+    target_latent = empty_krea2_latent(
+        work_source.width,
+        work_source.height,
         batch_size=1,
-    )[0]
+    )
 
     patched_model = KREA2_EDIT_PATCH.patch(
         model=identity_edit_model(
