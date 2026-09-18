@@ -14,7 +14,7 @@
 #   MISSING_LINK_TOKEN - required; validated against MissingLink before the UI can start
 #   HF_TOKEN           - optional; used for private/gated Hugging Face downloads where applicable
 #   CIVITAI_API_KEY    - optional; NEVER required for startup. Public CivitAI installs are attempted anonymously.
-#   OPENAI_API_KEY     - optional; used only when the user explicitly invokes Auto Prompt.
+#   OPENAI_API_KEY     - optional; used only when the user explicitly invokes Auto Prompt or GPT-Image 2.5 Next Scene.
 # SageAttention is never built from source in this UI cell; Blackwell requires the MissingLink wheel.
 #
 # It auto-detects the GPU. Blackwell keeps the existing CU130/Sage resident path;
@@ -3945,6 +3945,7 @@ if _CU130_CHILD:
             "name": _safe_timeline_name(name, f"Sequence {sid[:4]}"),
             "segments": [],
             "master_file": None,
+            "director_state": {},
             "created": now,
             "updated": now,
         }
@@ -4039,6 +4040,7 @@ if _CU130_CHILD:
                 "id": seq.get("id") or uuid.uuid4().hex[:10],
                 "name": seq.get("name") or "Sequence",
                 "master_file": seq.get("master_file"),
+                "director_state": dict(seq.get("director_state") or {}),
                 "created": seq.get("created", time.time()),
                 "updated": seq.get("updated", time.time()),
                 "segments": [],
@@ -4135,6 +4137,7 @@ if _CU130_CHILD:
             seq = _new_sequence(raw_seq.get("name") or f"Sequence {len(restored['sequences']) + 1}")
             seq["id"] = raw_seq.get("id") or seq["id"]
             seq["master_file"] = raw_seq.get("master_file")
+            seq["director_state"] = dict(raw_seq.get("director_state") or {})
             seq["created"] = raw_seq.get("created", time.time())
             seq["updated"] = raw_seq.get("updated", time.time())
             seq["segments"] = []
@@ -5875,6 +5878,571 @@ Additional user Auto Prompt instructions:
             used_last_image=bool(last_data),
         )
 
+    NEXT_SCENE_DIRECTOR_MODELS = [
+        {"id":"gpt-5.6-terra", "label":"GPT-5.6 Terra · balanced director"},
+        {"id":"gpt-5.6-sol", "label":"GPT-5.6 Sol · strongest director"},
+    ]
+    NEXT_SCENE_DEFAULT_DIRECTOR_MODEL = "gpt-5.6-terra"
+    NEXT_SCENE_IMAGE_MODELS = [
+        {"id":"gpt-image-2.5-flare", "label":"GPT-Image-2.5 Flare · fast"},
+        {"id":"gpt-image-2.5-sunburst", "label":"GPT-Image-2.5 Sunburst · precision"},
+    ]
+    NEXT_SCENE_DEFAULT_IMAGE_MODEL = "gpt-image-2.5-flare"
+    NEXT_SCENE_IMAGE_QUALITIES = {"auto", "low", "medium", "high", "xhigh", "max"}
+    NEXT_SCENE_REPAIR_MODEL = "gpt-image-2.5-sunburst"
+    NEXT_SCENE_MAX_REPAIRS = 2
+
+    def _next_scene_timeline_context(max_segments=8):
+        with TIMELINE_LOCK:
+            seq = _active_sequence_unlocked(create=True)
+            seq_name = str((seq or {}).get("name") or "Sequence")
+            seq_id = str((seq or {}).get("id") or "")
+            director_state = dict((seq or {}).get("director_state") or {})
+            all_segs = list((seq or {}).get("segments") or [])
+            start_index = max(0, len(all_segs) - max_segments)
+            segs = all_segs[start_index:]
+        rows = []
+        for i, seg in enumerate(segs, start=start_index + 1):
+            prompt = re.sub(r"\s+", " ", str(seg.get("prompt") or "")).strip()
+            if len(prompt) > 1500:
+                prompt = prompt[:1500] + "…"
+            rows.append(
+                f"Clip {i}: {float(seg.get('duration') or 0):.2f}s, "
+                f"{int(seg.get('width') or 0)}x{int(seg.get('height') or 0)}, "
+                f"prompt: {prompt or '(no saved prompt)'}"
+            )
+        return seq_id, seq_name, rows, director_state
+
+    def _normalize_gpt_image_size(width, height):
+        try:
+            w = max(256, int(float(width)))
+            h = max(256, int(float(height)))
+        except Exception:
+            w, h = 1024, 1024
+        ratio = w / max(1.0, float(h))
+        if ratio > 3.0:
+            w = int(h * 3.0)
+        elif ratio < (1.0 / 3.0):
+            h = int(w * 3.0)
+        # Keep the H3 canvas aspect but satisfy GPT Image arbitrary-size constraints.
+        min_pixels = 655_360
+        max_pixels = 8_294_400
+        max_edge = 3840
+        pixels = w * h
+        if pixels < min_pixels:
+            scale = (min_pixels / max(1.0, float(pixels))) ** 0.5
+            w = int(w * scale)
+            h = int(h * scale)
+        if max(w, h) > max_edge:
+            scale = max_edge / float(max(w, h))
+            w = int(w * scale)
+            h = int(h * scale)
+        pixels = w * h
+        if pixels > max_pixels:
+            scale = (max_pixels / float(pixels)) ** 0.5
+            w = int(w * scale)
+            h = int(h * scale)
+        w = max(256, int(round(w / 16.0)) * 16)
+        h = max(256, int(round(h / 16.0)) * 16)
+        return w, h
+
+    def _multipart_body(fields, files):
+        boundary = "----MissingLinkGPTImage" + uuid.uuid4().hex
+        chunks = []
+        for name, value in fields.items():
+            chunks += [
+                f"--{boundary}\r\n".encode(),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
+                str(value).encode("utf-8"), b"\r\n",
+            ]
+        for name, filename, mime, data in files:
+            chunks += [
+                f"--{boundary}\r\n".encode(),
+                f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode(),
+                f"Content-Type: {mime}\r\n\r\n".encode(),
+                data, b"\r\n",
+            ]
+        chunks.append(f"--{boundary}--\r\n".encode())
+        return boundary, b"".join(chunks)
+
+    def _openai_image_request(*, key, model, prompt, width, height, quality, reference_path=None, reference_paths=None):
+        size = f"{width}x{height}"
+        headers = {
+            "Authorization": "Bearer " + key,
+            "User-Agent": "MissingLink-H3-StoryDirector/2",
+        }
+        refs = []
+        if reference_paths:
+            refs.extend([x for x in reference_paths if x and os.path.exists(x)])
+        elif reference_path and os.path.exists(reference_path):
+            refs.append(reference_path)
+        if refs:
+            edit_files = []
+            for idx, ref in enumerate(refs[:16], start=1):
+                img = Image.open(ref).convert("RGB")
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                edit_files.append(("image[]", f"reference_{idx}.png", "image/png", buf.getvalue()))
+            fields = {
+                "model": model,
+                "prompt": prompt,
+                "size": size,
+                "quality": quality,
+                "input_fidelity": "high",
+                "output_format": "png",
+                "background": "opaque",
+                "n": "1",
+            }
+            boundary, body = _multipart_body(fields, edit_files)
+            headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+            url = "https://api.openai.com/v1/images/edits"
+        else:
+            body = json.dumps({
+                "model": model,
+                "prompt": prompt,
+                "size": size,
+                "quality": quality,
+                "output_format": "png",
+                "background": "opaque",
+                "n": 1,
+            }).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+            url = "https://api.openai.com/v1/images/generations"
+
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")[-4000:]
+            try:
+                message = (json.loads(detail).get("error") or {}).get("message") or detail
+            except Exception:
+                message = detail
+            raise RuntimeError(f"OpenAI GPT-Image request failed ({e.code}): {message}") from e
+        except Exception as e:
+            raise RuntimeError(f"OpenAI GPT-Image request failed: {e}") from e
+
+        rows = payload.get("data") or []
+        if not rows or not isinstance(rows[0], dict) or not rows[0].get("b64_json"):
+            raise RuntimeError("GPT-Image returned no base64 image payload.")
+        try:
+            raw = base64.b64decode(rows[0]["b64_json"], validate=True)
+        except Exception as e:
+            raise RuntimeError(f"Could not decode GPT-Image output: {e}") from e
+        return raw, rows[0].get("revised_prompt") or "", bool(refs)
+
+    def _openai_structured_response(*, key, model, instructions, user_text, schema_name, schema, images=None, max_output_tokens=5200):
+        content = [{"type":"input_text", "text":str(user_text)}]
+        for label, image_path in (images or []):
+            if image_path and os.path.exists(image_path):
+                content.append({"type":"input_text", "text":str(label)})
+                content.append({"type":"input_image", "image_url":_vision_data_url(image_path)})
+        payload = {
+            "model": model,
+            "instructions": instructions,
+            "input": [{"role":"user", "content":content}],
+            "text": {"format": {"type":"json_schema", "name":schema_name, "strict":True, "schema":schema}},
+            "max_output_tokens": int(max_output_tokens),
+            "store": False,
+        }
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/responses",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Authorization":"Bearer "+key, "Content-Type":"application/json", "User-Agent":"MissingLink-H3-StoryDirector/2"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=210) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")[-3500:]
+            try:
+                msg = (json.loads(detail).get("error") or {}).get("message") or detail
+            except Exception:
+                msg = detail
+            raise RuntimeError(f"OpenAI story-director error ({e.code}): {msg}") from e
+        except Exception as e:
+            raise RuntimeError(f"OpenAI story-director request failed: {e}") from e
+        text = _extract_response_text(result)
+        if not text:
+            raise RuntimeError("The story director returned no structured output.")
+        try:
+            return json.loads(text)
+        except Exception as e:
+            raise RuntimeError(f"The story director returned invalid JSON: {e}") from e
+
+    def _director_story_schema():
+        return {
+            "type":"object",
+            "properties":{
+                "scene_title":{"type":"string"},
+                "scene_goal":{"type":"string"},
+                "duration_seconds":{"type":"number"},
+                "image_prompt":{"type":"string"},
+                "h3_prompt":{"type":"string"},
+                "end_state":{"type":"string"},
+                "story_state":{
+                    "type":"object",
+                    "properties":{
+                        "summary":{"type":"string"},
+                        "characters":{"type":"array","items":{"type":"string"}},
+                        "continuity_facts":{"type":"array","items":{"type":"string"}},
+                        "unresolved_threads":{"type":"array","items":{"type":"string"}},
+                        "trajectory":{"type":"string"},
+                        "next_after_this":{"type":"string"},
+                    },
+                    "required":["summary","characters","continuity_facts","unresolved_threads","trajectory","next_after_this"],
+                    "additionalProperties":False,
+                },
+                "timing_beats":{
+                    "type":"array",
+                    "items":{
+                        "type":"object",
+                        "properties":{
+                            "start_sec":{"type":"number"},
+                            "end_sec":{"type":"number"},
+                            "beat":{"type":"string"},
+                        },
+                        "required":["start_sec","end_sec","beat"],
+                        "additionalProperties":False,
+                    },
+                },
+            },
+            "required":["scene_title","scene_goal","duration_seconds","image_prompt","h3_prompt","end_state","story_state","timing_beats"],
+            "additionalProperties":False,
+        }
+
+    def _director_audit_schema():
+        return {
+            "type":"object",
+            "properties":{
+                "pass":{"type":"boolean"},
+                "score":{"type":"integer","minimum":0,"maximum":100},
+                "summary":{"type":"string"},
+                "problems":{"type":"array","items":{"type":"string"}},
+                "repair_instruction":{"type":"string"},
+                "observed_opening_state":{"type":"string"},
+                "final_h3_prompt":{"type":"string"},
+            },
+            "required":["pass","score","summary","problems","repair_instruction","observed_opening_state","final_h3_prompt"],
+            "additionalProperties":False,
+        }
+
+    def _h3_prompt_contract(duration):
+        return f'''The MiniMax H3 prompt MUST be directly usable in this studio for a {duration:.2f}-second I2VA/FL2VA continuation whose generated storyboard image is Picture 1 at time 0.00.
+It MUST begin exactly with this line:
+For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
+Then one blank line, then exactly these top-level fields in order:
+integrated_multimodal_description: ...
+overall_soundscape: ...
+non_diegetic_music: ...
+Write in playback order. [Shot 1] has no timestamp. Later shots are allowed only for real cuts and must have increasing timestamps that do not exceed {duration:.2f}s. Prefer one continuous shot unless a cut is narratively necessary. The final described action/state must be reachable within {duration:.2f}s. Dialogue belongs in integrated_multimodal_description; use stable subject IDs and <d>[English] exact words</d> when there is dialogue. Soundscape contains ambience/physical/nonverbal sound, not duplicate dialogue. Music is N/A when no score is appropriate.'''
+
+    def _normalize_h3_prompt(raw, duration):
+        text = str(raw or "").strip()
+        header = 'For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.'
+        if not text.startswith(header):
+            text = header + "\n\n" + text
+        if "integrated_multimodal_description:" not in text:
+            body = text[len(header):].strip()
+            text = header + "\n\nintegrated_multimodal_description: " + (body or f"[Shot 1] Continue the planned action naturally through {duration:.2f} seconds.")
+        if "overall_soundscape:" not in text:
+            text += "\noverall_soundscape: Natural production ambience and synchronized physical sounds appropriate to the scene."
+        if "non_diegetic_music:" not in text:
+            text += "\nnon_diegetic_music: N/A"
+        return text
+
+    def _story_director_plan_system(duration, n_frames, model_seconds, playback_speed):
+        return f'''You are the persistent STORY DIRECTOR for a MiniMax H3 audiovisual sequence. You are not merely writing an image prompt. Maintain narrative memory, continuity, trajectory, and scene-to-scene intent.
+
+Your job for this turn:
+1. Read the saved story state, recent H3 prompts, current creative prompt, optional user direction, and previous visual frame.
+2. Decide the next dramatic/story beat. If the user gives no new direction, autonomously choose the next beat that best advances the established trajectory without jumping too far.
+3. Design ONE storyboard opening frame for that next scene. It should preserve character identity, wardrobe, props, geography, lighting logic, and visual language unless a deliberate story change is justified.
+4. Write the exact MiniMax H3 motion/audio prompt that starts from that generated opening frame and evolves through the requested final scene duration.
+5. Update story_state so a later Auto Next Scene call knows what has happened, what remains unresolved, and where the story is going.
+
+TIMING CONTRACT:
+- requested FINAL output duration: {duration:.2f}s
+- MiniMax legal model frames after snapping: {int(n_frames)} frames at {MODEL_FPS:.0f} fps
+- native model-time before final retime: {model_seconds:.3f}s
+- requested motion/playback pace: {playback_speed:.3f}x
+Plan actions and camera motion that can physically read within the FINAL {duration:.2f}s. Use 2-5 timing beats whose ranges fit inside 0.00..{duration:.2f}s. Do not cram a feature-film sequence into a short clip.
+
+{_h3_prompt_contract(duration)}
+
+IMAGE PROMPT CONTRACT:
+image_prompt must describe a single clean cinematic opening frame, not a montage and not text. Give GPT-Image concrete composition, subjects, pose/action readiness, lens/camera position, spatial relationships, lighting, atmosphere, continuity details, and enough uncluttered motion headroom for H3 to animate. No captions, watermarks, subtitles, labels, split screens, contact sheets, or UI unless explicitly requested.'''
+
+    def _story_director_audit_system(duration):
+        return f'''You are the visual continuity supervisor and MiniMax H3 prompt supervisor for an ongoing scene sequence. Inspect the ACTUAL generated candidate pixels, not just the intent.
+
+Audit for:
+- continuity with the supplied previous frame and saved story facts;
+- stable character/object identity, wardrobe, props, location geography, lighting/time-of-day logic;
+- obvious generation defects, malformed anatomy/objects, accidental text/watermarks, duplicated subjects, impossible spatial relationships;
+- strong usability as the first frame of a MiniMax H3 clip: readable subject silhouette, useful motion headroom, coherent depth, no composition that forces impossible motion;
+- alignment with the planned next scene goal and its {duration:.2f}s action budget.
+
+Set pass=true only when the candidate is production-usable and score it at least 85/100. If it is weak, explain concrete repair instructions that an image editor can execute. Regardless of pass/fail, rewrite final_h3_prompt so it starts from what is ACTUALLY visible in the candidate while preserving the intended narrative trajectory and exact {duration:.2f}s budget.
+
+{_h3_prompt_contract(duration)}'''
+
+    @app.get("/api/next_scene/meta")
+    def api_next_scene_meta():
+        with STAGE_LOCK:
+            stage_ref = STAGE_STATE.get("last_frame_path")
+        seq_id, seq_name, recent, director_state = _next_scene_timeline_context()
+        return jsonify(
+            ok=True,
+            key_available=bool(_openai_api_key()),
+            director_models=NEXT_SCENE_DIRECTOR_MODELS,
+            default_director_model=NEXT_SCENE_DEFAULT_DIRECTOR_MODEL,
+            image_models=NEXT_SCENE_IMAGE_MODELS,
+            default_image_model=NEXT_SCENE_DEFAULT_IMAGE_MODEL,
+            qualities=sorted(NEXT_SCENE_IMAGE_QUALITIES),
+            has_stage_reference=bool(stage_ref and os.path.exists(stage_ref)),
+            active_sequence=seq_name,
+            active_sequence_id=seq_id,
+            recent_clip_count=len(recent),
+            has_story_memory=bool(director_state),
+            story_summary=str(director_state.get("summary") or "")[:600],
+            trajectory=str(director_state.get("trajectory") or "")[:600],
+        )
+
+    @app.post("/api/next_scene")
+    def api_next_scene():
+        key = _openai_api_key()
+        if not key:
+            return jsonify(error="OPENAI_API_KEY is not available to the UI process. Add it in Colab Secrets, then rerun the studio."), 400
+
+        director_model = str(request.form.get("director_model") or NEXT_SCENE_DEFAULT_DIRECTOR_MODEL).strip()
+        if director_model not in {x["id"] for x in NEXT_SCENE_DIRECTOR_MODELS}:
+            return jsonify(error="Choose GPT-5.6 Sol or Terra as the Story Director."), 400
+        image_model = str(request.form.get("image_model") or NEXT_SCENE_DEFAULT_IMAGE_MODEL).strip()
+        if image_model not in {x["id"] for x in NEXT_SCENE_IMAGE_MODELS}:
+            return jsonify(error="Choose a supported GPT-Image-2.5 renderer."), 400
+        quality = str(request.form.get("quality") or "auto").strip().lower()
+        if quality not in NEXT_SCENE_IMAGE_QUALITIES:
+            quality = "auto"
+
+        instruction = str(request.form.get("instruction") or "").strip()[:9000]
+        story_context = str(request.form.get("story_context") or "").strip()[:7000]
+        current_prompt = str(request.form.get("current_prompt") or "").strip()[:6500]
+        use_timeline = str(request.form.get("use_timeline") or "1").lower() in {"1","true","yes","on"}
+        use_stage = str(request.form.get("use_stage_reference") or "1").lower() in {"1","true","yes","on"}
+
+        length_p = {
+            "length_mode": request.form.get("length_mode") or "seconds",
+            "duration": request.form.get("duration") or "7",
+            "frames": request.form.get("frames") or "175",
+            "playback_speed": request.form.get("playback_speed") or "1",
+        }
+        try:
+            n_frames, model_seconds, requested_seconds = resolve_length(length_p)
+            requested_seconds = max(0.21, min(149.7, float(requested_seconds)))
+            playback_speed = max(0.05, min(8.0, float(length_p.get("playback_speed") or 1.0)))
+        except Exception as e:
+            return jsonify(error=f"Could not resolve the requested H3 scene length: {e}"), 400
+
+        image_width, image_height = _normalize_gpt_image_size(
+            request.form.get("width") or 1024,
+            request.form.get("height") or 1024,
+        )
+
+        seq_id, seq_name, recent_rows, saved_state = _next_scene_timeline_context()
+        reference_path = None
+        if use_stage:
+            with STAGE_LOCK:
+                candidate = STAGE_STATE.get("last_frame_path")
+            if candidate and os.path.exists(candidate):
+                reference_path = candidate
+
+        context_chunks = [
+            f"ACTIVE SEQUENCE: {seq_name}",
+            "SAVED STORY-DIRECTOR STATE:\n" + (json.dumps(saved_state, ensure_ascii=False)[:14000] if saved_state else "(none yet — infer conservatively from the existing sequence)"),
+        ]
+        if story_context:
+            context_chunks.append("USER STORY BIBLE / CONTINUITY NOTES:\n" + story_context)
+        if use_timeline and recent_rows:
+            context_chunks.append("RECENT COMPLETED H3 CLIPS, OLDEST TO NEWEST:\n" + "\n".join(recent_rows))
+        if current_prompt:
+            context_chunks.append("CURRENT H3 PROMPT / CREATIVE DIRECTION IN THE UI:\n" + current_prompt)
+        context_chunks.append("USER DIRECTION FOR THIS NEXT SCENE:\n" + (instruction or "(none — autonomously choose the next beat from the established story trajectory)"))
+        context_chunks.append(
+            f"TARGET H3 CANVAS: {request.form.get('width') or '?'}x{request.form.get('height') or '?'}; "
+            f"storyboard renderer canvas: {image_width}x{image_height}."
+        )
+        plan_user = "\n\n".join(context_chunks)
+        plan_images = [("IMMEDIATE PREVIOUS FRAME — use as hard visual continuity evidence.", reference_path)] if reference_path else []
+
+        try:
+            plan = _openai_structured_response(
+                key=key,
+                model=director_model,
+                instructions=_story_director_plan_system(requested_seconds, n_frames, model_seconds, playback_speed),
+                user_text=plan_user,
+                schema_name="h3_next_scene_plan",
+                schema=_director_story_schema(),
+                images=plan_images,
+                max_output_tokens=6200,
+            )
+            image_prompt = str(plan.get("image_prompt") or "").strip()
+            if not image_prompt:
+                raise RuntimeError("Story Director did not produce an image prompt.")
+            planned_h3_prompt = _normalize_h3_prompt(plan.get("h3_prompt"), requested_seconds)
+
+            work_id = uuid.uuid4().hex[:12]
+            work_paths = []
+            image_bytes, revised_prompt, used_reference = _openai_image_request(
+                key=key,
+                model=image_model,
+                prompt=image_prompt,
+                width=image_width,
+                height=image_height,
+                quality=quality,
+                reference_path=reference_path,
+            )
+            candidate_path = os.path.join(OUT, f".next_scene_{work_id}_candidate0.png")
+            with open(candidate_path, "wb") as fh:
+                fh.write(image_bytes)
+            with Image.open(candidate_path) as check:
+                check.verify()
+            work_paths.append(candidate_path)
+
+            repairs = 0
+            audit = None
+            while True:
+                audit_context = (
+                    f"PLANNED SCENE TITLE: {plan.get('scene_title','')}\n"
+                    f"PLANNED SCENE GOAL: {plan.get('scene_goal','')}\n"
+                    f"PLANNED END STATE: {plan.get('end_state','')}\n"
+                    f"PLANNED TIMING BEATS: {json.dumps(plan.get('timing_beats') or [], ensure_ascii=False)}\n"
+                    f"PLANNED H3 PROMPT:\n{planned_h3_prompt}\n\n"
+                    f"SAVED STORY STATE BEFORE THIS SCENE:\n{json.dumps(saved_state, ensure_ascii=False)[:12000]}"
+                )
+                audit_images = []
+                if reference_path:
+                    audit_images.append(("PREVIOUS FRAME — immediate visual state before this next scene.", reference_path))
+                audit_images.append(("CANDIDATE NEXT-SCENE OPENING FRAME — inspect these actual pixels.", candidate_path))
+                audit = _openai_structured_response(
+                    key=key,
+                    model=director_model,
+                    instructions=_story_director_audit_system(requested_seconds),
+                    user_text=audit_context,
+                    schema_name="h3_next_scene_audit",
+                    schema=_director_audit_schema(),
+                    images=audit_images,
+                    max_output_tokens=4300,
+                )
+                passed = bool(audit.get("pass")) and int(audit.get("score") or 0) >= 85
+                if passed or repairs >= NEXT_SCENE_MAX_REPAIRS:
+                    break
+                repair_instruction = str(audit.get("repair_instruction") or "").strip()
+                if not repair_instruction:
+                    break
+                repairs += 1
+                repair_prompt = (
+                    "Precision continuity repair. Edit the supplied candidate image rather than redesigning the scene. "
+                    "Keep the intended story beat, identity, wardrobe, props, location, lens language, and opening-frame composition unless the audit explicitly identifies them as the problem. "
+                    "Remove accidental text/UI/watermarks and fix anatomy/object/spatial defects. Preserve generous motion headroom for MiniMax H3.\n\n"
+                    f"PLANNED SCENE GOAL:\n{plan.get('scene_goal','')}\n\n"
+                    f"AUDIT REPAIR INSTRUCTIONS:\n{repair_instruction}"
+                )
+                repair_refs = [candidate_path] + ([reference_path] if reference_path else [])
+                repair_prompt += (
+                    "\n\nREFERENCE ORDER: image 1 is the candidate to repair. "
+                    + ("Image 2 is the immediate previous story frame; use it only to preserve identity/continuity while keeping image 1's planned next-scene composition." if reference_path else "Preserve image 1's intended next-scene composition while making the audited corrections.")
+                )
+                repaired_bytes, _, _ = _openai_image_request(
+                    key=key,
+                    model=NEXT_SCENE_REPAIR_MODEL,
+                    prompt=repair_prompt,
+                    width=image_width,
+                    height=image_height,
+                    quality="xhigh" if quality in {"xhigh","max"} else "high",
+                    reference_paths=repair_refs,
+                )
+                next_path = os.path.join(OUT, f".next_scene_{work_id}_candidate{repairs}.png")
+                with open(next_path, "wb") as fh:
+                    fh.write(repaired_bytes)
+                with Image.open(next_path) as check:
+                    check.verify()
+                work_paths.append(next_path)
+                candidate_path = next_path
+
+            audit_score = int((audit or {}).get("score") or 0)
+            audit_pass = bool((audit or {}).get("pass")) and audit_score >= 85
+            final_h3_prompt = _normalize_h3_prompt((audit or {}).get("final_h3_prompt") or planned_h3_prompt, requested_seconds)
+
+            out_name = f"next_scene_{work_id}.png"
+            out_path = os.path.join(OUT, out_name)
+            shutil.copyfile(candidate_path, out_path)
+
+            # Advance persistent story memory only after the pixels pass visual audit.
+            if audit_pass:
+                new_state = dict(plan.get("story_state") or {})
+                new_state.update({
+                    "last_scene_title": str(plan.get("scene_title") or ""),
+                    "last_scene_goal": str(plan.get("scene_goal") or ""),
+                    "last_end_state": str(plan.get("end_state") or ""),
+                    "last_observed_opening_state": str((audit or {}).get("observed_opening_state") or ""),
+                    "last_h3_prompt": final_h3_prompt,
+                    "last_opening_frame_file": out_name,
+                    "last_scene_duration": round(float(requested_seconds), 3),
+                    "last_director_model": director_model,
+                    "last_audit_score": audit_score,
+                    "revision": int(saved_state.get("revision") or 0) + 1,
+                    "updated": time.time(),
+                })
+                with TIMELINE_LOCK:
+                    seq = _find_sequence_unlocked(seq_id) if seq_id else _active_sequence_unlocked(create=True)
+                    if seq is not None:
+                        seq["director_state"] = new_state
+                        seq["updated"] = time.time()
+                        TIMELINE_STATE["updated"] = time.time()
+                        _autosave_timeline_unlocked("story_director_next_scene")
+
+            for wp in work_paths:
+                try:
+                    if os.path.exists(wp):
+                        os.remove(wp)
+                except Exception:
+                    pass
+
+            return jsonify(
+                ok=True,
+                file=out_name,
+                director_model=director_model,
+                image_model=image_model,
+                quality=quality,
+                width=image_width,
+                height=image_height,
+                used_reference=used_reference,
+                used_timeline=use_timeline,
+                scene_title=plan.get("scene_title") or "Next Scene",
+                scene_goal=plan.get("scene_goal") or "",
+                end_state=plan.get("end_state") or "",
+                duration=round(float(requested_seconds), 3),
+                model_seconds=round(float(model_seconds), 3),
+                frames=int(n_frames),
+                timing_beats=plan.get("timing_beats") or [],
+                h3_prompt=final_h3_prompt,
+                audit_pass=audit_pass,
+                audit_score=audit_score,
+                audit_summary=str((audit or {}).get("summary") or ""),
+                audit_problems=(audit or {}).get("problems") or [],
+                repairs=repairs,
+                story_advanced=audit_pass,
+                story_summary=str((plan.get("story_state") or {}).get("summary") or ""),
+                trajectory=str((plan.get("story_state") or {}).get("trajectory") or ""),
+                next_after_this=str((plan.get("story_state") or {}).get("next_after_this") or ""),
+                revised_image_prompt=revised_prompt,
+            )
+        except Exception as e:
+            return jsonify(error=str(e)), 502
+
     @app.get("/api/keepalive")
     def keepalive(): return jsonify(ok=True)
 
@@ -6317,6 +6885,7 @@ Additional user Auto Prompt instructions:
             clone = _new_sequence((src.get("name") or "Sequence") + " copy")
             clone["segments"] = [dict(seg) for seg in (src.get("segments") or [])]
             clone["master_file"] = src.get("master_file")
+            clone["director_state"] = dict(src.get("director_state") or {})
             TIMELINE_STATE["sequences"].append(clone)
             TIMELINE_STATE["active_sequence_id"] = clone["id"]
             TIMELINE_STATE["updated"] = time.time()
@@ -7214,7 +7783,7 @@ Additional user Auto Prompt instructions:
     .hfmodelbox.show{display:block}.hfmodelgrid{display:grid;grid-template-columns:minmax(0,1fr) 92px;gap:7px}.hfmodelactions{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:7px}.hfmodelactions button{margin:0}.hfprogress{height:6px;background:#24252a;border-radius:999px;overflow:hidden;margin-top:9px}.hfprogress i{display:block;height:100%;width:0;background:var(--accent);transition:width .18s}.hfprogresstext{font-size:8px;color:#8e9099;margin-top:5px;min-height:12px}.hfmodelbox select,.hfmodelbox input{font-size:10px}
     .modelcardtitle{display:flex;align-items:center;justify-content:space-between;gap:10px}.modelcardtitle>span{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.adultmodebtn{position:relative;width:48px!important;height:23px!important;flex:0 0 48px;margin:0!important;padding:0 17px 0 7px!important;background:#17181c!important;color:#8b8e97!important;border:1px solid #303139!important;border-radius:999px!important;font-size:7px!important;letter-spacing:.35px!important;text-align:left!important}.adultmodebtn::after{content:'';position:absolute;right:6px;top:50%;width:7px;height:7px;border-radius:50%;background:#555862;transform:translateY(-50%);box-shadow:0 0 0 1px #16171a}.adultmodebtn:hover{border-color:#52545d!important;color:#c7c9cf!important}.adultmodebtn.on{background:#211d10!important;color:#edc44a!important;border-color:#66551d!important}.adultmodebtn.on::after{background:var(--accent);box-shadow:0 0 8px #e8a91766}.adultmodebtn:disabled{opacity:.45!important}
     #go{width:100%;font-size:13px;margin-top:4px;padding:12px}
-    .autopromptrow{display:grid;grid-template-columns:minmax(0,1fr) 44px;gap:8px;margin-top:8px}.approfilerow{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:6px;align-items:center}.approfilerow button{width:auto;margin:0;padding:8px 9px;font-size:7.5px}.autopromptrow button{margin:0}.autopromptrow .gear{background:#29292f;color:#ddd;font-size:17px;padding:8px}.autopromptrow .gear:hover{color:var(--accent)}#auto_prompt_btn.working{background:#29292f;color:#aaa}.apmodal{display:none;position:fixed;inset:0;z-index:1600;background:rgba(0,0,0,.56);align-items:flex-start;justify-content:center;padding:72px 16px 16px}.apmodal.show{display:flex}.apdialog{width:min(520px,calc(100vw - 28px));background:#111114;border:1px solid #34353d;border-radius:12px;padding:13px;box-shadow:0 18px 60px rgba(0,0,0,.55)}.aphead{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}.aphead b{font-size:11px;letter-spacing:1px;color:#b8bac2}.apclose{width:auto;background:#29292f;color:#bbb;padding:6px 9px}.apdialog textarea{min-height:120px}.apactions{display:flex;justify-content:flex-end;gap:8px;margin-top:10px}.apactions button{width:auto}.apstatus{font-size:9.5px;color:#777982;margin-top:5px}.apstatus.ok{color:#65d78d}.apstatus.err{color:#ff8181}#ap_custom_wrap{display:none}
+    .autopromptrow{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) 44px;gap:8px;margin-top:8px}.approfilerow{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:6px;align-items:center}.approfilerow button{width:auto;margin:0;padding:8px 9px;font-size:7.5px}.autopromptrow button{margin:0}.autopromptrow .gear{background:#29292f;color:#ddd;font-size:17px;padding:8px}.autopromptrow .gear:hover{color:var(--accent)}#auto_prompt_btn.working,#next_scene_btn.working{background:#29292f;color:#aaa}.apmodal{display:none;position:fixed;inset:0;z-index:1600;background:rgba(0,0,0,.56);align-items:flex-start;justify-content:center;padding:72px 16px 16px}.apmodal.show{display:flex}.apdialog{width:min(520px,calc(100vw - 28px));background:#111114;border:1px solid #34353d;border-radius:12px;padding:13px;box-shadow:0 18px 60px rgba(0,0,0,.55)}.apdialog.wide{width:min(720px,calc(100vw - 28px));max-height:calc(100vh - 90px);overflow:auto}.aphead{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}.aphead b{font-size:11px;letter-spacing:1px;color:#b8bac2}.apclose{width:auto;background:#29292f;color:#bbb;padding:6px 9px}.apdialog textarea{min-height:120px}.apactions{display:flex;justify-content:flex-end;gap:8px;margin-top:10px}.apactions button{width:auto}.apstatus{font-size:9.5px;color:#777982;margin-top:5px}.apstatus.ok{color:#65d78d}.apstatus.err{color:#ff8181}#ap_custom_wrap{display:none}.nextscenegrid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.nextsceneheadrow{display:grid;grid-template-columns:1fr 1fr;gap:8px;align-items:end}.nextscenebudget{height:34px;display:flex;align-items:center;padding:0 9px;border:1px solid #2c2c33;border-radius:7px;background:#151519;color:#c4c6cc;font-size:10px}.mutedlabel{color:#666974;font-weight:400;text-transform:none;letter-spacing:0}.nextsceneadvanced{margin:9px 0 0!important;background:#0d0e11!important}.nextsceneadvanced summary{padding:8px 10px!important;font-size:8px!important}.nextsceneadvanced>div{padding:9px 10px!important}.nextsceneopts{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:8px}.nextsceneopt{display:flex;align-items:flex-start;gap:7px;padding:7px 8px;border:1px solid #292a30;border-radius:7px;background:#0d0e11;color:#a9abb3;font-size:8.5px;line-height:1.35}.nextsceneopt input{width:auto;margin:1px 0 0;accent-color:var(--accent);flex:0 0 auto}.nextscenepreview{display:none;margin-top:10px;border:1px solid #303139;border-radius:9px;overflow:hidden;background:#08080a}.nextscenepreview.show{display:grid;grid-template-columns:minmax(0,1fr) 178px}.nextscenepreview img{display:block;width:100%;max-height:420px;object-fit:contain;background:#050506;cursor:zoom-in}.nextscenepreviewmeta{padding:10px;border-left:1px solid #292a30;font-size:8.5px;color:#8e9099;line-height:1.5}.nextscenepreviewmeta b{color:#d4d5da}.nextscenepreviewmeta button{width:100%;margin-top:7px;padding:8px 9px;font-size:8px}.nextscenepreviewmeta .inlinebtn{margin-top:7px}.nscontext{min-height:108px!important}.nsinstruction{min-height:108px!important}@media(max-width:700px){.nextscenegrid,.nextsceneopts{grid-template-columns:1fr}.nextscenepreview.show{grid-template-columns:1fr}.nextscenepreviewmeta{border-left:0;border-top:1px solid #292a30}}
     .uimodal{display:none;position:fixed;inset:0;z-index:1800;background:rgba(0,0,0,.68);align-items:center;justify-content:center;padding:18px}.uimodal.show{display:flex}.uidialog{width:min(430px,calc(100vw - 30px));background:#111114;border:1px solid #34353d;border-radius:10px;box-shadow:0 20px 70px #000c;overflow:hidden}.uihead{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border-bottom:1px solid #282930}.uihead b{font-size:9.5px;letter-spacing:1.2px;color:#b9bac1;text-transform:uppercase}.uiclose{width:28px;height:28px;padding:0;background:#23242a;color:#aaa;border:1px solid #34353d;border-radius:6px}.uibody{padding:12px}.uimessage{color:#b6b8c0;font-size:10px;line-height:1.55;white-space:pre-wrap}.uiinput{margin-top:10px;height:36px}.uiactions{display:flex;justify-content:flex-end;gap:6px;padding:0 12px 12px}.uiactions button{width:auto;min-width:78px;padding:8px 11px;font-size:9px}.uicancel{background:#25262c;color:#c8c9ce}.uiconfirm.danger{background:#4a1e20;color:#ffb0b0;border:1px solid #7a3034}.uiconfirm.neutral{background:#29292f;color:#ddd}.adultlegal{font-size:9.5px;color:#aeb0b8;line-height:1.5}.adultcheck{display:flex;align-items:flex-start;gap:8px;margin:9px 0;color:#c4c6cd;font-size:9.5px;line-height:1.45}.adultcheck input{width:auto;flex:0 0 auto;margin-top:2px;accent-color:var(--accent)}.adultnotice{margin-top:10px;padding:8px;border:1px solid #37321d;background:#17150d;color:#aaa17d;border-radius:7px;font-size:8.5px;line-height:1.45}
     .imageslots{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:2px}.imageslot{position:relative;height:112px;border:1px dashed #34353d;border-radius:8px;background:#09090b;overflow:hidden;display:flex;align-items:center;justify-content:center;cursor:pointer;outline:none}.imageslot:hover,.imageslot:focus{border-color:#666974}.imageslot.has-image{border-style:solid}.imageslot img{display:none;width:100%;height:100%;object-fit:cover;background:#050506}.imageslot.has-image img{display:block}.slotempty{text-align:center;color:#656872;font-size:9px;letter-spacing:.8px;pointer-events:none}.slotempty b{display:block;color:#9698a1;font-size:10px;margin-bottom:3px}.imageslot.has-image .slotempty{display:none}.slottrash{display:none;position:absolute;right:5px;top:5px;z-index:4;width:24px;height:24px;padding:0;border-radius:6px;background:#18181dcc;color:#d6d7dc;border:1px solid #42434b;font-size:11px;line-height:1}.imageslot.has-image .slottrash{display:block}.slottrash:hover{background:#351719;color:#ff7777;border-color:#763336}.slotbadge{position:absolute;left:5px;bottom:5px;z-index:3;padding:3px 5px;border-radius:4px;background:#08090bcc;color:#ddd;font-size:7.5px;letter-spacing:.5px;pointer-events:none}.imageslot:not(.has-image) .slotbadge{display:none}.imgmodal{display:none;position:fixed;inset:0;z-index:1700;background:rgba(0,0,0,.88);padding:26px;align-items:center;justify-content:center}.imgmodal.show{display:flex}.imgmodal img{max-width:calc(100vw - 52px);max-height:calc(100vh - 52px);object-fit:contain;border-radius:8px;box-shadow:0 20px 80px #000}.imgmodalclose{position:absolute;right:20px;top:18px;width:38px;height:38px;padding:0;border-radius:50%;background:#202126;color:#ddd;border:1px solid #454750;font-size:16px}
     #status{position:relative;min-width:0;height:100%;display:flex;align-items:center;padding-bottom:3px}.row{display:flex;align-items:center;gap:7px;font-size:8.5px;min-width:0;width:100%}.row #stxt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#c1c2c8}.dot{width:6px;height:6px;flex:0 0 6px;border-radius:50%;background:#5fd68a}.dot.live{background:var(--accent);animation:p 1.3s infinite}.dot.err{background:#ff6b6b}@keyframes p{50%{opacity:.25}}.bar{position:absolute;left:0;right:0;bottom:2px;height:2px;background:#1d1e22;border-radius:2px;overflow:hidden}.bar i{display:block;height:100%;background:var(--accent);width:0;transition:width .25s}
@@ -7261,7 +7830,7 @@ Additional user Auto Prompt instructions:
 
     <div class=card><div class=cardtitle>Prompt</div><div class=cardbody>
     <textarea id=prompt placeholder="Describe the shot, motion, camera, environment, soundscape and music..."></textarea>
-    <div class=autopromptrow><button id=auto_prompt_btn type=button>✦ AUTO PROMPT</button><button id=auto_prompt_settings class=gear type=button title="Auto Prompt settings">⚙</button></div>
+    <div class=autopromptrow><button id=auto_prompt_btn type=button>✦ AUTO PROMPT</button><button id=next_scene_btn type=button>▣ NEXT SCENE</button><button id=auto_prompt_settings class=gear type=button title="Auto Prompt settings">⚙</button></div>
     <div class=hint id=auto_prompt_hint><b>RAW LOCAL is the default.</b> GENERATE sends the prompt exactly as shown directly to local H3. ✦ AUTO PROMPT is optional and runs only when you click it.</div>
     </div></div>
 
@@ -7441,6 +8010,38 @@ Additional user Auto Prompt instructions:
         <div id=ap_key_status class=apstatus>Checking OPENAI_API_KEY…</div>
         <div class=hint>The generated text follows MiniMax H3's timeline + soundscape + music format and visually inspects attached first/last frames. Your API key is read server-side and is never sent to the browser.</div>
         <div class=apactions><button id=ap_cancel class=inlinebtn type=button>Cancel</button><button id=ap_save type=button>Save settings</button></div>
+      </div>
+    </div>
+    <div id=next_scene_modal class=apmodal role=dialog aria-modal=true aria-labelledby=next_scene_title>
+      <div class="apdialog wide">
+        <div class=aphead><b id=next_scene_title>NEXT SCENE · STORY DIRECTOR</b><button id=next_scene_close class=apclose type=button>✕</button></div>
+        <div class=nextsceneheadrow>
+          <div><label>Director</label><select id=next_scene_director><option value="gpt-5.6-terra" selected>GPT-5.6 Terra</option><option value="gpt-5.6-sol">GPT-5.6 Sol</option></select></div>
+          <div><label>Scene budget</label><div id=next_scene_budget class=nextscenebudget>uses current H3 duration</div></div>
+        </div>
+        <label>Direction <span class=mutedlabel>optional — leave blank for autonomous story continuation</span></label>
+        <textarea id=next_scene_instruction class=nsinstruction placeholder="Optional: tell the director what should happen next. If blank, it follows the tracked story arc, unresolved threads, previous frames, and recent MiniMax prompts."></textarea>
+        <details class=nextsceneadvanced>
+          <summary>Story memory + render settings</summary>
+          <div>
+            <label>Story bible / continuity notes</label>
+            <textarea id=next_scene_context class=nscontext placeholder="Optional durable guidance: character facts, wardrobe, location rules, tone, plot destination, visual rules…"></textarea>
+            <div class=nextscenegrid>
+              <div><label>Image engine</label><select id=next_scene_model><option value="gpt-image-2.5-flare" selected>GPT-Image-2.5 Flare</option><option value="gpt-image-2.5-sunburst">GPT-Image-2.5 Sunburst</option></select></div>
+              <div><label>Render quality</label><select id=next_scene_quality><option value=auto selected>auto</option><option value=high>high</option><option value=xhigh>xhigh</option><option value=max>max</option><option value=medium>medium</option><option value=low>low</option></select></div>
+            </div>
+            <div class=nextsceneopts>
+              <label class=nextsceneopt><input id=next_scene_use_timeline type=checkbox checked><span><b>Use sequence history</b><br>Recent completed H3 prompts feed the story director.</span></label>
+              <label class=nextsceneopt><input id=next_scene_use_stage type=checkbox checked><span><b>Use previous frame</b><br>Continuity is planned and audited against the active sequence’s last frame.</span></label>
+            </div>
+          </div>
+        </details>
+        <div id=next_scene_status class=apstatus>Ready. The director plans → renders → audits → repairs → writes the MiniMax H3 prompt.</div>
+        <div id=next_scene_preview_wrap class=nextscenepreview>
+          <img id=next_scene_preview alt="Generated next scene" title="Click to view full size">
+          <div class=nextscenepreviewmeta><div id=next_scene_preview_info></div></div>
+        </div>
+        <div class=apactions><button id=next_scene_cancel class=inlinebtn type=button>Close</button><button id=next_scene_generate type=button>AUTO NEXT SCENE</button></div>
       </div>
     </div>
     <div id=lora_install_modal class=apmodal role=dialog aria-modal=true aria-labelledby=lora_install_title>
@@ -8378,6 +8979,93 @@ Additional user Auto Prompt instructions:
 
     function syncMotionPace(){$('motion_pace_value').textContent=Number($('playback_speed').value||1).toFixed(2)+'×'}
     $('playback_speed').addEventListener('input',syncMotionPace);syncMotionPace();
+
+    const NEXT_SCENE_STORE_KEY='h3_next_scene_story_director_v2';
+    const NEXT_SCENE_DEFAULT={director:'gpt-5.6-terra',imageModel:'gpt-image-2.5-flare',quality:'auto',context:'',useTimeline:true,useStage:true};
+    let NEXT_SCENE_RESULT_FILE='';
+    function getNextSceneSettings(){try{return {...NEXT_SCENE_DEFAULT,...JSON.parse(localStorage.getItem(NEXT_SCENE_STORE_KEY)||'{}')}}catch(e){return {...NEXT_SCENE_DEFAULT}}}
+    function saveNextSceneSettings(v){localStorage.setItem(NEXT_SCENE_STORE_KEY,JSON.stringify({...NEXT_SCENE_DEFAULT,...v}))}
+    function nextSceneBudgetText(){
+      const mode=$('length_mode')?.value||'seconds';
+      const pace=Number($('playback_speed')?.value||1);
+      if(mode==='frames')return `${$('frames')?.value||'?'} model frames · ${pace.toFixed(2)}× pace`;
+      return `${Number($('duration')?.value||7).toFixed(2)}s final · ${pace.toFixed(2)}× pace`;
+    }
+    function syncNextSceneModal(){
+      const s=getNextSceneSettings();
+      if([...$('next_scene_director').options].some(o=>o.value===s.director))$('next_scene_director').value=s.director;
+      if([...$('next_scene_model').options].some(o=>o.value===s.imageModel))$('next_scene_model').value=s.imageModel;
+      if([...$('next_scene_quality').options].some(o=>o.value===s.quality))$('next_scene_quality').value=s.quality;
+      $('next_scene_context').value=s.context||'';
+      $('next_scene_use_timeline').checked=s.useTimeline!==false;
+      $('next_scene_use_stage').checked=s.useStage!==false;
+      $('next_scene_budget').textContent=nextSceneBudgetText();
+    }
+    async function refreshNextSceneMeta(){
+      const st=$('next_scene_status');st.className='apstatus';st.textContent='Checking Story Director + sequence memory…';
+      try{
+        const r=await fetch('/api/next_scene/meta',{cache:'no-store'}),d=await r.json();
+        if(!r.ok||d.error)throw new Error(d.error||`HTTP ${r.status}`);
+        if(!d.key_available){st.className='apstatus err';st.textContent='OPENAI_API_KEY is not available to this UI process.';return d}
+        const memory=d.has_story_memory?'story memory active':'building story memory';
+        const visual=d.has_stage_reference?'previous frame available':'no previous frame yet';
+        st.className='apstatus ok';st.textContent=`✓ ${d.active_sequence||'active sequence'} · ${memory} · ${visual}`;
+        return d
+      }catch(e){st.className='apstatus err';st.textContent='Could not check Story Director: '+String(e&&e.message?e.message:e);return null}
+    }
+    function openNextSceneModal(){syncNextSceneModal();$('next_scene_modal').classList.add('show');refreshNextSceneMeta();setTimeout(()=>$('next_scene_instruction').focus(),0)}
+    function closeNextSceneModal(){saveNextSceneSettings({director:$('next_scene_director').value,imageModel:$('next_scene_model').value,quality:$('next_scene_quality').value,context:$('next_scene_context').value,useTimeline:$('next_scene_use_timeline').checked,useStage:$('next_scene_use_stage').checked});$('next_scene_modal').classList.remove('show')}
+    $('next_scene_btn').onclick=openNextSceneModal;$('next_scene_close').onclick=closeNextSceneModal;$('next_scene_cancel').onclick=closeNextSceneModal;
+    $('next_scene_modal').addEventListener('click',e=>{if(e.target===$('next_scene_modal'))closeNextSceneModal()});
+    $('next_scene_preview').onclick=()=>{if(NEXT_SCENE_RESULT_FILE)showImageModal('/out/'+encodeURIComponent(NEXT_SCENE_RESULT_FILE)+'?t='+Date.now())};
+
+    async function assignGeneratedSceneToFrame(kind){
+      if(!NEXT_SCENE_RESULT_FILE)return;
+      const resp=await fetch('/out/'+encodeURIComponent(NEXT_SCENE_RESULT_FILE)+'?t='+Date.now());
+      if(!resp.ok)throw new Error(`Could not fetch generated image (HTTP ${resp.status}).`);
+      const blob=await resp.blob();
+      const file=new File([blob],NEXT_SCENE_RESULT_FILE,{type:blob.type||'image/png'});
+      const dt=new DataTransfer();dt.items.add(file);$(kind+'_frame').files=dt.files;
+      $(kind+'_frame').dispatchEvent(new Event('change',{bubbles:true}));
+      if(currentModelMode()!=='fl2va')await setModelMode('fl2va');
+    }
+
+    $('next_scene_generate').onclick=async()=>{
+      const instruction=$('next_scene_instruction').value.trim(),context=$('next_scene_context').value.trim();
+      const btn=$('next_scene_generate'),mainBtn=$('next_scene_btn');
+      const settings={director:$('next_scene_director').value,imageModel:$('next_scene_model').value,quality:$('next_scene_quality').value,context,useTimeline:$('next_scene_use_timeline').checked,useStage:$('next_scene_use_stage').checked};
+      saveNextSceneSettings(settings);
+      const fd=new FormData();
+      fd.append('director_model',settings.director);fd.append('image_model',settings.imageModel);fd.append('quality',settings.quality);fd.append('story_context',context);fd.append('instruction',instruction);
+      fd.append('current_prompt',$('prompt').value||'');fd.append('width',$('width').value||'1024');fd.append('height',$('height').value||'1024');
+      fd.append('length_mode',$('length_mode').value||'seconds');fd.append('duration',$('duration').value||'7');fd.append('frames',$('frames').value||'175');fd.append('playback_speed',$('playback_speed').value||'1');
+      fd.append('use_timeline',settings.useTimeline?'1':'0');fd.append('use_stage_reference',settings.useStage?'1':'0');
+      btn.disabled=true;mainBtn.disabled=true;mainBtn.classList.add('working');mainBtn.textContent='▣ DIRECTING…';btn.textContent='DIRECTING…';
+      $('next_scene_status').className='apstatus';$('next_scene_status').textContent=`${settings.director.endsWith('sol')?'Sol':'Terra'} is planning the beat, rendering the opening frame, then auditing/repairing it…`;say('Story Director · '+settings.director);
+      try{
+        const resp=await fetch('/api/next_scene',{method:'POST',body:fd});
+        const r=await resp.json();
+        if(!resp.ok||r.error)throw new Error(r.error||`HTTP ${resp.status}`);
+        NEXT_SCENE_RESULT_FILE=r.file;
+        const src='/out/'+encodeURIComponent(r.file)+'?t='+Date.now();
+        $('next_scene_preview').src=src;$('next_scene_preview_wrap').classList.add('show');
+        const auditLine=r.audit_pass?`✓ audit ${esc(r.audit_score)}/100${Number(r.repairs||0)?` · ${esc(r.repairs)} auto-repair${Number(r.repairs)===1?'':'s'}`:''}`:`⚠ audit ${esc(r.audit_score)}/100 · not auto-applied`;
+        $('next_scene_preview_info').innerHTML=`<b>${esc(r.scene_title||'Next Scene')}</b><br>${esc(Number(r.duration||0).toFixed(2)+'s final')} · ${esc(r.frames+' H3 frames')}<br>${auditLine}<br>${esc(r.director_model)} → ${esc(r.image_model)}${r.used_reference?'<br>✓ previous frame continuity':''}${r.story_advanced?'<br>✓ story memory advanced':''}`;
+        if(r.audit_pass){
+          $('prompt').value=r.h3_prompt||'';$('prompt').dispatchEvent(new Event('input',{bubbles:true}));
+          await assignGeneratedSceneToFrame('first');
+          $('next_scene_status').className='apstatus ok';$('next_scene_status').textContent=`✓ ${r.scene_title||'Next scene'} ready · image + ${Number(r.duration||0).toFixed(2)}s MiniMax H3 prompt loaded.`;
+          say('Next scene ready · image + MiniMax prompt loaded');
+        }else{
+          $('next_scene_status').className='apstatus err';$('next_scene_status').textContent=`Audit remained below production threshold after ${r.repairs||0} repair pass${Number(r.repairs||0)===1?'':'es'}. Preview kept, but story state/prompt inputs were not advanced.`;
+          say('Next scene needs review · story state not advanced');
+        }
+      }catch(e){
+        $('next_scene_status').className='apstatus err';$('next_scene_status').textContent=String(e&&e.message?e.message:e);say('Story Director next scene failed');
+      }finally{
+        btn.disabled=false;mainBtn.disabled=false;mainBtn.classList.remove('working');mainBtn.textContent='▣ NEXT SCENE';btn.textContent='AUTO NEXT SCENE';$('next_scene_budget').textContent=nextSceneBudgetText();
+      }
+    };
 
     const AP_STORE_KEY='h3_auto_prompt_settings_v86';
     const AP_LEGACY_STORE_KEY='h3_auto_prompt_settings_v83';
