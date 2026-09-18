@@ -4041,6 +4041,7 @@ if _CU130_CHILD:
                 "name": seq.get("name") or "Sequence",
                 "master_file": seq.get("master_file"),
                 "director_state": dict(seq.get("director_state") or {}),
+                "director_pending": dict(seq.get("director_pending") or {}),
                 "created": seq.get("created", time.time()),
                 "updated": seq.get("updated", time.time()),
                 "segments": [],
@@ -4138,6 +4139,10 @@ if _CU130_CHILD:
             seq["id"] = raw_seq.get("id") or seq["id"]
             seq["master_file"] = raw_seq.get("master_file")
             seq["director_state"] = dict(raw_seq.get("director_state") or {})
+            seq["director_pending"] = dict(raw_seq.get("director_pending") or {})
+            _pending = seq["director_pending"]
+            if _pending and (not _pending.get("target_frame_path") or not os.path.exists(str(_pending.get("target_frame_path")))):
+                seq["director_pending"] = {}
             seq["created"] = raw_seq.get("created", time.time())
             seq["updated"] = raw_seq.get("updated", time.time())
             seq["segments"] = []
@@ -5021,6 +5026,21 @@ if _CU130_CHILD:
                     del HISTORY_STATE[:-300]
                 _save_history_unlocked()
             _sync_stage_from_sequence(seq)
+            # Story Director scenes remain pending until the ACTUAL H3 render passes a visual checkpoint audit.
+            _director_render_audit = None
+            try:
+                _director_render_audit = _postrender_story_director_finalize(jid, p, dest, entry)
+                if _director_render_audit:
+                    j["story_director_render_audit"] = _director_render_audit
+                    j["story_director_audit_score"] = int(_director_render_audit.get("score") or 0)
+                    j["story_director_canon_committed"] = bool(_director_render_audit.get("pass"))
+                    if not _director_render_audit.get("pass"):
+                        j["story_director_review_required"] = True
+                        j["story_director_recommended_prompt"] = str(_director_render_audit.get("recommended_prompt") or "")
+            except Exception as _director_audit_exc:
+                log(f"  ⚠ Story Director post-render audit warning: {_director_audit_exc}")
+                j["story_director_review_required"] = True
+                j["story_director_render_audit_error"] = str(_director_audit_exc)
             log(
                 f"  ✓ V86 TIMELINE: action={timeline_action} · active={active_sequence_name} · clips={timeline_count} · "
                 f"stitch={j['stitch_sec']:.3f}s · TOTAL={j['measured_total_sec']:.3f}s · {stitch_note}"
@@ -6072,7 +6092,27 @@ Additional user Auto Prompt instructions:
         except Exception as e:
             raise RuntimeError(f"The story director returned invalid JSON: {e}") from e
 
+    NEXT_SCENE_NATIVE_MIN_SEC = 4.0
+    NEXT_SCENE_NATIVE_MAX_SEC = 15.0
+    NEXT_SCENE_STILL_AUDIT_THRESHOLD = 85
+    NEXT_SCENE_RENDER_AUDIT_THRESHOLD = 82
+
     def _director_story_schema():
+        ledger = {
+            "type":"object",
+            "properties":{
+                "character_positions":{"type":"string"},
+                "poses_and_gaze":{"type":"string"},
+                "hands_and_props":{"type":"string"},
+                "prop_locations":{"type":"string"},
+                "camera_side_and_lens":{"type":"string"},
+                "lighting_and_time":{"type":"string"},
+                "motion_vector":{"type":"string"},
+                "audio_state":{"type":"string"},
+            },
+            "required":["character_positions","poses_and_gaze","hands_and_props","prop_locations","camera_side_and_lens","lighting_and_time","motion_vector","audio_state"],
+            "additionalProperties":False,
+        }
         return {
             "type":"object",
             "properties":{
@@ -6091,8 +6131,9 @@ Additional user Auto Prompt instructions:
                         "unresolved_threads":{"type":"array","items":{"type":"string"}},
                         "trajectory":{"type":"string"},
                         "next_after_this":{"type":"string"},
+                        "state_ledger":ledger,
                     },
-                    "required":["summary","characters","continuity_facts","unresolved_threads","trajectory","next_after_this"],
+                    "required":["summary","characters","continuity_facts","unresolved_threads","trajectory","next_after_this","state_ledger"],
                     "additionalProperties":False,
                 },
                 "timing_beats":{
@@ -6122,26 +6163,74 @@ Additional user Auto Prompt instructions:
                 "summary":{"type":"string"},
                 "problems":{"type":"array","items":{"type":"string"}},
                 "repair_instruction":{"type":"string"},
-                "observed_opening_state":{"type":"string"},
+                "observed_endpoint_state":{"type":"string"},
                 "final_h3_prompt":{"type":"string"},
             },
-            "required":["pass","score","summary","problems","repair_instruction","observed_opening_state","final_h3_prompt"],
+            "required":["pass","score","summary","problems","repair_instruction","observed_endpoint_state","final_h3_prompt"],
             "additionalProperties":False,
         }
 
-    def _h3_prompt_contract(duration):
-        return f'''The MiniMax H3 prompt MUST be directly usable in this studio for a {duration:.2f}-second I2VA/FL2VA continuation whose generated storyboard image is Picture 1 at time 0.00.
+    def _post_render_audit_schema():
+        return {
+            "type":"object",
+            "properties":{
+                "pass":{"type":"boolean"},
+                "score":{"type":"integer","minimum":0,"maximum":100},
+                "summary":{"type":"string"},
+                "problems":{"type":"array","items":{"type":"string"}},
+                "target_reached":{"type":"boolean"},
+                "motion_coherence":{"type":"boolean"},
+                "continuity_preserved":{"type":"boolean"},
+                "recommended_prompt":{"type":"string"},
+                "observed_end_state":{"type":"string"},
+            },
+            "required":["pass","score","summary","problems","target_reached","motion_coherence","continuity_preserved","recommended_prompt","observed_end_state"],
+            "additionalProperties":False,
+        }
+
+    def _prompt_repair_schema():
+        return {
+            "type":"object",
+            "properties":{"h3_prompt":{"type":"string"}},
+            "required":["h3_prompt"],
+            "additionalProperties":False,
+        }
+
+    def _h3_mode_header(mode, duration):
+        if mode == "fl2va":
+            return ("How the reference pictures align with the target video — "
+                    f"Picture 1 (from Shot 1) aligns with the 0.00-second mark of the target video; "
+                    f"Picture 2 (from Shot N) aligns with the {duration:.2f}-second mark of the target video.")
+        if mode == "l2va":
+            return f"How the reference pictures align with the target video — <Picture 1> (from [Shot N]) aligns with the {duration:.2f}-second mark of the target video."
+        return 'For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.'
+
+    def _h3_prompt_contract(mode, duration):
+        header = _h3_mode_header(mode, duration)
+        path_rule = (
+            "Picture 1 is the exact previous H3 last frame and Picture 2 is the exact generated destination frame. "
+            "Describe one continuous, physically plausible path from Picture 1 to Picture 2: opening state → onset → development → settle/convergence. "
+            "Prefer one shot; cuts usually weaken endpoint interpolation. The final state must visibly land on Picture 2."
+            if mode == "fl2va" else
+            "Picture 1 is the exact opening frame. Spend prompt words on what changes after it: onset → development → settle."
+        )
+        return f'''The MiniMax H3 prompt MUST be directly usable in this studio for {mode.upper()} at exactly {duration:.2f} seconds.
 It MUST begin exactly with this line:
-For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
+{header}
 Then one blank line, then exactly these top-level fields in order:
 integrated_multimodal_description: ...
 overall_soundscape: ...
 non_diegetic_music: ...
-Write in playback order. [Shot 1] has no timestamp. Later shots are allowed only for real cuts and must have increasing timestamps that do not exceed {duration:.2f}s. Prefer one continuous shot unless a cut is narratively necessary. The final described action/state must be reachable within {duration:.2f}s. Dialogue belongs in integrated_multimodal_description; use stable subject IDs and <d>[English] exact words</d> when there is dialogue. Soundscape contains ambience/physical/nonverbal sound, not duplicate dialogue. Music is N/A when no score is appropriate.'''
+{path_rule}
+Write in playback order. [Shot 1] has no timestamp. Later shots are allowed only for genuine cuts and use strictly increasing timestamps no later than {duration:.2f}s. Use concrete visible/audible actions rather than abstract adjectives. Preserve user dialogue verbatim with stable subject IDs and <d>[Language] exact words</d>. overall_soundscape is ambience, physical sounds and non-verbal human sounds; do not duplicate dialogue. non_diegetic_music is audience-only score or N/A.'''
 
-    def _normalize_h3_prompt(raw, duration):
+    def _normalize_h3_prompt(raw, mode, duration):
         text = str(raw or "").strip()
-        header = 'For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.'
+        header = _h3_mode_header(mode, duration)
+        # Remove a wrong legacy image-alignment header if the director used the wrong mode.
+        lines = text.splitlines()
+        if lines and (lines[0].startswith("For the target video, at 0.00 seconds") or lines[0].startswith("How the reference pictures align with the target video")):
+            text = "\n".join(lines[1:]).lstrip()
         if not text.startswith(header):
             text = header + "\n\n" + text
         if "integrated_multimodal_description:" not in text:
@@ -6151,43 +6240,176 @@ Write in playback order. [Shot 1] has no timestamp. Later shots are allowed only
             text += "\noverall_soundscape: Natural production ambience and synchronized physical sounds appropriate to the scene."
         if "non_diegetic_music:" not in text:
             text += "\nnon_diegetic_music: N/A"
-        return text
+        return text.strip()
 
-    def _story_director_plan_system(duration, n_frames, model_seconds, playback_speed):
-        return f'''You are the persistent STORY DIRECTOR for a MiniMax H3 audiovisual sequence. You are not merely writing an image prompt. Maintain narrative memory, continuity, trajectory, and scene-to-scene intent.
+    def _validate_h3_prompt(text, mode, duration):
+        text = str(text or "")
+        errs=[]
+        header=_h3_mode_header(mode,duration)
+        if not text.startswith(header + "\n\n"):
+            errs.append("first-line image alignment instruction is not exact")
+        order=[text.find("integrated_multimodal_description:"),text.find("overall_soundscape:"),text.find("non_diegetic_music:")]
+        if any(x < 0 for x in order) or order != sorted(order):
+            errs.append("three required top-level fields are missing or out of order")
+        if mode == "fl2va" and ("Picture 1" not in text or "Picture 2" not in text):
+            errs.append("FL2VA prompt does not explicitly preserve both endpoint pictures")
+        # Catch explicit shot timestamps beyond the actual scene budget.
+        for mm,ss,ms in re.findall(r"At\s+00:(\d{2})(?::(\d{2}))?(?:\.(\d{1,3}))?", text):
+            if ss:
+                t=int(mm)*60+int(ss)+(int((ms or "0").ljust(3,"0"))/1000.0)
+            else:
+                t=int(mm)+(int((ms or "0").ljust(3,"0"))/1000.0)
+            if t > float(duration) + 0.051:
+                errs.append(f"shot timestamp {t:.3f}s exceeds {duration:.2f}s")
+        return errs
 
-Your job for this turn:
-1. Read the saved story state, recent H3 prompts, current creative prompt, optional user direction, and previous visual frame.
-2. Decide the next dramatic/story beat. If the user gives no new direction, autonomously choose the next beat that best advances the established trajectory without jumping too far.
-3. Design ONE storyboard opening frame for that next scene. It should preserve character identity, wardrobe, props, geography, lighting logic, and visual language unless a deliberate story change is justified.
-4. Write the exact MiniMax H3 motion/audio prompt that starts from that generated opening frame and evolves through the requested final scene duration.
-5. Update story_state so a later Auto Next Scene call knows what has happened, what remains unresolved, and where the story is going.
+    def _choose_scene_duration(requested_budget, proposed):
+        budget=max(0.21,float(requested_budget))
+        if budget < NEXT_SCENE_NATIVE_MIN_SEC:
+            return budget
+        ceiling=min(NEXT_SCENE_NATIVE_MAX_SEC,budget)
+        try: d=float(proposed)
+        except Exception: d=min(10.0,ceiling)
+        return max(NEXT_SCENE_NATIVE_MIN_SEC,min(ceiling,d))
 
-TIMING CONTRACT:
-- requested FINAL output duration: {duration:.2f}s
-- MiniMax legal model frames after snapping: {int(n_frames)} frames at {MODEL_FPS:.0f} fps
-- native model-time before final retime: {model_seconds:.3f}s
-- requested motion/playback pace: {playback_speed:.3f}x
-Plan actions and camera motion that can physically read within the FINAL {duration:.2f}s. Use 2-5 timing beats whose ranges fit inside 0.00..{duration:.2f}s. Do not cram a feature-film sequence into a short clip.
+    def _sample_video_frames_for_director(video_path, *, count=4, tail_only=False, prefix="director"):
+        # Extract a few visual checkpoints; GPT-5.6 sees images, not video.
+        if not video_path or not os.path.exists(video_path): return []
+        duration=_probe_media_duration(video_path) or 0.0
+        if duration <= 0: return []
+        if tail_only:
+            times=[max(0.0,duration-x) for x in (1.5,0.75,0.08)]
+        else:
+            times=[0.05] if count<=1 else [max(0.05,min(duration-0.05,duration*i/(count-1))) for i in range(count)]
+        ffmpeg=shutil.which("ffmpeg")
+        out=[]
+        for idx,t in enumerate(times):
+            dest=os.path.join(OUT,f".{prefix}_{uuid.uuid4().hex[:10]}_{idx}.jpg")
+            try:
+                if ffmpeg:
+                    r=subprocess.run([ffmpeg,"-y","-ss",f"{t:.4f}","-i",video_path,"-frames:v","1","-q:v","2",dest],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=40)
+                    if r.returncode==0 and os.path.exists(dest) and os.path.getsize(dest)>1024: out.append(dest)
+            except Exception: pass
+        return out
 
-{_h3_prompt_contract(duration)}
+    def _story_director_plan_system(budget_seconds, n_frames, model_seconds, playback_speed, mode):
+        native_note = (
+            f"The current UI offers up to {budget_seconds:.2f}s. Choose duration_seconds between 4.00 and {min(15.0,budget_seconds):.2f}s based on how long this beat actually needs. "
+            if budget_seconds >= 4 else
+            f"The user explicitly set a short {budget_seconds:.2f}s budget; honor it. "
+        )
+        frame_role = "DESTINATION / LAST frame (Picture 2)" if mode=="fl2va" else "OPENING / FIRST frame (Picture 1)"
+        return f'''You are the persistent STORY DIRECTOR for a MiniMax H3 audiovisual sequence. Maintain narrative memory, visual continuity, motion continuity, trajectory, and scene-to-scene intent.
+
+Your job:
+1. Read canonical story state, recent H3 prompts, the boundary-state ledger, current prompt, optional user direction, previous visual frame, and any sampled frames from the motion tail of the previous clip.
+2. Choose the next dramatic beat. If no direction is supplied, advance unresolved threads without jumping too far.
+3. Choose how long the beat needs. {native_note}H3's quality-first native clip envelope is 4–15 seconds; if the story needs longer, stage only the next sub-beat and put the continuation in next_after_this.
+4. Design ONE clean storyboard {frame_role}. Preserve identity, wardrobe, props, geography, lighting/time, camera side and motion direction unless a deliberate change is narratively justified.
+5. Write the exact MiniMax H3 prompt for {mode.upper()}.
+6. Update story_state AND its state_ledger. The ledger is the literal boundary condition for the following scene: positions, pose/gaze, hands/props, prop locations, camera side/lens, lighting/time, motion vector, and audio state.
+
+CURRENT BUDGET REFERENCE:
+- UI final-duration budget: {budget_seconds:.2f}s
+- current snapped H3 frames if the full budget were used: {int(n_frames)} @ {MODEL_FPS:.0f}fps
+- current model-time before retime: {model_seconds:.3f}s
+- playback pace: {playback_speed:.3f}x
+Use 3–5 readable micro-beats (establish/hold, preparation, core action, settle/recovery, optional final hold) and keep ranges contiguous.
+
+{_h3_prompt_contract(mode, budget_seconds)}
 
 IMAGE PROMPT CONTRACT:
-image_prompt must describe a single clean cinematic opening frame, not a montage and not text. Give GPT-Image concrete composition, subjects, pose/action readiness, lens/camera position, spatial relationships, lighting, atmosphere, continuity details, and enough uncluttered motion headroom for H3 to animate. No captions, watermarks, subtitles, labels, split screens, contact sheets, or UI unless explicitly requested.'''
+image_prompt describes exactly one {frame_role}. No montage, split screen, captions, subtitles, UI, labels or watermarks. Be concrete about composition, subjects, pose, gaze, hands/props, lens/camera position, spatial relationships, lighting, atmosphere and the endpoint/opening state. Leave coherent motion headroom for H3.'''
 
-    def _story_director_audit_system(duration):
-        return f'''You are the visual continuity supervisor and MiniMax H3 prompt supervisor for an ongoing scene sequence. Inspect the ACTUAL generated candidate pixels, not just the intent.
+    def _story_director_audit_system(duration, mode):
+        role = "DESTINATION/LAST FRAME that H3 must reach" if mode=="fl2va" else "OPENING/FIRST FRAME H3 starts from"
+        return f'''You are the visual continuity supervisor and MiniMax H3 prompt supervisor. Inspect ACTUAL pixels.
+The candidate is the {role} for a {duration:.2f}s {mode.upper()} clip.
+Audit identity, wardrobe, props, geography, lighting/time, pose/gaze/hands, camera side, generation defects, accidental text/watermarks, duplicated subjects and impossible spatial relationships.
+For FL2VA, also judge whether the previous exact frame can physically and cinematically reach this candidate in {duration:.2f}s without teleportation or implausible reframing. Preserve the prior motion direction when appropriate.
+Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production usability. If weak, provide executable image-edit repair instructions. Rewrite final_h3_prompt around what is ACTUALLY visible while preserving story intent and exact duration.
 
-Audit for:
-- continuity with the supplied previous frame and saved story facts;
-- stable character/object identity, wardrobe, props, location geography, lighting/time-of-day logic;
-- obvious generation defects, malformed anatomy/objects, accidental text/watermarks, duplicated subjects, impossible spatial relationships;
-- strong usability as the first frame of a MiniMax H3 clip: readable subject silhouette, useful motion headroom, coherent depth, no composition that forces impossible motion;
-- alignment with the planned next scene goal and its {duration:.2f}s action budget.
+{_h3_prompt_contract(mode, duration)}'''
 
-Set pass=true only when the candidate is production-usable and score it at least 85/100. If it is weak, explain concrete repair instructions that an image editor can execute. Regardless of pass/fail, rewrite final_h3_prompt so it starts from what is ACTUALLY visible in the candidate while preserving the intended narrative trajectory and exact {duration:.2f}s budget.
+    def _repair_h3_prompt_if_needed(*, key, director_model, prompt, mode, duration, errors, context, images):
+        if not errors: return prompt, []
+        fixed=_openai_structured_response(
+            key=key, model=director_model,
+            instructions=("Repair ONLY the MiniMax H3 prompt. Preserve story/action/dialogue, but satisfy every deterministic validator error. Return only structured JSON.\n\n"+_h3_prompt_contract(mode,duration)),
+            user_text="VALIDATOR ERRORS:\n- "+"\n- ".join(errors)+"\n\nCONTEXT:\n"+str(context)[:12000]+"\n\nPROMPT TO REPAIR:\n"+str(prompt)[:18000],
+            schema_name="h3_prompt_repair", schema=_prompt_repair_schema(), images=images, max_output_tokens=4200,
+        )
+        repaired=_normalize_h3_prompt(fixed.get("h3_prompt"),mode,duration)
+        return repaired,_validate_h3_prompt(repaired,mode,duration)
 
-{_h3_prompt_contract(duration)}'''
+    def _postrender_story_director_finalize(jid, p, dest, entry):
+        # Audit actual H3 output before promoting planned state into canonical story memory.
+        token=str(p.get("story_director_token") or "").strip()
+        if not token: return None
+        seq_id=str(p.get("_target_sequence_id") or "")
+        with TIMELINE_LOCK:
+            seq=_find_sequence_unlocked(seq_id) if seq_id else _active_sequence_unlocked(create=True)
+            pending=dict((seq or {}).get("director_pending") or {})
+        if not pending or pending.get("token") != token: return None
+        key=_openai_api_key()
+        if not key:
+            return {"pass":False,"score":0,"summary":"OpenAI key unavailable for post-render audit","problems":["post-render audit skipped"],"recommended_prompt":pending.get("h3_prompt","")}
+        samples=_sample_video_frames_for_director(dest,count=4,tail_only=False,prefix=f"postaudit_{jid}")
+        try:
+            images=[]
+            start_path=pending.get("start_frame_path")
+            target_path=pending.get("target_frame_path")
+            mode=str(pending.get("mode") or "fl2va")
+            if start_path and os.path.exists(start_path): images.append(("EXACT PLANNED START FRAME / previous clip boundary.",start_path))
+            for i,sp in enumerate(samples,1): images.append((f"ACTUAL GENERATED H3 CHECKPOINT {i} in chronological order.",sp))
+            if target_path and os.path.exists(target_path):
+                images.append((("PLANNED EXACT DESTINATION FRAME / Picture 2." if mode == "fl2va" else "PLANNED EXACT OPENING FRAME / Picture 1."),target_path))
+            mode_rule = (
+                "The final generated checkpoint must converge closely to the planned destination Picture 2; target_reached means that endpoint was actually reached."
+                if mode == "fl2va" else
+                "The first generated checkpoint must honor the planned opening Picture 1; target_reached means the opening anchor and planned story action were respected, not that the final frame matches Picture 1."
+            )
+            audit=_openai_structured_response(
+                key=key, model=pending.get("director_model") or NEXT_SCENE_DEFAULT_DIRECTOR_MODEL,
+                instructions=f'''Audit the ACTUAL generated MiniMax H3 clip through its chronological frame samples. Judge continuity, motion coherence, character/prop/geography stability, whether the planned story beat reads within {float(pending.get('duration') or 0):.2f}s, and endpoint/opening-anchor compliance for {mode.upper()}. {mode_rule} Do not reward intent that is absent from the pixels. pass=true only if production-usable at >= {NEXT_SCENE_RENDER_AUDIT_THRESHOLD}/100. If it fails, write a corrected MiniMax prompt in recommended_prompt for a retry.''',
+                user_text=(f"SCENE: {pending.get('scene_title','')}\nGOAL: {pending.get('scene_goal','')}\nPLANNED END STATE: {pending.get('end_state','')}\nH3 PROMPT USED:\n{p.get('prompt','')}\n\nSTATE LEDGER:\n{json.dumps((pending.get('story_state') or {}).get('state_ledger') or {},ensure_ascii=False)}"),
+                schema_name="h3_post_render_audit", schema=_post_render_audit_schema(), images=images, max_output_tokens=3600,
+            )
+            score=int(audit.get("score") or 0)
+            passed=bool(audit.get("pass")) and score>=NEXT_SCENE_RENDER_AUDIT_THRESHOLD and bool(audit.get("target_reached"))
+            with TIMELINE_LOCK:
+                seq=_find_sequence_unlocked(seq_id) if seq_id else _active_sequence_unlocked(create=True)
+                if seq is not None and dict(seq.get("director_pending") or {}).get("token")==token:
+                    if passed:
+                        old=dict(seq.get("director_state") or {})
+                        new_state=dict(pending.get("story_state") or {})
+                        new_state.update({
+                            "last_scene_title":pending.get("scene_title",""),"last_scene_goal":pending.get("scene_goal",""),
+                            "last_end_state":str(audit.get("observed_end_state") or pending.get("end_state") or ""),
+                            "last_h3_prompt":str(p.get("prompt") or pending.get("h3_prompt") or ""),"last_video_file":os.path.basename(dest),
+                            "last_scene_duration":float(entry.get("duration") or pending.get("duration") or 0),"last_director_model":pending.get("director_model"),
+                            "last_still_audit_score":pending.get("still_audit_score"),"last_render_audit_score":score,
+                            "revision":int(old.get("revision") or 0)+1,"updated":time.time(),
+                        })
+                        seq["director_state"]=new_state
+                        seq.pop("director_pending",None)
+                        entry["director_canon_status"]="committed"
+                    else:
+                        pend=dict(seq.get("director_pending") or {})
+                        recommended=str(audit.get("recommended_prompt") or "").strip()
+                        pend["post_render_audit"]={"score":score,"summary":audit.get("summary"),"problems":audit.get("problems"),"recommended_prompt":recommended,"updated":time.time()}
+                        seq["director_pending"]=pend
+                        entry["director_canon_status"]="needs_review"
+                        entry["director_retry_prompt"]=recommended
+                        if recommended:
+                            entry.setdefault("params",{})["prompt"]=recommended
+                    seq["updated"]=time.time(); TIMELINE_STATE["updated"]=time.time(); _autosave_timeline_unlocked("story_director_post_render_audit")
+            audit["pass"]=passed
+            return audit
+        finally:
+            for sp in samples:
+                try: os.remove(sp)
+                except Exception: pass
 
     @app.get("/api/next_scene/meta")
     def api_next_scene_meta():
@@ -6216,232 +6438,106 @@ Set pass=true only when the candidate is production-usable and score it at least
         key = _openai_api_key()
         if not key:
             return jsonify(error="OPENAI_API_KEY is not available to the UI process. Add it in Colab Secrets, then rerun the studio."), 400
-
-        director_model = str(request.form.get("director_model") or NEXT_SCENE_DEFAULT_DIRECTOR_MODEL).strip()
-        if director_model not in {x["id"] for x in NEXT_SCENE_DIRECTOR_MODELS}:
-            return jsonify(error="Choose GPT-5.6 Sol or Terra as the Story Director."), 400
-        image_model = str(request.form.get("image_model") or NEXT_SCENE_DEFAULT_IMAGE_MODEL).strip()
-        if image_model not in {x["id"] for x in NEXT_SCENE_IMAGE_MODELS}:
-            return jsonify(error="Choose a supported GPT-Image-2.5 renderer."), 400
-        quality = str(request.form.get("quality") or "auto").strip().lower()
-        if quality not in NEXT_SCENE_IMAGE_QUALITIES:
-            quality = "auto"
-
-        instruction = str(request.form.get("instruction") or "").strip()[:9000]
-        story_context = str(request.form.get("story_context") or "").strip()[:7000]
-        current_prompt = str(request.form.get("current_prompt") or "").strip()[:6500]
-        use_timeline = str(request.form.get("use_timeline") or "1").lower() in {"1","true","yes","on"}
-        use_stage = str(request.form.get("use_stage_reference") or "1").lower() in {"1","true","yes","on"}
-
-        length_p = {
-            "length_mode": request.form.get("length_mode") or "seconds",
-            "duration": request.form.get("duration") or "7",
-            "frames": request.form.get("frames") or "175",
-            "playback_speed": request.form.get("playback_speed") or "1",
-        }
+        director_model=str(request.form.get("director_model") or NEXT_SCENE_DEFAULT_DIRECTOR_MODEL).strip()
+        if director_model not in {x["id"] for x in NEXT_SCENE_DIRECTOR_MODELS}: return jsonify(error="Choose GPT-5.6 Sol or Terra as the Story Director."),400
+        image_model=str(request.form.get("image_model") or NEXT_SCENE_DEFAULT_IMAGE_MODEL).strip()
+        if image_model not in {x["id"] for x in NEXT_SCENE_IMAGE_MODELS}: return jsonify(error="Choose a supported GPT-Image-2.5 renderer."),400
+        quality=str(request.form.get("quality") or "auto").strip().lower()
+        if quality not in NEXT_SCENE_IMAGE_QUALITIES: quality="auto"
+        instruction=str(request.form.get("instruction") or "").strip()[:9000]
+        story_context=str(request.form.get("story_context") or "").strip()[:7000]
+        current_prompt=str(request.form.get("current_prompt") or "").strip()[:6500]
+        use_timeline=str(request.form.get("use_timeline") or "1").lower() in {"1","true","yes","on"}
+        use_stage=str(request.form.get("use_stage_reference") or "1").lower() in {"1","true","yes","on"}
+        length_p={"length_mode":request.form.get("length_mode") or "seconds","duration":request.form.get("duration") or "7","frames":request.form.get("frames") or "175","playback_speed":request.form.get("playback_speed") or "1"}
         try:
-            n_frames, model_seconds, requested_seconds = resolve_length(length_p)
-            requested_seconds = max(0.21, min(149.7, float(requested_seconds)))
-            playback_speed = max(0.05, min(8.0, float(length_p.get("playback_speed") or 1.0)))
-        except Exception as e:
-            return jsonify(error=f"Could not resolve the requested H3 scene length: {e}"), 400
-
-        image_width, image_height = _normalize_gpt_image_size(
-            request.form.get("width") or 1024,
-            request.form.get("height") or 1024,
-        )
-
-        seq_id, seq_name, recent_rows, saved_state = _next_scene_timeline_context()
-        reference_path = None
+            budget_frames,budget_model_seconds,requested_budget=resolve_length(length_p)
+            requested_budget=max(0.21,min(149.7,float(requested_budget)))
+            playback_speed=max(0.05,min(8.0,float(length_p.get("playback_speed") or 1.0)))
+        except Exception as e: return jsonify(error=f"Could not resolve requested H3 scene length: {e}"),400
+        image_width,image_height=_normalize_gpt_image_size(request.form.get("width") or 1024,request.form.get("height") or 1024)
+        seq_id,seq_name,recent_rows,saved_state=_next_scene_timeline_context()
+        reference_path=None; previous_video_path=None
         if use_stage:
             with STAGE_LOCK:
-                candidate = STAGE_STATE.get("last_frame_path")
-            if candidate and os.path.exists(candidate):
-                reference_path = candidate
-
-        context_chunks = [
-            f"ACTIVE SEQUENCE: {seq_name}",
-            "SAVED STORY-DIRECTOR STATE:\n" + (json.dumps(saved_state, ensure_ascii=False)[:14000] if saved_state else "(none yet — infer conservatively from the existing sequence)"),
-        ]
-        if story_context:
-            context_chunks.append("USER STORY BIBLE / CONTINUITY NOTES:\n" + story_context)
-        if use_timeline and recent_rows:
-            context_chunks.append("RECENT COMPLETED H3 CLIPS, OLDEST TO NEWEST:\n" + "\n".join(recent_rows))
-        if current_prompt:
-            context_chunks.append("CURRENT H3 PROMPT / CREATIVE DIRECTION IN THE UI:\n" + current_prompt)
-        context_chunks.append("USER DIRECTION FOR THIS NEXT SCENE:\n" + (instruction or "(none — autonomously choose the next beat from the established story trajectory)"))
-        context_chunks.append(
-            f"TARGET H3 CANVAS: {request.form.get('width') or '?'}x{request.form.get('height') or '?'}; "
-            f"storyboard renderer canvas: {image_width}x{image_height}."
-        )
-        plan_user = "\n\n".join(context_chunks)
-        plan_images = [("IMMEDIATE PREVIOUS FRAME — use as hard visual continuity evidence.", reference_path)] if reference_path else []
-
+                candidate=STAGE_STATE.get("last_frame_path"); prev_video=STAGE_STATE.get("video_file")
+            if candidate and os.path.exists(candidate): reference_path=candidate
+            if prev_video and os.path.exists(os.path.join(OUT,os.path.basename(prev_video))): previous_video_path=os.path.join(OUT,os.path.basename(prev_video))
+        mode="fl2va" if reference_path else "i2va"
+        tail_samples=_sample_video_frames_for_director(previous_video_path,count=3,tail_only=True,prefix="motiontail") if previous_video_path else []
+        context_chunks=[f"ACTIVE SEQUENCE: {seq_name}","CANONICAL STORY STATE:\n"+(json.dumps(saved_state,ensure_ascii=False)[:16000] if saved_state else "(none yet — infer conservatively)")]
+        if story_context: context_chunks.append("USER STORY BIBLE / CONTINUITY NOTES:\n"+story_context)
+        if use_timeline and recent_rows: context_chunks.append("RECENT COMPLETED H3 CLIPS, OLDEST TO NEWEST:\n"+"\n".join(recent_rows))
+        if current_prompt: context_chunks.append("CURRENT H3 PROMPT / CREATIVE DIRECTION:\n"+current_prompt)
+        context_chunks.append("USER DIRECTION FOR THIS NEXT SCENE:\n"+(instruction or "(none — autonomously continue the tracked trajectory)"))
+        context_chunks.append(f"TARGET H3 CANVAS: {request.form.get('width') or '?'}x{request.form.get('height') or '?'}; storyboard canvas {image_width}x{image_height}; mode {mode.upper()}.")
+        plan_images=[]
+        for i,sp in enumerate(tail_samples,1): plan_images.append((f"PREVIOUS CLIP MOTION-TAIL SAMPLE {i}, chronological. Use these to infer movement/camera momentum.",sp))
+        if reference_path: plan_images.append(("EXACT PREVIOUS LAST FRAME. This will be Picture 1 and must remain the exact start boundary.",reference_path))
         try:
-            plan = _openai_structured_response(
-                key=key,
-                model=director_model,
-                instructions=_story_director_plan_system(requested_seconds, n_frames, model_seconds, playback_speed),
-                user_text=plan_user,
-                schema_name="h3_next_scene_plan",
-                schema=_director_story_schema(),
-                images=plan_images,
-                max_output_tokens=6200,
-            )
-            image_prompt = str(plan.get("image_prompt") or "").strip()
-            if not image_prompt:
-                raise RuntimeError("Story Director did not produce an image prompt.")
-            planned_h3_prompt = _normalize_h3_prompt(plan.get("h3_prompt"), requested_seconds)
-
-            work_id = uuid.uuid4().hex[:12]
-            work_paths = []
-            image_bytes, revised_prompt, used_reference = _openai_image_request(
-                key=key,
-                model=image_model,
-                prompt=image_prompt,
-                width=image_width,
-                height=image_height,
-                quality=quality,
-                reference_path=reference_path,
-            )
-            candidate_path = os.path.join(OUT, f".next_scene_{work_id}_candidate0.png")
-            with open(candidate_path, "wb") as fh:
-                fh.write(image_bytes)
-            with Image.open(candidate_path) as check:
-                check.verify()
+            plan=_openai_structured_response(key=key,model=director_model,instructions=_story_director_plan_system(requested_budget,budget_frames,budget_model_seconds,playback_speed,mode),user_text="\n\n".join(context_chunks),schema_name="h3_next_scene_plan",schema=_director_story_schema(),images=plan_images,max_output_tokens=6800)
+            chosen_duration=_choose_scene_duration(requested_budget,plan.get("duration_seconds"))
+            chosen_p={"length_mode":"seconds","duration":str(chosen_duration),"frames":str(budget_frames),"playback_speed":str(playback_speed)}
+            n_frames,model_seconds,chosen_duration=resolve_length(chosen_p)
+            chosen_duration=float(chosen_duration)
+            image_prompt=str(plan.get("image_prompt") or "").strip()
+            if not image_prompt: raise RuntimeError("Story Director did not produce an image prompt.")
+            if mode=="fl2va":
+                image_prompt=("Create the DESTINATION / LAST FRAME for the next MiniMax H3 FL2VA scene. Image 1 is the exact previous clip boundary. Do not merely reproduce it: preserve identity, wardrobe, props, geography, lighting logic and camera language while depicting the planned reachable end state after the next motion beat. The result must be one coherent frame H3 can physically reach.\n\n"+image_prompt)
+            else:
+                image_prompt=("Create the OPENING / FIRST FRAME for the first MiniMax H3 scene. It must be a clean animation-ready frame with motion headroom.\n\n"+image_prompt)
+            work_id=uuid.uuid4().hex[:12]; work_paths=[]
+            image_bytes,revised_prompt,used_reference=_openai_image_request(key=key,model=image_model,prompt=image_prompt,width=image_width,height=image_height,quality=quality,reference_path=reference_path)
+            candidate_path=os.path.join(OUT,f".next_scene_{work_id}_candidate0.png"); open(candidate_path,"wb").write(image_bytes)
+            with Image.open(candidate_path) as check: check.verify()
             work_paths.append(candidate_path)
-
-            repairs = 0
-            audit = None
+            repairs=0; audit=None
             while True:
-                audit_context = (
-                    f"PLANNED SCENE TITLE: {plan.get('scene_title','')}\n"
-                    f"PLANNED SCENE GOAL: {plan.get('scene_goal','')}\n"
-                    f"PLANNED END STATE: {plan.get('end_state','')}\n"
-                    f"PLANNED TIMING BEATS: {json.dumps(plan.get('timing_beats') or [], ensure_ascii=False)}\n"
-                    f"PLANNED H3 PROMPT:\n{planned_h3_prompt}\n\n"
-                    f"SAVED STORY STATE BEFORE THIS SCENE:\n{json.dumps(saved_state, ensure_ascii=False)[:12000]}"
-                )
-                audit_images = []
-                if reference_path:
-                    audit_images.append(("PREVIOUS FRAME — immediate visual state before this next scene.", reference_path))
-                audit_images.append(("CANDIDATE NEXT-SCENE OPENING FRAME — inspect these actual pixels.", candidate_path))
-                audit = _openai_structured_response(
-                    key=key,
-                    model=director_model,
-                    instructions=_story_director_audit_system(requested_seconds),
-                    user_text=audit_context,
-                    schema_name="h3_next_scene_audit",
-                    schema=_director_audit_schema(),
-                    images=audit_images,
-                    max_output_tokens=4300,
-                )
-                passed = bool(audit.get("pass")) and int(audit.get("score") or 0) >= 85
-                if passed or repairs >= NEXT_SCENE_MAX_REPAIRS:
-                    break
-                repair_instruction = str(audit.get("repair_instruction") or "").strip()
-                if not repair_instruction:
-                    break
-                repairs += 1
-                repair_prompt = (
-                    "Precision continuity repair. Edit the supplied candidate image rather than redesigning the scene. "
-                    "Keep the intended story beat, identity, wardrobe, props, location, lens language, and opening-frame composition unless the audit explicitly identifies them as the problem. "
-                    "Remove accidental text/UI/watermarks and fix anatomy/object/spatial defects. Preserve generous motion headroom for MiniMax H3.\n\n"
-                    f"PLANNED SCENE GOAL:\n{plan.get('scene_goal','')}\n\n"
-                    f"AUDIT REPAIR INSTRUCTIONS:\n{repair_instruction}"
-                )
-                repair_refs = [candidate_path] + ([reference_path] if reference_path else [])
-                repair_prompt += (
-                    "\n\nREFERENCE ORDER: image 1 is the candidate to repair. "
-                    + ("Image 2 is the immediate previous story frame; use it only to preserve identity/continuity while keeping image 1's planned next-scene composition." if reference_path else "Preserve image 1's intended next-scene composition while making the audited corrections.")
-                )
-                repaired_bytes, _, _ = _openai_image_request(
-                    key=key,
-                    model=NEXT_SCENE_REPAIR_MODEL,
-                    prompt=repair_prompt,
-                    width=image_width,
-                    height=image_height,
-                    quality="xhigh" if quality in {"xhigh","max"} else "high",
-                    reference_paths=repair_refs,
-                )
-                next_path = os.path.join(OUT, f".next_scene_{work_id}_candidate{repairs}.png")
-                with open(next_path, "wb") as fh:
-                    fh.write(repaired_bytes)
-                with Image.open(next_path) as check:
-                    check.verify()
-                work_paths.append(next_path)
-                candidate_path = next_path
-
-            audit_score = int((audit or {}).get("score") or 0)
-            audit_pass = bool((audit or {}).get("pass")) and audit_score >= 85
-            final_h3_prompt = _normalize_h3_prompt((audit or {}).get("final_h3_prompt") or planned_h3_prompt, requested_seconds)
-
-            out_name = f"next_scene_{work_id}.png"
-            out_path = os.path.join(OUT, out_name)
-            shutil.copyfile(candidate_path, out_path)
-
-            # Advance persistent story memory only after the pixels pass visual audit.
+                audit_context=(f"SCENE TITLE: {plan.get('scene_title','')}\nGOAL: {plan.get('scene_goal','')}\nPLANNED END STATE: {plan.get('end_state','')}\nTIMING BEATS: {json.dumps(plan.get('timing_beats') or [],ensure_ascii=False)}\nSTATE LEDGER: {json.dumps((plan.get('story_state') or {}).get('state_ledger') or {},ensure_ascii=False)}\nCANONICAL STORY STATE BEFORE SCENE: {json.dumps(saved_state,ensure_ascii=False)[:12000]}")
+                audit_images=[]
+                if reference_path: audit_images.append(("EXACT START FRAME / Picture 1.",reference_path))
+                audit_images.append(("CANDIDATE DESTINATION FRAME / Picture 2." if mode=="fl2va" else "CANDIDATE OPENING FRAME / Picture 1.",candidate_path))
+                audit=_openai_structured_response(key=key,model=director_model,instructions=_story_director_audit_system(chosen_duration,mode),user_text=audit_context,schema_name="h3_next_scene_audit",schema=_director_audit_schema(),images=audit_images,max_output_tokens=4600)
+                passed=bool(audit.get("pass")) and int(audit.get("score") or 0)>=NEXT_SCENE_STILL_AUDIT_THRESHOLD
+                if passed or repairs>=NEXT_SCENE_MAX_REPAIRS: break
+                repair_instruction=str(audit.get("repair_instruction") or "").strip()
+                if not repair_instruction: break
+                repairs+=1
+                role_text="destination endpoint" if mode=="fl2va" else "opening frame"
+                repair_prompt=(f"Precision continuity repair of image 1, which is the planned {role_text}. Preserve its valid composition and story beat. Fix only the audited defects. Maintain identity, wardrobe, props, geography, camera side/lens language, lighting and motion headroom. Remove accidental text/UI/watermarks.\n\nSCENE GOAL:\n{plan.get('scene_goal','')}\n\nAUDIT REPAIR INSTRUCTIONS:\n{repair_instruction}")
+                repair_refs=[candidate_path]+([reference_path] if reference_path else [])
+                repaired_bytes,_,_=_openai_image_request(key=key,model=NEXT_SCENE_REPAIR_MODEL,prompt=repair_prompt,width=image_width,height=image_height,quality="xhigh" if quality in {"xhigh","max"} else "high",reference_paths=repair_refs)
+                next_path=os.path.join(OUT,f".next_scene_{work_id}_candidate{repairs}.png"); open(next_path,"wb").write(repaired_bytes)
+                with Image.open(next_path) as check: check.verify()
+                work_paths.append(next_path); candidate_path=next_path
+            audit_score=int((audit or {}).get("score") or 0); audit_pass=bool((audit or {}).get("pass")) and audit_score>=NEXT_SCENE_STILL_AUDIT_THRESHOLD
+            planned_prompt=_normalize_h3_prompt((audit or {}).get("final_h3_prompt") or plan.get("h3_prompt"),mode,chosen_duration)
+            prompt_errors=_validate_h3_prompt(planned_prompt,mode,chosen_duration)
+            if audit_pass and prompt_errors:
+                prompt_images=[]
+                if reference_path: prompt_images.append(("Picture 1 exact start frame",reference_path))
+                prompt_images.append(("Picture 2 exact destination frame" if mode=="fl2va" else "Picture 1 exact opening frame",candidate_path))
+                planned_prompt,prompt_errors=_repair_h3_prompt_if_needed(key=key,director_model=director_model,prompt=planned_prompt,mode=mode,duration=chosen_duration,errors=prompt_errors,context=audit_context,images=prompt_images)
+            if prompt_errors: audit_pass=False
+            out_name=f"next_scene_{work_id}.png"; out_path=os.path.join(OUT,out_name); shutil.copyfile(candidate_path,out_path)
+            pending_token=uuid.uuid4().hex[:16] if audit_pass else ""
             if audit_pass:
-                new_state = dict(plan.get("story_state") or {})
-                new_state.update({
-                    "last_scene_title": str(plan.get("scene_title") or ""),
-                    "last_scene_goal": str(plan.get("scene_goal") or ""),
-                    "last_end_state": str(plan.get("end_state") or ""),
-                    "last_observed_opening_state": str((audit or {}).get("observed_opening_state") or ""),
-                    "last_h3_prompt": final_h3_prompt,
-                    "last_opening_frame_file": out_name,
-                    "last_scene_duration": round(float(requested_seconds), 3),
-                    "last_director_model": director_model,
-                    "last_audit_score": audit_score,
-                    "revision": int(saved_state.get("revision") or 0) + 1,
-                    "updated": time.time(),
-                })
+                pending={"token":pending_token,"scene_title":str(plan.get("scene_title") or "Next Scene"),"scene_goal":str(plan.get("scene_goal") or ""),"end_state":str(plan.get("end_state") or ""),"story_state":dict(plan.get("story_state") or {}),"duration":round(chosen_duration,3),"frames":int(n_frames),"h3_prompt":planned_prompt,"mode":mode,"director_model":director_model,"still_audit_score":audit_score,"start_frame_path":reference_path,"target_frame_path":out_path,"created":time.time()}
                 with TIMELINE_LOCK:
-                    seq = _find_sequence_unlocked(seq_id) if seq_id else _active_sequence_unlocked(create=True)
+                    seq=_find_sequence_unlocked(seq_id) if seq_id else _active_sequence_unlocked(create=True)
                     if seq is not None:
-                        seq["director_state"] = new_state
-                        seq["updated"] = time.time()
-                        TIMELINE_STATE["updated"] = time.time()
-                        _autosave_timeline_unlocked("story_director_next_scene")
-
+                        seq["director_pending"]=pending; seq["updated"]=time.time(); TIMELINE_STATE["updated"]=time.time(); _autosave_timeline_unlocked("story_director_pending_scene")
             for wp in work_paths:
                 try:
-                    if os.path.exists(wp):
-                        os.remove(wp)
-                except Exception:
-                    pass
-
-            return jsonify(
-                ok=True,
-                file=out_name,
-                director_model=director_model,
-                image_model=image_model,
-                quality=quality,
-                width=image_width,
-                height=image_height,
-                used_reference=used_reference,
-                used_timeline=use_timeline,
-                scene_title=plan.get("scene_title") or "Next Scene",
-                scene_goal=plan.get("scene_goal") or "",
-                end_state=plan.get("end_state") or "",
-                duration=round(float(requested_seconds), 3),
-                model_seconds=round(float(model_seconds), 3),
-                frames=int(n_frames),
-                timing_beats=plan.get("timing_beats") or [],
-                h3_prompt=final_h3_prompt,
-                audit_pass=audit_pass,
-                audit_score=audit_score,
-                audit_summary=str((audit or {}).get("summary") or ""),
-                audit_problems=(audit or {}).get("problems") or [],
-                repairs=repairs,
-                story_advanced=audit_pass,
-                story_summary=str((plan.get("story_state") or {}).get("summary") or ""),
-                trajectory=str((plan.get("story_state") or {}).get("trajectory") or ""),
-                next_after_this=str((plan.get("story_state") or {}).get("next_after_this") or ""),
-                revised_image_prompt=revised_prompt,
-            )
+                    if os.path.exists(wp): os.remove(wp)
+                except Exception: pass
+            return jsonify(ok=True,file=out_name,director_model=director_model,image_model=image_model,quality=quality,width=image_width,height=image_height,used_reference=used_reference,used_timeline=use_timeline,mode=mode,frame_role=("last" if mode=="fl2va" else "first"),start_frame_file=(os.path.basename(reference_path) if reference_path else None),scene_title=plan.get("scene_title") or "Next Scene",scene_goal=plan.get("scene_goal") or "",end_state=plan.get("end_state") or "",duration=round(chosen_duration,3),model_seconds=round(float(model_seconds),3),frames=int(n_frames),timing_beats=plan.get("timing_beats") or [],h3_prompt=planned_prompt,prompt_validation_errors=prompt_errors,audit_pass=audit_pass,audit_score=audit_score,audit_summary=str((audit or {}).get("summary") or ""),audit_problems=(audit or {}).get("problems") or [],repairs=repairs,story_advanced=False,story_pending=bool(audit_pass),pending_token=pending_token,story_summary=str((plan.get("story_state") or {}).get("summary") or ""),trajectory=str((plan.get("story_state") or {}).get("trajectory") or ""),next_after_this=str((plan.get("story_state") or {}).get("next_after_this") or ""),revised_image_prompt=revised_prompt)
         except Exception as e:
-            return jsonify(error=str(e)), 502
+            return jsonify(error=str(e)),502
+        finally:
+            for sp in tail_samples:
+                try: os.remove(sp)
+                except Exception: pass
 
     @app.get("/api/keepalive")
     def keepalive(): return jsonify(ok=True)
@@ -6602,7 +6698,7 @@ Set pass=true only when the candidate is production-usable and score it at least
         jid = uuid.uuid4().hex[:8]
         p = {k: request.form.get(k) for k in
              ("prompt","width","height","duration","frames","length_mode",
-              "playback_speed","image_fit","steps","seed","denoise",
+              "playback_speed","image_fit","steps","seed","denoise","story_director_token",
               "shift_video","shift_audio","sparse_percent","sampler_name","scheduler",
               "weight_dtype","lora","lora_strength","motion8","motion8_strength","action","action_strength","lightning",
               "lightning_strength","taomate","taomate_strength","unet", "use_stage_last", "timeline_action",
@@ -6786,6 +6882,22 @@ Set pass=true only when the candidate is production-usable and score it at least
             target_seq = _active_sequence_unlocked(create=True)
             p["_target_sequence_id"] = target_seq.get("id")
             target_has_clips = bool(target_seq.get("segments"))
+            _pending_director = dict(target_seq.get("director_pending") or {})
+
+        # A pending Story Director token is canon-sensitive. Only attach it to the exact
+        # staged prompt/sequence; if the user substantially edits the prompt first, that
+        # render remains a normal creative take and cannot accidentally rewrite story canon.
+        _submitted_director_token = str(p.get("story_director_token") or "").strip()
+        if _submitted_director_token:
+            _expected_token = str(_pending_director.get("token") or "")
+            _expected_prompt = re.sub(r"\s+", " ", str(_pending_director.get("h3_prompt") or "")).strip()
+            _submitted_prompt = re.sub(r"\s+", " ", str(p.get("prompt") or "")).strip()
+            if (not _expected_token or _submitted_director_token != _expected_token or
+                    _submitted_prompt != _expected_prompt):
+                log("  ↳ Story Director pending token detached: submitted prompt/plan no longer matches staged canon candidate")
+                p["story_director_token"] = ""
+            else:
+                p["prompt_source"] = "story_director"
         if timeline_action == "continue" and not target_has_clips:
             # Allow a continue behind another queued job targeting this sequence.
             with QUEUE_LOCK:
@@ -8017,7 +8129,7 @@ Set pass=true only when the candidate is production-usable and score it at least
         <div class=aphead><b id=next_scene_title>NEXT SCENE · STORY DIRECTOR</b><button id=next_scene_close class=apclose type=button>✕</button></div>
         <div class=nextsceneheadrow>
           <div><label>Director</label><select id=next_scene_director><option value="gpt-5.6-terra" selected>GPT-5.6 Terra</option><option value="gpt-5.6-sol">GPT-5.6 Sol</option></select></div>
-          <div><label>Scene budget</label><div id=next_scene_budget class=nextscenebudget>uses current H3 duration</div></div>
+          <div><label>Scene budget</label><div id=next_scene_budget class=nextscenebudget>director fits the beat to H3</div></div>
         </div>
         <label>Direction <span class=mutedlabel>optional — leave blank for autonomous story continuation</span></label>
         <textarea id=next_scene_instruction class=nsinstruction placeholder="Optional: tell the director what should happen next. If blank, it follows the tracked story arc, unresolved threads, previous frames, and recent MiniMax prompts."></textarea>
@@ -8036,7 +8148,7 @@ Set pass=true only when the candidate is production-usable and score it at least
             </div>
           </div>
         </details>
-        <div id=next_scene_status class=apstatus>Ready. The director plans → renders → audits → repairs → writes the MiniMax H3 prompt.</div>
+        <div id=next_scene_status class=apstatus>Ready. The director plans the beat → builds an H3 endpoint → audits/repairs → validates the MiniMax prompt.</div>
         <div id=next_scene_preview_wrap class=nextscenepreview>
           <img id=next_scene_preview alt="Generated next scene" title="Click to view full size">
           <div class=nextscenepreviewmeta><div id=next_scene_preview_info></div></div>
@@ -8983,13 +9095,15 @@ Set pass=true only when the candidate is production-usable and score it at least
     const NEXT_SCENE_STORE_KEY='h3_next_scene_story_director_v2';
     const NEXT_SCENE_DEFAULT={director:'gpt-5.6-terra',imageModel:'gpt-image-2.5-flare',quality:'auto',context:'',useTimeline:true,useStage:true};
     let NEXT_SCENE_RESULT_FILE='';
+    let NEXT_SCENE_PENDING_TOKEN='';
     function getNextSceneSettings(){try{return {...NEXT_SCENE_DEFAULT,...JSON.parse(localStorage.getItem(NEXT_SCENE_STORE_KEY)||'{}')}}catch(e){return {...NEXT_SCENE_DEFAULT}}}
     function saveNextSceneSettings(v){localStorage.setItem(NEXT_SCENE_STORE_KEY,JSON.stringify({...NEXT_SCENE_DEFAULT,...v}))}
     function nextSceneBudgetText(){
       const mode=$('length_mode')?.value||'seconds';
       const pace=Number($('playback_speed')?.value||1);
-      if(mode==='frames')return `${$('frames')?.value||'?'} model frames · ${pace.toFixed(2)}× pace`;
-      return `${Number($('duration')?.value||7).toFixed(2)}s final · ${pace.toFixed(2)}× pace`;
+      if(mode==='frames')return `${$('frames')?.value||'?'} frame budget · director fits beat`;
+      const d=Number($('duration')?.value||7),cap=d>=4?Math.min(15,d):d;
+      return `${cap.toFixed(2)}s max · director-fit · ${pace.toFixed(2)}×`;
     }
     function syncNextSceneModal(){
       const s=getNextSceneSettings();
@@ -9019,12 +9133,12 @@ Set pass=true only when the candidate is production-usable and score it at least
     $('next_scene_modal').addEventListener('click',e=>{if(e.target===$('next_scene_modal'))closeNextSceneModal()});
     $('next_scene_preview').onclick=()=>{if(NEXT_SCENE_RESULT_FILE)showImageModal('/out/'+encodeURIComponent(NEXT_SCENE_RESULT_FILE)+'?t='+Date.now())};
 
-    async function assignGeneratedSceneToFrame(kind){
-      if(!NEXT_SCENE_RESULT_FILE)return;
-      const resp=await fetch('/out/'+encodeURIComponent(NEXT_SCENE_RESULT_FILE)+'?t='+Date.now());
-      if(!resp.ok)throw new Error(`Could not fetch generated image (HTTP ${resp.status}).`);
+    async function assignOutFileToFrame(fileName,kind){
+      if(!fileName)return;
+      const resp=await fetch('/out/'+encodeURIComponent(fileName)+'?t='+Date.now());
+      if(!resp.ok)throw new Error(`Could not fetch generated/reference image (HTTP ${resp.status}).`);
       const blob=await resp.blob();
-      const file=new File([blob],NEXT_SCENE_RESULT_FILE,{type:blob.type||'image/png'});
+      const file=new File([blob],fileName,{type:blob.type||'image/png'});
       const dt=new DataTransfer();dt.items.add(file);$(kind+'_frame').files=dt.files;
       $(kind+'_frame').dispatchEvent(new Event('change',{bubbles:true}));
       if(currentModelMode()!=='fl2va')await setModelMode('fl2va');
@@ -9041,21 +9155,31 @@ Set pass=true only when the candidate is production-usable and score it at least
       fd.append('length_mode',$('length_mode').value||'seconds');fd.append('duration',$('duration').value||'7');fd.append('frames',$('frames').value||'175');fd.append('playback_speed',$('playback_speed').value||'1');
       fd.append('use_timeline',settings.useTimeline?'1':'0');fd.append('use_stage_reference',settings.useStage?'1':'0');
       btn.disabled=true;mainBtn.disabled=true;mainBtn.classList.add('working');mainBtn.textContent='▣ DIRECTING…';btn.textContent='DIRECTING…';
-      $('next_scene_status').className='apstatus';$('next_scene_status').textContent=`${settings.director.endsWith('sol')?'Sol':'Terra'} is planning the beat, rendering the opening frame, then auditing/repairing it…`;say('Story Director · '+settings.director);
+      $('next_scene_status').className='apstatus';$('next_scene_status').textContent=`${settings.director.endsWith('sol')?'Sol':'Terra'} is planning the beat, building the H3 endpoint, then auditing/repairing it…`;say('Story Director · '+settings.director);
       try{
         const resp=await fetch('/api/next_scene',{method:'POST',body:fd});
         const r=await resp.json();
         if(!resp.ok||r.error)throw new Error(r.error||`HTTP ${resp.status}`);
-        NEXT_SCENE_RESULT_FILE=r.file;
+        NEXT_SCENE_RESULT_FILE=r.file; NEXT_SCENE_PENDING_TOKEN=r.pending_token||'';
         const src='/out/'+encodeURIComponent(r.file)+'?t='+Date.now();
         $('next_scene_preview').src=src;$('next_scene_preview_wrap').classList.add('show');
-        const auditLine=r.audit_pass?`✓ audit ${esc(r.audit_score)}/100${Number(r.repairs||0)?` · ${esc(r.repairs)} auto-repair${Number(r.repairs)===1?'':'s'}`:''}`:`⚠ audit ${esc(r.audit_score)}/100 · not auto-applied`;
-        $('next_scene_preview_info').innerHTML=`<b>${esc(r.scene_title||'Next Scene')}</b><br>${esc(Number(r.duration||0).toFixed(2)+'s final')} · ${esc(r.frames+' H3 frames')}<br>${auditLine}<br>${esc(r.director_model)} → ${esc(r.image_model)}${r.used_reference?'<br>✓ previous frame continuity':''}${r.story_advanced?'<br>✓ story memory advanced':''}`;
+        const auditLine=r.audit_pass?`✓ endpoint audit ${esc(r.audit_score)}/100${Number(r.repairs||0)?` · ${esc(r.repairs)} auto-repair${Number(r.repairs)===1?'':'s'}`:''}`:`⚠ endpoint audit ${esc(r.audit_score)}/100 · not auto-applied`;
+        const role=r.mode==='fl2va'?'FL2VA destination frame':'I2VA opening frame';
+        $('next_scene_preview_info').innerHTML=`<b>${esc(r.scene_title||'Next Scene')}</b><br>${esc(Number(r.duration||0).toFixed(2)+'s final')} · ${esc(r.frames+' H3 frames')}<br>${esc(role)}<br>${auditLine}<br>${esc(r.director_model)} → ${esc(r.image_model)}${r.used_reference?'<br>✓ motion-boundary continuity':''}${r.story_pending?'<br>◌ story state pending actual H3 audit':''}`;
         if(r.audit_pass){
           $('prompt').value=r.h3_prompt||'';$('prompt').dispatchEvent(new Event('input',{bubbles:true}));
-          await assignGeneratedSceneToFrame('first');
-          $('next_scene_status').className='apstatus ok';$('next_scene_status').textContent=`✓ ${r.scene_title||'Next scene'} ready · image + ${Number(r.duration||0).toFixed(2)}s MiniMax H3 prompt loaded.`;
-          say('Next scene ready · image + MiniMax prompt loaded');
+          if($('length_mode').value!=='seconds'){$('length_mode').value='seconds';$('length_mode').dispatchEvent(new Event('change',{bubbles:true}))}
+          $('duration').value=Number(r.duration||7).toFixed(2);$('duration').dispatchEvent(new Event('input',{bubbles:true}));$('duration').dispatchEvent(new Event('change',{bubbles:true}));
+          if(r.mode==='fl2va'){
+            if(r.start_frame_file)await assignOutFileToFrame(r.start_frame_file,'first');
+            await assignOutFileToFrame(r.file,'last');
+            if($('continuity_enabled'))$('continuity_enabled').checked=true;
+          }else{
+            await assignOutFileToFrame(r.file,'first');
+            if($('last_frame')){$('last_frame').value='';$('last_frame').dispatchEvent(new Event('change',{bubbles:true}))}
+          }
+          $('next_scene_status').className='apstatus ok';$('next_scene_status').textContent=`✓ ${r.scene_title||'Next scene'} staged · ${Number(r.duration||0).toFixed(2)}s ${r.mode?.toUpperCase()||'H3'} prompt + endpoint loaded. Story becomes canon only after the generated H3 clip passes audit.`;
+          say('Next scene staged · generate H3 to commit story canon');
         }else{
           $('next_scene_status').className='apstatus err';$('next_scene_status').textContent=`Audit remained below production threshold after ${r.repairs||0} repair pass${Number(r.repairs||0)===1?'':'es'}. Preview kept, but story state/prompt inputs were not advanced.`;
           say('Next scene needs review · story state not advanced');
@@ -9951,6 +10075,7 @@ Set pass=true only when the candidate is production-usable and score it at least
       fd.append('motion8_strength',String(motion8Submit));fd.append('lightning_strength',String(lightningSubmit));
       fd.append('lora','none');fd.append('lora_strength','0');fd.append('lora_stack_json',JSON.stringify(activeCreativeLoraStack()));
       fd.append('studio_config_json',JSON.stringify(buildStudioConfig()));
+      if(NEXT_SCENE_PENDING_TOKEN)fd.append('story_director_token',NEXT_SCENE_PENDING_TOKEN);
       fd.append('timeline_action',timelineAction);fd.append('input_mode',mode);fd.append('ref_image_size',$('ref_image_size').value);fd.append('action','0');fd.append('action_strength','0');fd.append('lightning',Math.abs(lightningSubmit)>1e-6?'1':'0');
       if(mode==='ref2va'){
         for(let i=1;i<=9;i++) if($('ref_image_'+i).files[0]) fd.append('ref_image_'+i,$('ref_image_'+i).files[0]);
@@ -9973,6 +10098,7 @@ Set pass=true only when the candidate is production-usable and score it at least
         return;
       }
       if(r.error){fail(r.error);refreshTimeline(true);return}
+      if(NEXT_SCENE_PENDING_TOKEN)NEXT_SCENE_PENDING_TOKEN='';
       job=r.id;poll(job);refreshQueue();
     }
     $('go').onclick=()=>submitGeneration();
@@ -10065,12 +10191,13 @@ Set pass=true only when the candidate is production-usable and score it at least
       if(j.status==='done'){
         job=jid;
         dot('');
-        say(`done in ${j.secs}s · measured ${j.measured_total_sec||j.secs}s · sample ${j.sampling_sec||'?'}s · stitch ${j.stitch_sec||0}s · ${j.residency_mode||''} · ${(j.active_sequence_name||'sequence')} · output ${j.duration}s · ${j.frames} frames`);
+        const directorAudit=j.story_director_canon_committed?` · Story Director canon ✓ ${j.story_director_audit_score||0}/100`:(j.story_director_review_required?` · Story Director review ${j.story_director_audit_score||0}/100 · RETRY LAST uses repaired prompt`:'');
+        say(`done in ${j.secs}s · measured ${j.measured_total_sec||j.secs}s · sample ${j.sampling_sec||'?'}s · stitch ${j.stitch_sec||0}s · ${j.residency_mode||''} · ${(j.active_sequence_name||'sequence')} · output ${j.duration}s · ${j.frames} frames${directorAudit}`);
         $('pb').style.width='100%';
         const previewFile=j.file;
         $('vwrap').innerHTML=`<video controls autoplay src="/out/${previewFile}?t=${Date.now()}"></video>`;
         syncStageClear();
-        $('meta').textContent=j.file+(j.active_sequence_name?` · ${j.active_sequence_name}`:'')+(j.note?` · ${j.note}`:'');
+        $('meta').textContent=j.file+(j.active_sequence_name?` · ${j.active_sequence_name}`:'')+(j.note?` · ${j.note}`:'')+(j.story_director_canon_committed?` · canon committed ${j.story_director_audit_score||0}/100`:(j.story_director_review_required?` · director retry recommended ${j.story_director_audit_score||0}/100`:''));
         await refreshTimeline(true);
         await refreshHistory();
         await refreshQueue();
