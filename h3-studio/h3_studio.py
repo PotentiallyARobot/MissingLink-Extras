@@ -12,9 +12,10 @@
 #
 # Colab Secrets / optional integrations:
 #   MISSING_LINK_TOKEN - required; validated against MissingLink before the UI can start
-#   HF_TOKEN           - optional; used for private/gated Hugging Face downloads where applicable
-#   CIVITAI_API_KEY    - optional; NEVER required for startup. Public CivitAI installs are attempted anonymously.
-#   OPENAI_API_KEY     - optional; used only when the user explicitly invokes Auto Prompt or GPT-Image 2.5 Next Scene.
+#   HF_TOKEN           - optional; adds private/gated Hugging Face downloads. Public HF works without it.
+#   CIVITAI_API_KEY    - optional; adds authenticated/gated CivitAI downloads. Public CivitAI works anonymously.
+#   OPENAI_API_KEY     - optional; enables Auto Prompt plus GPT-powered Story Director / Next Scene features.
+# Only MISSING_LINK_TOKEN is required to launch the Studio.
 # SageAttention is never built from source in this UI cell; Blackwell requires the MissingLink wheel.
 #
 # It auto-detects the GPU. Blackwell keeps the existing CU130/Sage resident path;
@@ -185,14 +186,11 @@ import os as _os, sys as _sys, subprocess as _sp, pathlib as _pl, shutil as _shu
 FAST_STARTUP = _os.environ.get("H3_FAST_STARTUP", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 # ======================================================================
-# OUTPUT STORAGE CHOICE · ASK BEFORE EXPENSIVE STARTUP
+# OUTPUT STORAGE BOOTSTRAP · UI CHOOSES PERSISTENCE
 # ======================================================================
-# Colab's /content filesystem is ephemeral. Ask once, in the notebook parent
-# process, whether completed videos/timelines should live in Google Drive.
-# The decision is exported through the environment so the isolated Blackwell
-# child and the direct A100/T4 path use the exact same output directory.
-#
-# Automation / non-interactive overrides:
+# The Studio no longer blocks notebook startup with an input() prompt. In Colab it
+# starts on fast temporary /content storage, and the browser UI exposes the actual
+# Local ↔ Google Drive choice. Automation can still force a mode with:
 #   H3_OUTPUT_STORAGE=drive|local
 #   H3_OUTPUT_DIR=/custom/path          (takes precedence over the default path)
 # ======================================================================
@@ -200,8 +198,6 @@ def _configure_output_storage_parent():
     if _os.environ.get("H3_CU130_CHILD") == "1":
         return
 
-    # An explicit custom output directory is authoritative. This is useful on
-    # non-Colab clouds with their own persistent volume mounted somewhere else.
     explicit_dir = (_os.environ.get("H3_OUTPUT_DIR") or "").strip()
     explicit_mode = (_os.environ.get("H3_OUTPUT_STORAGE") or "").strip().lower()
     if explicit_dir:
@@ -214,8 +210,6 @@ def _configure_output_storage_parent():
         print(f"✓ H3 output directory override -> {target}", flush=True)
         return
 
-    # Outside Colab there is no Google Drive mount flow. Keep the historical
-    # local directory unless the host supplied H3_OUTPUT_DIR above.
     try:
         import google.colab  # noqa: F401
         in_colab = True
@@ -229,23 +223,9 @@ def _configure_output_storage_parent():
         _os.environ["H3_OUTPUT_LABEL"] = "local runtime · /content/h3_out"
         return
 
-    choice = explicit_mode
-    if choice not in {"drive", "local"}:
-        print("\n" + "=" * 78, flush=True)
-        print(" H3 OUTPUT STORAGE", flush=True)
-        print("=" * 78, flush=True)
-        print("Generated videos, timeline projects and history are currently stored under /content.", flush=True)
-        print("Colab can erase /content when the runtime disconnects or resets.", flush=True)
-        print("  [1] Google Drive  · recommended · persists after this Colab runtime is gone", flush=True)
-        print("  [2] Local /content · temporary · fastest local I/O, but files can be wiped", flush=True)
-        try:
-            answer = input("Save H3 outputs to Google Drive? [1/2, default 1]: ").strip().lower()
-        except Exception as exc:
-            print(f"⚠ Could not read storage choice ({type(exc).__name__}: {exc}); using temporary local storage.", flush=True)
-            answer = "2"
-        choice = "local" if answer in {"2", "n", "no", "local", "temporary", "temp"} else "drive"
-
-    if choice == "drive":
+    # Explicit automation may still request Drive before the UI opens. Normal human
+    # launches intentionally stay local until the user chooses storage in the Studio.
+    if explicit_mode == "drive":
         try:
             from google.colab import drive as _gdrive
             _gdrive.mount("/content/drive", force_remount=False)
@@ -262,19 +242,75 @@ def _configure_output_storage_parent():
             _os.environ["H3_OUTPUT_PERSISTENT"] = "1"
             _os.environ["H3_OUTPUT_DIR"] = str(target)
             _os.environ["H3_OUTPUT_LABEL"] = "Google Drive · MyDrive/MissingLink/MiniMax_H3_Studio/outputs"
-            print(f"✓ Persistent H3 outputs enabled -> {target}", flush=True)
+            print(f"✓ Persistent H3 outputs enabled by H3_OUTPUT_STORAGE -> {target}", flush=True)
             return
         except Exception as exc:
-            print(f"⚠ Google Drive output setup failed: {type(exc).__name__}: {exc}", flush=True)
-            print("  Falling back to /content/h3_out. THESE FILES CAN BE LOST WHEN THE RUNTIME ENDS.", flush=True)
+            print(f"⚠ Explicit Google Drive output setup failed: {type(exc).__name__}: {exc}", flush=True)
+            print("  Starting on temporary local storage; choose/fix Drive from the Studio UI.", flush=True)
 
     _os.environ["H3_OUTPUT_STORAGE"] = "local"
     _os.environ["H3_OUTPUT_PERSISTENT"] = "0"
     _os.environ["H3_OUTPUT_DIR"] = "/content/h3_out"
     _os.environ["H3_OUTPUT_LABEL"] = "temporary local runtime · /content/h3_out"
-    print("⚠ H3 outputs are TEMPORARY -> /content/h3_out; download/copy them before the runtime ends.", flush=True)
 
 _configure_output_storage_parent()
+
+# Parent-kernel bridge for UI-triggered Google Drive mounting. Blackwell runs the
+# Flask Studio in an isolated child interpreter, but Drive authorization belongs to
+# the actual Colab kernel. The child drops a tiny request file; this daemon performs
+# the mount in the parent process and returns only success/error metadata.
+H3_DRIVE_BRIDGE_REQUEST = "/content/.h3_drive_mount_request.json"
+H3_DRIVE_BRIDGE_RESPONSE = "/content/.h3_drive_mount_response.json"
+
+def _start_drive_mount_bridge_parent():
+    if _os.environ.get("H3_CU130_CHILD") == "1":
+        return
+    try:
+        import google.colab  # noqa: F401
+    except Exception:
+        return
+    if _os.environ.get("H3_DRIVE_BRIDGE_PARENT_PID") == str(_os.getpid()):
+        return
+    _os.environ["H3_DRIVE_BRIDGE_PARENT_PID"] = str(_os.getpid())
+
+    def _bridge_loop():
+        import json as _bridge_json, time as _bridge_time
+        req = _pl.Path(H3_DRIVE_BRIDGE_REQUEST)
+        resp = _pl.Path(H3_DRIVE_BRIDGE_RESPONSE)
+        while True:
+            if not req.exists():
+                _bridge_time.sleep(0.35)
+                continue
+            payload = {}
+            try:
+                payload = _bridge_json.loads(req.read_text())
+            except Exception:
+                payload = {}
+            try:
+                req.unlink(missing_ok=True)
+            except Exception:
+                pass
+            rid = str(payload.get("id") or "")
+            result = {"id": rid, "ok": False, "error": ""}
+            try:
+                from google.colab import drive as _gdrive
+                _gdrive.mount("/content/drive", force_remount=False)
+                roots = [x for x in ("/content/drive/MyDrive", "/content/drive/My Drive") if _pl.Path(x).is_dir()]
+                if not roots:
+                    raise RuntimeError("Google Drive mounted, but MyDrive could not be located")
+                result["ok"] = True
+            except Exception as exc:
+                result["error"] = f"{type(exc).__name__}: {exc}"
+            try:
+                tmp = _pl.Path(str(resp) + ".tmp")
+                tmp.write_text(_bridge_json.dumps(result))
+                _os.replace(tmp, resp)
+            except Exception:
+                pass
+
+    _threading.Thread(target=_bridge_loop, daemon=True, name="h3-drive-mount-bridge").start()
+
+_start_drive_mount_bridge_parent()
 
 # ======================================================================
 # MISSINGLINK ACCESS GATE · fail closed
@@ -1113,9 +1149,9 @@ if not _CU130_CHILD:
         pass
 
     if _env.get("OPENAI_API_KEY"):
-        print("✓ OPENAI_API_KEY found in Colab userdata and forwarded to the isolated UI process.", flush=True)
+        print("✓ Optional OPENAI_API_KEY available · Auto Prompt / Story Director features enabled.", flush=True)
     else:
-        print("⚠ OPENAI_API_KEY is not available in the parent Colab process.", flush=True)
+        print("ℹ Optional OPENAI_API_KEY not set · core H3 generation is unaffected; OpenAI add-on features stay disabled.", flush=True)
 
     def _try_reuse(_rr, _cc, _xx):
         if not _rr.exists():
@@ -4064,6 +4100,192 @@ if _CU130_CHILD:
 
     TIMELINE_STATE = _blank_timeline_state()
 
+    # ── Runtime output storage switcher ─────────────────────────────────────────
+    # Storage is a user-facing Studio preference, not a notebook-console question.
+    # The browser can switch between temporary /content and persistent Google Drive.
+    OUTPUT_STORAGE_LOCK = threading.Lock()
+
+    def _existing_drive_root():
+        for root in ("/content/drive/MyDrive", "/content/drive/My Drive"):
+            if os.path.isdir(root):
+                return root
+        return None
+
+    def _ensure_drive_root_from_ui():
+        root = _existing_drive_root()
+        if root:
+            return root
+
+        # Blackwell UI runs in a child interpreter. Ask the parent Colab kernel to
+        # perform Drive authorization so the choice genuinely lives in the web UI.
+        if os.environ.get("H3_CU130_CHILD") == "1":
+            rid = uuid.uuid4().hex
+            req_path = H3_DRIVE_BRIDGE_REQUEST
+            resp_path = H3_DRIVE_BRIDGE_RESPONSE
+            try:
+                try:
+                    os.remove(resp_path)
+                except FileNotFoundError:
+                    pass
+                tmp = req_path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump({"id": rid, "ts": time.time()}, fh)
+                os.replace(tmp, req_path)
+                deadline = time.time() + 240.0
+                while time.time() < deadline:
+                    if os.path.exists(resp_path):
+                        try:
+                            data = json.load(open(resp_path, "r", encoding="utf-8"))
+                        except Exception:
+                            data = {}
+                        if str(data.get("id") or "") == rid:
+                            try:
+                                os.remove(resp_path)
+                            except Exception:
+                                pass
+                            if not data.get("ok"):
+                                raise RuntimeError(data.get("error") or "Google Drive authorization failed in the Colab parent kernel.")
+                            root = _existing_drive_root()
+                            if root:
+                                return root
+                            raise RuntimeError("Drive authorization succeeded, but MyDrive is not visible to the Studio process.")
+                    time.sleep(0.35)
+                raise RuntimeError("Timed out waiting for Google Drive authorization in the Colab notebook.")
+            except Exception as exc:
+                raise RuntimeError(
+                    "Google Drive could not be enabled from the Studio UI. "
+                    "Complete any Colab Drive authorization prompt and try again. "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+
+        # A100/T4 execute the Studio in the notebook process itself, so mount directly.
+        try:
+            from google.colab import drive as _gdrive
+            _gdrive.mount("/content/drive", force_remount=False)
+        except Exception as exc:
+            raise RuntimeError(
+                "Google Drive could not be mounted from the Studio UI. "
+                "Allow the Colab Drive authorization prompt and try again. "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        root = _existing_drive_root()
+        if not root:
+            raise RuntimeError("Google Drive mount completed, but MyDrive could not be located.")
+        return root
+
+    def _copy_output_tree(src, dst):
+        src = os.path.abspath(src); dst = os.path.abspath(dst)
+        if src == dst or not os.path.isdir(src):
+            return 0, 0
+        copied_files = 0; copied_bytes = 0
+        for base, dirs, files in os.walk(src):
+            rel = os.path.relpath(base, src)
+            target_base = dst if rel == "." else os.path.join(dst, rel)
+            os.makedirs(target_base, exist_ok=True)
+            for name in files:
+                sp = os.path.join(base, name); dp = os.path.join(target_base, name)
+                try:
+                    size = os.path.getsize(sp)
+                    if os.path.exists(dp) and os.path.getsize(dp) == size:
+                        continue
+                    shutil.copy2(sp, dp)
+                    copied_files += 1; copied_bytes += size
+                except Exception as exc:
+                    raise RuntimeError(f"Could not migrate output file {name}: {exc}") from exc
+        return copied_files, copied_bytes
+
+    def _remap_output_path(value, old_root, new_root):
+        if not value or not isinstance(value, str):
+            return value
+        try:
+            av = os.path.abspath(value); old = os.path.abspath(old_root)
+            if av == old or av.startswith(old + os.sep):
+                return os.path.join(new_root, os.path.relpath(av, old))
+        except Exception:
+            pass
+        return value
+
+    def _remap_live_output_state(old_root, new_root):
+        with STAGE_LOCK:
+            for k in ("first_frame_path", "last_frame_path"):
+                STAGE_STATE[k] = _remap_output_path(STAGE_STATE.get(k), old_root, new_root)
+        with TIMELINE_LOCK:
+            for seq in (TIMELINE_STATE.get("sequences") or []):
+                for seg in (seq.get("segments") or []):
+                    for k in ("first_frame_path", "last_frame_path"):
+                        seg[k] = _remap_output_path(seg.get(k), old_root, new_root)
+                pending = seq.get("director_pending") or {}
+                for k in ("start_frame_path", "target_frame_path"):
+                    if k in pending:
+                        pending[k] = _remap_output_path(pending.get(k), old_root, new_root)
+        with HISTORY_LOCK:
+            for row in HISTORY_STATE:
+                for k in ("first_frame_path", "last_frame_path"):
+                    if k in row:
+                        row[k] = _remap_output_path(row.get(k), old_root, new_root)
+
+    def _output_storage_state():
+        return {
+            "output_storage": OUTPUT_STORAGE,
+            "output_persistent": bool(OUTPUT_PERSISTENT),
+            "output_label": OUTPUT_LABEL,
+            "drive_mounted": bool(_existing_drive_root()),
+            "output_dir_name": ("Google Drive" if OUTPUT_PERSISTENT else "/content/h3_out"),
+        }
+
+    def _switch_output_storage(mode, migrate=True):
+        global OUT, OUTPUT_STORAGE, OUTPUT_PERSISTENT, OUTPUT_LABEL, PROJECTS_DIR, HISTORY_FILE
+        mode = str(mode or "").strip().lower()
+        if mode not in {"local", "drive"}:
+            raise ValueError("Output storage must be 'local' or 'drive'.")
+
+        busy = any((j or {}).get("status") in {"queued", "running"} for j in JOBS.values())
+        if busy:
+            raise RuntimeError("Wait for the generation queue to finish before changing output storage.")
+
+        if mode == "drive":
+            drive_root = _ensure_drive_root_from_ui()
+            target = os.path.join(drive_root, "MissingLink", "MiniMax_H3_Studio", "outputs")
+            label = "Google Drive · MyDrive/MissingLink/MiniMax_H3_Studio/outputs"
+            persistent = True
+        else:
+            target = "/content/h3_out"
+            label = "temporary local runtime · /content/h3_out"
+            persistent = False
+
+        target = os.path.abspath(os.path.expanduser(target))
+        os.makedirs(target, exist_ok=True)
+        old = OUT
+        copied_files = copied_bytes = 0
+        if migrate and os.path.abspath(old) != target:
+            copied_files, copied_bytes = _copy_output_tree(old, target)
+
+        with OUTPUT_STORAGE_LOCK:
+            OUT = target
+            OUTPUT_STORAGE = mode
+            OUTPUT_PERSISTENT = persistent
+            OUTPUT_LABEL = label
+            PROJECTS_DIR = os.path.join(OUT, "timeline_projects")
+            HISTORY_FILE = os.path.join(OUT, "generation_history.json")
+            os.makedirs(PROJECTS_DIR, exist_ok=True)
+            os.environ["H3_OUTPUT_STORAGE"] = mode
+            os.environ["H3_OUTPUT_PERSISTENT"] = "1" if persistent else "0"
+            os.environ["H3_OUTPUT_DIR"] = OUT
+            os.environ["H3_OUTPUT_LABEL"] = OUTPUT_LABEL
+            if os.path.abspath(old) != OUT:
+                _remap_live_output_state(old, OUT)
+                with HISTORY_LOCK:
+                    _save_history_unlocked()
+                with TIMELINE_LOCK:
+                    try:
+                        _autosave_timeline_unlocked("storage_switch")
+                    except Exception:
+                        pass
+
+        log(f"  ✓ output storage switched -> {OUTPUT_LABEL}")
+        return {**_output_storage_state(), "migrated_files": copied_files, "migrated_bytes": copied_bytes}
+
+
     def _sequence_duration(seq):
         return round(sum(float(s.get("duration") or 0) for s in (seq.get("segments") or [])), 3)
 
@@ -5217,6 +5439,22 @@ if _CU130_CHILD:
     app.config["SESSION_COOKIE_HTTPONLY"] = True
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
+    @app.get("/api/storage")
+    def api_storage_get():
+        return jsonify(ok=True, **_output_storage_state())
+
+    @app.post("/api/storage")
+    def api_storage_set():
+        body = request.get_json(silent=True) or request.form or {}
+        try:
+            state = _switch_output_storage(
+                body.get("mode"),
+                migrate=str(body.get("migrate", "1")).lower() not in {"0", "false", "no", "off"},
+            )
+            return jsonify(ok=True, **state)
+        except Exception as exc:
+            return jsonify(error=str(exc)), 400
+
     # Content-neutral local generation path. The studio performs technical/file
     # validation only; it does not classify or block prompts, checkpoints, or LoRAs.
     def _adult_access_ok():
@@ -5812,6 +6050,12 @@ if _CU130_CHILD:
             ref2va_unet=REF2VA_DIT_FILE, stock_ref2va_unet=REF2VA_DIT_FILE,
             base_fl2va_unet=(T4_DIT_FILE if LOWVRAM_T4_PROFILE else FALLBACK_DIT_FILE),
             output_storage=OUTPUT_STORAGE, output_persistent=bool(OUTPUT_PERSISTENT), output_label=OUTPUT_LABEL,
+            integration_keys=dict(
+                missinglink=bool(ML_OK),
+                openai=bool(_openai_api_key()),
+                huggingface=bool(_hf_token()),
+                civitai=bool(_civitai_token()),
+            ),
             eros_max_unet="", redmix_unet="", eros_max_sha256="", eros_integrated_turbo=False,
             motion8_file=MOTION8_FILE, motion8_available=bool(not LOWVRAM_T4_PROFILE), model_profiles=profile_state,
             naughty_file="", naughty_strength=0.0,
@@ -6538,7 +6782,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     def api_next_scene():
         key = _openai_api_key()
         if not key:
-            return jsonify(error="OPENAI_API_KEY is not available to the UI process. Add it in Colab Secrets, then rerun the studio."), 400
+            return jsonify(error="Optional OPENAI_API_KEY is not set. Add it in Colab Secrets and rerun the Studio to enable Story Director / Next Scene."), 400
         director_model=str(request.form.get("director_model") or NEXT_SCENE_DEFAULT_DIRECTOR_MODEL).strip()
         if director_model not in {x["id"] for x in NEXT_SCENE_DIRECTOR_MODELS}: return jsonify(error="Choose GPT-5.6 Sol or Terra as the Story Director."),400
         image_model=str(request.form.get("image_model") or NEXT_SCENE_DEFAULT_IMAGE_MODEL).strip()
@@ -8009,6 +8253,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     *{scrollbar-width:none}*::-webkit-scrollbar{display:none;width:0;height:0}
     .consolebox{display:none;position:fixed;right:16px;top:72px;z-index:1220;width:min(720px,calc(100vw - 32px));border:1px solid #303139;border-radius:9px;background:#060607;overflow:hidden;box-shadow:0 18px 60px #000c}.consolehead{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 9px;border-bottom:1px solid var(--line);color:#81838c;font-size:9.5px}.consoleactions{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}.consolehead button{width:auto;margin:0;background:#29292f;color:#bbb;padding:5px 9px;font-size:9px;border-radius:5px}.consolebox pre{margin:0;padding:8px 9px;height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word;color:#c8c9ce;font:9.5px/1.4 ui-monospace,Menlo,monospace}.consolebox.collapsed pre{display:none}.consolebox.collapsed .consolehead{border-bottom:0}
     #err{display:none;white-space:pre-wrap;color:#ff8a8a;font-size:10px;max-height:180px;overflow:auto;border:1px solid #3a2020;background:#160e0e;padding:10px;border-radius:8px}
+    .storagegrid{display:grid;grid-template-columns:1fr 1fr;gap:6px}.storagebtn{margin:0!important;background:#191a1f!important;color:#aeb0b8!important;border:1px solid #303139!important}.storagebtn.active{background:#24200f!important;color:#f1d56d!important;border-color:#7b6721!important}.storagebtn.working{opacity:.55;pointer-events:none}.integrationlist{margin-top:9px;border:1px solid #292a30;border-radius:8px;overflow:hidden}.integrationrow{display:grid;grid-template-columns:minmax(110px,.75fr) minmax(0,1.65fr) auto;gap:8px;align-items:center;padding:8px 9px;border-top:1px solid #24252a;background:#121216}.integrationrow:first-child{border-top:0}.integrationname{font-size:8.5px;font-weight:800;color:#d0d1d6}.integrationfeature{font-size:7.5px;color:#777a84;line-height:1.35}.integrationstate{font-size:7px;font-weight:800;white-space:nowrap;border:1px solid #373941;border-radius:999px;padding:3px 6px;color:#9a9da7}.integrationstate.ok{color:#79d394;border-color:#315b3d;background:#102017}.integrationstate.required{color:#f1d56d;border-color:#6b5a20;background:#211d0d}.integrationstate.optional{color:#8fa8d9;border-color:#344768;background:#111927}.integrationnote{margin-top:7px;font-size:8px;color:#858892;line-height:1.5}.integrationnote b{color:#d8d9dd}
     .footerlink{display:block;text-align:center;color:#62646d;text-decoration:none;font-size:9px;margin:6px 0 2px}.footerlink:hover{color:var(--accent)}
     @media(max-width:1100px){.topdock{grid-template-columns:minmax(160px,1fr) auto}.main{grid-template-rows:36px minmax(0,1fr) 138px}.gpuoverlay{right:7px;top:7px}}
     @media(max-width:850px){body{overflow:auto}.wrap{height:auto;grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid var(--line);max-height:none}.main{height:auto;overflow:visible;grid-template-rows:auto 420px 152px;min-height:0}.topdock{grid-template-columns:1fr}.floatpanel.history{left:8px;top:48px}.floatpanel.queue{right:8px;bottom:8px}.timelinehead{align-items:flex-start}.timelineactions{justify-content:flex-start}.projectpopover{left:8px;right:8px;width:auto}.projectline{grid-template-columns:1fr auto}.imageslot{height:126px}.refimageslots{grid-template-columns:1fr 1fr}.consolebox{left:8px;right:8px;top:56px;width:auto}}
@@ -8105,6 +8350,19 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       <div class=hint id=continuity_hint><b>OFF:</b> GENERATE makes a fully independent clip. When enabled, the next GENERATE uses the previous timeline clip's lossless final frame as its first-frame anchor. No latent data is carried between clips.</div>
     </div>
     </div></div>
+
+    <details open><summary>Storage + Integrations</summary><div>
+      <label>Output storage</label>
+      <div class=storagegrid><button id=storage_local class=storagebtn type=button>LOCAL · TEMPORARY</button><button id=storage_drive class=storagebtn type=button>GOOGLE DRIVE · PERSISTENT</button></div>
+      <div id=storage_status class=hint style="margin-top:7px">Checking output storage…</div>
+      <div class=integrationlist>
+        <div class=integrationrow><div class=integrationname>MISSING_LINK_TOKEN</div><div class=integrationfeature>Studio access + MissingLink runtime components</div><div id=key_missinglink class="integrationstate required">REQUIRED</div></div>
+        <div class=integrationrow><div class=integrationname>OPENAI_API_KEY</div><div class=integrationfeature>Auto Prompt + Story Director / Next Scene image features</div><div id=key_openai class="integrationstate optional">OPTIONAL</div></div>
+        <div class=integrationrow><div class=integrationname>HF_TOKEN</div><div class=integrationfeature>Private / gated Hugging Face models and LoRAs; public HF works without it</div><div id=key_hf class="integrationstate optional">OPTIONAL</div></div>
+        <div class=integrationrow><div class=integrationname>CIVITAI_API_KEY</div><div class=integrationfeature>Authenticated / gated CivitAI downloads; public CivitAI works without it</div><div id=key_civitai class="integrationstate optional">OPTIONAL</div></div>
+      </div>
+      <div class=integrationnote><b>Only MISSING_LINK_TOKEN is required.</b> The other Colab Secrets simply unlock extra integrations. Secret values stay server-side and are never displayed in the browser.</div>
+    </div></details>
 
     <div class=card><div class=cardtitle>Generation Presets</div><div class=cardbody>
     <div class=preset3><button id=fastpreset class="inlinebtn active">FAST</button><button id=taomatepreset class=inlinebtn>TAOMATE · 3</button><button id=ultrafastpreset class=inlinebtn>ULTRA FAST</button><button id=qualitypreset class=inlinebtn>QUALITY</button></div>
@@ -8298,8 +8556,50 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     const say=t=>$('stxt').textContent=t;
 
     const MODEL_MODE_STORE_KEY='h3_model_mode_v86';
+    const OUTPUT_STORAGE_STORE_KEY='h3_output_storage_v1';
     const STUDIO_CONFIG_SCHEMA=1;
     let DRIVE_CONFIG_STATUS={drive_connected:false,exists:false,config:null,error:''};
+
+    function renderIntegrationKeys(m=window.H3META||{}){
+      const k=m.integration_keys||{};
+      const rows=[
+        ['key_missinglink',!!k.missinglink,true],
+        ['key_openai',!!k.openai,false],
+        ['key_hf',!!k.huggingface,false],
+        ['key_civitai',!!k.civitai,false],
+      ];
+      for(const [id,on,required] of rows){
+        const el=$(id);if(!el)continue;
+        el.className='integrationstate '+(on?'ok':(required?'required':'optional'));
+        el.textContent=on?(required?'✓ REQUIRED · READY':'✓ OPTIONAL · ENABLED'):(required?'REQUIRED · MISSING':'OPTIONAL · NOT SET');
+      }
+    }
+    function renderStorageState(state=window.H3META||{}){
+      const mode=state.output_storage||'local',persistent=!!state.output_persistent;
+      const a=$('storage_local'),b=$('storage_drive'),st=$('storage_status');
+      if(a)a.classList.toggle('active',mode==='local'&&!persistent);
+      if(b)b.classList.toggle('active',mode==='drive'||persistent);
+      if(st){
+        st.innerHTML=persistent
+          ? `<b style="color:#79d394">Persistent:</b> ${esc(state.output_label||'Google Drive')} · generated videos, timelines and history survive runtime resets.`
+          : `<b style="color:#e0a36d">Temporary:</b> ${esc(state.output_label||'/content/h3_out')} · fastest local I/O, but Colab can erase it when the runtime resets.`;
+      }
+    }
+    async function setOutputStorage(mode,{quiet=false,remember=true}={}){
+      const a=$('storage_local'),b=$('storage_drive'),target=mode==='drive'?b:a;
+      if(target)target.classList.add('working');
+      try{
+        const resp=await fetch('/api/storage',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,migrate:true})});
+        const data=await _readJsonResponse(resp,'Output storage');
+        if(!resp.ok||data.error)throw new Error(data.error||`Storage switch failed (HTTP ${resp.status}).`);
+        if(remember)localStorage.setItem(OUTPUT_STORAGE_STORE_KEY,mode);
+        window.H3META={...(window.H3META||{}),...data};
+        renderStorageState(data);
+        const moved=Number(data.migrated_files||0);
+        if(!quiet)say(`${mode==='drive'?'Google Drive':'local'} output storage active${moved?` · migrated ${moved} file(s)`:''}`);
+        return data;
+      }finally{if(target)target.classList.remove('working')}
+    }
 
     function currentModelMode(){return $('input_mode').value||localStorage.getItem(MODEL_MODE_STORE_KEY)||'fl2va'}
 
@@ -9337,7 +9637,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       say('Auto Prompt profile selected · '+p.name);
     }
 
-    async function checkAPKey(){const el=$('ap_key_status');el.className='apstatus';el.textContent='Checking OPENAI_API_KEY…';try{const d=await(await fetch('/api/auto_prompt/meta',{cache:'no-store'})).json();if(d.key_available){el.className='apstatus ok';el.textContent='✓ OPENAI_API_KEY available to Auto Prompt.'}else{el.className='apstatus err';el.textContent='OPENAI_API_KEY is not available to this UI process. Add it in Colab Secrets, then rerun V86.'}}catch(e){el.className='apstatus err';el.textContent='Could not check OPENAI_API_KEY.'}}
+    async function checkAPKey(){const el=$('ap_key_status');el.className='apstatus';el.textContent='Checking OPENAI_API_KEY…';try{const d=await(await fetch('/api/auto_prompt/meta',{cache:'no-store'})).json();if(d.key_available){el.className='apstatus ok';el.textContent='✓ OPENAI_API_KEY available to Auto Prompt.'}else{el.className='apstatus err';el.textContent='Optional OPENAI_API_KEY is not set. Core H3 generation still works; add the key in Colab Secrets and rerun to enable Auto Prompt.'}}catch(e){el.className='apstatus err';el.textContent='Could not check OPENAI_API_KEY.'}}
     function openAPModal(){syncAPModal();$('auto_prompt_modal').classList.add('show');checkAPKey();$('ap_profile_select').focus()}
     function closeAPModal(){$('auto_prompt_modal').classList.remove('show')}
     $('auto_prompt_settings').onclick=openAPModal;$('ap_close').onclick=closeAPModal;$('ap_cancel').onclick=closeAPModal;
@@ -9694,6 +9994,8 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       return fetch('/api/meta',{cache:'no-store'}).then(async r=>{const m=await _readJsonResponse(r,'Studio metadata');if(!r.ok||m.error)throw new Error(m.error||`Studio metadata failed (HTTP ${r.status}).`);return m}).then(m=>{
         window.H3META=m;
         window.ADULT_ENABLED=!!m.adult_enabled;
+        renderStorageState(m);
+        renderIntegrationKeys(m);
         syncAdultModeButton(m);
         if(firstMeta)ACTIVE_MODEL_PROFILE='stock_quality';
 
@@ -9785,10 +10087,16 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       });
     }
     async function initializeStudio(){
+      // Respect the user's prior UI storage choice. Drive mounting is now initiated
+      // from the Studio itself, never from a blocking notebook input() prompt.
+      const wantedStorage=localStorage.getItem(OUTPUT_STORAGE_STORE_KEY);
+      if(wantedStorage==='drive'){
+        try{await setOutputStorage('drive',{quiet:true,remember:false})}
+        catch(e){console.warn('Saved Google Drive output preference could not be restored:',e);localStorage.setItem(OUTPUT_STORAGE_STORE_KEY,'local')}
+      }
+
       try{
         const persisted=await loadDriveStudioConfig();
-        // Set the saved mode before the first metadata pass so mode-dependent LoRA
-        // cards and stock transformer defaults are built for the right workflow.
         if(persisted.exists&&persisted.config){
           const savedMode=persisted.config.input_mode==='ref2va'?'ref2va':'fl2va';
           $('input_mode').value=savedMode;
@@ -9804,15 +10112,14 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       if(DRIVE_CONFIG_STATUS.exists&&DRIVE_CONFIG_STATUS.config){
         await restoreStudioConfig(DRIVE_CONFIG_STATUS.config,m);
       }else if(DRIVE_CONFIG_STATUS.drive_connected){
-        // Per design, absence of the Drive file keeps the normal built-in defaults.
-        // The first generation submission will create it with the current choices.
         say('ready · Drive connected · default config · first generation will save preferences');
       }
-      if(!m.output_persistent){
-        await uiAlert('Generated videos, timeline projects, and history are being saved to temporary /content storage. Colab can erase these files when the runtime disconnects or resets. Rerun the studio and choose Google Drive at the startup prompt if you want automatic persistence.','Temporary output storage');
-      }
+      renderStorageState(window.H3META||m);
+      renderIntegrationKeys(window.H3META||m);
     }
     initializeStudio().catch(e=>{console.error(e);fail(String(e&&e.message?e.message:e))});
+    $('storage_local').onclick=async()=>{try{await setOutputStorage('local')}catch(e){await uiAlert(String(e&&e.message?e.message:e),'Output storage')}};
+    $('storage_drive').onclick=async()=>{try{await setOutputStorage('drive')}catch(e){await uiAlert(String(e&&e.message?e.message:e),'Google Drive storage')}};
     refreshStageState(true);
     refreshTimeline(true);
     $('project_menu_btn').onclick=()=>{$('project_popover').classList.toggle('show')};
