@@ -185,6 +185,98 @@ import os as _os, sys as _sys, subprocess as _sp, pathlib as _pl, shutil as _shu
 FAST_STARTUP = _os.environ.get("H3_FAST_STARTUP", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 # ======================================================================
+# OUTPUT STORAGE CHOICE · ASK BEFORE EXPENSIVE STARTUP
+# ======================================================================
+# Colab's /content filesystem is ephemeral. Ask once, in the notebook parent
+# process, whether completed videos/timelines should live in Google Drive.
+# The decision is exported through the environment so the isolated Blackwell
+# child and the direct A100/T4 path use the exact same output directory.
+#
+# Automation / non-interactive overrides:
+#   H3_OUTPUT_STORAGE=drive|local
+#   H3_OUTPUT_DIR=/custom/path          (takes precedence over the default path)
+# ======================================================================
+def _configure_output_storage_parent():
+    if _os.environ.get("H3_CU130_CHILD") == "1":
+        return
+
+    # An explicit custom output directory is authoritative. This is useful on
+    # non-Colab clouds with their own persistent volume mounted somewhere else.
+    explicit_dir = (_os.environ.get("H3_OUTPUT_DIR") or "").strip()
+    explicit_mode = (_os.environ.get("H3_OUTPUT_STORAGE") or "").strip().lower()
+    if explicit_dir:
+        target = _pl.Path(explicit_dir).expanduser()
+        target.mkdir(parents=True, exist_ok=True)
+        mode = explicit_mode if explicit_mode in {"drive", "local", "persistent"} else "persistent"
+        _os.environ["H3_OUTPUT_STORAGE"] = mode
+        _os.environ["H3_OUTPUT_PERSISTENT"] = "1" if mode in {"drive", "persistent"} else "0"
+        _os.environ.setdefault("H3_OUTPUT_LABEL", str(target))
+        print(f"✓ H3 output directory override -> {target}", flush=True)
+        return
+
+    # Outside Colab there is no Google Drive mount flow. Keep the historical
+    # local directory unless the host supplied H3_OUTPUT_DIR above.
+    try:
+        import google.colab  # noqa: F401
+        in_colab = True
+    except Exception:
+        in_colab = False
+
+    if not in_colab:
+        _os.environ["H3_OUTPUT_STORAGE"] = "local"
+        _os.environ["H3_OUTPUT_PERSISTENT"] = "0"
+        _os.environ["H3_OUTPUT_DIR"] = "/content/h3_out"
+        _os.environ["H3_OUTPUT_LABEL"] = "local runtime · /content/h3_out"
+        return
+
+    choice = explicit_mode
+    if choice not in {"drive", "local"}:
+        print("\n" + "=" * 78, flush=True)
+        print(" H3 OUTPUT STORAGE", flush=True)
+        print("=" * 78, flush=True)
+        print("Generated videos, timeline projects and history are currently stored under /content.", flush=True)
+        print("Colab can erase /content when the runtime disconnects or resets.", flush=True)
+        print("  [1] Google Drive  · recommended · persists after this Colab runtime is gone", flush=True)
+        print("  [2] Local /content · temporary · fastest local I/O, but files can be wiped", flush=True)
+        try:
+            answer = input("Save H3 outputs to Google Drive? [1/2, default 1]: ").strip().lower()
+        except Exception as exc:
+            print(f"⚠ Could not read storage choice ({type(exc).__name__}: {exc}); using temporary local storage.", flush=True)
+            answer = "2"
+        choice = "local" if answer in {"2", "n", "no", "local", "temporary", "temp"} else "drive"
+
+    if choice == "drive":
+        try:
+            from google.colab import drive as _gdrive
+            _gdrive.mount("/content/drive", force_remount=False)
+            drive_root = None
+            for cand in (_pl.Path("/content/drive/MyDrive"), _pl.Path("/content/drive/My Drive")):
+                if cand.is_dir():
+                    drive_root = cand
+                    break
+            if drive_root is None:
+                raise RuntimeError("Google Drive mounted, but MyDrive could not be located")
+            target = drive_root / "MissingLink" / "MiniMax_H3_Studio" / "outputs"
+            target.mkdir(parents=True, exist_ok=True)
+            _os.environ["H3_OUTPUT_STORAGE"] = "drive"
+            _os.environ["H3_OUTPUT_PERSISTENT"] = "1"
+            _os.environ["H3_OUTPUT_DIR"] = str(target)
+            _os.environ["H3_OUTPUT_LABEL"] = "Google Drive · MyDrive/MissingLink/MiniMax_H3_Studio/outputs"
+            print(f"✓ Persistent H3 outputs enabled -> {target}", flush=True)
+            return
+        except Exception as exc:
+            print(f"⚠ Google Drive output setup failed: {type(exc).__name__}: {exc}", flush=True)
+            print("  Falling back to /content/h3_out. THESE FILES CAN BE LOST WHEN THE RUNTIME ENDS.", flush=True)
+
+    _os.environ["H3_OUTPUT_STORAGE"] = "local"
+    _os.environ["H3_OUTPUT_PERSISTENT"] = "0"
+    _os.environ["H3_OUTPUT_DIR"] = "/content/h3_out"
+    _os.environ["H3_OUTPUT_LABEL"] = "temporary local runtime · /content/h3_out"
+    print("⚠ H3 outputs are TEMPORARY -> /content/h3_out; download/copy them before the runtime ends.", flush=True)
+
+_configure_output_storage_parent()
+
+# ======================================================================
 # MISSINGLINK ACCESS GATE · fail closed
 # ======================================================================
 # The current public MiniMax H3 notebook instructs users to put their key in the
@@ -3877,7 +3969,15 @@ if _CU130_CHILD:
         return True, ""
 
     # ── 5. Generate ────────────────────────────────────────────────────────────
-    OUT = "/content/h3_out"; os.makedirs(OUT, exist_ok=True)
+    OUT = os.path.abspath(os.path.expanduser(os.environ.get("H3_OUTPUT_DIR") or "/content/h3_out"))
+    os.makedirs(OUT, exist_ok=True)
+    OUTPUT_STORAGE = (os.environ.get("H3_OUTPUT_STORAGE") or "local").strip().lower()
+    OUTPUT_PERSISTENT = (os.environ.get("H3_OUTPUT_PERSISTENT") or "0").strip().lower() in {"1","true","yes","on"}
+    OUTPUT_LABEL = (os.environ.get("H3_OUTPUT_LABEL") or ("persistent storage" if OUTPUT_PERSISTENT else "temporary local runtime")).strip()
+    if OUTPUT_PERSISTENT:
+        log(f"  ✓ output storage -> {OUTPUT_LABEL}")
+    else:
+        log(f"  ⚠ output storage -> {OUTPUT_LABEL} · files can be wiped when this runtime ends")
     JOBS = {}
     STAGE_LOCK = threading.Lock()
     STAGE_STATE = {
@@ -5711,6 +5811,7 @@ if _CU130_CHILD:
             h3opt_commit=_h3opt_commit[:12] if _h3opt_commit else "", ref2va_available=bool(REF2VA_NODE_NAME), ref2va_node=REF2VA_NODE_NAME or "",
             ref2va_unet=REF2VA_DIT_FILE, stock_ref2va_unet=REF2VA_DIT_FILE,
             base_fl2va_unet=(T4_DIT_FILE if LOWVRAM_T4_PROFILE else FALLBACK_DIT_FILE),
+            output_storage=OUTPUT_STORAGE, output_persistent=bool(OUTPUT_PERSISTENT), output_label=OUTPUT_LABEL,
             eros_max_unet="", redmix_unet="", eros_max_sha256="", eros_integrated_turbo=False,
             motion8_file=MOTION8_FILE, motion8_available=bool(not LOWVRAM_T4_PROFILE), model_profiles=profile_state,
             naughty_file="", naughty_strength=0.0,
@@ -9669,9 +9770,13 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
               : (m.a100_40
                 ? '<b>A100 40GB QUALITY STACK</b> · sequential TE→DiT→VAE handoff.'
                 : '<b>BLACKWELL SM120 QUALITY STACK</b> · CUDA13 quality path.'));
+          const storageLine=m.output_persistent
+            ? `<br><span style="color:#7cc38c">Output storage</span> · ${esc(m.output_label||'persistent storage')} · survives runtime reset`
+            : `<br><span style="color:#e0a36d"><b>Output storage</b></span> · ${esc(m.output_label||'/content/h3_out')} · TEMPORARY; runtime reset can erase generated videos`;
           mh.innerHTML=profileBlurb
             + `<br><span style="color:#9aa0aa">Residency</span> · ${m.lowvram_t4?'DYNAMIC VRAM / CPU↔GPU paging':(m.full_stack_residency?'FULL STACK RESIDENT':'PARTITIONED TE↔DiT handoff')} · ${m.physical_vram_gib||'?'} GiB physical`
             + `<br><span style="color:#9aa0aa">Conditioning TE</span> · ${m.quality_text_encoder||'Qwen3-VL-32B'}`
+            + storageLine
             + '<br>' + (m.ref2va_available
               ? `<span style="color:#9aa0aa">Ref2VA available</span> · stock Ref2VA downloads on first use · ${m.ref2va_max_images||9} image / ${m.ref2va_max_videos||3} video / ${m.ref2va_max_audios||3} audio slots.`
               : '<span style="color:#d99191">Ref2VA unavailable</span> · update ComfyUI to expose MiniMaxH3ReferenceToVideo.');
@@ -9702,6 +9807,9 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         // Per design, absence of the Drive file keeps the normal built-in defaults.
         // The first generation submission will create it with the current choices.
         say('ready · Drive connected · default config · first generation will save preferences');
+      }
+      if(!m.output_persistent){
+        await uiAlert('Generated videos, timeline projects, and history are being saved to temporary /content storage. Colab can erase these files when the runtime disconnects or resets. Rerun the studio and choose Google Drive at the startup prompt if you want automatic persistence.','Temporary output storage');
       }
     }
     initializeStudio().catch(e=>{console.error(e);fail(String(e&&e.message?e.message:e))});
