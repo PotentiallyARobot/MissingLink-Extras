@@ -4635,24 +4635,220 @@ if _CU130_CHILD:
         return {**_output_storage_state(), "migrated_files": copied_files, "migrated_bytes": copied_bytes}
 
 
+    def _segment_source_shape(seg):
+        """Return immutable source frame count/duration and normalize non-destructive trim fields."""
+        try:
+            source_frames = int(seg.get("source_frames") or seg.get("frames") or 1)
+        except Exception:
+            source_frames = 1
+        source_frames = max(1, source_frames)
+
+        try:
+            source_duration = float(seg.get("source_duration") or 0.0)
+        except Exception:
+            source_duration = 0.0
+        if source_duration <= 0:
+            src = os.path.join(OUT, str(seg.get("file") or ""))
+            source_duration = float(_probe_media_duration(src) or seg.get("duration") or (source_frames / MODEL_FPS))
+        source_duration = max(0.001, source_duration)
+
+        try:
+            start = int(seg.get("trim_start_frame") if seg.get("trim_start_frame") is not None else 0)
+        except Exception:
+            start = 0
+        try:
+            end = int(seg.get("trim_end_frame") if seg.get("trim_end_frame") is not None else source_frames - 1)
+        except Exception:
+            end = source_frames - 1
+        start = max(0, min(source_frames - 1, start))
+        end = max(start, min(source_frames - 1, end))
+
+        seg["source_frames"] = source_frames
+        seg["source_duration"] = round(source_duration, 6)
+        seg["trim_start_frame"] = start
+        seg["trim_end_frame"] = end
+        seg["frames"] = end - start + 1
+        seg["duration"] = round(source_duration * (seg["frames"] / source_frames), 3)
+        return source_frames, source_duration, start, end
+
+    def _segment_is_trimmed(seg):
+        source_frames, _dur, start, end = _segment_source_shape(seg)
+        return start != 0 or end != source_frames - 1
+
+    def _cleanup_segment_trim_artifacts(segment_id, keep=None):
+        keep_abs = {os.path.abspath(x) for x in (keep or []) if x}
+        prefix = f"timeline_trim_{re.sub(r'[^A-Za-z0-9_-]+', '_', str(segment_id or 'clip'))}_"
+        try:
+            for name in os.listdir(OUT):
+                if not name.startswith(prefix):
+                    continue
+                path = os.path.abspath(os.path.join(OUT, name))
+                if path in keep_abs:
+                    continue
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _extract_timeline_frame(seg, frame_index, role):
+        source_frames, _source_duration, _start, _end = _segment_source_shape(seg)
+        frame_index = max(0, min(source_frames - 1, int(frame_index)))
+        if frame_index == 0 and seg.get("first_frame_path") and os.path.exists(seg.get("first_frame_path")):
+            return seg.get("first_frame_path")
+        if frame_index == source_frames - 1 and seg.get("last_frame_path") and os.path.exists(seg.get("last_frame_path")):
+            return seg.get("last_frame_path")
+
+        ffmpeg = shutil.which("ffmpeg")
+        src = os.path.join(OUT, str(seg.get("file") or ""))
+        if not ffmpeg or not os.path.exists(src):
+            return None
+        sid = re.sub(r"[^A-Za-z0-9_-]+", "_", str(seg.get("segment_id") or seg.get("job") or "clip"))
+        dest = os.path.join(OUT, f"timeline_trim_{sid}_{role}_{frame_index}.png")
+        if os.path.exists(dest) and os.path.getsize(dest) > 128:
+            return dest
+        tmp = dest + ".tmp.png"
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+        vf = f"select=eq(n\\,{frame_index})"
+        cmd = [ffmpeg, "-y", "-i", src, "-vf", vf, "-frames:v", "1", "-vsync", "0", tmp]
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if r.returncode != 0 or not os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            return None
+        os.replace(tmp, dest)
+        return dest
+
+    def _effective_segment_frame_paths(seg):
+        source_frames, _source_duration, start, end = _segment_source_shape(seg)
+        if start == 0:
+            first_path = seg.get("first_frame_path")
+        else:
+            first_path = seg.get("trim_first_frame_path")
+            if not first_path or not os.path.exists(first_path):
+                first_path = _extract_timeline_frame(seg, start, "first")
+                if first_path:
+                    seg["trim_first_frame_path"] = first_path
+                    seg["trim_first_frame_file"] = os.path.basename(first_path)
+        if end == source_frames - 1:
+            last_path = seg.get("last_frame_path")
+        else:
+            last_path = seg.get("trim_last_frame_path")
+            if not last_path or not os.path.exists(last_path):
+                last_path = _extract_timeline_frame(seg, end, "last")
+                if last_path:
+                    seg["trim_last_frame_path"] = last_path
+                    seg["trim_last_frame_file"] = os.path.basename(last_path)
+        return first_path, last_path
+
+    def _media_has_audio(path):
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe or not os.path.exists(path):
+            return True
+        try:
+            r = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=index",
+                 "-of", "csv=p=0", path], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=20,
+            )
+            return r.returncode == 0 and bool((r.stdout or "").strip())
+        except Exception:
+            return True
+
+    def _timeline_segment_media_path(seg):
+        """Materialize a non-destructive in/out-frame trim and return the MP4 used by the timeline."""
+        source_frames, source_duration, start, end = _segment_source_shape(seg)
+        src = os.path.join(OUT, str(seg.get("file") or ""))
+        if not os.path.exists(src):
+            raise RuntimeError(f"Timeline source clip is missing: {seg.get('file') or '(unknown)'}")
+        if start == 0 and end == source_frames - 1:
+            seg.pop("trim_file", None)
+            seg.pop("trim_first_frame_path", None); seg.pop("trim_first_frame_file", None)
+            seg.pop("trim_last_frame_path", None); seg.pop("trim_last_frame_file", None)
+            return src
+
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError("ffmpeg is required to trim timeline clips")
+        sid = re.sub(r"[^A-Za-z0-9_-]+", "_", str(seg.get("segment_id") or seg.get("job") or "clip"))
+        dest = os.path.join(OUT, f"timeline_trim_{sid}_{start}_{end}.mp4")
+        if not (os.path.exists(dest) and os.path.getsize(dest) > 1024):
+            tmp = dest + ".tmp.mp4"
+            for pth in (tmp,):
+                try:
+                    os.remove(pth)
+                except FileNotFoundError:
+                    pass
+            # Frame indexes are exact for video. Audio boundaries use the corresponding
+            # frame timestamps so A/V stays aligned after the cut.
+            sec_per_frame = source_duration / max(1, source_frames)
+            start_sec = start * sec_per_frame
+            end_sec = (end + 1) * sec_per_frame
+            vf = f"[0:v]trim=start_frame={start}:end_frame={end + 1},setpts=PTS-STARTPTS[v]"
+            if _media_has_audio(src):
+                af = f"[0:a]atrim=start={start_sec:.9f}:end={end_sec:.9f},asetpts=PTS-STARTPTS[a]"
+                cmd = [ffmpeg, "-y", "-i", src, "-filter_complex", vf + ";" + af,
+                       "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast",
+                       "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+                       "-movflags", "+faststart", tmp]
+            else:
+                cmd = [ffmpeg, "-y", "-i", src, "-filter_complex", vf,
+                       "-map", "[v]", "-c:v", "libx264", "-preset", "veryfast",
+                       "-crf", "18", "-pix_fmt", "yuv420p", "-an", "-movflags", "+faststart", tmp]
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if r.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) <= 1024:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+                raise RuntimeError("Timeline clip trim failed: " + (r.stderr[-700:] if r.stderr else "ffmpeg failed"))
+            os.replace(tmp, dest)
+        seg["trim_file"] = os.path.basename(dest)
+        actual = _probe_media_duration(dest)
+        if actual and actual > 0:
+            seg["duration"] = round(float(actual), 3)
+        _effective_segment_frame_paths(seg)
+        _cleanup_segment_trim_artifacts(seg.get("segment_id") or seg.get("job"), keep=[dest, seg.get("trim_first_frame_path"), seg.get("trim_last_frame_path")])
+        return dest
+
     def _sequence_duration(seq):
-        return round(sum(float(s.get("duration") or 0) for s in (seq.get("segments") or [])), 3)
+        total = 0.0
+        for seg in (seq.get("segments") or []):
+            _segment_source_shape(seg)
+            total += float(seg.get("duration") or 0)
+        return round(total, 3)
 
     def _public_segment(seg, idx, seq_id=None):
+        source_frames, source_duration, start, end = _segment_source_shape(seg)
+        first_path, last_path = _effective_segment_frame_paths(seg)
+        trimmed = (start != 0 or end != source_frames - 1)
+        timeline_file = seg.get("trim_file") if trimmed and seg.get("trim_file") else seg.get("file")
         return {
             "index": idx,
             "sequence_id": seq_id,
             "segment_id": seg.get("segment_id") or seg.get("job"),
             "job": seg.get("job"),
             "file": seg.get("file"),
+            "timeline_file": timeline_file,
             "duration": seg.get("duration"),
             "frames": seg.get("frames"),
+            "source_duration": source_duration,
+            "source_frames": source_frames,
+            "trim_start_frame": start,
+            "trim_end_frame": end,
+            "trimmed": trimmed,
             "width": seg.get("width"),
             "height": seg.get("height"),
             "seed": seg.get("seed"),
             "prompt": seg.get("prompt", ""),
-            "last_frame_file": seg.get("last_frame_file"),
-            "first_frame_file": seg.get("first_frame_file"),
+            "last_frame_file": (os.path.basename(last_path) if last_path else seg.get("last_frame_file")),
+            "first_frame_file": (os.path.basename(first_path) if first_path else seg.get("first_frame_file")),
             "continued": bool(seg.get("continued")),
             "continued_from_job": seg.get("continued_from_job"),
         }
@@ -4660,11 +4856,14 @@ if _CU130_CHILD:
     def _sync_stage_from_sequence(seq):
         segs = list((seq or {}).get("segments") or [])
         last = segs[-1] if segs else None
+        first_path = last_path = None
+        if last:
+            first_path, last_path = _effective_segment_frame_paths(last)
         with STAGE_LOCK:
-            if last and last.get("last_frame_path") and os.path.exists(last.get("last_frame_path")):
-                STAGE_STATE["first_frame_path"] = last.get("first_frame_path")
-                STAGE_STATE["last_frame_path"] = last.get("last_frame_path")
-                STAGE_STATE["video_file"] = last.get("file")
+            if last and last_path and os.path.exists(last_path):
+                STAGE_STATE["first_frame_path"] = first_path
+                STAGE_STATE["last_frame_path"] = last_path
+                STAGE_STATE["video_file"] = last.get("trim_file") or last.get("file")
                 STAGE_STATE["job"] = last.get("job")
                 STAGE_STATE["updated"] = time.time()
             else:
@@ -4824,6 +5023,7 @@ if _CU130_CHILD:
                     seg["first_frame_path"] = os.path.join(OUT, seg["first_frame_file"])
                 if not seg.get("last_frame_path") and seg.get("last_frame_file"):
                     seg["last_frame_path"] = os.path.join(OUT, seg["last_frame_file"])
+                _segment_source_shape(seg)
                 seq["segments"].append(seg)
             restored["sequences"].append(seq)
         if not restored["sequences"]:
@@ -4936,7 +5136,7 @@ if _CU130_CHILD:
         enc_cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", list_path,
                    "-map", "0:v:0", "-map", "0:a:0",
                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-                   "-pix_fmt", "yuv660p", "-c:a", "aac", "-b:a", "192k",
+                   "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
                    "-fflags", "+genpts", "-movflags", "+faststart", tmp]
         r2 = subprocess.run(enc_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try: os.remove(list_path)
@@ -4952,18 +5152,21 @@ if _CU130_CHILD:
             if not seq:
                 return False, None, "sequence not found"
             segs = list(seq.get("segments") or [])
-            paths = [os.path.join(OUT, s.get("file", "")) for s in segs]
+        try:
+            paths = [_timeline_segment_media_path(seg) for seg in segs]
+        except Exception as exc:
+            return False, None, str(exc)
         if not segs:
             master_file = None
             ok, note = True, "empty sequence"
         elif len(segs) == 1:
-            master_file = segs[0].get("file")
-            ok, note = True, "single-segment sequence"
+            master_file = os.path.basename(paths[0])
+            ok, note = True, ("single trimmed segment" if _segment_is_trimmed(segs[0]) else "single-segment sequence")
         else:
             master_file = f"timeline_{uuid.uuid4().hex[:10]}.mp4"
             ok, note = _concat_mp4_timeline(paths, os.path.join(OUT, master_file))
             if not ok:
-                master_file = segs[-1].get("file")
+                master_file = os.path.basename(paths[-1])
         with TIMELINE_LOCK:
             seq = _find_sequence_unlocked(seq_id)
             if seq:
@@ -5673,6 +5876,10 @@ if _CU130_CHILD:
                 "file": os.path.basename(dest),
                 "duration": round(final_duration, 3),
                 "frames": int(n_frames),
+                "source_duration": round(final_duration, 3),
+                "source_frames": int(n_frames),
+                "trim_start_frame": 0,
+                "trim_end_frame": max(0, int(n_frames) - 1),
                 "width": int(width),
                 "height": int(height),
                 "seed": int(p.get("seed") or 0),
@@ -5697,18 +5904,23 @@ if _CU130_CHILD:
                 seq["segments"] = segs
                 seq["updated"] = time.time()
                 TIMELINE_STATE["updated"] = time.time()
-                segment_paths = [os.path.join(OUT, s["file"]) for s in segs]
+                seq_id_for_stitch = seq.get("id")
 
             stitch0 = time.perf_counter()
-            if len(segment_paths) <= 1:
+            if len(segs) <= 1:
                 master_file = os.path.basename(dest)
                 stitch_ok, stitch_note = True, "single-segment sequence"
             else:
-                master_name = f"timeline_{uuid.uuid4().hex[:10]}.mp4"
-                master_path = os.path.join(OUT, master_name)
                 _set_job_stage(jid, "stitching timeline")
-                stitch_ok, stitch_note = _concat_mp4_timeline(segment_paths, master_path)
-                master_file = master_name if stitch_ok else os.path.basename(dest)
+                try:
+                    segment_paths = [_timeline_segment_media_path(s) for s in segs]
+                    master_name = f"timeline_{uuid.uuid4().hex[:10]}.mp4"
+                    master_path = os.path.join(OUT, master_name)
+                    stitch_ok, stitch_note = _concat_mp4_timeline(segment_paths, master_path)
+                    master_file = master_name if stitch_ok else os.path.basename(dest)
+                except Exception as _stitch_exc:
+                    stitch_ok, stitch_note = False, f"timeline stitch failed: {_stitch_exc}"
+                    master_file = os.path.basename(dest)
             j["stitch_sec"] = round(time.perf_counter() - stitch0, 3)
             j["stitch_note"] = stitch_note
             j["measured_total_sec"] = round(time.perf_counter() - _job_wall0, 3)
@@ -8541,6 +8753,14 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
             src["continued"] = False
             src["continued_from_job"] = None
             src["params"] = dict(src.get("params") or {})
+            src["source_frames"] = int(src.get("source_frames") or src.get("frames") or 1)
+            src["source_duration"] = float(src.get("source_duration") or src.get("duration") or (src["source_frames"] / MODEL_FPS))
+            src["trim_start_frame"] = 0
+            src["trim_end_frame"] = max(0, src["source_frames"] - 1)
+            src.pop("trim_file", None)
+            src.pop("trim_first_frame_path", None); src.pop("trim_first_frame_file", None)
+            src.pop("trim_last_frame_path", None); src.pop("trim_last_frame_file", None)
+            _segment_source_shape(src)
             idx = len(segs) if insert_index is None else max(0, min(len(segs), insert_index))
             segs.insert(idx, src)
             seq["segments"] = segs
@@ -8548,6 +8768,45 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
             seq_id = seq.get("id")
         ok, master, note = _restitch_sequence(seq_id, "history_drop")
         return jsonify(ok=ok, master_file=master, note=note, timeline=_timeline_public_state())
+
+    @app.post("/api/timeline/trim/<segment_id>")
+    def api_timeline_trim_segment(segment_id):
+        body = request.get_json(silent=True) or {}
+        try:
+            start_frame = int(body.get("start_frame"))
+            end_frame = int(body.get("end_frame"))
+        except Exception:
+            return jsonify(error="Start and end frame must be whole numbers."), 400
+
+        with TIMELINE_LOCK:
+            seq = _active_sequence_unlocked(create=True)
+            seg = next((x for x in (seq.get("segments") or [])
+                        if str(x.get("segment_id") or x.get("job")) == str(segment_id)), None)
+            if not seg:
+                return jsonify(error="Timeline clip not found."), 404
+            source_frames, source_duration, _old_start, _old_end = _segment_source_shape(seg)
+            if start_frame < 0 or start_frame >= source_frames:
+                return jsonify(error=f"Start frame must be between 1 and {source_frames}."), 400
+            if end_frame < start_frame or end_frame >= source_frames:
+                return jsonify(error=f"End frame must be between {start_frame + 1} and {source_frames}."), 400
+            seg["trim_start_frame"] = start_frame
+            seg["trim_end_frame"] = end_frame
+            seg["frames"] = end_frame - start_frame + 1
+            seg["duration"] = round(source_duration * (seg["frames"] / source_frames), 3)
+            seg.pop("trim_file", None)
+            seg.pop("trim_first_frame_path", None); seg.pop("trim_first_frame_file", None)
+            seg.pop("trim_last_frame_path", None); seg.pop("trim_last_frame_file", None)
+            seq_id = seq.get("id")
+            seq["updated"] = time.time()
+            TIMELINE_STATE["updated"] = time.time()
+
+        ok, master, note = _restitch_sequence(seq_id, "trim_clip")
+        if not ok:
+            return jsonify(error=note or "Could not trim the timeline clip."), 500
+        state = _timeline_public_state()
+        updated = next((x for x in (state.get("segments") or [])
+                        if str(x.get("segment_id") or x.get("job")) == str(segment_id)), None)
+        return jsonify(ok=True, master_file=master, note=note, segment=updated, timeline=state)
 
     @app.delete("/api/timeline/segment/<segment_id>")
     def api_timeline_delete_segment(segment_id):
@@ -8699,7 +8958,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     .stagearea{position:relative;min-height:0;min-width:0;height:100%;overflow:hidden}.stagearea #vwrap{height:100%;min-height:0}#vwrap{border:1px solid var(--line);border-radius:8px;background:#070708;display:flex;align-items:center;justify-content:center;overflow:hidden}#empty{color:#3a3c43;font-size:8.5px}video{width:100%;height:100%;object-fit:contain;background:#000}.stagecontrols{position:absolute;left:10px;top:10px;z-index:6;display:none;align-items:center;gap:6px}.stageclear,.stagegrab{position:static;width:auto!important;height:27px!important;padding:0 8px!important;background:#111217d9!important;color:#aeb0b8!important;border:1px solid #303139!important;border-radius:6px!important;font-size:7px!important;opacity:.82;backdrop-filter:blur(7px)}.stageclear:hover,.stagegrab:hover{opacity:1;color:#fff!important}.stagegrab{background:#221f11df!important;border-color:#62531f!important;color:#e8d071!important;font-weight:800!important}.stagegrab.working{pointer-events:none;opacity:.55}
     .tclip{position:relative}.tclip.dragging{opacity:.35}.tclip.drop-before{box-shadow:inset 3px 0 0 var(--accent)}.tclip.drop-after{box-shadow:inset -3px 0 0 var(--accent)}.ttools{position:absolute;right:5px;top:5px;display:flex;gap:4px;z-index:3}.ttools button{width:24px;height:24px;padding:0;border-radius:50%;background:#241718;color:#ff6b6b;border:1px solid #6b2c2c;font-size:11px}.dragbadge{position:absolute;left:5px;top:5px;background:#111c;color:#c9c9cf;border:1px solid #363840;border-radius:5px;padding:3px 5px;font-size:7.5px;z-index:3}.timeline.drop-target{outline:1px dashed var(--accent);outline-offset:3px}
     .floatpanel{display:none;position:fixed;z-index:1190;width:min(310px,calc(100vw - 20px));background:#0d0d10;border:1px solid #2a2b31;border-radius:9px;box-shadow:0 14px 40px #000b;overflow:hidden}.floatpanel.history{left:14px;top:70px}.floatpanel.queue{right:14px;bottom:14px;width:min(330px,calc(100vw - 20px))}.floatpanel.minimized .floatbody{display:none}.floathead{display:flex;align-items:center;gap:6px;padding:6px 7px;border-bottom:1px solid #24252b;cursor:move;user-select:none;min-height:31px}.floatpanel.minimized .floathead{border-bottom:0}.floatgrip{color:#80828c;letter-spacing:1px;font-size:8px}.floattitle{font-size:8.5px;color:#989aa4;font-weight:800;letter-spacing:1.3px;text-transform:uppercase;flex:1}.floatcount{color:var(--accent);font-size:8px}.floatactions{display:flex;gap:4px}.floatactions button{width:auto;margin:0;background:#25262c;color:#ddd;padding:4px 6px;font-size:7px}.floatbody{padding:5px;max-height:190px;overflow:auto}.historyitem,.queueitem{display:grid;grid-template-columns:42px minmax(0,1fr) auto;gap:6px;align-items:center;border:1px solid #292a30;border-radius:6px;background:#151518;padding:4px;margin-bottom:4px}.historyitem{cursor:grab}.historyitem:active{cursor:grabbing}.histthumb,.qthumb{width:42px;height:36px;border-radius:4px;background:#090a0c;overflow:hidden}.histthumb img,.qthumb img{width:100%;height:100%;object-fit:cover}.histmain,.qmain{min-width:0}.histstatus,.qstatus{font-size:8.5px;color:#dedfe4;font-weight:800}.histsub,.qsub{font-size:7px;color:#777983;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.historyitem .trash{width:24px;height:24px;border-radius:50%;padding:0;background:#281718;color:#ff6b6b;border:1px solid #782f31;font-size:9px}.historyitem .recallprompt,.tclip .recallprompt{width:auto;height:24px;border-radius:5px;padding:0 7px;background:#24252a;color:#c9cbd2;border:1px solid #363840;font-size:6.5px;font-weight:800;letter-spacing:.4px}.queueitem .cancel{width:auto;height:25px;border-radius:5px;padding:0 8px;background:#281718;color:#ff8585;border:1px solid #782f31;font-size:7px;font-weight:800;letter-spacing:.45px}.queueitem .stoprun{width:auto;height:25px;border-radius:5px;padding:0 8px;background:#3a1818;color:#ff9a9a;border:1px solid #8b3737;font-size:7px;font-weight:800;letter-spacing:.45px}.queuehealth{font-size:6px;color:#8f939d;border:1px solid #30323a;border-radius:4px;padding:2px 4px;margin-left:4px}.queuehealth.busy{color:#f1c34d;border-color:#725b1d}.queuehealth.warn{color:#ff9a9a;border-color:#7d3333;background:#2a1515}.queueprogress{height:3px;border-radius:999px;background:#24252a;margin-top:3px;overflow:hidden}.queueprogress i{display:block;height:100%;background:var(--accent);width:0}.floatempty{padding:15px 8px;text-align:center;color:#5f616a;font-size:8px}.addhist{font-size:6.5px;color:#9a9ca4;margin-top:2px}.queuebadge{color:var(--accent);font-weight:800}
-    .timelinebox{position:relative;border:1px solid var(--line);border-radius:8px;background:#0e0e11;padding:6px 8px;min-width:0;height:138px;display:grid;grid-template-rows:27px minmax(0,1fr);overflow:hidden}.timelinehead{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0;min-height:0}.timelineheading{display:flex;align-items:baseline;gap:8px;min-width:0}.timelinehead .title{font-size:9px;font-weight:800;letter-spacing:1px;color:#a0a1a9;text-transform:uppercase;white-space:nowrap}.timelinecontext{font-size:7.5px;color:#62646d;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.timelineactions{display:flex;align-items:center;gap:4px;flex-wrap:wrap;justify-content:flex-end}.timelineactions button,.timelineactions a{height:24px;width:auto;margin:0;border-radius:6px;background:#18191d;color:#bfc0c6;border:1px solid #2b2c31;padding:0 7px;font-size:7px;line-height:25px;text-decoration:none;font-weight:800;white-space:nowrap}.timelineactions button:hover,.timelineactions a:hover{border-color:#555862;color:#fff}.timelineactions button.primary{background:var(--accent);border-color:var(--accent);color:#111}.timelineactions button.compile{background:#24200f;border-color:#66551d;color:#e8ce6b}.timelineactions button.compile:not(:disabled):hover{border-color:var(--accent);color:var(--accent)}.timelineactions button.danger{background:#211516;border-color:#522b2d;color:#d98989}.timelineactions button.danger:not(:disabled):hover{border-color:#8a3e42;color:#ff9a9f}.timelineactions button:disabled,.timelineactions a.disabled{background:#17181c;color:#555761;border-color:#24252a;pointer-events:none}.sequenceselect{display:none;height:22px;max-width:150px;margin:0;padding:2px 24px 2px 6px;border:1px solid #292a2f;border-radius:5px;background:#141519;color:#bfc0c6;font-size:7.2px;line-height:18px}.sequenceselect.show{display:block}.timeline{--timeline-clip-width:136px;display:flex;align-items:stretch;gap:6px;overflow-x:auto;overflow-y:hidden;min-height:0;height:100%;padding:2px 0 8px;scroll-behavior:smooth;overscroll-behavior-x:contain;scrollbar-width:thin;scrollbar-color:#555862 #17181c;touch-action:pan-x pan-y}.timeline::-webkit-scrollbar{display:block!important;height:8px!important}.timeline::-webkit-scrollbar-track{background:#17181c;border-radius:999px}.timeline::-webkit-scrollbar-thumb{background:#555862;border:2px solid #17181c;border-radius:999px}.timeline::-webkit-scrollbar-thumb:hover{background:#777a84}.tclip{min-width:var(--timeline-clip-width);max-width:var(--timeline-clip-width);border:1px solid #2a2b31;border-radius:7px;background:#0b0b0d;overflow:hidden;cursor:pointer;height:100%;transition:min-width .12s ease,max-width .12s ease}.tclip:hover{border-color:#484a53}.tclip:last-child{border-color:#725d25}.timelinecontrols{display:flex;align-items:center;gap:3px;margin-right:2px}.timelinecontrols button{min-width:24px!important;width:24px!important;padding:0!important;font-size:10px!important}.timelinecontrols .timelinepan{font-size:9px!important}.timelinezoomreadout{min-width:36px;text-align:center;color:#777982;font-size:7px;font-weight:800;font-family:ui-monospace,Menlo,monospace;user-select:none}.tthumb{height:48px;background:#050506;display:flex;align-items:center;justify-content:center}.tthumb img{width:100%;height:100%;object-fit:cover}.tinfo{padding:5px 6px;font-size:7.5px;color:#777982;line-height:1.28}.tinfo b{color:#c7c8cd}.timelineempty{display:flex;align-items:center;justify-content:center;min-width:100%;height:100%;color:#555761;font-size:8.5px}.timelinefoot{display:none}.projectpopover{display:none;position:absolute;right:8px;top:42px;z-index:40;width:min(360px,calc(100% - 16px));padding:9px;background:#0d0d10;border:1px solid #303139;border-radius:8px;box-shadow:0 14px 36px #000c}.projectpopover.show{display:block}.projectpophead{display:flex;align-items:center;justify-content:space-between;margin-bottom:7px;color:#b6b8c0;font-size:9px;letter-spacing:.8px;text-transform:uppercase}.projectpophead button{width:24px;height:24px;padding:0;background:#202126;color:#bbb;border:1px solid #303139}.projectpopover label{font-size:7px;margin:6px 0 3px}.projectline{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:5px;margin-bottom:5px}.projectline input,.projectline select{height:29px;padding:5px 7px;font-size:9px}.projectline button{height:29px;width:auto;padding:0 8px;background:#202126;color:#c7c8cd;border:1px solid #303139;font-size:7.5px}.projectline button:hover{border-color:#555862;color:#fff}.projectline button.disabled{color:#4e5058;border-color:#25262b;pointer-events:none}.projectdanger{width:100%;height:29px;margin-top:4px;background:#1d1516;color:#d98989;border:1px solid #522b2d;font-size:7.5px}.timeline sub{font-size:7px}
+    .timelinebox{position:relative;border:1px solid var(--line);border-radius:8px;background:#0e0e11;padding:6px 8px;min-width:0;height:138px;display:grid;grid-template-rows:27px minmax(0,1fr);overflow:hidden}.timelinehead{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0;min-height:0}.timelineheading{display:flex;align-items:baseline;gap:8px;min-width:0}.timelinehead .title{font-size:9px;font-weight:800;letter-spacing:1px;color:#a0a1a9;text-transform:uppercase;white-space:nowrap}.timelinecontext{font-size:7.5px;color:#62646d;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.timelineactions{display:flex;align-items:center;gap:4px;flex-wrap:wrap;justify-content:flex-end}.timelineactions button,.timelineactions a{height:24px;width:auto;margin:0;border-radius:6px;background:#18191d;color:#bfc0c6;border:1px solid #2b2c31;padding:0 7px;font-size:7px;line-height:25px;text-decoration:none;font-weight:800;white-space:nowrap}.timelineactions button:hover,.timelineactions a:hover{border-color:#555862;color:#fff}.timelineactions button.primary{background:var(--accent);border-color:var(--accent);color:#111}.timelineactions button.compile{background:#24200f;border-color:#66551d;color:#e8ce6b}.timelineactions button.compile:not(:disabled):hover{border-color:var(--accent);color:var(--accent)}.timelineactions button.danger{background:#211516;border-color:#522b2d;color:#d98989}.timelineactions button.danger:not(:disabled):hover{border-color:#8a3e42;color:#ff9a9f}.timelineactions button:disabled,.timelineactions a.disabled{background:#17181c;color:#555761;border-color:#24252a;pointer-events:none}.sequenceselect{display:none;height:22px;max-width:150px;margin:0;padding:2px 24px 2px 6px;border:1px solid #292a2f;border-radius:5px;background:#141519;color:#bfc0c6;font-size:7.2px;line-height:18px}.sequenceselect.show{display:block}.timeline{--timeline-clip-width:136px;display:flex;align-items:stretch;gap:6px;overflow-x:auto;overflow-y:hidden;min-height:0;height:100%;padding:2px 0 8px;scroll-behavior:smooth;overscroll-behavior-x:contain;scrollbar-width:thin;scrollbar-color:#555862 #17181c;touch-action:pan-x pan-y}.timeline::-webkit-scrollbar{display:block!important;height:8px!important}.timeline::-webkit-scrollbar-track{background:#17181c;border-radius:999px}.timeline::-webkit-scrollbar-thumb{background:#555862;border:2px solid #17181c;border-radius:999px}.timeline::-webkit-scrollbar-thumb:hover{background:#777a84}.tclip{min-width:var(--timeline-clip-width);max-width:var(--timeline-clip-width);border:1px solid #2a2b31;border-radius:7px;background:#0b0b0d;overflow:hidden;cursor:pointer;height:100%;transition:min-width .12s ease,max-width .12s ease}.tclip:hover{border-color:#484a53}.tclip:last-child{border-color:#725d25}.timelinecontrols{display:flex;align-items:center;gap:3px;margin-right:2px}.timelinecontrols button{min-width:24px!important;width:24px!important;padding:0!important;font-size:10px!important}.timelinecontrols .timelinepan{font-size:9px!important}.timelinezoomreadout{min-width:36px;text-align:center;color:#777982;font-size:7px;font-weight:800;font-family:ui-monospace,Menlo,monospace;user-select:none}.tthumb{height:48px;background:#050506;display:flex;align-items:center;justify-content:center}.tthumb img{width:100%;height:100%;object-fit:cover}.tinfo{padding:5px 6px;font-size:7.5px;color:#777982;line-height:1.28}.tinfo b{color:#c7c8cd}.timelineempty{display:flex;align-items:center;justify-content:center;min-width:100%;height:100%;color:#555761;font-size:8.5px}.timelinefoot{display:none}.projectpopover{display:none;position:absolute;right:8px;top:42px;z-index:40;width:min(360px,calc(100% - 16px));padding:9px;background:#0d0d10;border:1px solid #303139;border-radius:8px;box-shadow:0 14px 36px #000c}.projectpopover.show{display:block}.projectpophead{display:flex;align-items:center;justify-content:space-between;margin-bottom:7px;color:#b6b8c0;font-size:9px;letter-spacing:.8px;text-transform:uppercase}.projectpophead button{width:24px;height:24px;padding:0;background:#202126;color:#bbb;border:1px solid #303139}.projectpopover label{font-size:7px;margin:6px 0 3px}.projectline{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:5px;margin-bottom:5px}.projectline input,.projectline select{height:29px;padding:5px 7px;font-size:9px}.projectline button{height:29px;width:auto;padding:0 8px;background:#202126;color:#c7c8cd;border:1px solid #303139;font-size:7.5px}.projectline button:hover{border-color:#555862;color:#fff}.projectline button.disabled{color:#4e5058;border-color:#25262b;pointer-events:none}.projectdanger{width:100%;height:29px;margin-top:4px;background:#1d1516;color:#d98989;border:1px solid #522b2d;font-size:7.5px}.timeline sub{font-size:7px}.tclip .ttrim{width:27px!important;height:24px!important;padding:0!important;border-radius:5px!important;background:#211e12!important;color:#e8ce6b!important;border:1px solid #62531d!important;font-size:10px!important}.tclip .ttrim:hover{border-color:var(--accent)!important;color:var(--accent)!important}.tclip.trimmed{border-color:#66551d}.ttrimmark{color:#d7bb5d;font-size:6.5px;font-weight:800;letter-spacing:.3px}.trimdialog{width:min(620px,calc(100vw - 30px))}.trimvideo{display:block;width:100%;max-height:290px;background:#050506;border:1px solid #292a30;border-radius:8px}.trimsummary{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;margin:8px 0;color:#8d8f98;font-size:8.5px}.trimsummary b{color:#e2c35e}.trimgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.trimfield{border:1px solid #292a30;border-radius:8px;background:#0d0e11;padding:9px}.trimfield label{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 7px;font-size:8px;color:#999ba4;text-transform:uppercase;letter-spacing:.7px}.trimfield input[type=number]{width:82px;height:28px;margin:0;padding:4px 6px;font-size:9px}.trimfield input[type=range]{width:100%;padding:0;margin:3px 0 0;accent-color:var(--accent)}.trimhint{margin-top:8px;color:#656872;font-size:8px;line-height:1.45}.trimactionsleft{margin-right:auto}.trimactionsleft button{background:#24200f;color:#e8ce6b;border:1px solid #66551d}@media(max-width:620px){.trimgrid{grid-template-columns:1fr}.trimvideo{max-height:220px}}
     *{scrollbar-width:none}*::-webkit-scrollbar{display:none;width:0;height:0}
     .consolebox{display:none;position:fixed;right:16px;top:72px;z-index:1220;width:min(720px,calc(100vw - 32px));border:1px solid #303139;border-radius:9px;background:#060607;overflow:hidden;box-shadow:0 18px 60px #000c}.consolehead{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 9px;border-bottom:1px solid var(--line);color:#81838c;font-size:9.5px}.consoleactions{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}.consolehead button{width:auto;margin:0;background:#29292f;color:#bbb;padding:5px 9px;font-size:9px;border-radius:5px}.consolebox pre{margin:0;padding:8px 9px;height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word;color:#c8c9ce;font:9.5px/1.4 ui-monospace,Menlo,monospace}.consolebox.collapsed pre{display:none}.consolebox.collapsed .consolehead{border-bottom:0}
     #err{display:none;white-space:pre-wrap;color:#ff8a8a;font-size:10px;max-height:180px;overflow:auto;border:1px solid #3a2020;background:#160e0e;padding:10px;border-radius:8px}
@@ -8994,6 +9253,27 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         <div class=hfprogress><i id=lora_download_progress></i></div>
         <div id=lora_download_text class=hfprogresstext>Paste whatever source link you have. Direct HF file links and CivitAI version links are preselected automatically when possible.</div>
         <div class=hint>HF_TOKEN is only needed for private/gated Hugging Face files. CIVITAI_API_KEY is optional and is only needed when CivitAI itself requires authentication for the selected file.</div>
+      </div>
+    </div>
+    <div id=clip_trim_modal class=uimodal role=dialog aria-modal=true aria-labelledby=clip_trim_title>
+      <div class="uidialog trimdialog">
+        <div class=uihead><b id=clip_trim_title>Trim timeline clip</b><button id=clip_trim_close class=uiclose type=button>✕</button></div>
+        <div class=uibody>
+          <video id=clip_trim_video class=trimvideo controls preload=metadata></video>
+          <div class=trimsummary><span id=clip_trim_range>Frames 1–1</span><span id=clip_trim_length><b>0.00 s</b> selected</span></div>
+          <div class=trimgrid>
+            <div class=trimfield>
+              <label>Start frame <input id=clip_trim_start_num type=number min=1 step=1 value=1></label>
+              <input id=clip_trim_start type=range min=1 max=1 step=1 value=1 aria-label="Clip start frame">
+            </div>
+            <div class=trimfield>
+              <label>End frame <input id=clip_trim_end_num type=number min=1 step=1 value=1></label>
+              <input id=clip_trim_end type=range min=1 max=1 step=1 value=1 aria-label="Clip end frame">
+            </div>
+          </div>
+          <div class=trimhint>Non-destructive trim: shorten the clip, or extend it back toward its original first/last frame. The original render stays in History.</div>
+        </div>
+        <div class=uiactions><div class=trimactionsleft><button id=clip_trim_reset type=button>FULL CLIP</button></div><button id=clip_trim_cancel class=uicancel type=button>Cancel</button><button id=clip_trim_apply class="uiconfirm neutral" type=button>Apply trim</button></div>
       </div>
     </div>
     <div id=ui_modal class=uimodal role=dialog aria-modal=true aria-labelledby=ui_modal_title>
@@ -10829,6 +11109,75 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       say('active sequence changed');
     });
 
+    let CLIP_TRIM_SEGMENT=null;
+    function clipTrimFrameTime(seg,frameOneBased){
+      const total=Math.max(1,Number(seg?.source_frames||seg?.frames||1));
+      const dur=Math.max(.001,Number(seg?.source_duration||seg?.duration||0));
+      return Math.max(0,Math.min(dur,(Number(frameOneBased)-1)*(dur/total)));
+    }
+    function syncClipTrimEditor(changed=''){
+      const seg=CLIP_TRIM_SEGMENT;if(!seg)return;
+      const total=Math.max(1,Math.round(Number(seg.source_frames||seg.frames||1)));
+      const sn=$('clip_trim_start_num'),en=$('clip_trim_end_num'),sr=$('clip_trim_start'),er=$('clip_trim_end');
+      let start=Math.round(Number((changed==='start_range'?sr.value:sn.value)||1));
+      let end=Math.round(Number((changed==='end_range'?er.value:en.value)||total));
+      start=Math.max(1,Math.min(total,start));end=Math.max(1,Math.min(total,end));
+      if(start>end){if(changed.startsWith('start'))end=start;else start=end}
+      sn.value=sr.value=String(start);en.value=er.value=String(end);
+      sr.max=er.max=sn.max=en.max=String(total);
+      const selected=end-start+1;
+      const sourceDur=Math.max(.001,Number(seg.source_duration||seg.duration||0));
+      const seconds=sourceDur*(selected/total);
+      $('clip_trim_range').textContent=`Frames ${start}–${end} of ${total}`;
+      $('clip_trim_length').innerHTML=`<b>${seconds.toFixed(2)} s</b> selected · ${sourceDur.toFixed(2)} s source`;
+      const v=$('clip_trim_video');
+      if(changed.startsWith('start')){try{v.currentTime=clipTrimFrameTime(seg,start)}catch(e){}}
+      if(changed.startsWith('end')){try{v.currentTime=Math.min(sourceDur,clipTrimFrameTime(seg,end)+sourceDur/total)}catch(e){}}
+    }
+    function openClipTrim(segmentId){
+      const seg=((window.H3TIMELINE||{}).segments||[]).find(x=>String(x.segment_id||x.job)===String(segmentId));
+      if(!seg)return;
+      CLIP_TRIM_SEGMENT=seg;
+      const total=Math.max(1,Math.round(Number(seg.source_frames||seg.frames||1)));
+      const start=Math.max(1,Math.min(total,Number(seg.trim_start_frame??0)+1));
+      const end=Math.max(start,Math.min(total,Number(seg.trim_end_frame??(total-1))+1));
+      for(const id of ['clip_trim_start','clip_trim_end']){$(id).min='1';$(id).max=String(total)}
+      for(const id of ['clip_trim_start_num','clip_trim_end_num']){$(id).min='1';$(id).max=String(total)}
+      $('clip_trim_start').value=$('clip_trim_start_num').value=String(start);
+      $('clip_trim_end').value=$('clip_trim_end_num').value=String(end);
+      const v=$('clip_trim_video');v.src='/out/'+encodeURIComponent(seg.file);v.currentTime=clipTrimFrameTime(seg,start);
+      syncClipTrimEditor();
+      $('clip_trim_modal').classList.add('show');
+      setTimeout(()=>$('clip_trim_start_num').focus(),0);
+      mlTrack('notebook_h3_timeline_trim_opened',{action:'open',target:String(segmentId),meta:{source_frames:total,start_frame:start,end_frame:end}});
+    }
+    function closeClipTrim(){
+      $('clip_trim_modal').classList.remove('show');
+      const v=$('clip_trim_video');try{v.pause()}catch(e){}v.removeAttribute('src');v.load();CLIP_TRIM_SEGMENT=null;
+    }
+    $('clip_trim_close').onclick=closeClipTrim;$('clip_trim_cancel').onclick=closeClipTrim;
+    $('clip_trim_modal').addEventListener('click',e=>{if(e.target===$('clip_trim_modal'))closeClipTrim()});
+    document.addEventListener('keydown',e=>{if(e.key==='Escape'&&$('clip_trim_modal').classList.contains('show')){e.preventDefault();closeClipTrim()}});
+    $('clip_trim_start').addEventListener('input',()=>syncClipTrimEditor('start_range'));
+    $('clip_trim_end').addEventListener('input',()=>syncClipTrimEditor('end_range'));
+    $('clip_trim_start_num').addEventListener('input',()=>syncClipTrimEditor('start_num'));
+    $('clip_trim_end_num').addEventListener('input',()=>syncClipTrimEditor('end_num'));
+    $('clip_trim_reset').onclick=()=>{if(!CLIP_TRIM_SEGMENT)return;const total=Math.max(1,Number(CLIP_TRIM_SEGMENT.source_frames||CLIP_TRIM_SEGMENT.frames||1));$('clip_trim_start_num').value='1';$('clip_trim_end_num').value=String(total);syncClipTrimEditor('end_num')};
+    $('clip_trim_apply').onclick=async()=>{
+      const seg=CLIP_TRIM_SEGMENT;if(!seg)return;
+      syncClipTrimEditor();
+      const start=Math.max(1,Math.round(Number($('clip_trim_start_num').value||1)));
+      const end=Math.max(start,Math.round(Number($('clip_trim_end_num').value||start)));
+      const b=$('clip_trim_apply');b.disabled=true;const old=b.textContent;b.textContent='APPLYING…';
+      try{
+        const r=await(await fetch('/api/timeline/trim/'+encodeURIComponent(seg.segment_id||seg.job),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({start_frame:start-1,end_frame:end-1})})).json();
+        if(r.error){await uiAlert(r.error,'Trim clip');return}
+        mlTrack('notebook_h3_timeline_trim_applied',{action:'apply',target:String(seg.segment_id||seg.job),meta:{start_frame:start,end_frame:end,selected_frames:end-start+1},immediate:true});
+        closeClipTrim();await refreshTimeline(true);say(`clip trimmed · frames ${start}–${end}`);
+      }catch(e){await uiAlert(String(e?.message||e),'Trim clip')}
+      finally{b.disabled=false;b.textContent=old}
+    };
+
     async function refreshTimeline(quiet=false){
       let t;
       try{t=await (await fetch('/api/timeline')).json()}catch(e){if(!quiet)console.warn(e);return null}
@@ -10852,9 +11201,10 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         seqSelect.classList.remove('show');
       }
       if(!segs.length){$('timeline').innerHTML='<div class=timelineempty>Drop a History clip here or generate the first clip.</div>';wireTimelineDnD();return t}
-      $('timeline').innerHTML=segs.map((s,i)=>{const thumb=s.last_frame_file?`<img src="/out/${encodeURIComponent(s.last_frame_file)}?t=${t.updated||0}">`:'';const p=esc((s.prompt||'').slice(0,58));return `<div class=tclip data-segment="${esc(s.segment_id||s.job)}" data-file="${esc(s.file)}" title="Drag to move · ${esc(s.prompt||'')}"><span class=dragbadge>⠿ ${i+1}</span><div class=ttools><button class=recallprompt data-prompt="${esc(s.prompt||'')}" title="Restore full prompt">P</button><button class=tdelete data-segment="${esc(s.segment_id||s.job)}" title="Delete clip">⌫</button></div><div class=tthumb>${thumb}</div><div class=tinfo><b>${s.continued?'LAST-FRAME CONTINUITY':'SHOT'}</b> · ${Number(s.duration||0).toFixed(2)}s<br>${s.width||'?'}×${s.height||'?'} · seed ${s.seed??'?'}<br>${p||'—'}</div></div>`}).join('');
+      $('timeline').innerHTML=segs.map((s,i)=>{const thumb=s.last_frame_file?`<img src="/out/${encodeURIComponent(s.last_frame_file)}?t=${t.updated||0}">`:'';const p=esc((s.prompt||'').slice(0,58));const trim=s.trimmed?`<span class=ttrimmark> · FRAMES ${Number(s.trim_start_frame||0)+1}–${Number(s.trim_end_frame??((s.source_frames||1)-1))+1}/${Number(s.source_frames||s.frames||1)}</span>`:'';return `<div class="tclip ${s.trimmed?'trimmed':''}" data-segment="${esc(s.segment_id||s.job)}" data-file="${esc(s.timeline_file||s.file)}" title="Drag to move · click to preview · use ✂ to set in/out frames"><span class=dragbadge>⠿ ${i+1}</span><div class=ttools><button class=recallprompt data-prompt="${esc(s.prompt||'')}" title="Restore full prompt">P</button><button class=ttrim data-segment="${esc(s.segment_id||s.job)}" title="Set start and end frames">✂</button><button class=tdelete data-segment="${esc(s.segment_id||s.job)}" title="Delete clip">⌫</button></div><div class=tthumb>${thumb}</div><div class=tinfo><b>${s.continued?'LAST-FRAME CONTINUITY':'SHOT'}</b> · ${Number(s.duration||0).toFixed(2)}s${trim}<br>${s.width||'?'}×${s.height||'?'} · seed ${s.seed??'?'}<br>${p||'—'}</div></div>`}).join('');
       [...document.querySelectorAll('.tclip')].forEach(el=>el.addEventListener('click',e=>{if(!e.target.closest('button'))previewTimelineFile(el.dataset.file)}));
       [...document.querySelectorAll('.tclip .recallprompt')].forEach(b=>b.onclick=e=>{e.stopPropagation();restoreClipPrompt(b.dataset.prompt||'')});
+      [...document.querySelectorAll('.ttrim')].forEach(b=>b.onclick=e=>{e.stopPropagation();openClipTrim(b.dataset.segment)});
       [...document.querySelectorAll('.tdelete')].forEach(b=>b.onclick=e=>{e.stopPropagation();deleteTimelineClip(b.dataset.segment)});
       applyTimelineZoom(TIMELINE_CLIP_WIDTH,{remember:false,preserveCenter:false});
       wireTimelineDnD();return t
