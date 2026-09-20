@@ -317,9 +317,11 @@ _start_drive_mount_bridge_parent()
 # MISSINGLINK NOTEBOOK ACCESS · Google identity + 5 free H3 generations
 # ======================================================================
 # MISSING_LINK_TOKEN may be either:
-#   1) the Studio JWT returned by https://missinglink.build/notebook-signin
-#      after Google verifies the user's identity/email, or
+#   1) an opaque `mls_...` starter code issued after MissingLink verifies a real
+#      Gmail identity through Google OAuth, or
 #   2) a paid/legacy MissingLink API key.
+# The starter code can be rotated, but its free-generation ledger remains tied to
+# the same verified MissingLink/Google user id.
 #
 # Free H3 usage is counted server-side against a stable MissingLink/Google user id
 # through /api/notebook/render. Reopening Colab does not reset it. H3 has its own
@@ -336,11 +338,11 @@ MISSING_LINK_AUTH_URL = (_os.environ.get("MISSING_LINK_AUTH_URL") or
                          MISSING_LINK_BASE_URL + "/api/cache-token").strip()
 MISSING_LINK_SIGNIN_URL = (
     MISSING_LINK_BASE_URL +
-    "/notebook-signin?source=colab&model=minimax-h3&placement=free-access"
+    "/get-token?source=h3-studio&model=minimax-h3&placement=free-access"
 )
 MISSING_LINK_UPGRADE_URL = (
     MISSING_LINK_BASE_URL +
-    "/get-token?source=h3-studio&model=minimax-h3&placement=free-limit"
+    "/notebook-pro/start?source=h3-studio&model=minimax-h3&placement=free-limit"
 )
 # Compatibility alias for older UI paths below.
 MISSING_LINK_TRIAL_URL = MISSING_LINK_SIGNIN_URL
@@ -394,8 +396,8 @@ def _ml_headers(token=None, *, json_body=False):
     tok = token or _read_missinglink_token()
     headers = {"Accept": "application/json", "User-Agent": "MissingLink-H3-Notebook/5free"}
     if tok:
-        # Notebook JWTs authenticate via Bearer; paid API keys use x-api-key.
-        # Sending both lets the same Colab secret work for either credential type.
+        # Starter codes and paid API keys are accepted by the Notebook API.
+        # Sending both headers preserves compatibility with existing paid tokens.
         headers["Authorization"] = "Bearer " + tok
         headers["x-api-key"] = tok
     if json_body:
@@ -448,7 +450,7 @@ def _ml_apply_notebook_state(data):
         email=str(data.get("email") or ""), used=used,
         free_limit=H3_FREE_RENDER_LIMIT, server_free_limit=server_limit,
         remaining=(-1 if member else max(0, H3_FREE_RENDER_LIMIT - used)),
-        access_mode=("notebook_google" if data.get("email") else "notebook_token"),
+        access_mode=("gmail_starter" if data.get("starter") else ("notebook_google" if data.get("email") else "notebook_token")),
     )
 
 def _validate_missinglink_token(*, force=False):
@@ -460,8 +462,8 @@ def _validate_missinglink_token(*, force=False):
     token = _read_missinglink_token()
     if not token:
         msg = (
-            "MISSING_LINK_TOKEN is not set. Sign in with Google at " + MISSING_LINK_SIGNIN_URL +
-            ", copy the Notebook code into Colab Secrets as MISSING_LINK_TOKEN, "
+            "MISSING_LINK_TOKEN is not set. Get your free MissingLink starter code at " + MISSING_LINK_SIGNIN_URL +
+            ", then copy that code into Colab Secrets as MISSING_LINK_TOKEN, "
             "enable notebook access, then rerun this cell."
         )
         _ML_AUTH_STATE.update(ok=False, checked=now, error=msg)
@@ -655,8 +657,9 @@ def _require_missinglink_access():
         raise SystemExit(
             "\n✗ MissingLink notebook sign-in required.\n"
             f"  {error}\n"
-            f"  Free Google sign-in: {MISSING_LINK_SIGNIN_URL}\n"
-            "  Copy the Notebook code into the Colab Secret MISSING_LINK_TOKEN, "
+            f"  Get 5 free H3 generations: {MISSING_LINK_SIGNIN_URL}\n"
+            "  Google will verify your Gmail and issue a starter MissingLink code.\n"
+            "  Copy that code into the Colab Secret MISSING_LINK_TOKEN, "
             "enable notebook access, then rerun this cell. No card is required.\n"
         )
     state = _ml_public_access_state()
@@ -669,10 +672,12 @@ def _require_missinglink_access():
                 meta={"free_used": state.get("used"), "free_remaining": 0},
             )
             raise SystemExit(
-                f"\n✗ Your {H3_FREE_RENDER_LIMIT} free MiniMax H3 generations are used.\n"
-                f"  Upgrade to Notebook Pro for unlimited H3 access:\n  {MISSING_LINK_UPGRADE_URL}\n"
+                f"\n✗ Your {H3_FREE_RENDER_LIMIT} free MiniMax H3 generations are complete.\n"
+                "  Start the 7-day Notebook Pro trial to keep generating and unlock all MissingLink notebooks.\n"
+                "  Then $20/month; cancel anytime.\n"
+                f"  {MISSING_LINK_UPGRADE_URL}\n"
             )
-        print(f"✓ MissingLink Google identity verified · {state['remaining']} of {H3_FREE_RENDER_LIMIT} free H3 generations remaining", flush=True)
+        print(f"✓ MissingLink Gmail starter verified · {state['remaining']} of {H3_FREE_RENDER_LIMIT} free H3 generations remaining", flush=True)
     _ml_telemetry_async("notebook_h3_runtime_started", action="start", target="colab_runtime",
                         meta={"access_mode": state["access_mode"], "member": state["member"],
                               "free_used": state["used"], "free_remaining": state["remaining"]})
@@ -6170,8 +6175,8 @@ if _CU130_CHILD:
             "<h1>MissingLink access required</h1>"
             f"<p>{msg}</p>"
             "<p>Add a valid <code>MISSING_LINK_TOKEN</code> in Colab Secrets and rerun the cell.</p>"
-            f"<p><a href='{MISSING_LINK_SIGNIN_URL}' target='_blank'>Sign in with Google for 5 free H3 generations</a></p>"
-            f"<p><a href='{MISSING_LINK_UPGRADE_URL}' target='_blank'>Already used the free generations? Upgrade to Notebook Pro</a></p>",
+            f"<p><a href='{MISSING_LINK_SIGNIN_URL}' target='_blank'>Get a Gmail-tied starter code for 5 free H3 generations</a></p>"
+            f"<p><a href='{MISSING_LINK_UPGRADE_URL}' target='_blank'>5 free generations complete? Start the 7-day Notebook Pro trial</a></p>",
             status=401, mimetype="text/html"
         )
 
@@ -9106,9 +9111,9 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     <div id=ml_access_card style="margin:10px 0 8px;border:1px solid #343019;background:#17150b;border-radius:8px;padding:9px">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
         <b id=ml_access_label style="font-size:9px;color:#f1d56d">Checking Notebook access…</b>
-        <a id=ml_upgrade_link href="https://missinglink.build/get-token?source=h3-studio&model=minimax-h3&placement=free-limit" target="_blank" rel="noopener" style="font-size:8px;color:#E8A917;text-decoration:none;font-weight:800">UPGRADE →</a>
+        <a id=ml_upgrade_link href="https://missinglink.build/notebook-pro/start?source=h3-studio&model=minimax-h3&placement=free-limit" target="_blank" rel="noopener" style="display:none;font-size:8px;color:#E8A917;text-decoration:none;font-weight:800">START 7-DAY TRIAL →</a>
       </div>
-      <div id=ml_access_sub style="font-size:7.5px;color:#858892;margin-top:4px">5 free H3 generations · no card required.</div>
+      <div id=ml_access_sub style="font-size:7.5px;color:#858892;margin-top:4px">5 free H3 generations · verified Gmail · no card required.</div>
     </div>
     <button id=go>+ ADD GENERATION TO QUEUE</button>
     <a class=footerlink href="https://missinglink.build/studio" target="_blank" rel="noopener">missinglink.build/studio</a>
@@ -9290,13 +9295,30 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       </div>
     </div>
     <div id=adult_gate_modal hidden><input id=adult_ack_age type=checkbox><input id=adult_ack_law type=checkbox><input id=adult_ack_consent type=checkbox><button id=adult_gate_close type=button></button><button id=adult_gate_cancel type=button></button><button id=adult_gate_accept type=button disabled></button></div>
+
+    <div id=ml_upgrade_modal role=dialog aria-modal=true aria-labelledby=ml_upgrade_title style="display:none;position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.68);align-items:center;justify-content:center;padding:18px">
+      <div style="width:min(430px,calc(100vw - 36px));background:#111113;border:1px solid #3b3420;border-radius:14px;padding:20px;box-shadow:0 22px 70px rgba(0,0,0,.55);position:relative">
+        <button id=ml_upgrade_close type=button aria-label="Close" style="position:absolute;right:10px;top:8px;background:transparent;border:0;color:#7f8188;font-size:20px;padding:4px 7px;cursor:pointer">×</button>
+        <div style="display:flex;gap:12px;align-items:center;padding-right:22px">
+          <img src="https://missinglink.build/assets/missinglink_notebook_pro.png" alt="MissingLink Notebook Pro" style="width:58px;height:58px;object-fit:cover;border-radius:10px;border:1px solid #343019;flex:0 0 auto" onerror="this.style.display='none'">
+          <div style="min-width:0">
+            <div style="font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:#E8A917;font-weight:800">5 free generations complete</div>
+            <div id=ml_upgrade_title style="font-size:20px;line-height:1.15;font-weight:800;color:#f2f2f3;margin-top:6px">Keep creating for 7 days free.</div>
+          </div>
+        </div>
+        <div style="font-size:12px;line-height:1.55;color:#a5a6ac;margin-top:9px">Notebook Pro unlocks unlimited H3 access and the full MissingLink notebook library.</div>
+        <div style="margin-top:13px;padding:10px 11px;border:1px solid #292a30;border-radius:9px;background:#151518;font-size:11px;color:#d5d6da"><b style="color:#f1d56d">7-day free trial</b> · then $20/month · cancel anytime</div>
+        <a id=ml_upgrade_modal_cta href="https://missinglink.build/notebook-pro/start?source=h3-studio&model=minimax-h3&placement=free-limit" target="_blank" rel="noopener" style="display:block;margin-top:12px;background:#E8A917;color:#09090B;text-align:center;text-decoration:none;border-radius:9px;padding:11px 14px;font:800 11px 'JetBrains Mono',monospace">START 7-DAY FREE TRIAL →</a>
+        <button id=ml_upgrade_later type=button style="width:100%;margin-top:7px;background:transparent;border:0;color:#777a84;font-size:10px;padding:7px;cursor:pointer">Not now</button>
+      </div>
+    </div>
     <script>
     const $=i=>document.getElementById(i);
 
     const ML_UI_TELEMETRY_QUEUE=[];
     let ML_UI_TELEMETRY_TIMER=null;
     let ML_ACCESS_STATE=null;
-    const ML_UPGRADE_URL='https://missinglink.build/get-token?source=h3-studio&model=minimax-h3&placement=free-limit';
+    const ML_UPGRADE_URL='https://missinglink.build/notebook-pro/start?source=h3-studio&model=minimax-h3&placement=free-limit';
     function mlSafeTarget(el){
       if(!el)return '';
       if(el.id)return '#'+el.id;
@@ -9339,16 +9361,37 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       const label=$('ml_access_label'),sub=$('ml_access_sub'),up=$('ml_upgrade_link');
       if(a.member){
         if(label)label.textContent='Notebook Pro · UNLIMITED';
-        if(sub)sub.textContent='Your paid Notebook access is active.';
+        if(sub)sub.textContent='Your Notebook Pro access is active · all MissingLink notebooks unlocked.';
         if(up)up.style.display='none';
       }else{
         const rem=Math.max(0,Number(a.remaining||0));
-        if(label)label.textContent=rem>0?rem+' OF 5 FREE H3 GENERATIONS LEFT':'5 FREE H3 GENERATIONS USED';
-        if(sub)sub.textContent=rem>0?'No card required. Each queued render uses one free generation.':'Upgrade to keep generating with this optimized runtime.';
-        if(up){up.style.display='inline';up.href=a.upgrade_url||ML_UPGRADE_URL}
+        if(label)label.textContent=rem>0?rem+' OF 5 FREE H3 GENERATIONS LEFT':'YOUR 5 FREE H3 GENERATIONS ARE COMPLETE';
+        if(sub)sub.textContent=rem>0?'Starter access is tied to your verified Gmail · no card required.':'Start the 7-day Notebook Pro trial to keep generating and unlock all MissingLink notebooks.';
+        if(up){up.style.display=rem<=0?'inline':'none';up.href=a.upgrade_url||ML_UPGRADE_URL}
       }
     }
-    async function mlRefreshAccess(){try{const r=await fetch('/api/ml/access',{cache:'no-store'}),a=await r.json();if(r.ok&&a.ok)mlRenderAccess(a)}catch(e){}}
+    function mlShowUpgradeModal(trigger='free_limit'){
+      if(ML_ACCESS_STATE?.member)return;
+      const m=$('ml_upgrade_modal');if(!m)return;
+      m.style.display='flex';
+      mlTrack('notebook_h3_upgrade_shown',{action:trigger,target:'#ml_upgrade_modal',meta:{free_used:ML_ACCESS_STATE?.used??5,free_remaining:ML_ACCESS_STATE?.remaining??0},immediate:true});
+      setTimeout(()=>$('ml_upgrade_modal_cta')?.focus(),0);
+    }
+    function mlHideUpgradeModal(reason='dismissed'){
+      const m=$('ml_upgrade_modal');if(m)m.style.display='none';
+      mlTrack('notebook_h3_upgrade_dismissed',{action:reason,target:'#ml_upgrade_modal'});
+    }
+    async function mlRefreshAccess(){
+      try{
+        const r=await fetch('/api/ml/access',{cache:'no-store'}),a=await r.json();
+        if(r.ok&&a.ok){mlRenderAccess(a);return a}
+      }catch(e){}
+      return null;
+    }
+    $('ml_upgrade_close')?.addEventListener('click',()=>mlHideUpgradeModal('close'));
+    $('ml_upgrade_later')?.addEventListener('click',()=>mlHideUpgradeModal('not_now'));
+    $('ml_upgrade_modal')?.addEventListener('click',e=>{if(e.target===$('ml_upgrade_modal'))mlHideUpgradeModal('backdrop')});
+    $('ml_upgrade_modal_cta')?.addEventListener('click',()=>mlTrack('notebook_h3_upgrade_clicked',{action:'start_7_day_trial',target:'#ml_upgrade_modal_cta',meta:{free_used:ML_ACCESS_STATE?.used??5},immediate:true}));
     function mlGenerationUiMeta(){
       const mode=typeof currentModelMode==='function'?currentModelMode():($('input_mode')?.value||''),files=(id)=>($(id)?.files||[]).length;
       return {input_mode:mode,model_profile:typeof ACTIVE_MODEL_PROFILE!=='undefined'?ACTIVE_MODEL_PROFILE:'',
@@ -9364,7 +9407,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       const el=e.target&&e.target.closest?e.target.closest('button,a,summary,input[type="checkbox"],input[type="radio"]'):null;
       if(!el)return;
       mlTrack('notebook_h3_click',{action:'activate',target:mlSafeTarget(el),meta:{tag:(el.tagName||'').toLowerCase()}});
-      if(el.id==='ml_upgrade_link')mlTrack('notebook_h3_upgrade_clicked',{action:'upgrade',target:'#ml_upgrade_link',
+      if(el.id==='ml_upgrade_link')mlTrack('notebook_h3_upgrade_clicked',{action:'start_7_day_trial',target:'#ml_upgrade_link',
         meta:{free_used:ML_ACCESS_STATE?.used??null,free_remaining:ML_ACCESS_STATE?.remaining??null},immediate:true});
     },true);
     document.addEventListener('change',e=>{const el=e.target;if(el&&('value' in el))mlTrack('notebook_h3_control_change',{action:'change',target:mlSafeTarget(el),meta:mlControlMeta(el)})},true);
@@ -11454,7 +11497,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       if(r.error){
         if(r.code==='free_limit_reached'){
           mlRenderAccess(r);
-          mlTrack('notebook_h3_upgrade_shown',{action:'free_limit',target:'#ml_upgrade_link',meta:{free_used:r.used??5,free_remaining:0},immediate:true});
+          mlShowUpgradeModal('free_limit');
         }
         mlTrack('notebook_h3_generate_rejected',{action:r.code||'error',target:'#go',meta:{code:r.code||'',message:String(r.error||'').slice(0,180)},immediate:true});
         fail(r.error);refreshTimeline(true);return
@@ -11570,6 +11613,9 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         syncStageClear();
         $('meta').textContent=j.file+(j.active_sequence_name?` · ${j.active_sequence_name}`:'')+(j.note?` · ${j.note}`:'')+(j.story_director_canon_committed?` · canon committed ${j.story_director_audit_score||0}/100`:(j.story_director_review_required?` · director retry recommended ${j.story_director_audit_score||0}/100`:''));
         mlTrack('notebook_h3_result_viewed',{action:'done',target:'video_output',meta:{job_id:jid,elapsed_s:j.secs??null,duration_s:j.duration??null,frames:j.frames??null},immediate:true});
+        if(!ML_ACCESS_STATE?.member && Number(ML_ACCESS_STATE?.remaining??1)<=0){
+          mlShowUpgradeModal('fifth_generation_complete');
+        }
         await refreshTimeline(true);
         await refreshHistory();
         await refreshQueue();
