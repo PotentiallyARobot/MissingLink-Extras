@@ -1,0 +1,23 @@
+{
+  "aad_b64": "TUxQS0cxfDIwMjYwOTIwVDE5NDI1OFotYTkwZjJlNjg3NTRjNWQzNXxhOTBmMmU2ODc1NGM1ZDM1ODYyZDcwYzc3M2M0MTliYWQ2ODM5MzViZGM5MDg2NzRlOGNhZDdhMDNlNTExNzQ0fGgzX3N0dWRpb18zLnB5",
+  "access_endpoint": "https://missinglink.build/api/notebook/access",
+  "algorithm": "AES-256-GCM",
+  "build_id": "20260920T194258Z-a90f2e68754c5d35",
+  "compressed_size": 164373,
+  "compression": "zlib-9",
+  "created_utc": "2026-09-20T19:42:58.284772+00:00",
+  "h3_hardening": [
+    "Blackwell relaunch -> encrypted loader (no full-source self-copy)"
+  ],
+  "kdf": "HKDF-SHA256",
+  "key_endpoint": "https://missinglink.build/api/notebook/package-key",
+  "loader_file": "h3_studio_3_loader.py",
+  "nonce_b64": "UT0GqmUBjpm7KjJq",
+  "original_filename": "h3_studio_3.py",
+  "package_file": "h3_studio_3.mlpkg",
+  "package_sha256": "eabd683184f36b0d6316404146877038d3ae96e3fb1092b1706e487ddf15fee7",
+  "salt_b64": "ITKA8rmrw5dRLhBl1PxQxQ",
+  "source_sha256": "a90f2e68754c5d35862d70c773c419bad683935bdc908674e8cad7a03e511744",
+  "source_size": 661429,
+  "version": 1
+}
