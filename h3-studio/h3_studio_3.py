@@ -16,7 +16,7 @@
 #   HF_TOKEN           - optional; adds private/gated Hugging Face downloads. Public HF works without it.
 #   CIVITAI_API_KEY    - optional; adds authenticated/gated CivitAI downloads. Public CivitAI works anonymously.
 #   OPENAI_API_KEY     - optional; enables Auto Prompt plus GPT-powered Story Director / Next Scene features.
-# Free Google-verified users get 5 H3 generation dispatches; Notebook Pro members are unlimited.
+# Free Google-verified users get 15 H3 generation dispatches; Notebook Pro members are unlimited.
 # SageAttention is never built from source in this UI cell; Blackwell requires the MissingLink wheel.
 #
 # It auto-detects the GPU. Blackwell keeps the existing CU130/Sage resident path;
@@ -314,7 +314,7 @@ def _start_drive_mount_bridge_parent():
 _start_drive_mount_bridge_parent()
 
 # ======================================================================
-# MISSINGLINK NOTEBOOK ACCESS · Google identity + 5 free H3 generations
+# MISSINGLINK NOTEBOOK ACCESS · Google identity + 15 free H3 generations
 # ======================================================================
 # MISSING_LINK_TOKEN may be either:
 #   1) an opaque `mls_...` starter code issued after MissingLink verifies a real
@@ -325,7 +325,7 @@ _start_drive_mount_bridge_parent()
 #
 # Free H3 usage is counted server-side against a stable MissingLink/Google user id
 # through /api/notebook/render. Reopening Colab does not reset it. H3 has its own
-# five-generation allowance; the older Wan/LTX notebook allowance remains separate.
+# fifteen-generation allowance; the older Wan/LTX notebook allowance remains separate.
 #
 # Rich UI telemetry is sent to /api/activity. Arbitrary prompt text is NOT sent to
 # product_activity; generation telemetry records prompt length plus settings/results.
@@ -346,9 +346,9 @@ MISSING_LINK_UPGRADE_URL = (
 )
 # Compatibility alias for older UI paths below.
 MISSING_LINK_TRIAL_URL = MISSING_LINK_SIGNIN_URL
-H3_FREE_RENDER_LIMIT = 5
+H3_FREE_RENDER_LIMIT = 15
 MISSING_LINK_AUTH_TTL_SEC = 120.0
-ML_DESIGN_VERSION = "h3-studio-2026-09-20-free5-v1"
+ML_DESIGN_VERSION = "h3-studio-2026-09-20-free15-v1"
 
 import hashlib as _ml_hashlib
 import json as _ml_json
@@ -394,7 +394,7 @@ def _ml_token_fingerprint(token=None):
 
 def _ml_headers(token=None, *, json_body=False):
     tok = token or _read_missinglink_token()
-    headers = {"Accept": "application/json", "User-Agent": "MissingLink-H3-Notebook/5free"}
+    headers = {"Accept": "application/json", "User-Agent": "MissingLink-H3-Notebook/15free"}
     if tok:
         # Starter codes and paid API keys are accepted by the Notebook API.
         # Sending both headers preserves compatibility with existing paid tokens.
@@ -669,7 +669,7 @@ def _require_missinglink_access():
         raise SystemExit(
             "\n✗ MissingLink notebook sign-in required.\n"
             f"  {error}\n"
-            f"  Get 5 free H3 generations: {MISSING_LINK_SIGNIN_URL}\n"
+            f"  Get 15 free H3 generations: {MISSING_LINK_SIGNIN_URL}\n"
             "  Google will verify your Gmail and issue a starter MissingLink code.\n"
             "  Copy that code into the Colab Secret MISSING_LINK_TOKEN, "
             "enable notebook access, then rerun this cell. No card is required.\n"
@@ -6187,8 +6187,8 @@ if _CU130_CHILD:
             "<h1>MissingLink access required</h1>"
             f"<p>{msg}</p>"
             "<p>Add a valid <code>MISSING_LINK_TOKEN</code> in Colab Secrets and rerun the cell.</p>"
-            f"<p><a href='{MISSING_LINK_SIGNIN_URL}' target='_blank'>Get a Gmail-tied starter code for 5 free H3 generations</a></p>"
-            f"<p><a href='{MISSING_LINK_UPGRADE_URL}' target='_blank'>5 free generations complete? Start the 7-day Notebook Pro trial</a></p>",
+            f"<p><a href='{MISSING_LINK_SIGNIN_URL}' target='_blank'>Get a Gmail-tied starter code for 15 free H3 generations</a></p>"
+            f"<p><a href='{MISSING_LINK_UPGRADE_URL}' target='_blank'>15 free generations complete? Start the 7-day Notebook Pro trial</a></p>",
             status=401, mimetype="text/html"
         )
 
@@ -9125,7 +9125,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         <b id=ml_access_label style="font-size:9px;color:#f1d56d">Checking Notebook access…</b>
         <a id=ml_upgrade_link href="https://missinglink.build/notebook-pro/start?source=h3-studio&model=minimax-h3&placement=free-limit" target="_blank" rel="noopener" style="display:none;font-size:8px;color:#E8A917;text-decoration:none;font-weight:800">START 7-DAY TRIAL →</a>
       </div>
-      <div id=ml_access_sub style="font-size:7.5px;color:#858892;margin-top:4px">5 free H3 generations · verified Gmail · no card required.</div>
+      <div id=ml_access_sub style="font-size:7.5px;color:#858892;margin-top:4px">15 free H3 generations · verified Gmail · no card required.</div>
     </div>
     <button id=go>+ ADD GENERATION TO QUEUE</button>
     <a class=footerlink href="https://missinglink.build/studio" target="_blank" rel="noopener">missinglink.build/studio</a>
@@ -9314,7 +9314,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         <div style="display:flex;gap:12px;align-items:center;padding-right:22px">
           <img src="https://missinglink.build/assets/missinglink_notebook_pro.png" alt="MissingLink Notebook Pro" style="width:58px;height:58px;object-fit:cover;border-radius:10px;border:1px solid #343019;flex:0 0 auto" onerror="this.style.display='none'">
           <div style="min-width:0">
-            <div style="font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:#E8A917;font-weight:800">5 free generations complete</div>
+            <div style="font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:#E8A917;font-weight:800">15 free generations complete</div>
             <div id=ml_upgrade_title style="font-size:20px;line-height:1.15;font-weight:800;color:#f2f2f3;margin-top:6px">Keep creating for 7 days free.</div>
           </div>
         </div>
@@ -9377,7 +9377,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         if(up)up.style.display='none';
       }else{
         const rem=Math.max(0,Number(a.remaining||0));
-        if(label)label.textContent=rem>0?rem+' OF 5 FREE H3 GENERATIONS LEFT':'YOUR 5 FREE H3 GENERATIONS ARE COMPLETE';
+        if(label)label.textContent=rem>0?rem+' OF 15 FREE H3 GENERATIONS LEFT':'YOUR 15 FREE H3 GENERATIONS ARE COMPLETE';
         if(sub)sub.textContent=rem>0?'Starter access is tied to your verified Gmail · no card required.':'Start the 7-day Notebook Pro trial to keep generating and unlock all MissingLink notebooks.';
         if(up){up.style.display=rem<=0?'inline':'none';up.href=a.upgrade_url||ML_UPGRADE_URL}
       }
