@@ -477,7 +477,19 @@ def _validate_missinglink_token(*, force=False):
             return True, ""
         notebook_error = "Notebook identity was rejected."
     except _ml_urlerr.HTTPError as e:
-        notebook_error = f"Notebook identity was rejected (HTTP {e.code})."
+        try:
+            _body = e.read(4096).decode("utf-8", "replace")
+            try:
+                _err = _ml_json.loads(_body)
+                _detail = str(_err.get("detail") or _err.get("error") or "").strip()
+            except Exception:
+                _detail = _body.strip()
+        except Exception:
+            _detail = ""
+        notebook_error = f"Notebook identity was rejected (HTTP {e.code})"
+        if _detail:
+            notebook_error += f": {_detail[:240]}"
+        notebook_error += "."
     except Exception as e:
         notebook_error = f"Notebook identity check failed: {type(e).__name__}: {e}"
     # Compatibility for paid API keys on older deployments.
