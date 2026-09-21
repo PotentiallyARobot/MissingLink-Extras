@@ -1,4 +1,20 @@
 # CUDA13 launcher: never replace Torch inside an already-running notebook.
+def _h3_open_colab_ui(port):
+    from google.colab import output
+    from IPython.display import HTML, display
+    import html
+    # Resolve the public proxy in the notebook, never inside the Torch child.
+    try:
+        url = output.eval_js(f'google.colab.kernel.proxyPort({int(port)})')
+        if not isinstance(url, str) or not url.startswith('https://'):
+            raise RuntimeError('Colab did not return an HTTPS proxy URL')
+        display(HTML(f'<a href="{html.escape(url, quote=True)}" target="_blank" '
+                     'rel="noopener">Open H3 Studio</a>'))
+        print('H3 Studio: ' + url, flush=True)
+    except Exception as error:
+        print(f'Colab proxy lookup failed: {error}; trying Colab window transport.', flush=True)
+        output.serve_kernel_port_as_window(port, anchor_text='Open H3 Studio')
+
 def _h3_launch_cuda13():
     import os, sys, subprocess, pathlib, shutil, socket, time, threading
     root = pathlib.Path('/content/h3_ada_cu130')
@@ -131,8 +147,7 @@ def _h3_launch_cuda13():
     while process.poll() is None:
         with socket.socket() as sock:
             if sock.connect_ex(('127.0.0.1', port)) == 0:
-                from google.colab import output
-                output.serve_kernel_port_as_window(port)
+                _h3_open_colab_ui(port)
                 print('H3 is running in the isolated CUDA13 process.', flush=True)
                 return
         time.sleep(2)
@@ -10653,7 +10668,9 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     IN_COLAB = "google.colab" in sys.modules
     url = mode = None
 
-    if IN_COLAB:
+    if os.environ.get("H3_UI_BLOCKING_CHILD") == "1":
+        log(f"H3 UI ready on port {UI_PORT}; the notebook launcher will display the Colab HTTPS link.")
+    elif IN_COLAB:
         from google.colab import output as _co
         from IPython.display import display, HTML as _H
 
