@@ -1,4 +1,4 @@
-# MiniMax H3 Studio - L40S 48 GB / Ada SM89 edition
+# MiniMax H3 Studio - L4 / L40S · adaptive Ada SM89 edition
 # Derived from h3_studio_3.py. UI, auth, LoRAs, Ref2VA and timeline preserved.
 # Linux CUDA PyTorch + current H3-capable ComfyUI required. No SM120 wheel.
 # Stage-resident INT8 DiT + INT8 Qwen encoder; full stack does not fit 48 GB.
@@ -768,7 +768,7 @@ if _CU130_CHILD:
     def log(m): print(m, flush=True)
 
     log("="*74)
-    log("  MiniMax H3 · L40S 48 GB · Ada SM89 optimized edition")
+    log("  MiniMax H3 · L4 / L40S · adaptive Ada SM89 edition")
     log("="*74)
 
     # ── MissingLink access gate ───────────────────────────────────────────────
@@ -1072,19 +1072,26 @@ if _CU130_CHILD:
     gpu = torch.cuda.get_device_name(0)
     GPU_CC = torch.cuda.get_device_capability(0)
     PHYSICAL_VRAM_GIB = torch.cuda.get_device_properties(0).total_memory / 1024**3
-    if GPU_CC != (8, 9) or "L40S" not in gpu.upper() or PHYSICAL_VRAM_GIB < 40:
-        raise RuntimeError(f"This edition requires a full L40S 48 GB (SM89); got {gpu}, {GPU_CC}, {PHYSICAL_VRAM_GIB:.1f} GiB.")
+    if GPU_CC != (8, 9) or not any(name in gpu.upper().split() for name in ("L4", "L40S")) or PHYSICAL_VRAM_GIB < 21:
+        raise RuntimeError(f"This edition requires an L4 or L40S (SM89) with at least 21 GiB usable VRAM; got {gpu}, {GPU_CC}, {PHYSICAL_VRAM_GIB:.1f} GiB.")
+    ADA_LOW_VRAM = PHYSICAL_VRAM_GIB < 40
+    if ADA_LOW_VRAM:
+        if "H3_L40S_RESERVE_GIB" not in os.environ:
+            L40S_RESERVE_GIB = 2.0
+        if "H3_L40S_CHUNK_ROWS" not in os.environ:
+            L40S_CHUNK_ROWS = 1024
     if not torch.cuda.is_bf16_supported():
         raise RuntimeError("The installed PyTorch/driver does not expose L40S BF16 support.")
     vram = PHYSICAL_VRAM_GIB * 1024**3 / 1e9
     disk = shutil.disk_usage("/content").free / 1e9
-    GPU_PROFILE = "l40s_48gb"
-    GPU_ARCH_LABEL = f"L40S SM89 · {PHYSICAL_VRAM_GIB:.0f} GiB"
+    GPU_PROFILE = "ada_lowvram" if ADA_LOW_VRAM else "l40s_48gb"
+    os.environ["H3_GPU_PROFILE"] = GPU_PROFILE
+    GPU_ARCH_LABEL = f"{gpu} SM89 · {PHYSICAL_VRAM_GIB:.1f} GiB"
     IS_BLACKWELL_SM120 = IS_A100_SM80 = False
     LOWVRAM_T4_PROFILE = A100_PROFILE = A100_80_PROFILE = A100_40_PROFILE = False
     BLACKWELL_FULL_CARD = False
     RESERVE_VRAM = L40S_RESERVE_GIB
-    LOWVRAM = False
+    LOWVRAM = ADA_LOW_VRAM
     log(f"  L40S runtime: Torch {torch.__version__} / CUDA {torch.version.cuda}; {PHYSICAL_VRAM_GIB:.1f} GiB; reserve {RESERVE_VRAM:.1f} GiB")
     log("  Quality INT8 encoder and DiT use staged residency; no native NVFP4/SM120 requirement.")
 
@@ -1965,11 +1972,11 @@ if _CU130_CHILD:
     # normally initializes comfy_aimdo and flips memory_management.aimdo_enabled.
     _bw_highvram = bool(BLACKWELL_FULL_CARD and not LOWVRAM_T4_PROFILE)  # includes A100-80 alias
     for _name, _value in {
-        "lowvram": bool(LOWVRAM_T4_PROFILE),
+        "lowvram": bool(LOWVRAM_T4_PROFILE or ADA_LOW_VRAM),
         "novram": False,
         "highvram": _bw_highvram,
         "gpu_only": False,
-        "normalvram": bool((not LOWVRAM_T4_PROFILE) and (not _bw_highvram)),
+        "normalvram": bool(not (LOWVRAM_T4_PROFILE or ADA_LOW_VRAM or _bw_highvram)),
         "enable_dynamic_vram": bool(LOWVRAM_T4_PROFILE),
         "disable_dynamic_vram": True,
     }.items():
@@ -2327,7 +2334,7 @@ if _CU130_CHILD:
                     mm.load_models_gpu([model])
                 else:
                     try:
-                        mm.load_models_gpu([model], force_full_load=True)
+                        mm.load_models_gpu([model], force_full_load=not ADA_LOW_VRAM)
                     except TypeError:
                         mm.load_models_gpu([model])
 
@@ -2775,7 +2782,7 @@ if _CU130_CHILD:
         try:
             with torch.no_grad():
                 try:
-                    mm.load_models_gpu([patcher], force_full_load=True)
+                    mm.load_models_gpu([patcher], force_full_load=not ADA_LOW_VRAM)
                 except TypeError:
                     mm.load_models_gpu([patcher])
             torch.cuda.synchronize()
@@ -2818,6 +2825,10 @@ if _CU130_CHILD:
 
         torch.cuda.synchronize()
         mm.unload_all_models()
+        if ADA_LOW_VRAM:
+            note = "models cached in host RAM; encoder/DiT load on demand with CPU offload"
+            log(f"  {reason}: {note}")
+            return True, note
         if not _load_resident_patcher(clip, "conditioning TE", TEXT_ENCODER_GIB, mandatory=True):
             raise RuntimeError("L40S text encoder preload failed.")
         note = f"conditioning encoder ready; {_resident_free_gib():.1f} GiB free; DiT/VAEs cached in host memory"
