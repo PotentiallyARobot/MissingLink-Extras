@@ -1,4 +1,120 @@
-# MiniMax H3 Studio - L4 / L40S · adaptive Ada SM89 edition
+# CUDA13 launcher: never replace Torch inside an already-running notebook.
+def _h3_launch_cuda13():
+    import os, sys, subprocess, pathlib, shutil, socket, time, threading
+    root = pathlib.Path('/content/h3_ada_cu130')
+    root.mkdir(parents=True, exist_ok=True)
+    port = int(os.environ.get('H3_UI_PORT', '7860'))
+    with socket.socket() as sock:
+        if sock.connect_ex(('127.0.0.1', port)) == 0:
+            raise RuntimeError(f'Port {port} is already serving an app. Stop the previous H3 process or restart the Colab runtime before launching this CUDA13 edition.')
+    env = os.environ.copy()
+    for key in ('PYTHONPATH', 'PYTHONHOME', 'CUDA_HOME', 'CUDA_PATH', 'CPATH',
+                'CPLUS_INCLUDE_PATH', 'LIBRARY_PATH', 'LD_LIBRARY_PATH', 'H3_CU130_CHILD'):
+        env.pop(key, None)
+    env['PYTHONNOUSERSITE'] = '1'
+    try:
+        from google.colab import userdata
+    except ImportError:
+        userdata = None
+    if userdata is not None:
+        for key in ('MISSING_LINK_TOKEN', 'HF_TOKEN', 'CIVITAI_API_KEY', 'OPENAI_API_KEY'):
+            if not env.get(key):
+                try:
+                    value = userdata.get(key)
+                    if value:
+                        env[key] = value
+                except Exception:
+                    pass
+    def run(cmd, title, capture=False):
+        print('\nCUDA13: ' + title, flush=True)
+        return subprocess.run([str(x) for x in cmd], env=env, check=True, text=True,
+                              stdout=subprocess.PIPE if capture else None)
+    venv = root / 'venv'
+    py = venv / 'bin/python'
+    if not py.exists():
+        run([sys.executable, '-m', 'venv', venv], 'create isolated environment')
+    env['PATH'] = str(venv / 'bin') + ':' + env.get('PATH', '')
+    constraints = root / 'constraints.txt'
+    constraints.write_text('torch==2.11.0+cu130\ntorchvision==0.26.0+cu130\ntorchaudio==2.11.0+cu130\n')
+    env['PIP_CONSTRAINT'] = str(constraints)
+    pip = [py, '-m', 'pip']
+    installed = subprocess.run([str(py), '-c',
+        "import torch,torchvision,torchaudio; assert torch.__version__=='2.11.0+cu130'; assert torch.version.cuda=='13.0'"],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    if not installed:
+        run(pip + ['install', 'torch==2.11.0+cu130', 'torchvision==0.26.0+cu130',
+            'torchaudio==2.11.0+cu130', '--index-url', 'https://download.pytorch.org/whl/cu130'],
+            'install pinned Torch 2.11.0 + CUDA13 (cached on later launches)')
+    run([py, '-c', "import torch; assert torch.cuda.is_available(), 'CUDA13 failed to initialize; check NVIDIA driver'; assert torch.cuda.get_device_capability(0)==(8,9), 'L4/L40S SM89 required'; x=torch.ones(8,device='cuda'); assert x.sum().item()==8; print('Verified:',torch.__version__,torch.version.cuda,torch.cuda.get_device_name(0))"],
+        'verify CUDA13 on the actual GPU')
+    req = pathlib.Path(os.environ.get('COMFY_DIR', '/content/ComfyUI')) / 'requirements.txt'
+    import hashlib
+    dep_key = hashlib.sha256((req.read_bytes() if req.exists() else b'no-comfy-yet') + b'ada-cu130-deps-v1').hexdigest()
+    marker = root / 'dependencies.sha256'
+    if not marker.exists() or marker.read_text() != dep_key:
+        if req.exists():
+            run(pip + ['install', '-r', req], 'install Comfy dependencies with Torch pins enforced')
+        run(pip + ['install', 'comfy-kitchen', 'comfy-aimdo', 'flask', 'requests',
+            'huggingface_hub', 'pillow', 'numpy', 'psutil', 'safetensors', 'ninja',
+            'setuptools==74.1.3', 'wheel==0.43.0', 'packaging==23.2'], 'install studio and Sage build dependencies')
+        marker.write_text(dep_key)
+    # Install the same coherent compiler family as the V73 lab. A driver or a
+    # cu130 Torch wheel alone does not provide nvcc for Sage compilation.
+    toolkit = root / 'toolkit'
+    if not (toolkit / '.complete').exists():
+        run(pip + ['install', '--upgrade', '--target', toolkit,
+            '--extra-index-url', 'https://pypi.nvidia.com',
+            'cuda-toolkit[nvcc,cccl,cudart,cublas,cusparse,cusolver,nvrtc]==13.0.2',
+            'nvidia-nvvm==13.0.88', 'nvidia-cuda-crt==13.0.88', 'nvidia-nvjitlink==13.0.88'],
+            'install CUDA13 compiler for the SM89 Sage build')
+        (toolkit / '.complete').touch()
+    nvccs = sorted(toolkit.glob('nvidia/**/bin/nvcc'))
+    if not nvccs or not shutil.which('c++'):
+        raise RuntimeError('Sage needs CUDA13 nvcc and a C++ compiler; install build-essential if c++ is missing.')
+    cuda_home = nvccs[0].resolve().parent.parent
+    version = run([nvccs[0], '--version'], 'verify compiler', True).stdout
+    if 'release 13.0' not in version:
+        raise RuntimeError('Expected CUDA13 compiler: ' + version)
+    libs = sorted({str(p.parent) for p in toolkit.glob('nvidia/**/libcudart.so*') if p.is_file()})
+    for lib in libs:
+        directory = pathlib.Path(lib)
+        if not (directory / 'libcudart.so').exists():
+            (directory / 'libcudart.so').symlink_to(next(directory.glob('libcudart.so.*')).name)
+    env.update(CUDA_HOME=str(cuda_home), CUDA_PATH=str(cuda_home),
+               TORCH_CUDA_ARCH_LIST='8.9', LIBRARY_PATH=':'.join(libs),
+               LDFLAGS=' '.join('-L' + p for p in libs),
+               H3_ADA_CU130_CHILD='1', H3_UI_BLOCKING_CHILD='1')
+    env['PATH'] = str(cuda_home / 'bin') + ':' + env['PATH']
+    env.setdefault('MAX_JOBS', '2')
+    env.setdefault('EXT_PARALLEL', '1')
+    script = str(pathlib.Path(__file__).resolve())
+    if userdata is None:
+        os.execve(str(py), [str(py), '-u', script], env)
+    # The parent notebook owns the Colab transport; the child owns Torch/Flask.
+    process = subprocess.Popen([str(py), '-u', script], env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    def pump():
+        for line in process.stdout:
+            print(line, end='', flush=True)
+    threading.Thread(target=pump, daemon=True).start()
+    print(f'CUDA13 H3 child PID {process.pid}; waiting for UI on port {port}', flush=True)
+    while process.poll() is None:
+        with socket.socket() as sock:
+            if sock.connect_ex(('127.0.0.1', port)) == 0:
+                from google.colab import output
+                output.serve_kernel_port_as_window(port)
+                print('H3 is running in the isolated CUDA13 process.', flush=True)
+                return
+        time.sleep(2)
+    raise RuntimeError(f'CUDA13 H3 exited before the UI was ready (exit {process.returncode}); see output above.')
+
+import os as _ada_boot_os
+if _ada_boot_os.environ.get('H3_ADA_CU130_CHILD') != '1':
+    _h3_launch_cuda13()
+    raise SystemExit(0)
+
+
+# MiniMax H3 Studio - L4 / L40S · CUDA13 · Ada SM89 edition
 # Derived from h3_studio_3.py. UI, auth, LoRAs, Ref2VA and timeline preserved.
 # Linux CUDA PyTorch + current H3-capable ComfyUI required. No SM120 wheel.
 # Stage-resident INT8 DiT + INT8 Qwen encoder; full stack does not fit 48 GB.
@@ -768,7 +884,7 @@ if _CU130_CHILD:
     def log(m): print(m, flush=True)
 
     log("="*74)
-    log("  MiniMax H3 · L4 / L40S · adaptive Ada SM89 edition")
+    log("  MiniMax H3 · L4 / L40S · CUDA13 · Ada SM89 edition")
     log("="*74)
 
     # ── MissingLink access gate ───────────────────────────────────────────────
@@ -1068,6 +1184,13 @@ if _CU130_CHILD:
 
     if not torch.cuda.is_available():
         raise RuntimeError("A CUDA-enabled PyTorch runtime and NVIDIA L40S are required.")
+    if torch.version.cuda != "13.0" or torch.__version__ != "2.11.0+cu130":
+        raise RuntimeError(f"CUDA13 runtime required; got Torch {torch.__version__}, CUDA {torch.version.cuda}. Launch this script through its CUDA13 bootstrap.")
+    import comfy_kitchen as _ada_kitchen
+    _ada_cuda_backend = _ada_kitchen.list_backends().get("cuda", {})
+    if not _ada_cuda_backend.get("available") or _ada_cuda_backend.get("disabled"):
+        raise RuntimeError(f"Kitchen CUDA backend is unavailable in the CUDA13 runtime: {_ada_cuda_backend}")
+    print("CUDA13 verified · Kitchen CUDA backend enabled", flush=True)
     from flask import Flask, request, jsonify, Response, send_file, session
     gpu = torch.cuda.get_device_name(0)
     GPU_CC = torch.cuda.get_device_capability(0)
