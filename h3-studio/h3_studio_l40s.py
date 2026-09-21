@@ -1879,14 +1879,30 @@ if _CU130_CHILD:
     def _civitai_json(url, token=""):
         # CivitAI authentication is optional. Public API requests are made anonymously
         # when CIVITAI_API_KEY is absent; only a resource that CivitAI itself gates may
-        # reject that specific user-requested install.
+        # reject that specific user-requested install. Read the body ourselves so an
+        # upstream/proxy empty response produces a useful Studio error instead of a raw
+        # JSONDecodeError.
         headers = {"User-Agent":"Standalone-MiniMax-H3/1.0", "Accept":"application/json"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=45) as r:
-                return json.load(r)
+                raw = r.read()
+                status = int(getattr(r, "status", 200) or 200)
+                ctype = str(r.headers.get("Content-Type") or "")
+            if not raw or not raw.strip():
+                raise RuntimeError(
+                    f"CivitAI API returned an empty response (HTTP {status}) for {url}. "
+                    "Retry the request; if this is a civitai.red URL, keep the .red source URL so the Studio uses the mature-content API host."
+                )
+            try:
+                return json.loads(raw.decode("utf-8", "replace"))
+            except Exception as exc:
+                preview = raw[:500].decode("utf-8", "replace").replace("\n", " ").strip()
+                raise RuntimeError(
+                    f"CivitAI API returned non-JSON content (HTTP {status}, {ctype or 'unknown content type'}): {preview[:300]}"
+                ) from exc
         except urllib.error.HTTPError as e:
             if not token and int(getattr(e, "code", 0) or 0) in (401, 403):
                 raise RuntimeError(
@@ -1894,7 +1910,12 @@ if _CU130_CHILD:
                     "CIVITAI_API_KEY is optional and is not required to start or use MiniMax H3 Studio; "
                     "only this protected CivitAI download needs it."
                 ) from e
-            raise
+            try:
+                body = e.read(1200).decode("utf-8", "replace").replace("\n", " ").strip()
+            except Exception:
+                body = ""
+            detail = (": " + body[:500]) if body else ""
+            raise RuntimeError(f"CivitAI API request failed (HTTP {e.code}) for {url}{detail}") from e
 
     def _is_h3_version(v):
         v = v or {}
@@ -1972,11 +1993,11 @@ if _CU130_CHILD:
     # normally initializes comfy_aimdo and flips memory_management.aimdo_enabled.
     _bw_highvram = bool(BLACKWELL_FULL_CARD and not LOWVRAM_T4_PROFILE)  # includes A100-80 alias
     for _name, _value in {
-        "lowvram": bool(LOWVRAM_T4_PROFILE or ADA_LOW_VRAM),
+        "lowvram": bool(LOWVRAM_T4_PROFILE),
         "novram": False,
         "highvram": _bw_highvram,
         "gpu_only": False,
-        "normalvram": bool(not (LOWVRAM_T4_PROFILE or ADA_LOW_VRAM or _bw_highvram)),
+        "normalvram": bool((not LOWVRAM_T4_PROFILE) and (not _bw_highvram)),
         "enable_dynamic_vram": bool(LOWVRAM_T4_PROFILE),
         "disable_dynamic_vram": True,
     }.items():
@@ -2825,10 +2846,6 @@ if _CU130_CHILD:
 
         torch.cuda.synchronize()
         mm.unload_all_models()
-        if ADA_LOW_VRAM:
-            note = "models cached in host RAM; encoder/DiT load on demand with CPU offload"
-            log(f"  {reason}: {note}")
-            return True, note
         if not _load_resident_patcher(clip, "conditioning TE", TEXT_ENCODER_GIB, mandatory=True):
             raise RuntimeError("L40S text encoder preload failed.")
         note = f"conditioning encoder ready; {_resident_free_gib():.1f} GiB free; DiT/VAEs cached in host memory"
@@ -7104,6 +7121,35 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
                 "Use a Hugging Face repo/URL or a CivitAI model/version/download URL."
             )
 
+        # IMPORTANT: civitai.red is not just a cosmetic alias. Mature-content model
+        # pages can be visible on .red while the corresponding .com API lookup is
+        # filtered/blocked or stalls behind an upstream proxy. Keep API inspection on
+        # the same CivitAI host the user supplied. browsingLevel=31 requests the full
+        # browsing set supported by the .red API.
+        civitai_base = "https://civitai.red" if host.endswith("civitai.red") else "https://civitai.com"
+
+        def _civitai_api_url(path):
+            url = civitai_base + str(path)
+            if civitai_base.endswith(".red"):
+                url += ("&" if "?" in url else "?") + "browsingLevel=31"
+            return url
+
+        def _same_civitai_download_host(download_url):
+            # CivitAI metadata may occasionally emit a civitai.com download URL even
+            # when the model was inspected on civitai.red. Preserve CDN/signed URLs,
+            # but rewrite only the first-party civitai.com host for .red sources.
+            if not download_url or not civitai_base.endswith(".red"):
+                return download_url
+            try:
+                d = urlsplit(str(download_url))
+                if (d.hostname or "").lower() in {"civitai.com", "www.civitai.com"}:
+                    netloc = "civitai.red" + ((":" + str(d.port)) if d.port else "")
+                    from urllib.parse import urlunsplit
+                    return urlunsplit((d.scheme or "https", netloc, d.path, d.query, d.fragment))
+            except Exception:
+                pass
+            return download_url
+
         q = parse_qs(parts.query)
         seg = [x for x in parts.path.split("/") if x]
         tok = _civitai_token()
@@ -7114,7 +7160,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         if len(seg) >= 4 and seg[:3] == ["api", "download", "models"]:
             preferred_version_id = int(seg[3])
             v = _civitai_json(
-                f"https://civitai.com/api/v1/model-versions/{preferred_version_id}",
+                _civitai_api_url(f"/api/v1/model-versions/{preferred_version_id}"),
                 tok,
             )
             versions = [v]
@@ -7122,7 +7168,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
 
         elif len(seg) >= 2 and seg[0] == "models":
             model_id = int(seg[1].split("-")[0])
-            model = _civitai_json(f"https://civitai.com/api/v1/models/{model_id}", tok)
+            model = _civitai_json(_civitai_api_url(f"/api/v1/models/{model_id}"), tok)
             versions = list(model.get("modelVersions") or [])
             requested = (q.get("modelVersionId") or [None])[0]
             if requested:
@@ -7155,6 +7201,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
                 if not filename.lower().endswith(".safetensors"):
                     continue
                 download_url = (fobj or {}).get("downloadUrl") or (v or {}).get("downloadUrl")
+                download_url = _same_civitai_download_host(download_url)
                 if not download_url:
                     continue
                 file_id = str((fobj or {}).get("id") or filename)
@@ -7169,7 +7216,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
                     "model_id": int((v or {}).get("modelId") or model_id or 0),
                     "download_url": download_url,
                     "friendly_source_url": (
-                        f"https://civitai.com/models/{int((v or {}).get('modelId') or model_id)}"
+                        f"{civitai_base}/models/{int((v or {}).get('modelId') or model_id)}"
                         f"?modelVersionId={version_id}"
                     ),
                 })
@@ -9138,7 +9185,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
           headers:{'Content-Type':'application/json'},
           body:JSON.stringify({source,revision})
         });
-        const r=await resp.json();
+        const r=await _readJsonResponse(resp,'LoRA source inspection');
         if(!resp.ok||r.error)throw new Error(r.error||'Could not inspect LoRA source.');
         $('lora_source_type').value=(r.source_type||'unknown').toUpperCase();
         if(r.source_type==='hf'&&r.revision)$('lora_revision').value=r.revision;
@@ -9163,7 +9210,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     async function pollLoraDownload(id){
       while(true){
         const resp=await fetch('/api/loras/progress/'+encodeURIComponent(id),{cache:'no-store'});
-        const r=await resp.json();
+        const r=await _readJsonResponse(resp,'LoRA download status');
         if(!resp.ok)throw new Error(r.error||'LoRA download status failed.');
         const pct=r.pct==null?0:Math.max(0,Math.min(100,Number(r.pct)));
         $('lora_download_progress').style.width=pct+'%';
@@ -9190,7 +9237,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
           headers:{'Content-Type':'application/json'},
           body:JSON.stringify({source,revision,candidate_key})
         });
-        const r=await resp.json();
+        const r=await _readJsonResponse(resp,'LoRA download start');
         if(!resp.ok||r.error)throw new Error(r.error||'Could not start LoRA download.');
         const done=await pollLoraDownload(r.id);
         await loadMeta();
