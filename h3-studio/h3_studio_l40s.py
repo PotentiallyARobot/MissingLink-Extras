@@ -1249,27 +1249,109 @@ if _CU130_CHILD:
         return _invoke_patch_node("TorchCompileModel", model=model, backend="inductor"), True
 
 
-    def _l40s_select_attention():
-        """Probe optional Sage in another process: bad kernels cannot poison this UI."""
-        global ATTN_BACKEND, ATTN_BENCH
+    def _l40s_build_sage(*, rebuild=False):
+        """Build/cache an SM89 wheel against the running Torch, never replace Torch."""
+        import hashlib
+        import importlib
+        import pathlib
+        import re
+        import shutil
+        import tempfile
+        import urllib.parse
+        from torch.utils.cpp_extension import CUDA_HOME
+        ref = os.environ.get("H3_L40S_SAGE_REF", "v2.2.0").strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", ref) or ".." in ref:
+            raise ValueError("H3_L40S_SAGE_REF must be a SageAttention tag or commit/ref")
+        if "sageattention" in sys.modules:
+            raise RuntimeError("Restart Python before rebuilding Sage: an older native module is already imported.")
+        cuda_root = CUDA_HOME
+        if not cuda_root:
+            nvcc_path = shutil.which("nvcc")
+            if nvcc_path:
+                cuda_root = str(pathlib.Path(nvcc_path).resolve().parent.parent)
+        if not cuda_root or not (pathlib.Path(cuda_root) / "bin/nvcc").is_file():
+            raise RuntimeError(
+                "Building SageAttention requires a CUDA devel toolkit (nvcc + headers). "
+                "Use a CUDA devel image matching torch.version.cuda, or set CUDA_HOME to that toolkit. "
+                "The driver/nvidia-smi alone is not a compiler. Torch will not be replaced.")
+        if not shutil.which(os.environ.get("CXX", "c++")):
+            raise RuntimeError("Sage build needs a C++ compiler; install build-essential in the GPU image.")
+        version = subprocess.run([str(pathlib.Path(cuda_root) / "bin/nvcc"), "--version"],
+                                 capture_output=True, text=True, timeout=30, check=True).stdout
+        match = re.search(r"release\s+(\d+)\.(\d+)", version)
+        if not match or tuple(map(int, match.groups())) < (12, 4):
+            raise RuntimeError("Sage SM89 requires CUDA toolkit 12.4 or newer.")
+        if not torch.version.cuda or int(match[1]) != int(torch.version.cuda.split('.')[0]):
+            raise RuntimeError(f"Toolkit and Torch CUDA major versions differ: nvcc={match[0]}, Torch={torch.version.cuda}.")
+        identity = dict(ref=ref, python=sys.version, torch=torch.__version__, cuda=torch.version.cuda,
+                        nvcc=version, arch="8.9", abi=str(torch._C._GLIBCXX_USE_CXX11_ABI),
+                        cxx=os.environ.get("CXX", "c++"),
+                        cxx_flags=os.environ.get("CXX_APPEND_FLAGS", ""),
+                        nvcc_flags=os.environ.get("NVCC_APPEND_FLAGS", ""))
+        cache_key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:24]
+        root = pathlib.Path(os.environ.get("H3_L40S_CACHE_DIR", "/content/.h3_l40s_cache")) / "sage" / cache_key
+        root.mkdir(parents=True, exist_ok=True)
+        wheel_dir = root / "wheels"
+        wheel_dir.mkdir(exist_ok=True)
+        env = os.environ.copy()
+        env.update(CUDA_HOME=str(cuda_root), TORCH_CUDA_ARCH_LIST="8.9", SAGEATTN_SKIP_CUDA_BUILD="0")
+        env.setdefault("MAX_JOBS", "2")
+        env.setdefault("EXT_PARALLEL", "1")
+        log_path = root / "build.log"
+        def run(cmd, label):
+            log(f"  Sage SM89: {label}; log: {log_path}")
+            with log_path.open("a", encoding="utf-8") as stream:
+                stream.write("\n" + label + "\n"); stream.flush()
+                proc = subprocess.run(cmd, env=env, stdout=stream, stderr=subprocess.STDOUT,
+                                      text=True, timeout=3600)
+            if proc.returncode:
+                tail = log_path.read_text(errors="replace")[-4000:]
+                raise RuntimeError(f"{label} failed (exit {proc.returncode}). {log_path}\n{tail}")
+        wheels = sorted(wheel_dir.glob("sageattention-*.whl"))
+        if rebuild or not wheels:
+            needed = [pkg for pkg, mod in (("setuptools", "setuptools"), ("wheel", "wheel"),
+                        ("packaging", "packaging"), ("ninja", "ninja"))
+                      if _importlib_util.find_spec(mod) is None]
+            if needed:
+                run([sys.executable, "-m", "pip", "install", "--no-deps", *needed], "install missing build tools")
+            url = "https://codeload.github.com/thu-ml/SageAttention/zip/" + urllib.parse.quote(ref, safe="")
+            # A fresh output directory prevents a failed rebuild from reusing an old wheel.
+            with tempfile.TemporaryDirectory(prefix="build-", dir=root) as temporary:
+                run([sys.executable, "-m", "pip", "wheel", "--no-deps", "--no-build-isolation",
+                     "--no-cache-dir", "--wheel-dir", temporary, url], f"build SageAttention {ref} for SM89")
+                built = list(pathlib.Path(temporary).glob("sageattention-*.whl"))
+                if len(built) != 1:
+                    raise RuntimeError("Sage source build did not produce exactly one wheel.")
+                wheel = wheel_dir / built[0].name
+                pending = wheel.with_suffix(".pending")
+                shutil.copy2(built[0], pending)
+                os.replace(pending, wheel)
+            (root / "build.json").write_text(json.dumps(identity, indent=2), encoding="utf-8")
+        else:
+            wheel = wheels[-1]
+            log(f"  Sage SM89: reusing cached wheel {wheel.name}")
+        target = root / "site"
+        run([sys.executable, "-m", "pip", "install", "--no-deps", "--upgrade",
+             "--target", str(target), str(wheel)], "install cached wheel into private Sage directory")
+        target_s = str(target)
+        if target_s in sys.path:
+            sys.path.remove(target_s)
+        sys.path.insert(0, target_s)
+        env_paths = [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p and p != target_s]
+        os.environ["PYTHONPATH"] = os.pathsep.join([target_s, *env_paths])
+        importlib.invalidate_caches()
+        return dict(ref=ref, cache=str(root), wheel=str(wheel),
+                    sha256=hashlib.sha256(wheel.read_bytes()).hexdigest())
+
+
+    def _l40s_probe_sage():
+        """Compatibility check and diagnostic timings, not an H3 speed ranking."""
         import textwrap
-        requested = os.environ.get("H3_L40S_ATTENTION", "auto").strip().lower()
-        if requested not in {"auto", "sdpa", "sage"}:
-            raise ValueError("H3_L40S_ATTENTION must be auto, sdpa, or sage")
-        ATTN_BACKEND = "pytorch-sdpa"
-        ATTN_BENCH = {"profile": "l40s_48gb", "requested": requested}
-        if requested == "sdpa":
-            ATTN_BENCH["note"] = "PyTorch fused SDPA selected explicitly"
-            return
-        if _importlib_util.find_spec("sageattention") is None:
-            if requested == "sage":
-                raise RuntimeError("Install an SM89-compatible SageAttention build, or use H3_L40S_ATTENTION=auto.")
-            ATTN_BENCH["note"] = "Sage not installed; using PyTorch fused SDPA"
-            log("  L40S: Sage not installed; using PyTorch fused SDPA")
-            return
         probe = r'''
     import json, torch
     from sageattention import sageattn
+    import sageattention._qattn_sm89
+    import sageattention._fused
     assert torch.cuda.get_device_capability(0) == (8, 9)
     torch.set_grad_enabled(False)
     torch.manual_seed(314159)
@@ -1297,23 +1379,47 @@ if _CU130_CHILD:
                              sdpa_ms=elapsed(native), sage_ms=elapsed(sage), relative_rmse=relative_rmse))
     print('L40S_PROBE=' + json.dumps(rows))
     '''
+        proc = subprocess.run([sys.executable, "-c", textwrap.dedent(probe)], capture_output=True,
+                              text=True, timeout=180, env=os.environ.copy())
+        if proc.returncode:
+            raise RuntimeError((proc.stderr or proc.stdout)[-1200:])
+        line = next(x for x in proc.stdout.splitlines() if x.startswith("L40S_PROBE="))
+        return json.loads(line.split("=", 1)[1])
+
+
+    def _l40s_select_attention():
+        """Sage required by default, matching the original production policy."""
+        global ATTN_BACKEND, ATTN_BENCH
+        requested = os.environ.get("H3_L40S_ATTENTION", "sage").strip().lower()
+        if requested not in {"auto", "sdpa", "sage"}:
+            raise ValueError("H3_L40S_ATTENTION must be sage, auto, or sdpa")
+        ATTN_BACKEND = "pytorch-sdpa"
+        ATTN_BENCH = {"profile": "l40s_48gb", "requested": requested}
+        if requested == "sdpa":
+            ATTN_BENCH["note"] = "SDPA explicitly requested; Sage build skipped"
+            return
         try:
-            proc = subprocess.run([sys.executable, "-c", textwrap.dedent(probe)], capture_output=True,
-                                  text=True, timeout=180, env=os.environ.copy())
-            if proc.returncode:
-                raise RuntimeError((proc.stderr or proc.stdout)[-1200:])
-            line = next(x for x in proc.stdout.splitlines() if x.startswith("L40S_PROBE="))
-            rows = json.loads(line.split("=", 1)[1])
+            rows = None
+            if _importlib_util.find_spec("sageattention") is not None:
+                try:
+                    rows = _l40s_probe_sage()
+                except Exception as exc:
+                    log(f"  Existing Sage failed SM89 validation; rebuilding once: {str(exc)[-400:]}")
+                    ATTN_BENCH["existing_sage_error"] = str(exc)[-1200:]
+            if rows is None:
+                ATTN_BENCH["build"] = _l40s_build_sage(rebuild="existing_sage_error" in ATTN_BENCH)
+                rows = _l40s_probe_sage()
             faster = sum(x["sage_ms"] for x in rows) < 0.97 * sum(x["sdpa_ms"] for x in rows)
             ATTN_BENCH.update(tests=rows, sage_compatible=True, sage_faster=faster)
             if faster or requested == "sage":
                 from sageattention import sageattn  # noqa: F401
                 ATTN_BACKEND = "sageattention"
-            log(f"  L40S dense attention -> {ATTN_BACKEND} (isolated SM89 numerical + timing probe)")
+            ATTN_BENCH["selection_policy"] = "required_sage" if requested == "sage" else "opt_in_microbenchmark"
+            log(f"  L40S dense attention -> {ATTN_BACKEND}; policy={ATTN_BENCH['selection_policy']}")
         except Exception as exc:
             ATTN_BENCH.update(sage_compatible=False, note=str(exc)[-1200:])
             if requested == "sage":
-                raise RuntimeError("Sage failed the isolated L40S probe; use auto/SDPA. " + str(exc)) from exc
+                raise RuntimeError("Required L40S SageAttention build/validation failed. " + str(exc)) from exc
             log(f"  L40S Sage probe failed; using PyTorch SDPA: {str(exc)[-400:]}")
 
 
