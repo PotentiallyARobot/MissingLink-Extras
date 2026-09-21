@@ -29,11 +29,14 @@ def _h3_launch_cuda13():
         print('\nCUDA13: ' + title, flush=True)
         return subprocess.run([str(x) for x in cmd], env=env, check=True, text=True,
                               stdout=subprocess.PIPE if capture else None)
-    venv = root / 'venv'
-    py = venv / 'bin/python'
-    if not py.exists():
-        run([sys.executable, '-m', 'venv', venv], 'create isolated environment')
-    env['PATH'] = str(venv / 'bin') + ':' + env.get('PATH', '')
+    print('H3-ADA-CU130-TARGET-V2 · no venv / no ensurepip', flush=True)
+    target = root / 'runtime'
+    extras = root / 'packages'
+    target.mkdir(exist_ok=True)
+    extras.mkdir(exist_ok=True)
+    py = sys.executable
+    env['PYTHONPATH'] = os.pathsep.join((str(extras), str(target)))
+    env['PATH'] = str(extras / 'bin') + ':' + str(target / 'bin') + ':' + env.get('PATH', '')
     constraints = root / 'constraints.txt'
     constraints.write_text('torch==2.11.0+cu130\ntorchvision==0.26.0+cu130\ntorchaudio==2.11.0+cu130\n')
     env['PIP_CONSTRAINT'] = str(constraints)
@@ -42,22 +45,31 @@ def _h3_launch_cuda13():
         "import torch,torchvision,torchaudio; assert torch.__version__=='2.11.0+cu130'; assert torch.version.cuda=='13.0'"],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
     if not installed:
-        run(pip + ['install', 'torch==2.11.0+cu130', 'torchvision==0.26.0+cu130',
+        run(pip + ['install', '--upgrade', '--target', target, 'torch==2.11.0+cu130', 'torchvision==0.26.0+cu130',
             'torchaudio==2.11.0+cu130', '--index-url', 'https://download.pytorch.org/whl/cu130'],
             'install pinned Torch 2.11.0 + CUDA13 (cached on later launches)')
     run([py, '-c', "import torch; assert torch.cuda.is_available(), 'CUDA13 failed to initialize; check NVIDIA driver'; assert torch.cuda.get_device_capability(0)==(8,9), 'L4/L40S SM89 required'; x=torch.ones(8,device='cuda'); assert x.sum().item()==8; print('Verified:',torch.__version__,torch.version.cuda,torch.cuda.get_device_name(0))"],
         'verify CUDA13 on the actual GPU')
     req = pathlib.Path(os.environ.get('COMFY_DIR', '/content/ComfyUI')) / 'requirements.txt'
     import hashlib
-    dep_key = hashlib.sha256((req.read_bytes() if req.exists() else b'no-comfy-yet') + b'ada-cu130-deps-v1').hexdigest()
+    dep_key = hashlib.sha256((req.read_bytes() if req.exists() else b'no-comfy-yet') + b'ada-cu130-target-deps-v2').hexdigest()
     marker = root / 'dependencies.sha256'
     if not marker.exists() or marker.read_text() != dep_key:
         if req.exists():
-            run(pip + ['install', '-r', req], 'install Comfy dependencies with Torch pins enforced')
-        run(pip + ['install', 'comfy-kitchen', 'comfy-aimdo', 'flask', 'requests',
+            import re
+            filtered = root / 'comfy-no-torch.txt'
+            filtered.write_text('\n'.join(line for line in req.read_text().splitlines()
+                if re.split(r'[<>=!~\[ ;]', line.strip().lower(), 1)[0]
+                not in {'torch', 'torchvision', 'torchaudio'}))
+            run(pip + ['install', '--upgrade', '--no-deps', '--target', extras, '-r', filtered],
+                'install Comfy packages without replacing private Torch (V73 policy)')
+        run(pip + ['install', '--upgrade', '--no-deps', '--target', extras,
+            'comfy-kitchen', 'comfy-aimdo', 'flask', 'requests',
             'huggingface_hub', 'pillow', 'numpy', 'psutil', 'safetensors', 'ninja',
             'setuptools==74.1.3', 'wheel==0.43.0', 'packaging==23.2'], 'install studio and Sage build dependencies')
         marker.write_text(dep_key)
+    run([py, '-c', "from torch.utils.cpp_extension import verify_ninja_availability; verify_ninja_availability(); print('Private CUDA13 Torch / Ninja OK')"],
+        'verify Ninja in private runtime')
     # Install the same coherent compiler family as the V73 lab. A driver or a
     # cu130 Torch wheel alone does not provide nvcc for Sage compilation.
     toolkit = root / 'toolkit'
@@ -85,6 +97,12 @@ def _h3_launch_cuda13():
                LDFLAGS=' '.join('-L' + p for p in libs),
                H3_ADA_CU130_CHILD='1', H3_UI_BLOCKING_CHILD='1')
     env['PATH'] = str(cuda_home / 'bin') + ':' + env['PATH']
+    runtime_libs = sorted({str(p) for pattern in ('nvidia/**/lib', 'nvidia/**/lib64')
+                          for p in target.glob(pattern) if p.is_dir()})
+    env['LD_LIBRARY_PATH'] = ':'.join(runtime_libs)
+    env['LIBRARY_PATH'] = ':'.join([*libs, *runtime_libs])
+    # Any later dependency installation by H3 also stays outside Colab's site-packages.
+    env['PIP_TARGET'] = str(extras)
     env.setdefault('MAX_JOBS', '2')
     env.setdefault('EXT_PARALLEL', '1')
     script = str(pathlib.Path(__file__).resolve())
@@ -112,7 +130,6 @@ import os as _ada_boot_os
 if _ada_boot_os.environ.get('H3_ADA_CU130_CHILD') != '1':
     _h3_launch_cuda13()
     raise SystemExit(0)
-
 
 # MiniMax H3 Studio - L4 / L40S · CUDA13 · Ada SM89 edition
 # Derived from h3_studio_3.py. UI, auth, LoRAs, Ref2VA and timeline preserved.
