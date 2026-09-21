@@ -9,7 +9,7 @@ def _h3_launch_cuda13():
             raise RuntimeError(f'Port {port} is already serving an app. Stop the previous H3 process or restart the Colab runtime before launching this CUDA13 edition.')
     env = os.environ.copy()
     for key in ('PYTHONPATH', 'PYTHONHOME', 'CUDA_HOME', 'CUDA_PATH', 'CPATH',
-                'CPLUS_INCLUDE_PATH', 'LIBRARY_PATH', 'LD_LIBRARY_PATH', 'H3_CU130_CHILD'):
+                'CPLUS_INCLUDE_PATH', 'LIBRARY_PATH', 'H3_CU130_CHILD'):
         env.pop(key, None)
     env['PYTHONNOUSERSITE'] = '1'
     try:
@@ -27,8 +27,20 @@ def _h3_launch_cuda13():
                     pass
     def run(cmd, title, capture=False):
         print('\nCUDA13: ' + title, flush=True)
-        return subprocess.run([str(x) for x in cmd], env=env, check=True, text=True,
-                              stdout=subprocess.PIPE if capture else None)
+        if capture:
+            result = subprocess.run([str(x) for x in cmd], env=env, text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        else:
+            process = subprocess.Popen([str(x) for x in cmd], env=env, text=True,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
+            lines = []
+            for line in process.stdout:
+                print(line, end='', flush=True)
+                lines.append(line)
+            result = subprocess.CompletedProcess(cmd, process.wait(), ''.join(lines))
+        if result.returncode:
+            raise RuntimeError(title + '\n' + result.stdout[-12000:])
+        return result
     print('H3-ADA-CU130-TARGET-V2 · no venv / no ensurepip', flush=True)
     target = root / 'runtime'
     extras = root / 'packages'
@@ -99,7 +111,7 @@ def _h3_launch_cuda13():
     env['PATH'] = str(cuda_home / 'bin') + ':' + env['PATH']
     runtime_libs = sorted({str(p) for pattern in ('nvidia/**/lib', 'nvidia/**/lib64')
                           for p in target.glob(pattern) if p.is_dir()})
-    env['LD_LIBRARY_PATH'] = ':'.join(runtime_libs)
+    env['LD_LIBRARY_PATH'] = ':'.join([*runtime_libs, *filter(None, env.get('LD_LIBRARY_PATH', '').split(':'))])
     env['LIBRARY_PATH'] = ':'.join([*libs, *runtime_libs])
     # Any later dependency installation by H3 also stays outside Colab's site-packages.
     env['PIP_TARGET'] = str(extras)
