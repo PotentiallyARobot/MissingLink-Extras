@@ -11,11 +11,12 @@
 #
 #
 # Colab Secrets / optional integrations:
-#   MISSING_LINK_TOKEN - required; validated against MissingLink before the UI can start
+#   MISSING_LINK_TOKEN - required; accepts a free Google-verified Notebook code or paid MissingLink API key.
+#                        New users can sign in at https://missinglink.build/notebook-signin — no card required.
 #   HF_TOKEN           - optional; adds private/gated Hugging Face downloads. Public HF works without it.
 #   CIVITAI_API_KEY    - optional; adds authenticated/gated CivitAI downloads. Public CivitAI works anonymously.
 #   OPENAI_API_KEY     - optional; enables Auto Prompt plus GPT-powered Story Director / Next Scene features.
-# Only MISSING_LINK_TOKEN is required to launch the Studio.
+# Free Google-verified users get 15 H3 generation dispatches; Notebook Pro members are unlimited.
 # SageAttention is never built from source in this UI cell; Blackwell requires the MissingLink wheel.
 #
 # It auto-detects the GPU. Blackwell keeps the existing CU130/Sage resident path;
@@ -313,19 +314,58 @@ def _start_drive_mount_bridge_parent():
 _start_drive_mount_bridge_parent()
 
 # ======================================================================
-# MISSINGLINK ACCESS GATE · fail closed
+# MISSINGLINK NOTEBOOK ACCESS · Google identity + 15 free H3 generations
 # ======================================================================
-# The current public MiniMax H3 notebook instructs users to put their key in the
-# Colab Secret MISSING_LINK_TOKEN and advertises a 7-day free trial.  The older
-# H3 studio code had ML_OK=True, which meant the UI was not actually protected.
-# V88 validates the key against MissingLink's existing non-generation auth endpoint
-# before doing expensive CUDA/model setup, and re-checks periodically while the UI
-# is running.  The token is never printed or written to disk.
+# MISSING_LINK_TOKEN may be either:
+#   1) an opaque `mls_...` starter code issued after MissingLink verifies a real
+#      Gmail identity through Google OAuth, or
+#   2) a paid/legacy MissingLink API key.
+# The starter code can be rotated, but its free-generation ledger remains tied to
+# the same verified MissingLink/Google user id.
+#
+# Free H3 usage is counted server-side against a stable MissingLink/Google user id
+# through /api/notebook/render. Reopening Colab does not reset it. H3 has its own
+# fifteen-generation allowance; the older Wan/LTX notebook allowance remains separate.
+#
+# Rich UI telemetry is sent to /api/activity. Arbitrary prompt text is NOT sent to
+# product_activity; generation telemetry records prompt length plus settings/results.
+MISSING_LINK_BASE_URL = (_os.environ.get("MISSING_LINK_BASE_URL") or
+                         "https://missinglink.build").rstrip("/")
+MISSING_LINK_NOTEBOOK_ME_URL = MISSING_LINK_BASE_URL + "/api/notebook/me?engine=h3"
+MISSING_LINK_NOTEBOOK_RENDER_URL = MISSING_LINK_BASE_URL + "/api/notebook/render"
+MISSING_LINK_ACTIVITY_URL = MISSING_LINK_BASE_URL + "/api/activity"
 MISSING_LINK_AUTH_URL = (_os.environ.get("MISSING_LINK_AUTH_URL") or
-                         "https://missinglink.build/api/cache-token").strip()
-MISSING_LINK_TRIAL_URL = "https://www.missinglink.build/pricing.html"
-MISSING_LINK_AUTH_TTL_SEC = 600.0
-_ML_AUTH_STATE = {"ok": False, "checked": 0.0, "error": "not checked"}
+                         MISSING_LINK_BASE_URL + "/api/cache-token").strip()
+MISSING_LINK_SIGNIN_URL = (
+    MISSING_LINK_BASE_URL +
+    "/get-token?source=h3-studio&model=minimax-h3&placement=free-access"
+)
+MISSING_LINK_UPGRADE_URL = (
+    MISSING_LINK_BASE_URL +
+    "/notebook-pro/start?source=h3-studio&model=minimax-h3&placement=free-limit"
+)
+# Compatibility alias for older UI paths below.
+MISSING_LINK_TRIAL_URL = MISSING_LINK_SIGNIN_URL
+H3_FREE_RENDER_LIMIT = 15
+MISSING_LINK_AUTH_TTL_SEC = 120.0
+ML_DESIGN_VERSION = "h3-studio-2026-09-20-free15-v1"
+
+import hashlib as _ml_hashlib
+import json as _ml_json
+import threading as _ml_threading
+import time as _ml_time
+import urllib.error as _ml_urlerr
+import urllib.request as _ml_urlreq
+import uuid as _ml_uuid
+
+ML_TELEMETRY_SESSION_ID = "h3_" + _ml_uuid.uuid4().hex
+_ML_AUTH_STATE = {
+    "ok": False, "checked": 0.0, "error": "not checked",
+    "member": False, "email": "", "used": 0,
+    "free_limit": H3_FREE_RENDER_LIMIT, "server_free_limit": None,
+    "remaining": H3_FREE_RENDER_LIMIT, "access_mode": "",
+}
+_ML_TELEMETRY_VISITOR_ID = None
 
 def _read_missinglink_token():
     token = (_os.environ.get("MISSING_LINK_TOKEN") or "").strip()
@@ -336,75 +376,325 @@ def _read_missinglink_token():
         except Exception:
             token = ""
     if token:
-        # Child processes inherit the already-read secret without needing access to
-        # Colab's userdata API themselves.
         _os.environ["MISSING_LINK_TOKEN"] = token
     return token
 
-def _validate_missinglink_token(*, force=False):
-    """Validate MISSING_LINK_TOKEN without consuming a generation/credit."""
-    import json as _ml_json
-    import time as _ml_time
-    import urllib.request as _ml_urlreq
-    import urllib.error as _ml_urlerr
+def _ml_token_fingerprint(token=None):
+    global _ML_TELEMETRY_VISITOR_ID
+    if _ML_TELEMETRY_VISITOR_ID:
+        return _ML_TELEMETRY_VISITOR_ID
+    tok = token or _read_missinglink_token()
+    if tok:
+        _ML_TELEMETRY_VISITOR_ID = "h3tok_" + _ml_hashlib.sha256(
+            tok.encode("utf-8", "ignore")
+        ).hexdigest()[:20]
+    else:
+        _ML_TELEMETRY_VISITOR_ID = "h3anon_" + _ml_uuid.uuid4().hex[:20]
+    return _ML_TELEMETRY_VISITOR_ID
 
+def _ml_headers(token=None, *, json_body=False):
+    tok = token or _read_missinglink_token()
+    headers = {"Accept": "application/json", "User-Agent": "MissingLink-H3-Notebook/15free"}
+    if tok:
+        # Starter codes and paid API keys are accepted by the Notebook API.
+        # Sending both headers preserves compatibility with existing paid tokens.
+        headers["Authorization"] = "Bearer " + tok
+        headers["x-api-key"] = tok
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+def _ml_json_request(url, *, method="GET", body=None, timeout=15):
+    data = None
+    headers = _ml_headers(json_body=body is not None)
+    if body is not None:
+        data = _ml_json.dumps(body, separators=(",", ":")).encode("utf-8")
+    req = _ml_urlreq.Request(url, data=data, headers=headers, method=method)
+    with _ml_urlreq.urlopen(req, timeout=timeout) as resp:
+        status = int(getattr(resp, "status", 200) or 200)
+        raw = resp.read(262144)
+    try:
+        payload = _ml_json.loads(raw.decode("utf-8", "replace")) if raw else {}
+    except Exception:
+        payload = {}
+    return status, payload
+
+def _ml_public_access_state():
+    return {
+        "ok": bool(_ML_AUTH_STATE.get("ok")),
+        "member": bool(_ML_AUTH_STATE.get("member")),
+        "email": str(_ML_AUTH_STATE.get("email") or ""),
+        "used": int(_ML_AUTH_STATE.get("used") or 0),
+        "free_limit": H3_FREE_RENDER_LIMIT,
+        "server_free_limit": _ML_AUTH_STATE.get("server_free_limit"),
+        "remaining": int(_ML_AUTH_STATE.get("remaining") if _ML_AUTH_STATE.get("remaining") is not None else H3_FREE_RENDER_LIMIT),
+        "access_mode": str(_ML_AUTH_STATE.get("access_mode") or ""),
+        "upgrade_url": MISSING_LINK_UPGRADE_URL,
+        "signin_url": MISSING_LINK_SIGNIN_URL,
+        "telemetry_session_id": ML_TELEMETRY_SESSION_ID,
+        "design_version": ML_DESIGN_VERSION,
+    }
+
+def _ml_apply_notebook_state(data):
+    member = bool(data.get("member"))
+    try:
+        used = max(0, int(data.get("used") or 0))
+    except Exception:
+        used = 0
+    try:
+        server_limit = int(data.get("free_limit")) if data.get("free_limit") is not None else None
+    except Exception:
+        server_limit = None
+    _ML_AUTH_STATE.update(
+        ok=True, checked=_ml_time.monotonic(), error="", member=member,
+        email=str(data.get("email") or ""), used=used,
+        free_limit=H3_FREE_RENDER_LIMIT, server_free_limit=server_limit,
+        remaining=(-1 if member else max(0, H3_FREE_RENDER_LIMIT - used)),
+        access_mode=("gmail_starter" if data.get("starter") else ("notebook_google" if data.get("email") else "notebook_token")),
+    )
+
+def _validate_missinglink_token(*, force=False):
+    """Validate Notebook identity/API key without consuming a generation."""
     now = _ml_time.monotonic()
     if (not force and _ML_AUTH_STATE.get("ok") and
             now - float(_ML_AUTH_STATE.get("checked") or 0.0) < MISSING_LINK_AUTH_TTL_SEC):
         return True, ""
-
     token = _read_missinglink_token()
     if not token:
         msg = (
-            "MISSING_LINK_TOKEN is not set. Add it in Colab Secrets (key icon), "
-            "enable notebook access, then rerun the cell."
+            "MISSING_LINK_TOKEN is not set. Get your free MissingLink starter code at " + MISSING_LINK_SIGNIN_URL +
+            ", then copy that code into Colab Secrets as MISSING_LINK_TOKEN, "
+            "enable notebook access, then rerun this cell."
         )
         _ML_AUTH_STATE.update(ok=False, checked=now, error=msg)
         return False, msg
-
-    req = _ml_urlreq.Request(
-        MISSING_LINK_AUTH_URL,
-        headers={
-            "x-api-key": token,
-            "Accept": "application/json",
-            "User-Agent": "MissingLink-H3-V88-Colab",
-        },
-        method="GET",
-    )
+    notebook_error = ""
     try:
-        with _ml_urlreq.urlopen(req, timeout=15) as resp:
-            status = int(getattr(resp, "status", 200) or 200)
-            raw = resp.read(65536)
-        try:
-            data = _ml_json.loads(raw.decode("utf-8", "replace")) if raw else {}
-        except Exception:
-            data = {}
+        status, data = _ml_json_request(MISSING_LINK_NOTEBOOK_ME_URL, timeout=15)
         if 200 <= status < 300 and data.get("ok") is True:
-            _ML_AUTH_STATE.update(ok=True, checked=now, error="")
+            _ml_apply_notebook_state(data)
+            _ml_token_fingerprint(token)
             return True, ""
-        msg = f"MissingLink rejected this API key (HTTP {status})."
+        notebook_error = "Notebook identity was rejected."
     except _ml_urlerr.HTTPError as e:
-        # Do not echo a response body: auth services sometimes include account data.
-        msg = f"MissingLink rejected this API key (HTTP {e.code})."
+        try:
+            _body = e.read(4096).decode("utf-8", "replace")
+            try:
+                _err = _ml_json.loads(_body)
+                _detail = str(_err.get("detail") or _err.get("error") or "").strip()
+            except Exception:
+                _detail = _body.strip()
+        except Exception:
+            _detail = ""
+        notebook_error = f"Notebook identity was rejected (HTTP {e.code})"
+        if _detail:
+            notebook_error += f": {_detail[:240]}"
+        notebook_error += "."
     except Exception as e:
-        # Fail closed: if validity cannot be established, the paid UI should not run.
-        msg = f"Could not validate the MissingLink API key: {type(e).__name__}: {e}"
+        notebook_error = f"Notebook identity check failed: {type(e).__name__}: {e}"
+    # Compatibility for paid API keys on older deployments.
+    try:
+        status, data = _ml_json_request(MISSING_LINK_AUTH_URL, timeout=15)
+        if 200 <= status < 300 and data.get("ok") is True:
+            _ML_AUTH_STATE.update(
+                ok=True, checked=now, error="", member=True, email="", used=0,
+                free_limit=H3_FREE_RENDER_LIMIT, server_free_limit=None,
+                remaining=-1, access_mode="legacy_paid_api_key",
+            )
+            _ml_token_fingerprint(token)
+            return True, ""
+    except Exception:
+        pass
+    _ML_AUTH_STATE.update(ok=False, checked=now, error=notebook_error)
+    return False, notebook_error
 
-    _ML_AUTH_STATE.update(ok=False, checked=now, error=msg)
-    return False, msg
+def _ml_generation_meta(p=None, *, origin="generate", jid=None, extra=None):
+    p = dict(p or {})
+    def _num(name, cast=float):
+        try:
+            v = p.get(name)
+            return cast(v) if v is not None and str(v) != "" else None
+        except Exception:
+            return None
+    raw_loras = p.get("extra_loras") or []
+    loras = []
+    for item in raw_loras[:12] if isinstance(raw_loras, (list, tuple)) else []:
+        try:
+            name, strength = item
+            loras.append({"name": _os.path.basename(str(name))[:160], "strength": round(float(strength), 4)})
+        except Exception:
+            continue
+    meta = {
+        "runtime_session_id": ML_TELEMETRY_SESSION_ID, "origin": origin, "job_id": jid,
+        "gpu_profile": str(_os.environ.get("H3_GPU_PROFILE") or "")[:80],
+        "member": bool(_ML_AUTH_STATE.get("member")),
+        "free_used": int(_ML_AUTH_STATE.get("used") or 0),
+        "free_limit": H3_FREE_RENDER_LIMIT,
+        "free_remaining": int(_ML_AUTH_STATE.get("remaining") if _ML_AUTH_STATE.get("remaining") is not None else H3_FREE_RENDER_LIMIT),
+        "prompt_chars": len(str(p.get("prompt") or "")),
+        "input_mode": str(p.get("input_mode") or "")[:40],
+        "model_profile": str(p.get("model_profile") or "")[:100],
+        "unet": _os.path.basename(str(p.get("unet") or ""))[:180],
+        "performance_preset": str(p.get("performance_preset") or "")[:40],
+        "width": _num("width", int), "height": _num("height", int),
+        "duration": _num("duration", float), "frames": _num("frames", int),
+        "playback_speed": _num("playback_speed", float), "steps": _num("steps", int),
+        "seed": _num("seed", int), "denoise": _num("denoise", float),
+        "sampler": str(p.get("sampler_name") or "")[:80],
+        "scheduler": str(p.get("scheduler") or "")[:80],
+        "weight_dtype": str(p.get("weight_dtype") or "")[:80],
+        "sparse_percent": _num("sparse_percent", float),
+        "shift_video": _num("shift_video", float), "shift_audio": _num("shift_audio", float),
+        "timeline_action": str(p.get("timeline_action") or "")[:40],
+        "use_previous_last_frame": str(p.get("use_stage_last") or "0") == "1",
+        "has_first_frame": bool(p.get("first_frame")), "has_last_frame": bool(p.get("last_frame")),
+        "ref_images": len(p.get("ref_images") or []), "ref_videos": len(p.get("ref_videos") or []),
+        "ref_audios": len(p.get("ref_audios") or []), "loras": loras,
+    }
+    if isinstance(extra, dict):
+        for k, v in extra.items():
+            if len(meta) >= 60:
+                break
+            meta[str(k)[:80]] = v
+    return meta
+
+def _ml_post_activity(events):
+    token = _read_missinglink_token()
+    if not token:
+        return False
+    if isinstance(events, dict):
+        events = [events]
+    clean = []
+    for raw in list(events or [])[:30]:
+        if not isinstance(raw, dict) or not raw.get("event"):
+            continue
+        try:
+            active_ms = max(0, min(300000, int(raw.get("active_ms") or 0)))
+        except Exception:
+            active_ms = 0
+        meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
+        row = {
+            "event": str(raw.get("event") or "")[:64],
+            "surface": str(raw.get("surface") or "notebook:h3")[:80],
+            "action": str(raw.get("action") or "")[:100] or None,
+            "target": str(raw.get("target") or "")[:220] or None,
+            "path": "/h3-studio", "design_version": ML_DESIGN_VERSION,
+            "active_ms": active_ms, "meta": meta,
+        }
+        row["meta"].setdefault("runtime_session_id", ML_TELEMETRY_SESSION_ID)
+        row["meta"].setdefault("gpu_profile", str(_os.environ.get("H3_GPU_PROFILE") or "")[:80])
+        row["meta"].setdefault("member", bool(_ML_AUTH_STATE.get("member")))
+        row["meta"].setdefault("free_used", int(_ML_AUTH_STATE.get("used") or 0))
+        row["meta"].setdefault("free_remaining", int(_ML_AUTH_STATE.get("remaining") if _ML_AUTH_STATE.get("remaining") is not None else H3_FREE_RENDER_LIMIT))
+        clean.append(row)
+    if not clean:
+        return False
+    payload = {
+        "session_id": ML_TELEMETRY_SESSION_ID,
+        "visitor_id": _ml_token_fingerprint(token),
+        "path": "/h3-studio", "design_version": ML_DESIGN_VERSION, "events": clean,
+    }
+    try:
+        status, _ = _ml_json_request(MISSING_LINK_ACTIVITY_URL, method="POST", body=payload, timeout=6)
+        return 200 <= status < 300
+    except Exception:
+        return False
+
+def _ml_telemetry_async(event, *, action="", target="", meta=None, active_ms=0):
+    row = {"event": event, "surface": "notebook:h3", "action": action, "target": target,
+           "meta": dict(meta or {}), "active_ms": active_ms}
+    _ml_threading.Thread(target=lambda: _ml_post_activity([row]), daemon=True, name="h3-telemetry").start()
+
+def _ml_reserve_generation(p=None, *, origin="generate"):
+    """Persist one H3 generation dispatch against this verified identity."""
+    ok, error = _validate_missinglink_token(force=True)
+    if not ok:
+        return False, {"error": error or "MissingLink access required.",
+                       "code": "missinglink_auth_required", "signin_url": MISSING_LINK_SIGNIN_URL}
+    if not _ML_AUTH_STATE.get("member") and int(_ML_AUTH_STATE.get("used") or 0) >= H3_FREE_RENDER_LIMIT:
+        _ml_telemetry_async("notebook_h3_free_limit_reached", action="block", target="generation",
+                            meta=_ml_generation_meta(p, origin=origin))
+        return False, {"error": f"Your {H3_FREE_RENDER_LIMIT} free H3 generations are used. Upgrade to keep generating.",
+                       "code": "free_limit_reached", **_ml_public_access_state()}
+    request_body = {
+        "engine": "h3", "surface": "h3_studio", "model": "minimax-h3", "origin": origin,
+        "runtime_session_id": ML_TELEMETRY_SESSION_ID,
+        "settings": _ml_generation_meta(p, origin=origin),
+    }
+    try:
+        status, data = _ml_json_request(MISSING_LINK_NOTEBOOK_RENDER_URL, method="POST", body=request_body, timeout=15)
+        if 200 <= status < 300 and data.get("ok") is True:
+            _ML_AUTH_STATE["member"] = bool(data.get("member", _ML_AUTH_STATE.get("member")))
+            if not _ML_AUTH_STATE.get("member"):
+                try:
+                    used = max(int(_ML_AUTH_STATE.get("used") or 0) + 1, int(data.get("used") or 0))
+                except Exception:
+                    used = int(_ML_AUTH_STATE.get("used") or 0) + 1
+                _ML_AUTH_STATE["used"] = used
+                _ML_AUTH_STATE["remaining"] = max(0, H3_FREE_RENDER_LIMIT - used)
+            else:
+                _ML_AUTH_STATE["remaining"] = -1
+            _ML_AUTH_STATE["checked"] = _ml_time.monotonic()
+            return True, _ml_public_access_state()
+        if data.get("error") == "free_limit_reached":
+            _ML_AUTH_STATE["used"] = max(H3_FREE_RENDER_LIMIT, int(data.get("used") or H3_FREE_RENDER_LIMIT))
+            _ML_AUTH_STATE["remaining"] = 0
+            return False, {"error": f"Your {H3_FREE_RENDER_LIMIT} free H3 generations are used. Upgrade to keep generating.",
+                           "code": "free_limit_reached", **_ml_public_access_state()}
+        raise RuntimeError(str(data.get("error") or f"HTTP {status}"))
+    except _ml_urlerr.HTTPError as e:
+        try:
+            payload = _ml_json.loads(e.read().decode("utf-8", "replace"))
+        except Exception:
+            payload = {}
+        if e.code == 402 or payload.get("error") == "free_limit_reached":
+            _ML_AUTH_STATE["used"] = max(H3_FREE_RENDER_LIMIT, int(payload.get("used") or H3_FREE_RENDER_LIMIT))
+            _ML_AUTH_STATE["remaining"] = 0
+            return False, {"error": f"Your {H3_FREE_RENDER_LIMIT} free H3 generations are used. Upgrade to keep generating.",
+                           "code": "free_limit_reached", **_ml_public_access_state()}
+        if _ML_AUTH_STATE.get("member"):
+            # Paid users should not be stranded by a transient usage-ledger failure.
+            return True, _ml_public_access_state()
+        return False, {"error": f"Could not verify the free-generation allowance (HTTP {e.code}). Try again.",
+                       "code": "quota_check_failed"}
+    except Exception as e:
+        if _ML_AUTH_STATE.get("member"):
+            return True, _ml_public_access_state()
+        return False, {"error": f"Could not verify the free-generation allowance: {type(e).__name__}. Try again.",
+                       "code": "quota_check_failed"}
 
 def _require_missinglink_access():
     ok, error = _validate_missinglink_token(force=True)
     if not ok:
         raise SystemExit(
-            "\n✗ MissingLink access required.\n"
+            "\n✗ MissingLink notebook sign-in required.\n"
             f"  {error}\n"
-            "  Put a valid key in the Colab Secret MISSING_LINK_TOKEN and rerun.\n"
-            f"  Start the 7-day free trial / get access: {MISSING_LINK_TRIAL_URL}\n"
+            f"  Get 15 free H3 generations: {MISSING_LINK_SIGNIN_URL}\n"
+            "  Google will verify your Gmail and issue a starter MissingLink code.\n"
+            "  Copy that code into the Colab Secret MISSING_LINK_TOKEN, "
+            "enable notebook access, then rerun this cell. No card is required.\n"
         )
-    print("✓ MissingLink API key validated · UI access granted", flush=True)
+    state = _ml_public_access_state()
+    if state["member"]:
+        print("✓ MissingLink Notebook Pro verified · unlimited H3 generations", flush=True)
+    else:
+        if int(state.get("remaining") or 0) <= 0:
+            _ml_telemetry_async(
+                "notebook_h3_free_limit_reached", action="startup_block", target="colab_runtime",
+                meta={"free_used": state.get("used"), "free_remaining": 0},
+            )
+            raise SystemExit(
+                f"\n✗ Your {H3_FREE_RENDER_LIMIT} free MiniMax H3 generations are complete.\n"
+                "  Start the 7-day Notebook Pro trial to keep generating and unlock all MissingLink notebooks.\n"
+                "  Then $20/month; cancel anytime.\n"
+                f"  {MISSING_LINK_UPGRADE_URL}\n"
+            )
+        print(f"✓ MissingLink Gmail starter verified · {state['remaining']} of {H3_FREE_RENDER_LIMIT} free H3 generations remaining", flush=True)
+    _ml_telemetry_async("notebook_h3_runtime_started", action="start", target="colab_runtime",
+                        meta={"access_mode": state["access_mode"], "member": state["member"],
+                              "free_used": state["used"], "free_remaining": state["remaining"]})
 
-# Gate the notebook before CUDA builds, weight downloads, or the Flask UI start.
+# Gate before CUDA builds, weight downloads, or Flask UI startup.
 _require_missinglink_access()
 
 def _probe_parent_gpu_no_torch():
@@ -970,7 +1260,74 @@ def _show_child_ui(_port, _pid):
         print(f"Open http://127.0.0.1:{_port}")
 
 if not _CU130_CHILD:
-    _sp.run(["pkill", "-9", "-f", "h3_cu130_production_ui_v(39|40|41|42|43|44|45|46|47|48|49|50|51|52|53|54|55|56|57|58|59|60|61|62|63|64|65|66|67|68|69|70|71|72|73|74|75|76|77|78|79|80|81|82|83|84|85|86).py"],
+    # 2026-09-19 protected-loader fix:
+    # The new h3_studio_loader.py can be the actual persistent CUDA child process.
+    # The old cleanup only matched h3_cu130_production_ui_vXX.py, so rerunning the
+    # notebook could leave the loader-backed child alive with ~50 GiB of VRAM and
+    # then start a second H3 child on another port.
+    _H3_CHILD_PIDFILE = _pl.Path("/content/.missinglink_h3_ui_child.pid")
+
+    def _is_h3_cuda_child_pid(_pid):
+        try:
+            _proc = _pl.Path(f"/proc/{int(_pid)}")
+            if not _proc.exists():
+                return False
+            _cmd = (_proc / "cmdline").read_bytes().replace(b"\\x00", b" ").decode("utf-8", "replace")
+            _envb = (_proc / "environ").read_bytes()
+            _child_env = b"H3_CU130_CHILD=1" in _envb
+            _known_cmd = (
+                "h3_studio_loader.py" in _cmd
+                or _re.search(r"h3_cu130_production_ui_v\\d+\\.py", _cmd) is not None
+            )
+            return bool(_child_env and _known_cmd)
+        except Exception:
+            return False
+
+    def _kill_h3_child_pid(_pid, _why):
+        try:
+            _pid = int(_pid)
+        except Exception:
+            return False
+        if _pid <= 1 or _pid == _os.getpid() or not _is_h3_cuda_child_pid(_pid):
+            return False
+        try:
+            _os.kill(_pid, 9)
+            print(f"✓ stopped stale H3 CUDA child PID {_pid} ({_why})", flush=True)
+            return True
+        except ProcessLookupError:
+            return False
+        except Exception as _e:
+            print(f"⚠ could not stop stale H3 CUDA child PID {_pid}: {_e}", flush=True)
+            return False
+
+    # Exact PID from the previous launch in this notebook kernel.
+    _old_pid = (_os.environ.get("H3_V86_UI_PID") or "").strip()
+    if _old_pid:
+        _kill_h3_child_pid(_old_pid, "previous H3_V86_UI_PID")
+
+    # Persistent PID survives %run state changes and protects against the new loader path.
+    try:
+        if _H3_CHILD_PIDFILE.exists():
+            _kill_h3_child_pid(_H3_CHILD_PIDFILE.read_text().strip(), "saved child pid")
+    except Exception:
+        pass
+
+    # Sweep only processes that explicitly identify themselves as the isolated H3
+    # CUDA child. This catches loader-backed children created before the PID-file fix.
+    try:
+        for _p in _pl.Path("/proc").iterdir():
+            if _p.name.isdigit():
+                _kill_h3_child_pid(_p.name, "orphaned protected child")
+    except Exception:
+        pass
+
+    try:
+        _H3_CHILD_PIDFILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    # Keep the historical filename cleanup as a final compatibility fallback.
+    _sp.run(["pkill", "-9", "-f", r"h3_cu130_production_ui_v[0-9]+\\.py"],
             stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, check=False)
     _root = _pl.Path("/content/h3_cu130_target_v35")
     _cuda_pkg_root = _pl.Path("/content/h3_cuda130_compiler_pkgs_v35")
@@ -1253,6 +1610,10 @@ print("FAST-REUSE OK:", torch.__version__, torch.version.cuda, torch.cuda.get_de
             # Parent notebook cell ends normally. The isolated child keeps the
             # model + Flask UI alive until this cell is rerun or the runtime stops.
             _os.environ["H3_V86_UI_PID"] = str(_proc.pid)
+            try:
+                _pl.Path("/content/.missinglink_h3_ui_child.pid").write_text(str(_proc.pid))
+            except Exception:
+                pass
             _os.environ["H3_V86_UI_PORT"] = str(_ui_port)
             _os.environ["H3_V86_UI_LOG"] = str(_child_log)
             print("✓ V86 ready. No SystemExit is expected.", flush=True)
@@ -1658,6 +2019,7 @@ assert str(torch.version.cuda).startswith("13.0")
                 _ML_SAGE_URL,
                 headers={
                     "x-api-key": _ml_token,
+                    "Authorization": "Bearer " + _ml_token,
                     "User-Agent": "MissingLink-H3-SageWheel/1",
                     "Accept": "application/octet-stream",
                 },
@@ -1728,6 +2090,10 @@ assert str(torch.version.cuda).startswith("13.0")
         _wait_for_ui(_proc, _ui_port, _child_log)
         _show_child_ui(_ui_port, _proc.pid)
         _os.environ["H3_V86_UI_PID"] = str(_proc.pid)
+        try:
+            _pl.Path("/content/.missinglink_h3_ui_child.pid").write_text(str(_proc.pid))
+        except Exception:
+            pass
         _os.environ["H3_V86_UI_PORT"] = str(_ui_port)
         _os.environ["H3_V86_UI_LOG"] = str(_child_log)
         print("✓ V86 ready. No SystemExit is expected.", flush=True)
@@ -1812,9 +2178,9 @@ if _CU130_CHILD:
     ML_OK, ML_AUTH_ERROR = _validate_missinglink_token(force=False)
     if not ML_OK:
         raise SystemExit(
-            "MissingLink API key validation failed before UI startup: "
+            "MissingLink notebook identity validation failed before UI startup: "
             + (ML_AUTH_ERROR or "unknown auth error")
-            + f"\nStart a 7-day trial / get access: {MISSING_LINK_TRIAL_URL}"
+            + f"\nFree Google sign-in: {MISSING_LINK_SIGNIN_URL}"
         )
     REQUESTED_GPU_PROFILE = (os.environ.get("H3_GPU_PROFILE") or "blackwell_sm120").strip().lower()
     LOWVRAM_T4_REQUESTED = REQUESTED_GPU_PROFILE == "t4_16gb"
@@ -4286,24 +4652,220 @@ if _CU130_CHILD:
         return {**_output_storage_state(), "migrated_files": copied_files, "migrated_bytes": copied_bytes}
 
 
+    def _segment_source_shape(seg):
+        """Return immutable source frame count/duration and normalize non-destructive trim fields."""
+        try:
+            source_frames = int(seg.get("source_frames") or seg.get("frames") or 1)
+        except Exception:
+            source_frames = 1
+        source_frames = max(1, source_frames)
+
+        try:
+            source_duration = float(seg.get("source_duration") or 0.0)
+        except Exception:
+            source_duration = 0.0
+        if source_duration <= 0:
+            src = os.path.join(OUT, str(seg.get("file") or ""))
+            source_duration = float(_probe_media_duration(src) or seg.get("duration") or (source_frames / MODEL_FPS))
+        source_duration = max(0.001, source_duration)
+
+        try:
+            start = int(seg.get("trim_start_frame") if seg.get("trim_start_frame") is not None else 0)
+        except Exception:
+            start = 0
+        try:
+            end = int(seg.get("trim_end_frame") if seg.get("trim_end_frame") is not None else source_frames - 1)
+        except Exception:
+            end = source_frames - 1
+        start = max(0, min(source_frames - 1, start))
+        end = max(start, min(source_frames - 1, end))
+
+        seg["source_frames"] = source_frames
+        seg["source_duration"] = round(source_duration, 6)
+        seg["trim_start_frame"] = start
+        seg["trim_end_frame"] = end
+        seg["frames"] = end - start + 1
+        seg["duration"] = round(source_duration * (seg["frames"] / source_frames), 3)
+        return source_frames, source_duration, start, end
+
+    def _segment_is_trimmed(seg):
+        source_frames, _dur, start, end = _segment_source_shape(seg)
+        return start != 0 or end != source_frames - 1
+
+    def _cleanup_segment_trim_artifacts(segment_id, keep=None):
+        keep_abs = {os.path.abspath(x) for x in (keep or []) if x}
+        prefix = f"timeline_trim_{re.sub(r'[^A-Za-z0-9_-]+', '_', str(segment_id or 'clip'))}_"
+        try:
+            for name in os.listdir(OUT):
+                if not name.startswith(prefix):
+                    continue
+                path = os.path.abspath(os.path.join(OUT, name))
+                if path in keep_abs:
+                    continue
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _extract_timeline_frame(seg, frame_index, role):
+        source_frames, _source_duration, _start, _end = _segment_source_shape(seg)
+        frame_index = max(0, min(source_frames - 1, int(frame_index)))
+        if frame_index == 0 and seg.get("first_frame_path") and os.path.exists(seg.get("first_frame_path")):
+            return seg.get("first_frame_path")
+        if frame_index == source_frames - 1 and seg.get("last_frame_path") and os.path.exists(seg.get("last_frame_path")):
+            return seg.get("last_frame_path")
+
+        ffmpeg = shutil.which("ffmpeg")
+        src = os.path.join(OUT, str(seg.get("file") or ""))
+        if not ffmpeg or not os.path.exists(src):
+            return None
+        sid = re.sub(r"[^A-Za-z0-9_-]+", "_", str(seg.get("segment_id") or seg.get("job") or "clip"))
+        dest = os.path.join(OUT, f"timeline_trim_{sid}_{role}_{frame_index}.png")
+        if os.path.exists(dest) and os.path.getsize(dest) > 128:
+            return dest
+        tmp = dest + ".tmp.png"
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+        vf = f"select=eq(n\\,{frame_index})"
+        cmd = [ffmpeg, "-y", "-i", src, "-vf", vf, "-frames:v", "1", "-vsync", "0", tmp]
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if r.returncode != 0 or not os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            return None
+        os.replace(tmp, dest)
+        return dest
+
+    def _effective_segment_frame_paths(seg):
+        source_frames, _source_duration, start, end = _segment_source_shape(seg)
+        if start == 0:
+            first_path = seg.get("first_frame_path")
+        else:
+            first_path = seg.get("trim_first_frame_path")
+            if not first_path or not os.path.exists(first_path):
+                first_path = _extract_timeline_frame(seg, start, "first")
+                if first_path:
+                    seg["trim_first_frame_path"] = first_path
+                    seg["trim_first_frame_file"] = os.path.basename(first_path)
+        if end == source_frames - 1:
+            last_path = seg.get("last_frame_path")
+        else:
+            last_path = seg.get("trim_last_frame_path")
+            if not last_path or not os.path.exists(last_path):
+                last_path = _extract_timeline_frame(seg, end, "last")
+                if last_path:
+                    seg["trim_last_frame_path"] = last_path
+                    seg["trim_last_frame_file"] = os.path.basename(last_path)
+        return first_path, last_path
+
+    def _media_has_audio(path):
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe or not os.path.exists(path):
+            return True
+        try:
+            r = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=index",
+                 "-of", "csv=p=0", path], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=20,
+            )
+            return r.returncode == 0 and bool((r.stdout or "").strip())
+        except Exception:
+            return True
+
+    def _timeline_segment_media_path(seg):
+        """Materialize a non-destructive in/out-frame trim and return the MP4 used by the timeline."""
+        source_frames, source_duration, start, end = _segment_source_shape(seg)
+        src = os.path.join(OUT, str(seg.get("file") or ""))
+        if not os.path.exists(src):
+            raise RuntimeError(f"Timeline source clip is missing: {seg.get('file') or '(unknown)'}")
+        if start == 0 and end == source_frames - 1:
+            seg.pop("trim_file", None)
+            seg.pop("trim_first_frame_path", None); seg.pop("trim_first_frame_file", None)
+            seg.pop("trim_last_frame_path", None); seg.pop("trim_last_frame_file", None)
+            return src
+
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError("ffmpeg is required to trim timeline clips")
+        sid = re.sub(r"[^A-Za-z0-9_-]+", "_", str(seg.get("segment_id") or seg.get("job") or "clip"))
+        dest = os.path.join(OUT, f"timeline_trim_{sid}_{start}_{end}.mp4")
+        if not (os.path.exists(dest) and os.path.getsize(dest) > 1024):
+            tmp = dest + ".tmp.mp4"
+            for pth in (tmp,):
+                try:
+                    os.remove(pth)
+                except FileNotFoundError:
+                    pass
+            # Frame indexes are exact for video. Audio boundaries use the corresponding
+            # frame timestamps so A/V stays aligned after the cut.
+            sec_per_frame = source_duration / max(1, source_frames)
+            start_sec = start * sec_per_frame
+            end_sec = (end + 1) * sec_per_frame
+            vf = f"[0:v]trim=start_frame={start}:end_frame={end + 1},setpts=PTS-STARTPTS[v]"
+            if _media_has_audio(src):
+                af = f"[0:a]atrim=start={start_sec:.9f}:end={end_sec:.9f},asetpts=PTS-STARTPTS[a]"
+                cmd = [ffmpeg, "-y", "-i", src, "-filter_complex", vf + ";" + af,
+                       "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast",
+                       "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+                       "-movflags", "+faststart", tmp]
+            else:
+                cmd = [ffmpeg, "-y", "-i", src, "-filter_complex", vf,
+                       "-map", "[v]", "-c:v", "libx264", "-preset", "veryfast",
+                       "-crf", "18", "-pix_fmt", "yuv420p", "-an", "-movflags", "+faststart", tmp]
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if r.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) <= 1024:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+                raise RuntimeError("Timeline clip trim failed: " + (r.stderr[-700:] if r.stderr else "ffmpeg failed"))
+            os.replace(tmp, dest)
+        seg["trim_file"] = os.path.basename(dest)
+        actual = _probe_media_duration(dest)
+        if actual and actual > 0:
+            seg["duration"] = round(float(actual), 3)
+        _effective_segment_frame_paths(seg)
+        _cleanup_segment_trim_artifacts(seg.get("segment_id") or seg.get("job"), keep=[dest, seg.get("trim_first_frame_path"), seg.get("trim_last_frame_path")])
+        return dest
+
     def _sequence_duration(seq):
-        return round(sum(float(s.get("duration") or 0) for s in (seq.get("segments") or [])), 3)
+        total = 0.0
+        for seg in (seq.get("segments") or []):
+            _segment_source_shape(seg)
+            total += float(seg.get("duration") or 0)
+        return round(total, 3)
 
     def _public_segment(seg, idx, seq_id=None):
+        source_frames, source_duration, start, end = _segment_source_shape(seg)
+        first_path, last_path = _effective_segment_frame_paths(seg)
+        trimmed = (start != 0 or end != source_frames - 1)
+        timeline_file = seg.get("trim_file") if trimmed and seg.get("trim_file") else seg.get("file")
         return {
             "index": idx,
             "sequence_id": seq_id,
             "segment_id": seg.get("segment_id") or seg.get("job"),
             "job": seg.get("job"),
             "file": seg.get("file"),
+            "timeline_file": timeline_file,
             "duration": seg.get("duration"),
             "frames": seg.get("frames"),
+            "source_duration": source_duration,
+            "source_frames": source_frames,
+            "trim_start_frame": start,
+            "trim_end_frame": end,
+            "trimmed": trimmed,
             "width": seg.get("width"),
             "height": seg.get("height"),
             "seed": seg.get("seed"),
             "prompt": seg.get("prompt", ""),
-            "last_frame_file": seg.get("last_frame_file"),
-            "first_frame_file": seg.get("first_frame_file"),
+            "last_frame_file": (os.path.basename(last_path) if last_path else seg.get("last_frame_file")),
+            "first_frame_file": (os.path.basename(first_path) if first_path else seg.get("first_frame_file")),
             "continued": bool(seg.get("continued")),
             "continued_from_job": seg.get("continued_from_job"),
         }
@@ -4311,11 +4873,14 @@ if _CU130_CHILD:
     def _sync_stage_from_sequence(seq):
         segs = list((seq or {}).get("segments") or [])
         last = segs[-1] if segs else None
+        first_path = last_path = None
+        if last:
+            first_path, last_path = _effective_segment_frame_paths(last)
         with STAGE_LOCK:
-            if last and last.get("last_frame_path") and os.path.exists(last.get("last_frame_path")):
-                STAGE_STATE["first_frame_path"] = last.get("first_frame_path")
-                STAGE_STATE["last_frame_path"] = last.get("last_frame_path")
-                STAGE_STATE["video_file"] = last.get("file")
+            if last and last_path and os.path.exists(last_path):
+                STAGE_STATE["first_frame_path"] = first_path
+                STAGE_STATE["last_frame_path"] = last_path
+                STAGE_STATE["video_file"] = last.get("trim_file") or last.get("file")
                 STAGE_STATE["job"] = last.get("job")
                 STAGE_STATE["updated"] = time.time()
             else:
@@ -4475,6 +5040,7 @@ if _CU130_CHILD:
                     seg["first_frame_path"] = os.path.join(OUT, seg["first_frame_file"])
                 if not seg.get("last_frame_path") and seg.get("last_frame_file"):
                     seg["last_frame_path"] = os.path.join(OUT, seg["last_frame_file"])
+                _segment_source_shape(seg)
                 seq["segments"].append(seg)
             restored["sequences"].append(seq)
         if not restored["sequences"]:
@@ -4587,7 +5153,7 @@ if _CU130_CHILD:
         enc_cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", list_path,
                    "-map", "0:v:0", "-map", "0:a:0",
                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-                   "-pix_fmt", "yuv660p", "-c:a", "aac", "-b:a", "192k",
+                   "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
                    "-fflags", "+genpts", "-movflags", "+faststart", tmp]
         r2 = subprocess.run(enc_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try: os.remove(list_path)
@@ -4603,18 +5169,21 @@ if _CU130_CHILD:
             if not seq:
                 return False, None, "sequence not found"
             segs = list(seq.get("segments") or [])
-            paths = [os.path.join(OUT, s.get("file", "")) for s in segs]
+        try:
+            paths = [_timeline_segment_media_path(seg) for seg in segs]
+        except Exception as exc:
+            return False, None, str(exc)
         if not segs:
             master_file = None
             ok, note = True, "empty sequence"
         elif len(segs) == 1:
-            master_file = segs[0].get("file")
-            ok, note = True, "single-segment sequence"
+            master_file = os.path.basename(paths[0])
+            ok, note = True, ("single trimmed segment" if _segment_is_trimmed(segs[0]) else "single-segment sequence")
         else:
             master_file = f"timeline_{uuid.uuid4().hex[:10]}.mp4"
             ok, note = _concat_mp4_timeline(paths, os.path.join(OUT, master_file))
             if not ok:
-                master_file = segs[-1].get("file")
+                master_file = os.path.basename(paths[-1])
         with TIMELINE_LOCK:
             seq = _find_sequence_unlocked(seq_id)
             if seq:
@@ -4777,6 +5346,13 @@ if _CU130_CHILD:
                 traceback.print_exc()
                 if jid in JOBS:
                     JOBS[jid].update(status="error", msg=traceback.format_exc()[-1600:])
+                    try:
+                        _ml_telemetry_async(
+                            "notebook_h3_generation_failed", action="queue_worker_error", target="generation",
+                            meta=_ml_generation_meta(p if "p" in locals() else {}, origin="queue_worker", jid=jid),
+                        )
+                    except Exception:
+                        pass
             finally:
                 with QUEUE_CV:
                     QUEUE_ACTIVE_JOB = None
@@ -4833,6 +5409,33 @@ if _CU130_CHILD:
                     except Exception:
                         pass
         finally:
+            try:
+                _st = str(JOBS.get(jid, {}).get("status") or "")
+                _event = {
+                    "done": "notebook_h3_generation_succeeded",
+                    "cancelled": "notebook_h3_generation_cancelled",
+                    "error": "notebook_h3_generation_failed",
+                }.get(_st)
+                if _event:
+                    _jr = JOBS.get(jid, {})
+                    _ml_telemetry_async(
+                        _event, action=_st, target="generation",
+                        meta=_ml_generation_meta(
+                            p, origin="worker_result", jid=jid,
+                            extra={
+                                "status": _st,
+                                "elapsed_s": _jr.get("secs"),
+                                "measured_total_s": _jr.get("measured_total_sec"),
+                                "sampling_s": _jr.get("sampling_sec"),
+                                "stitch_s": _jr.get("stitch_sec"),
+                                "output_duration_s": _jr.get("duration"),
+                                "output_frames": _jr.get("frames"),
+                                "restart_count": _jr.get("restart_count", 0),
+                            },
+                        ),
+                    )
+            except Exception:
+                pass
             GPU_LOCK.release()
 
     def _generate(jid, p):
@@ -5290,6 +5893,10 @@ if _CU130_CHILD:
                 "file": os.path.basename(dest),
                 "duration": round(final_duration, 3),
                 "frames": int(n_frames),
+                "source_duration": round(final_duration, 3),
+                "source_frames": int(n_frames),
+                "trim_start_frame": 0,
+                "trim_end_frame": max(0, int(n_frames) - 1),
                 "width": int(width),
                 "height": int(height),
                 "seed": int(p.get("seed") or 0),
@@ -5314,18 +5921,23 @@ if _CU130_CHILD:
                 seq["segments"] = segs
                 seq["updated"] = time.time()
                 TIMELINE_STATE["updated"] = time.time()
-                segment_paths = [os.path.join(OUT, s["file"]) for s in segs]
+                seq_id_for_stitch = seq.get("id")
 
             stitch0 = time.perf_counter()
-            if len(segment_paths) <= 1:
+            if len(segs) <= 1:
                 master_file = os.path.basename(dest)
                 stitch_ok, stitch_note = True, "single-segment sequence"
             else:
-                master_name = f"timeline_{uuid.uuid4().hex[:10]}.mp4"
-                master_path = os.path.join(OUT, master_name)
                 _set_job_stage(jid, "stitching timeline")
-                stitch_ok, stitch_note = _concat_mp4_timeline(segment_paths, master_path)
-                master_file = master_name if stitch_ok else os.path.basename(dest)
+                try:
+                    segment_paths = [_timeline_segment_media_path(s) for s in segs]
+                    master_name = f"timeline_{uuid.uuid4().hex[:10]}.mp4"
+                    master_path = os.path.join(OUT, master_name)
+                    stitch_ok, stitch_note = _concat_mp4_timeline(segment_paths, master_path)
+                    master_file = master_name if stitch_ok else os.path.basename(dest)
+                except Exception as _stitch_exc:
+                    stitch_ok, stitch_note = False, f"timeline stitch failed: {_stitch_exc}"
+                    master_file = os.path.basename(dest)
             j["stitch_sec"] = round(time.perf_counter() - stitch0, 3)
             j["stitch_note"] = stitch_note
             j["measured_total_sec"] = round(time.perf_counter() - _job_wall0, 3)
@@ -5514,6 +6126,45 @@ if _CU130_CHILD:
     def api_adult_exit():
         return jsonify(ok=True, legacy=True), 200
 
+    @app.get("/api/ml/access")
+    def api_ml_access():
+        ok, error = _validate_missinglink_token(force=True)
+        if not ok:
+            return jsonify(ok=False, error=error, signin_url=MISSING_LINK_SIGNIN_URL), 401
+        return jsonify(**_ml_public_access_state())
+
+    @app.post("/api/ml/activity")
+    def api_ml_activity():
+        body = request.get_json(silent=True) or {}
+        incoming = body.get("events") if isinstance(body.get("events"), list) else [body]
+        safe_events = []
+        for raw in incoming[:30]:
+            if not isinstance(raw, dict) or not raw.get("event"):
+                continue
+            meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
+            meta = {
+                str(k)[:80]: v for k, v in list(meta.items())[:40]
+                if str(k).lower() not in {"prompt", "text", "raw_text", "value_text", "token", "api_key"}
+            }
+            try:
+                _active_ms = max(0, min(300000, int(raw.get("active_ms") or 0)))
+            except Exception:
+                _active_ms = 0
+            safe_events.append({
+                "event": str(raw.get("event") or "")[:64],
+                "surface": str(raw.get("surface") or "notebook:h3")[:80],
+                "action": str(raw.get("action") or "")[:100],
+                "target": str(raw.get("target") or "")[:220],
+                "active_ms": _active_ms,
+                "meta": meta,
+            })
+        if safe_events:
+            _ml_threading.Thread(
+                target=lambda: _ml_post_activity(safe_events),
+                daemon=True, name="h3-ui-telemetry",
+            ).start()
+        return ("", 204)
+
     @app.before_request
     def _missinglink_ui_gate():
         # Startup already validated the key. Re-check on a short TTL so revoked keys
@@ -5536,7 +6187,8 @@ if _CU130_CHILD:
             "<h1>MissingLink access required</h1>"
             f"<p>{msg}</p>"
             "<p>Add a valid <code>MISSING_LINK_TOKEN</code> in Colab Secrets and rerun the cell.</p>"
-            f"<p><a href='{MISSING_LINK_TRIAL_URL}' target='_blank'>Start the 7-day free trial / get access</a></p>",
+            f"<p><a href='{MISSING_LINK_SIGNIN_URL}' target='_blank'>Get a Gmail-tied starter code for 15 free H3 generations</a></p>"
+            f"<p><a href='{MISSING_LINK_UPGRADE_URL}' target='_blank'>15 free generations complete? Start the 7-day Notebook Pro trial</a></p>",
             status=401, mimetype="text/html"
         )
 
@@ -6050,12 +6702,6 @@ if _CU130_CHILD:
             ref2va_unet=REF2VA_DIT_FILE, stock_ref2va_unet=REF2VA_DIT_FILE,
             base_fl2va_unet=(T4_DIT_FILE if LOWVRAM_T4_PROFILE else FALLBACK_DIT_FILE),
             output_storage=OUTPUT_STORAGE, output_persistent=bool(OUTPUT_PERSISTENT), output_label=OUTPUT_LABEL,
-            integration_keys=dict(
-                missinglink=bool(ML_OK),
-                openai=bool(_openai_api_key()),
-                huggingface=bool(_hf_token()),
-                civitai=bool(_civitai_token()),
-            ),
             eros_max_unet="", redmix_unet="", eros_max_sha256="", eros_integrated_turbo=False,
             motion8_file=MOTION8_FILE, motion8_available=bool(not LOWVRAM_T4_PROFILE), model_profiles=profile_state,
             naughty_file="", naughty_strength=0.0,
@@ -7047,7 +7693,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
               "shift_video","shift_audio","sparse_percent","sampler_name","scheduler",
               "weight_dtype","lora","lora_strength","motion8","motion8_strength","action","action_strength","lightning",
               "lightning_strength","taomate","taomate_strength","unet", "use_stage_last", "timeline_action",
-              "input_mode", "ref_image_size")}
+              "input_mode", "ref_image_size", "model_profile", "performance_preset")}
         input_mode = (p.get("input_mode") or "fl2va").strip().lower()
         if input_mode not in {"fl2va", "ref2va"}:
             input_mode = "fl2va"
@@ -7255,6 +7901,21 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         # references are resolved by the worker when this job reaches the GPU.
         thumb_src = p.get("first_frame") or ((p.get("ref_images") or [None])[0])
         thumb_file = os.path.basename(thumb_src) if thumb_src else None
+        _ml_telemetry_async(
+            "notebook_h3_generation_attempted", action="attempt", target="generate",
+            meta=_ml_generation_meta(p, origin="generate", jid=jid),
+        )
+        _ml_allowed, _ml_access = _ml_reserve_generation(p, origin="generate")
+        if not _ml_allowed:
+            return jsonify(_ml_access), (402 if _ml_access.get("code") == "free_limit_reached" else 503)
+        _ml_telemetry_async(
+            "notebook_h3_generation_queued", action="queue", target="generate",
+            meta=_ml_generation_meta(
+                p, origin="generate", jid=jid,
+                extra={"quota_used": _ml_access.get("used"), "quota_remaining": _ml_access.get("remaining")},
+            ),
+        )
+
         _now = time.time()
         JOBS[jid] = {
             "status":"queued", "t0":_now, "prompt":p.get("prompt") or "",
@@ -7264,7 +7925,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         }
         _enqueue_generation(jid, p)
         return jsonify(
-            id=jid, queued=True,
+            id=jid, queued=True, access=_ml_public_access_state(),
             drive_config_connected=bool(_config_save_result.get("drive_connected")),
             drive_config_saved=bool(_config_save_result.get("saved")),
             drive_config_error=_config_save_result.get("error", ""),
@@ -7389,11 +8050,22 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         p["_retry_continued"] = "1" if last.get("continued") else "0"
         p["_target_sequence_id"] = seq.get("id")
         jid = uuid.uuid4().hex[:8]
+        _ml_telemetry_async(
+            "notebook_h3_generation_attempted", action="retry", target="timeline_retry",
+            meta=_ml_generation_meta(p, origin="retry_last", jid=jid),
+        )
+        _ml_allowed, _ml_access = _ml_reserve_generation(p, origin="retry_last")
+        if not _ml_allowed:
+            return jsonify(_ml_access), (402 if _ml_access.get("code") == "free_limit_reached" else 503)
         JOBS[jid] = {"status":"queued", "t0":time.time(), "stage":"queued", "stage_started":time.time(), "last_activity":time.time(), "retry_of":last.get("job"),
                      "prompt":p.get("prompt") or "", "requested_duration":float(p.get("duration") or 0),
                      "thumb_file":last.get("last_frame_file")}
         _enqueue_generation(jid,p)
-        return jsonify(id=jid, seed=retry_seed, queued=True)
+        _ml_telemetry_async(
+            "notebook_h3_generation_queued", action="retry", target="timeline_retry",
+            meta=_ml_generation_meta(p, origin="retry_last", jid=jid),
+        )
+        return jsonify(id=jid, seed=retry_seed, queued=True, access=_ml_public_access_state())
 
     @app.post("/api/timeline/clear")
     def api_timeline_clear():
@@ -8098,6 +8770,14 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
             src["continued"] = False
             src["continued_from_job"] = None
             src["params"] = dict(src.get("params") or {})
+            src["source_frames"] = int(src.get("source_frames") or src.get("frames") or 1)
+            src["source_duration"] = float(src.get("source_duration") or src.get("duration") or (src["source_frames"] / MODEL_FPS))
+            src["trim_start_frame"] = 0
+            src["trim_end_frame"] = max(0, src["source_frames"] - 1)
+            src.pop("trim_file", None)
+            src.pop("trim_first_frame_path", None); src.pop("trim_first_frame_file", None)
+            src.pop("trim_last_frame_path", None); src.pop("trim_last_frame_file", None)
+            _segment_source_shape(src)
             idx = len(segs) if insert_index is None else max(0, min(len(segs), insert_index))
             segs.insert(idx, src)
             seq["segments"] = segs
@@ -8105,6 +8785,45 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
             seq_id = seq.get("id")
         ok, master, note = _restitch_sequence(seq_id, "history_drop")
         return jsonify(ok=ok, master_file=master, note=note, timeline=_timeline_public_state())
+
+    @app.post("/api/timeline/trim/<segment_id>")
+    def api_timeline_trim_segment(segment_id):
+        body = request.get_json(silent=True) or {}
+        try:
+            start_frame = int(body.get("start_frame"))
+            end_frame = int(body.get("end_frame"))
+        except Exception:
+            return jsonify(error="Start and end frame must be whole numbers."), 400
+
+        with TIMELINE_LOCK:
+            seq = _active_sequence_unlocked(create=True)
+            seg = next((x for x in (seq.get("segments") or [])
+                        if str(x.get("segment_id") or x.get("job")) == str(segment_id)), None)
+            if not seg:
+                return jsonify(error="Timeline clip not found."), 404
+            source_frames, source_duration, _old_start, _old_end = _segment_source_shape(seg)
+            if start_frame < 0 or start_frame >= source_frames:
+                return jsonify(error=f"Start frame must be between 1 and {source_frames}."), 400
+            if end_frame < start_frame or end_frame >= source_frames:
+                return jsonify(error=f"End frame must be between {start_frame + 1} and {source_frames}."), 400
+            seg["trim_start_frame"] = start_frame
+            seg["trim_end_frame"] = end_frame
+            seg["frames"] = end_frame - start_frame + 1
+            seg["duration"] = round(source_duration * (seg["frames"] / source_frames), 3)
+            seg.pop("trim_file", None)
+            seg.pop("trim_first_frame_path", None); seg.pop("trim_first_frame_file", None)
+            seg.pop("trim_last_frame_path", None); seg.pop("trim_last_frame_file", None)
+            seq_id = seq.get("id")
+            seq["updated"] = time.time()
+            TIMELINE_STATE["updated"] = time.time()
+
+        ok, master, note = _restitch_sequence(seq_id, "trim_clip")
+        if not ok:
+            return jsonify(error=note or "Could not trim the timeline clip."), 500
+        state = _timeline_public_state()
+        updated = next((x for x in (state.get("segments") or [])
+                        if str(x.get("segment_id") or x.get("job")) == str(segment_id)), None)
+        return jsonify(ok=True, master_file=master, note=note, segment=updated, timeline=state)
 
     @app.delete("/api/timeline/segment/<segment_id>")
     def api_timeline_delete_segment(segment_id):
@@ -8235,7 +8954,14 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     button{border:0;border-radius:7px;background:var(--accent);color:#111;padding:10px 11px;font:inherit;font-weight:800;cursor:pointer}
     button:disabled{background:#29292f;color:#666;cursor:not-allowed}.inlinebtn{background:#29292f;color:#ccc;padding:8px 9px;width:100%;margin-top:8px;font-size:10.5px}.inlinebtn.active{background:var(--accent);color:#111}
     .installed{color:#7cc38c}.missing{color:#d6a56d}
-    .preset3{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}
+    .preset3{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
+    .preset3 .inlinebtn{margin:0;min-height:58px;padding:9px 10px;display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:3px;text-align:left;border:1px solid #35363d;border-radius:10px}
+    .preset3 .inlinebtn:hover{border-color:#555761}
+    .preset3 .inlinebtn.active{border-color:var(--accent)}
+    .presetname{font-size:10.5px;font-weight:900;letter-spacing:.35px;line-height:1.05}
+    .presetsub{font-size:7.5px;font-weight:700;letter-spacing:.25px;opacity:.68;line-height:1.1;text-transform:uppercase}
+    .preset3 .inlinebtn.active .presetsub{opacity:.78}
+    @media(max-width:720px){.preset3{grid-template-columns:repeat(2,minmax(0,1fr))}}
     .hfmodelbox{margin-top:9px;padding:9px;border:1px solid #2b2c32;border-radius:8px;background:#0d0e11;display:none}
     .hfmodelbox.show{display:block}.hfmodelgrid{display:grid;grid-template-columns:minmax(0,1fr) 92px;gap:7px}.hfmodelactions{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:7px}.hfmodelactions button{margin:0}.hfprogress{height:6px;background:#24252a;border-radius:999px;overflow:hidden;margin-top:9px}.hfprogress i{display:block;height:100%;width:0;background:var(--accent);transition:width .18s}.hfprogresstext{font-size:8px;color:#8e9099;margin-top:5px;min-height:12px}.hfmodelbox select,.hfmodelbox input{font-size:10px}
     .modelcardtitle{display:flex;align-items:center;justify-content:space-between;gap:10px}.modelcardtitle>span{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.adultmodebtn{position:relative;width:48px!important;height:23px!important;flex:0 0 48px;margin:0!important;padding:0 17px 0 7px!important;background:#17181c!important;color:#8b8e97!important;border:1px solid #303139!important;border-radius:999px!important;font-size:7px!important;letter-spacing:.35px!important;text-align:left!important}.adultmodebtn::after{content:'';position:absolute;right:6px;top:50%;width:7px;height:7px;border-radius:50%;background:#555862;transform:translateY(-50%);box-shadow:0 0 0 1px #16171a}.adultmodebtn:hover{border-color:#52545d!important;color:#c7c9cf!important}.adultmodebtn.on{background:#211d10!important;color:#edc44a!important;border-color:#66551d!important}.adultmodebtn.on::after{background:var(--accent);box-shadow:0 0 8px #e8a91766}.adultmodebtn:disabled{opacity:.45!important}
@@ -8249,11 +8975,11 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     .stagearea{position:relative;min-height:0;min-width:0;height:100%;overflow:hidden}.stagearea #vwrap{height:100%;min-height:0}#vwrap{border:1px solid var(--line);border-radius:8px;background:#070708;display:flex;align-items:center;justify-content:center;overflow:hidden}#empty{color:#3a3c43;font-size:8.5px}video{width:100%;height:100%;object-fit:contain;background:#000}.stagecontrols{position:absolute;left:10px;top:10px;z-index:6;display:none;align-items:center;gap:6px}.stageclear,.stagegrab{position:static;width:auto!important;height:27px!important;padding:0 8px!important;background:#111217d9!important;color:#aeb0b8!important;border:1px solid #303139!important;border-radius:6px!important;font-size:7px!important;opacity:.82;backdrop-filter:blur(7px)}.stageclear:hover,.stagegrab:hover{opacity:1;color:#fff!important}.stagegrab{background:#221f11df!important;border-color:#62531f!important;color:#e8d071!important;font-weight:800!important}.stagegrab.working{pointer-events:none;opacity:.55}
     .tclip{position:relative}.tclip.dragging{opacity:.35}.tclip.drop-before{box-shadow:inset 3px 0 0 var(--accent)}.tclip.drop-after{box-shadow:inset -3px 0 0 var(--accent)}.ttools{position:absolute;right:5px;top:5px;display:flex;gap:4px;z-index:3}.ttools button{width:24px;height:24px;padding:0;border-radius:50%;background:#241718;color:#ff6b6b;border:1px solid #6b2c2c;font-size:11px}.dragbadge{position:absolute;left:5px;top:5px;background:#111c;color:#c9c9cf;border:1px solid #363840;border-radius:5px;padding:3px 5px;font-size:7.5px;z-index:3}.timeline.drop-target{outline:1px dashed var(--accent);outline-offset:3px}
     .floatpanel{display:none;position:fixed;z-index:1190;width:min(310px,calc(100vw - 20px));background:#0d0d10;border:1px solid #2a2b31;border-radius:9px;box-shadow:0 14px 40px #000b;overflow:hidden}.floatpanel.history{left:14px;top:70px}.floatpanel.queue{right:14px;bottom:14px;width:min(330px,calc(100vw - 20px))}.floatpanel.minimized .floatbody{display:none}.floathead{display:flex;align-items:center;gap:6px;padding:6px 7px;border-bottom:1px solid #24252b;cursor:move;user-select:none;min-height:31px}.floatpanel.minimized .floathead{border-bottom:0}.floatgrip{color:#80828c;letter-spacing:1px;font-size:8px}.floattitle{font-size:8.5px;color:#989aa4;font-weight:800;letter-spacing:1.3px;text-transform:uppercase;flex:1}.floatcount{color:var(--accent);font-size:8px}.floatactions{display:flex;gap:4px}.floatactions button{width:auto;margin:0;background:#25262c;color:#ddd;padding:4px 6px;font-size:7px}.floatbody{padding:5px;max-height:190px;overflow:auto}.historyitem,.queueitem{display:grid;grid-template-columns:42px minmax(0,1fr) auto;gap:6px;align-items:center;border:1px solid #292a30;border-radius:6px;background:#151518;padding:4px;margin-bottom:4px}.historyitem{cursor:grab}.historyitem:active{cursor:grabbing}.histthumb,.qthumb{width:42px;height:36px;border-radius:4px;background:#090a0c;overflow:hidden}.histthumb img,.qthumb img{width:100%;height:100%;object-fit:cover}.histmain,.qmain{min-width:0}.histstatus,.qstatus{font-size:8.5px;color:#dedfe4;font-weight:800}.histsub,.qsub{font-size:7px;color:#777983;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.historyitem .trash{width:24px;height:24px;border-radius:50%;padding:0;background:#281718;color:#ff6b6b;border:1px solid #782f31;font-size:9px}.historyitem .recallprompt,.tclip .recallprompt{width:auto;height:24px;border-radius:5px;padding:0 7px;background:#24252a;color:#c9cbd2;border:1px solid #363840;font-size:6.5px;font-weight:800;letter-spacing:.4px}.queueitem .cancel{width:auto;height:25px;border-radius:5px;padding:0 8px;background:#281718;color:#ff8585;border:1px solid #782f31;font-size:7px;font-weight:800;letter-spacing:.45px}.queueitem .stoprun{width:auto;height:25px;border-radius:5px;padding:0 8px;background:#3a1818;color:#ff9a9a;border:1px solid #8b3737;font-size:7px;font-weight:800;letter-spacing:.45px}.queuehealth{font-size:6px;color:#8f939d;border:1px solid #30323a;border-radius:4px;padding:2px 4px;margin-left:4px}.queuehealth.busy{color:#f1c34d;border-color:#725b1d}.queuehealth.warn{color:#ff9a9a;border-color:#7d3333;background:#2a1515}.queueprogress{height:3px;border-radius:999px;background:#24252a;margin-top:3px;overflow:hidden}.queueprogress i{display:block;height:100%;background:var(--accent);width:0}.floatempty{padding:15px 8px;text-align:center;color:#5f616a;font-size:8px}.addhist{font-size:6.5px;color:#9a9ca4;margin-top:2px}.queuebadge{color:var(--accent);font-weight:800}
-    .timelinebox{position:relative;border:1px solid var(--line);border-radius:8px;background:#0e0e11;padding:6px 8px;min-width:0;height:138px;display:grid;grid-template-rows:27px minmax(0,1fr);overflow:hidden}.timelinehead{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0;min-height:0}.timelineheading{display:flex;align-items:baseline;gap:8px;min-width:0}.timelinehead .title{font-size:9px;font-weight:800;letter-spacing:1px;color:#a0a1a9;text-transform:uppercase;white-space:nowrap}.timelinecontext{font-size:7.5px;color:#62646d;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.timelineactions{display:flex;align-items:center;gap:4px;flex-wrap:wrap;justify-content:flex-end}.timelineactions button,.timelineactions a{height:24px;width:auto;margin:0;border-radius:6px;background:#18191d;color:#bfc0c6;border:1px solid #2b2c31;padding:0 7px;font-size:7px;line-height:25px;text-decoration:none;font-weight:800;white-space:nowrap}.timelineactions button:hover,.timelineactions a:hover{border-color:#555862;color:#fff}.timelineactions button.primary{background:var(--accent);border-color:var(--accent);color:#111}.timelineactions button.compile{background:#24200f;border-color:#66551d;color:#e8ce6b}.timelineactions button.compile:not(:disabled):hover{border-color:var(--accent);color:var(--accent)}.timelineactions button.danger{background:#211516;border-color:#522b2d;color:#d98989}.timelineactions button.danger:not(:disabled):hover{border-color:#8a3e42;color:#ff9a9f}.timelineactions button:disabled,.timelineactions a.disabled{background:#17181c;color:#555761;border-color:#24252a;pointer-events:none}.sequenceselect{display:none;height:22px;max-width:150px;margin:0;padding:2px 24px 2px 6px;border:1px solid #292a2f;border-radius:5px;background:#141519;color:#bfc0c6;font-size:7.2px;line-height:18px}.sequenceselect.show{display:block}.timeline{display:flex;align-items:stretch;gap:6px;overflow-x:auto;min-height:0;height:100%;padding:2px 0}.tclip{min-width:136px;max-width:136px;border:1px solid #2a2b31;border-radius:7px;background:#0b0b0d;overflow:hidden;cursor:pointer;height:100%}.tclip:hover{border-color:#484a53}.tclip:last-child{border-color:#725d25}.tthumb{height:48px;background:#050506;display:flex;align-items:center;justify-content:center}.tthumb img{width:100%;height:100%;object-fit:cover}.tinfo{padding:5px 6px;font-size:7.5px;color:#777982;line-height:1.28}.tinfo b{color:#c7c8cd}.timelineempty{display:flex;align-items:center;justify-content:center;min-width:100%;height:100%;color:#555761;font-size:8.5px}.timelinefoot{display:none}.projectpopover{display:none;position:absolute;right:8px;top:42px;z-index:40;width:min(360px,calc(100% - 16px));padding:9px;background:#0d0d10;border:1px solid #303139;border-radius:8px;box-shadow:0 14px 36px #000c}.projectpopover.show{display:block}.projectpophead{display:flex;align-items:center;justify-content:space-between;margin-bottom:7px;color:#b6b8c0;font-size:9px;letter-spacing:.8px;text-transform:uppercase}.projectpophead button{width:24px;height:24px;padding:0;background:#202126;color:#bbb;border:1px solid #303139}.projectpopover label{font-size:7px;margin:6px 0 3px}.projectline{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:5px;margin-bottom:5px}.projectline input,.projectline select{height:29px;padding:5px 7px;font-size:9px}.projectline button{height:29px;width:auto;padding:0 8px;background:#202126;color:#c7c8cd;border:1px solid #303139;font-size:7.5px}.projectline button:hover{border-color:#555862;color:#fff}.projectline button.disabled{color:#4e5058;border-color:#25262b;pointer-events:none}.projectdanger{width:100%;height:29px;margin-top:4px;background:#1d1516;color:#d98989;border:1px solid #522b2d;font-size:7.5px}.timeline sub{font-size:7px}
+    .timelinebox{position:relative;border:1px solid var(--line);border-radius:8px;background:#0e0e11;padding:6px 8px;min-width:0;height:138px;display:grid;grid-template-rows:27px minmax(0,1fr);overflow:hidden}.timelinehead{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0;min-height:0}.timelineheading{display:flex;align-items:baseline;gap:8px;min-width:0}.timelinehead .title{font-size:9px;font-weight:800;letter-spacing:1px;color:#a0a1a9;text-transform:uppercase;white-space:nowrap}.timelinecontext{font-size:7.5px;color:#62646d;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.timelineactions{display:flex;align-items:center;gap:4px;flex-wrap:wrap;justify-content:flex-end}.timelineactions button,.timelineactions a{height:24px;width:auto;margin:0;border-radius:6px;background:#18191d;color:#bfc0c6;border:1px solid #2b2c31;padding:0 7px;font-size:7px;line-height:25px;text-decoration:none;font-weight:800;white-space:nowrap}.timelineactions button:hover,.timelineactions a:hover{border-color:#555862;color:#fff}.timelineactions button.primary{background:var(--accent);border-color:var(--accent);color:#111}.timelineactions button.compile{background:#24200f;border-color:#66551d;color:#e8ce6b}.timelineactions button.compile:not(:disabled):hover{border-color:var(--accent);color:var(--accent)}.timelineactions button.danger{background:#211516;border-color:#522b2d;color:#d98989}.timelineactions button.danger:not(:disabled):hover{border-color:#8a3e42;color:#ff9a9f}.timelineactions button:disabled,.timelineactions a.disabled{background:#17181c;color:#555761;border-color:#24252a;pointer-events:none}.sequenceselect{display:none;height:22px;max-width:150px;margin:0;padding:2px 24px 2px 6px;border:1px solid #292a2f;border-radius:5px;background:#141519;color:#bfc0c6;font-size:7.2px;line-height:18px}.sequenceselect.show{display:block}.timeline{--timeline-clip-width:136px;display:flex;align-items:stretch;gap:6px;overflow-x:auto;overflow-y:hidden;min-height:0;height:100%;padding:2px 0 8px;scroll-behavior:smooth;overscroll-behavior-x:contain;scrollbar-width:thin;scrollbar-color:#555862 #17181c;touch-action:pan-x pan-y}.timeline::-webkit-scrollbar{display:block!important;height:8px!important}.timeline::-webkit-scrollbar-track{background:#17181c;border-radius:999px}.timeline::-webkit-scrollbar-thumb{background:#555862;border:2px solid #17181c;border-radius:999px}.timeline::-webkit-scrollbar-thumb:hover{background:#777a84}.tclip{min-width:var(--timeline-clip-width);max-width:var(--timeline-clip-width);border:1px solid #2a2b31;border-radius:7px;background:#0b0b0d;overflow:hidden;cursor:pointer;height:100%;transition:min-width .12s ease,max-width .12s ease}.tclip:hover{border-color:#484a53}.tclip:last-child{border-color:#725d25}.timelinecontrols{display:flex;align-items:center;gap:3px;margin-right:2px}.timelinecontrols button{min-width:24px!important;width:24px!important;padding:0!important;font-size:10px!important}.timelinecontrols .timelinepan{font-size:9px!important}.timelinezoomreadout{min-width:36px;text-align:center;color:#777982;font-size:7px;font-weight:800;font-family:ui-monospace,Menlo,monospace;user-select:none}.tthumb{height:48px;background:#050506;display:flex;align-items:center;justify-content:center}.tthumb img{width:100%;height:100%;object-fit:cover}.tinfo{padding:5px 6px;font-size:7.5px;color:#777982;line-height:1.28}.tinfo b{color:#c7c8cd}.timelineempty{display:flex;align-items:center;justify-content:center;min-width:100%;height:100%;color:#555761;font-size:8.5px}.timelinefoot{display:none}.projectpopover{display:none;position:absolute;right:8px;top:42px;z-index:40;width:min(360px,calc(100% - 16px));padding:9px;background:#0d0d10;border:1px solid #303139;border-radius:8px;box-shadow:0 14px 36px #000c}.projectpopover.show{display:block}.projectpophead{display:flex;align-items:center;justify-content:space-between;margin-bottom:7px;color:#b6b8c0;font-size:9px;letter-spacing:.8px;text-transform:uppercase}.projectpophead button{width:24px;height:24px;padding:0;background:#202126;color:#bbb;border:1px solid #303139}.projectpopover label{font-size:7px;margin:6px 0 3px}.projectline{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:5px;margin-bottom:5px}.projectline input,.projectline select{height:29px;padding:5px 7px;font-size:9px}.projectline button{height:29px;width:auto;padding:0 8px;background:#202126;color:#c7c8cd;border:1px solid #303139;font-size:7.5px}.projectline button:hover{border-color:#555862;color:#fff}.projectline button.disabled{color:#4e5058;border-color:#25262b;pointer-events:none}.projectdanger{width:100%;height:29px;margin-top:4px;background:#1d1516;color:#d98989;border:1px solid #522b2d;font-size:7.5px}.timeline sub{font-size:7px}.tclip .ttrim{width:27px!important;height:24px!important;padding:0!important;border-radius:5px!important;background:#211e12!important;color:#e8ce6b!important;border:1px solid #62531d!important;font-size:10px!important}.tclip .ttrim:hover{border-color:var(--accent)!important;color:var(--accent)!important}.tclip.trimmed{border-color:#66551d}.ttrimmark{color:#d7bb5d;font-size:6.5px;font-weight:800;letter-spacing:.3px}.trimdialog{width:min(620px,calc(100vw - 30px))}.trimvideo{display:block;width:100%;max-height:290px;background:#050506;border:1px solid #292a30;border-radius:8px}.trimsummary{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;margin:8px 0;color:#8d8f98;font-size:8.5px}.trimsummary b{color:#e2c35e}.trimgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.trimfield{border:1px solid #292a30;border-radius:8px;background:#0d0e11;padding:9px}.trimfield label{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 7px;font-size:8px;color:#999ba4;text-transform:uppercase;letter-spacing:.7px}.trimfield input[type=number]{width:82px;height:28px;margin:0;padding:4px 6px;font-size:9px}.trimfield input[type=range]{width:100%;padding:0;margin:3px 0 0;accent-color:var(--accent)}.trimhint{margin-top:8px;color:#656872;font-size:8px;line-height:1.45}.trimactionsleft{margin-right:auto}.trimactionsleft button{background:#24200f;color:#e8ce6b;border:1px solid #66551d}@media(max-width:620px){.trimgrid{grid-template-columns:1fr}.trimvideo{max-height:220px}}
     *{scrollbar-width:none}*::-webkit-scrollbar{display:none;width:0;height:0}
     .consolebox{display:none;position:fixed;right:16px;top:72px;z-index:1220;width:min(720px,calc(100vw - 32px));border:1px solid #303139;border-radius:9px;background:#060607;overflow:hidden;box-shadow:0 18px 60px #000c}.consolehead{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 9px;border-bottom:1px solid var(--line);color:#81838c;font-size:9.5px}.consoleactions{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}.consolehead button{width:auto;margin:0;background:#29292f;color:#bbb;padding:5px 9px;font-size:9px;border-radius:5px}.consolebox pre{margin:0;padding:8px 9px;height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word;color:#c8c9ce;font:9.5px/1.4 ui-monospace,Menlo,monospace}.consolebox.collapsed pre{display:none}.consolebox.collapsed .consolehead{border-bottom:0}
     #err{display:none;white-space:pre-wrap;color:#ff8a8a;font-size:10px;max-height:180px;overflow:auto;border:1px solid #3a2020;background:#160e0e;padding:10px;border-radius:8px}
-    .storagegrid{display:grid;grid-template-columns:1fr 1fr;gap:6px}.storagebtn{margin:0!important;background:#191a1f!important;color:#aeb0b8!important;border:1px solid #303139!important}.storagebtn.active{background:#24200f!important;color:#f1d56d!important;border-color:#7b6721!important}.storagebtn.working{opacity:.55;pointer-events:none}.integrationlist{margin-top:9px;border:1px solid #292a30;border-radius:8px;overflow:hidden}.integrationrow{display:grid;grid-template-columns:minmax(110px,.75fr) minmax(0,1.65fr) auto;gap:8px;align-items:center;padding:8px 9px;border-top:1px solid #24252a;background:#121216}.integrationrow:first-child{border-top:0}.integrationname{font-size:8.5px;font-weight:800;color:#d0d1d6}.integrationfeature{font-size:7.5px;color:#777a84;line-height:1.35}.integrationstate{font-size:7px;font-weight:800;white-space:nowrap;border:1px solid #373941;border-radius:999px;padding:3px 6px;color:#9a9da7}.integrationstate.ok{color:#79d394;border-color:#315b3d;background:#102017}.integrationstate.required{color:#f1d56d;border-color:#6b5a20;background:#211d0d}.integrationstate.optional{color:#8fa8d9;border-color:#344768;background:#111927}.integrationnote{margin-top:7px;font-size:8px;color:#858892;line-height:1.5}.integrationnote b{color:#d8d9dd}
+    .storageradios{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-top:4px}.storageradio{display:flex;align-items:center;gap:6px;margin:0;color:#b9bbc2;font-size:9px;cursor:pointer;text-transform:none;letter-spacing:0}.storageradio input{width:auto;margin:0;accent-color:var(--accent)}.storageradio input:disabled+span{opacity:.55}
     .footerlink{display:block;text-align:center;color:#62646d;text-decoration:none;font-size:9px;margin:6px 0 2px}.footerlink:hover{color:var(--accent)}
     @media(max-width:1100px){.topdock{grid-template-columns:minmax(160px,1fr) auto}.main{grid-template-rows:36px minmax(0,1fr) 138px}.gpuoverlay{right:7px;top:7px}}
     @media(max-width:850px){body{overflow:auto}.wrap{height:auto;grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid var(--line);max-height:none}.main{height:auto;overflow:visible;grid-template-rows:auto 420px 152px;min-height:0}.topdock{grid-template-columns:1fr}.floatpanel.history{left:8px;top:48px}.floatpanel.queue{right:8px;bottom:8px}.timelinehead{align-items:flex-start}.timelineactions{justify-content:flex-start}.projectpopover{left:8px;right:8px;width:auto}.projectline{grid-template-columns:1fr auto}.imageslot{height:126px}.refimageslots{grid-template-columns:1fr 1fr}.consolebox{left:8px;right:8px;top:56px;width:auto}}
@@ -8351,23 +9077,23 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     </div>
     </div></div>
 
-    <details open><summary>Storage + Integrations</summary><div>
-      <label>Output storage</label>
-      <div class=storagegrid><button id=storage_local class=storagebtn type=button>LOCAL · TEMPORARY</button><button id=storage_drive class=storagebtn type=button>GOOGLE DRIVE · PERSISTENT</button></div>
-      <div id=storage_status class=hint style="margin-top:7px">Checking output storage…</div>
-      <div class=integrationlist>
-        <div class=integrationrow><div class=integrationname>MISSING_LINK_TOKEN</div><div class=integrationfeature>Studio access + MissingLink runtime components</div><div id=key_missinglink class="integrationstate required">REQUIRED</div></div>
-        <div class=integrationrow><div class=integrationname>OPENAI_API_KEY</div><div class=integrationfeature>Auto Prompt + Story Director / Next Scene image features</div><div id=key_openai class="integrationstate optional">OPTIONAL</div></div>
-        <div class=integrationrow><div class=integrationname>HF_TOKEN</div><div class=integrationfeature>Private / gated Hugging Face models and LoRAs; public HF works without it</div><div id=key_hf class="integrationstate optional">OPTIONAL</div></div>
-        <div class=integrationrow><div class=integrationname>CIVITAI_API_KEY</div><div class=integrationfeature>Authenticated / gated CivitAI downloads; public CivitAI works without it</div><div id=key_civitai class="integrationstate optional">OPTIONAL</div></div>
+    <details open><summary>Storage</summary><div>
+      <label>Save outputs to</label>
+      <div class=storageradios role=radiogroup aria-label="Output storage">
+        <label class=storageradio><input id=storage_local name=output_storage type=radio value=local><span>Local · temporary</span></label>
+        <label class=storageradio><input id=storage_drive name=output_storage type=radio value=drive><span>Google Drive · persistent</span></label>
       </div>
-      <div class=integrationnote><b>Only MISSING_LINK_TOKEN is required.</b> The other Colab Secrets simply unlock extra integrations. Secret values stay server-side and are never displayed in the browser.</div>
+      <div id=storage_status class=hint style="margin-top:7px">Checking output storage…</div>
     </div></details>
 
     <div class=card><div class=cardtitle>Generation Presets</div><div class=cardbody>
-    <div class=preset3><button id=fastpreset class="inlinebtn active">FAST</button><button id=taomatepreset class=inlinebtn>TAOMATE · 3</button><button id=ultrafastpreset class=inlinebtn>ULTRA FAST</button><button id=qualitypreset class=inlinebtn>QUALITY</button></div>
-    <div class=hint id=preset_hint>Preset recipe follows the model selected above.</div>
-    <div class=hint id=modelhint>Model mode will be shown here after startup.</div>
+    <div class=preset3>
+      <button id=fastpreset class="inlinebtn active"><span class=presetname>FAST</span><span class=presetsub>Recommended</span></button>
+      <button id=ultrafastpreset class=inlinebtn><span class=presetname>ULTRA</span><span class=presetsub>Max speed</span></button>
+      <button id=qualitypreset class=inlinebtn><span class=presetname>QUALITY</span><span class=presetsub>Best quality</span></button>
+      <button id=taomatepreset class=inlinebtn><span class=presetname>TAOMATE</span><span class=presetsub>3-step alt</span></button>
+    </div>
+    <div class=hint id=preset_hint><b>FAST</b> · recommended default</div>
     </div></div>
 
     <details><summary>Sampling</summary><div>
@@ -8394,6 +9120,13 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     <div class=hint>Paste an HF repo, full HF URL, direct .safetensors URL, or CivitAI model/version URL. The Studio discovers the files, shows download progress, then adds the LoRA as a card. OFF = 0.00 · ON = 1.00; numeric strength remains fully editable.</div>
     </div></details>
 
+    <div id=ml_access_card style="margin:10px 0 8px;border:1px solid #343019;background:#17150b;border-radius:8px;padding:9px">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+        <b id=ml_access_label style="font-size:9px;color:#f1d56d">Checking Notebook access…</b>
+        <a id=ml_upgrade_link href="https://missinglink.build/notebook-pro/start?source=h3-studio&model=minimax-h3&placement=free-limit" target="_blank" rel="noopener" style="display:none;font-size:8px;color:#E8A917;text-decoration:none;font-weight:800">START 7-DAY TRIAL →</a>
+      </div>
+      <div id=ml_access_sub style="font-size:7.5px;color:#858892;margin-top:4px">15 free H3 generations · verified Gmail · no card required.</div>
+    </div>
     <button id=go>+ ADD GENERATION TO QUEUE</button>
     <a class=footerlink href="https://missinglink.build/studio" target="_blank" rel="noopener">missinglink.build/studio</a>
     </div>
@@ -8431,6 +9164,13 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       <div class=timelinehead>
         <div class=timelineheading><div class=title>Timeline</div><div id=timeline_context class=timelinecontext>Sequence 1 · 0 clips · 0.00 s</div><select id=sequence_select class=sequenceselect aria-label="Active sequence"></select></div>
         <div class=timelineactions>
+          <div class=timelinecontrols aria-label="Timeline navigation and zoom">
+            <button id=timeline_pan_left class=timelinepan type=button title="Scroll timeline left" aria-label="Scroll timeline left">◀</button>
+            <button id=timeline_zoom_out type=button title="Zoom timeline out" aria-label="Zoom timeline out">−</button>
+            <span id=timeline_zoom_readout class=timelinezoomreadout>100%</span>
+            <button id=timeline_zoom_in type=button title="Zoom timeline in" aria-label="Zoom timeline in">+</button>
+            <button id=timeline_pan_right class=timelinepan type=button title="Scroll timeline right" aria-label="Scroll timeline right">▶</button>
+          </div>
           <button id=timeline_retry>↻ RETRY</button>
           <button id=timeline_new_sequence>+ SEQUENCE</button>
           <button id=project_menu_btn>PROJECT ▾</button>
@@ -8438,7 +9178,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
           <button id=timeline_clear class=danger type=button disabled>⌫ CLEAR</button>
         </div>
       </div>
-      <div id=timeline class=timeline><div class=timelineempty>Drop a History clip here or generate the first clip.</div></div>
+      <div id=timeline class=timeline tabindex="0" aria-label="Timeline clips. Scroll horizontally; Control or Command plus mouse wheel zooms."><div class=timelineempty>Drop a History clip here or generate the first clip.</div></div>
       <div id=timeline_foot class=timelinefoot>0 clips · 0.00 s</div>
       <div id=project_popover class=projectpopover>
         <div class=projectpophead><b>Project</b><button id=project_pop_close type=button>×</button></div>
@@ -8532,6 +9272,27 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         <div class=hint>HF_TOKEN is only needed for private/gated Hugging Face files. CIVITAI_API_KEY is optional and is only needed when CivitAI itself requires authentication for the selected file.</div>
       </div>
     </div>
+    <div id=clip_trim_modal class=uimodal role=dialog aria-modal=true aria-labelledby=clip_trim_title>
+      <div class="uidialog trimdialog">
+        <div class=uihead><b id=clip_trim_title>Trim timeline clip</b><button id=clip_trim_close class=uiclose type=button>✕</button></div>
+        <div class=uibody>
+          <video id=clip_trim_video class=trimvideo controls preload=metadata></video>
+          <div class=trimsummary><span id=clip_trim_range>Frames 1–1</span><span id=clip_trim_length><b>0.00 s</b> selected</span></div>
+          <div class=trimgrid>
+            <div class=trimfield>
+              <label>Start frame <input id=clip_trim_start_num type=number min=1 step=1 value=1></label>
+              <input id=clip_trim_start type=range min=1 max=1 step=1 value=1 aria-label="Clip start frame">
+            </div>
+            <div class=trimfield>
+              <label>End frame <input id=clip_trim_end_num type=number min=1 step=1 value=1></label>
+              <input id=clip_trim_end type=range min=1 max=1 step=1 value=1 aria-label="Clip end frame">
+            </div>
+          </div>
+          <div class=trimhint>Non-destructive trim: shorten the clip, or extend it back toward its original first/last frame. The original render stays in History.</div>
+        </div>
+        <div class=uiactions><div class=trimactionsleft><button id=clip_trim_reset type=button>FULL CLIP</button></div><button id=clip_trim_cancel class=uicancel type=button>Cancel</button><button id=clip_trim_apply class="uiconfirm neutral" type=button>Apply trim</button></div>
+      </div>
+    </div>
     <div id=ui_modal class=uimodal role=dialog aria-modal=true aria-labelledby=ui_modal_title>
       <div class=uidialog>
         <div class=uihead><b id=ui_modal_title>Dialog</b><button id=ui_modal_close class=uiclose type=button>✕</button></div>
@@ -8546,10 +9307,203 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       </div>
     </div>
     <div id=adult_gate_modal hidden><input id=adult_ack_age type=checkbox><input id=adult_ack_law type=checkbox><input id=adult_ack_consent type=checkbox><button id=adult_gate_close type=button></button><button id=adult_gate_cancel type=button></button><button id=adult_gate_accept type=button disabled></button></div>
+
+    <div id=ml_upgrade_modal role=dialog aria-modal=true aria-labelledby=ml_upgrade_title style="display:none;position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.68);align-items:center;justify-content:center;padding:18px">
+      <div style="width:min(430px,calc(100vw - 36px));background:#111113;border:1px solid #3b3420;border-radius:14px;padding:20px;box-shadow:0 22px 70px rgba(0,0,0,.55);position:relative">
+        <button id=ml_upgrade_close type=button aria-label="Close" style="position:absolute;right:10px;top:8px;background:transparent;border:0;color:#7f8188;font-size:20px;padding:4px 7px;cursor:pointer">×</button>
+        <div style="display:flex;gap:12px;align-items:center;padding-right:22px">
+          <img src="https://missinglink.build/assets/missinglink_notebook_pro.png" alt="MissingLink Notebook Pro" style="width:58px;height:58px;object-fit:cover;border-radius:10px;border:1px solid #343019;flex:0 0 auto" onerror="this.style.display='none'">
+          <div style="min-width:0">
+            <div style="font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:#E8A917;font-weight:800">15 free generations complete</div>
+            <div id=ml_upgrade_title style="font-size:20px;line-height:1.15;font-weight:800;color:#f2f2f3;margin-top:6px">Keep creating for 7 days free.</div>
+          </div>
+        </div>
+        <div style="font-size:12px;line-height:1.55;color:#a5a6ac;margin-top:9px">Notebook Pro unlocks unlimited H3 access and the full MissingLink notebook library.</div>
+        <div style="margin-top:13px;padding:10px 11px;border:1px solid #292a30;border-radius:9px;background:#151518;font-size:11px;color:#d5d6da"><b style="color:#f1d56d">7-day free trial</b> · then $20/month · cancel anytime</div>
+        <a id=ml_upgrade_modal_cta href="https://missinglink.build/notebook-pro/start?source=h3-studio&model=minimax-h3&placement=free-limit" target="_blank" rel="noopener" style="display:block;margin-top:12px;background:#E8A917;color:#09090B;text-align:center;text-decoration:none;border-radius:9px;padding:11px 14px;font:800 11px 'JetBrains Mono',monospace">START 7-DAY FREE TRIAL →</a>
+        <button id=ml_upgrade_later type=button style="width:100%;margin-top:7px;background:transparent;border:0;color:#777a84;font-size:10px;padding:7px;cursor:pointer">Not now</button>
+      </div>
+    </div>
     <script>
     const $=i=>document.getElementById(i);
+
+    const ML_UI_TELEMETRY_QUEUE=[];
+    let ML_UI_TELEMETRY_TIMER=null;
+    let ML_ACCESS_STATE=null;
+    const ML_UPGRADE_URL='https://missinglink.build/notebook-pro/start?source=h3-studio&model=minimax-h3&placement=free-limit';
+    function mlSafeTarget(el){
+      if(!el)return '';
+      if(el.id)return '#'+el.id;
+      const tag=(el.tagName||'').toLowerCase();
+      const txt=(el.getAttribute&&el.getAttribute('aria-label'))||
+        ((tag==='button'||tag==='a'||tag==='summary')?(el.textContent||'').trim().replace(/\s+/g,' ').slice(0,120):'');
+      return (txt||tag||'control').slice(0,180);
+    }
+    function mlControlMeta(el){
+      if(!el)return {};
+      const type=String(el.type||el.tagName||'').toLowerCase(),m={control_type:type};
+      if(type==='checkbox'||type==='radio')m.checked=!!el.checked;
+      else if(type==='file'){
+        m.file_count=(el.files||[]).length;
+        m.file_types=Array.from(el.files||[]).slice(0,12).map(f=>String(f.type||'').slice(0,80));
+      }else if(type==='text'||type==='textarea'||type==='password'||el.tagName==='TEXTAREA'){
+        m.chars=String(el.value||'').length;
+      }else if(el.value!==undefined&&el.value!==null){
+        m.value=String(el.value).slice(0,160);
+      }
+      return m;
+    }
+    function mlTrack(event,{action='',target='',meta={},active_ms=0,immediate=false}={}){
+      ML_UI_TELEMETRY_QUEUE.push({event:String(event||'').slice(0,64),surface:'notebook:h3',
+        action:String(action||'').slice(0,100),target:String(target||'').slice(0,220),
+        active_ms:Number(active_ms||0),meta:meta&&typeof meta==='object'?meta:{}});
+      if(immediate)return mlFlushTelemetry();
+      if(!ML_UI_TELEMETRY_TIMER)ML_UI_TELEMETRY_TIMER=setTimeout(mlFlushTelemetry,700);
+    }
+    async function mlFlushTelemetry(useBeacon=false){
+      if(ML_UI_TELEMETRY_TIMER){clearTimeout(ML_UI_TELEMETRY_TIMER);ML_UI_TELEMETRY_TIMER=null}
+      if(!ML_UI_TELEMETRY_QUEUE.length)return;
+      const events=ML_UI_TELEMETRY_QUEUE.splice(0,30),body=JSON.stringify({events});
+      if(useBeacon&&navigator.sendBeacon){try{navigator.sendBeacon('/api/ml/activity',new Blob([body],{type:'application/json'}));return}catch(e){}}
+      try{await fetch('/api/ml/activity',{method:'POST',headers:{'Content-Type':'application/json'},body,keepalive:true})}catch(e){}
+      if(ML_UI_TELEMETRY_QUEUE.length&&!useBeacon)ML_UI_TELEMETRY_TIMER=setTimeout(mlFlushTelemetry,500);
+    }
+    function mlRenderAccess(a){
+      if(!a||!a.ok)return; ML_ACCESS_STATE=a;
+      const label=$('ml_access_label'),sub=$('ml_access_sub'),up=$('ml_upgrade_link');
+      if(a.member){
+        if(label)label.textContent='Notebook Pro · UNLIMITED';
+        if(sub)sub.textContent='Your Notebook Pro access is active · all MissingLink notebooks unlocked.';
+        if(up)up.style.display='none';
+      }else{
+        const rem=Math.max(0,Number(a.remaining||0));
+        if(label)label.textContent=rem>0?rem+' OF 15 FREE H3 GENERATIONS LEFT':'YOUR 15 FREE H3 GENERATIONS ARE COMPLETE';
+        if(sub)sub.textContent=rem>0?'Starter access is tied to your verified Gmail · no card required.':'Start the 7-day Notebook Pro trial to keep generating and unlock all MissingLink notebooks.';
+        if(up){up.style.display=rem<=0?'inline':'none';up.href=a.upgrade_url||ML_UPGRADE_URL}
+      }
+    }
+    function mlShowUpgradeModal(trigger='free_limit'){
+      if(ML_ACCESS_STATE?.member)return;
+      const m=$('ml_upgrade_modal');if(!m)return;
+      m.style.display='flex';
+      mlTrack('notebook_h3_upgrade_shown',{action:trigger,target:'#ml_upgrade_modal',meta:{free_used:ML_ACCESS_STATE?.used??5,free_remaining:ML_ACCESS_STATE?.remaining??0},immediate:true});
+      setTimeout(()=>$('ml_upgrade_modal_cta')?.focus(),0);
+    }
+    function mlHideUpgradeModal(reason='dismissed'){
+      const m=$('ml_upgrade_modal');if(m)m.style.display='none';
+      mlTrack('notebook_h3_upgrade_dismissed',{action:reason,target:'#ml_upgrade_modal'});
+    }
+    async function mlRefreshAccess(){
+      try{
+        const r=await fetch('/api/ml/access',{cache:'no-store'}),a=await r.json();
+        if(r.ok&&a.ok){mlRenderAccess(a);return a}
+      }catch(e){}
+      return null;
+    }
+    $('ml_upgrade_close')?.addEventListener('click',()=>mlHideUpgradeModal('close'));
+    $('ml_upgrade_later')?.addEventListener('click',()=>mlHideUpgradeModal('not_now'));
+    $('ml_upgrade_modal')?.addEventListener('click',e=>{if(e.target===$('ml_upgrade_modal'))mlHideUpgradeModal('backdrop')});
+    $('ml_upgrade_modal_cta')?.addEventListener('click',()=>mlTrack('notebook_h3_upgrade_clicked',{action:'start_7_day_trial',target:'#ml_upgrade_modal_cta',meta:{free_used:ML_ACCESS_STATE?.used??5},immediate:true}));
+    function mlGenerationUiMeta(){
+      const mode=typeof currentModelMode==='function'?currentModelMode():($('input_mode')?.value||''),files=(id)=>($(id)?.files||[]).length;
+      return {input_mode:mode,model_profile:typeof ACTIVE_MODEL_PROFILE!=='undefined'?ACTIVE_MODEL_PROFILE:'',
+        performance_preset:typeof ACTIVE_PERF_PRESET!=='undefined'?ACTIVE_PERF_PRESET:'',
+        prompt_chars:String($('prompt')?.value||'').length,width:Number($('width')?.value||0),height:Number($('height')?.value||0),
+        duration:Number($('duration')?.value||0),frames:Number($('frames')?.value||0),steps:Number($('steps')?.value||0),
+        seed:Number($('seed')?.value||0),sampler:$('sampler_name')?.value||'',scheduler:$('scheduler')?.value||'',
+        sparse_percent:Number($('sparse_percent')?.value||0),first_frame:files('first_frame'),last_frame:files('last_frame'),
+        ref_images:[1,2,3,4,5,6,7,8,9].reduce((n,i)=>n+files('ref_image_'+i),0),
+        ref_videos:[1,2,3].reduce((n,i)=>n+files('ref_video_'+i),0),ref_audios:[1,2,3].reduce((n,i)=>n+files('ref_audio_'+i),0)};
+    }
+    document.addEventListener('click',e=>{
+      const el=e.target&&e.target.closest?e.target.closest('button,a,summary,input[type="checkbox"],input[type="radio"]'):null;
+      if(!el)return;
+      mlTrack('notebook_h3_click',{action:'activate',target:mlSafeTarget(el),meta:{tag:(el.tagName||'').toLowerCase()}});
+      if(el.id==='ml_upgrade_link')mlTrack('notebook_h3_upgrade_clicked',{action:'start_7_day_trial',target:'#ml_upgrade_link',
+        meta:{free_used:ML_ACCESS_STATE?.used??null,free_remaining:ML_ACCESS_STATE?.remaining??null},immediate:true});
+    },true);
+    document.addEventListener('change',e=>{const el=e.target;if(el&&('value' in el))mlTrack('notebook_h3_control_change',{action:'change',target:mlSafeTarget(el),meta:mlControlMeta(el)})},true);
+    window.addEventListener('error',e=>mlTrack('ui_error',{action:'window_error',target:'window',meta:{message:String(e.message||'').slice(0,180)}}));
+    window.addEventListener('unhandledrejection',e=>mlTrack('unhandled_rejection',{action:'promise',target:'window',meta:{message:String(e.reason?.message||e.reason||'').slice(0,180)}}));
+    setInterval(()=>{if(document.visibilityState==='visible')mlTrack('active_heartbeat',{action:'visible',target:'h3_ui',active_ms:15000})},15000);
+    window.addEventListener('pagehide',()=>{mlTrack('session_exit',{action:'pagehide',target:'h3_ui'});mlFlushTelemetry(true)});
+    mlTrack('notebook_h3_ui_opened',{action:'view',target:'MissingLink MiniMax H3',meta:{viewport_w:window.innerWidth,viewport_h:window.innerHeight},immediate:true});
+    mlRefreshAccess();
     let job=null;
     let activeQueueJob=null;
+
+    const TIMELINE_ZOOM_KEY='h3_timeline_zoom_width_v1';
+    const TIMELINE_ZOOM_BASE=136;
+    const TIMELINE_ZOOM_MIN=82;
+    const TIMELINE_ZOOM_MAX=260;
+    const TIMELINE_ZOOM_STEP=18;
+    let TIMELINE_CLIP_WIDTH=TIMELINE_ZOOM_BASE;
+
+    function timelineClampWidth(v){
+      const n=Number(v);
+      return Math.max(TIMELINE_ZOOM_MIN,Math.min(TIMELINE_ZOOM_MAX,Number.isFinite(n)?n:TIMELINE_ZOOM_BASE));
+    }
+    function applyTimelineZoom(width,{remember=true,preserveCenter=true}={}){
+      const tl=$('timeline');if(!tl)return;
+      const oldScrollWidth=Math.max(1,tl.scrollWidth);
+      const oldCenter=tl.scrollLeft+tl.clientWidth/2;
+      const centerRatio=oldCenter/oldScrollWidth;
+      TIMELINE_CLIP_WIDTH=timelineClampWidth(width);
+      tl.style.setProperty('--timeline-clip-width',TIMELINE_CLIP_WIDTH+'px');
+      const readout=$('timeline_zoom_readout');
+      if(readout)readout.textContent=Math.round(TIMELINE_CLIP_WIDTH/TIMELINE_ZOOM_BASE*100)+'%';
+      if(remember){try{localStorage.setItem(TIMELINE_ZOOM_KEY,String(TIMELINE_CLIP_WIDTH))}catch(e){}}
+      if(preserveCenter){
+        requestAnimationFrame(()=>{
+          const max=Math.max(0,tl.scrollWidth-tl.clientWidth);
+          tl.scrollLeft=Math.max(0,Math.min(max,centerRatio*tl.scrollWidth-tl.clientWidth/2));
+        });
+      }
+    }
+    function timelineZoomBy(delta){applyTimelineZoom(TIMELINE_CLIP_WIDTH+delta)}
+    function timelinePan(direction){
+      const tl=$('timeline');if(!tl)return;
+      const amount=Math.max(220,Math.round(tl.clientWidth*.72));
+      tl.scrollBy({left:direction*amount,behavior:'smooth'});
+    }
+    function timelineAutoScrollFromPointer(clientX){
+      const tl=$('timeline');if(!tl||tl.scrollWidth<=tl.clientWidth)return;
+      const r=tl.getBoundingClientRect(),edge=Math.min(90,Math.max(45,r.width*.12));
+      if(clientX<r.left+edge)tl.scrollLeft-=Math.max(12,(r.left+edge-clientX)*.45);
+      else if(clientX>r.right-edge)tl.scrollLeft+=Math.max(12,(clientX-(r.right-edge))*.45);
+    }
+    function initTimelineViewport(){
+      const tl=$('timeline');if(!tl)return;
+      let saved=TIMELINE_ZOOM_BASE;
+      try{const raw=Number(localStorage.getItem(TIMELINE_ZOOM_KEY));if(Number.isFinite(raw)&&raw>0)saved=raw}catch(e){}
+      applyTimelineZoom(saved,{remember:false,preserveCenter:false});
+      $('timeline_zoom_out').onclick=()=>timelineZoomBy(-TIMELINE_ZOOM_STEP);
+      $('timeline_zoom_in').onclick=()=>timelineZoomBy(TIMELINE_ZOOM_STEP);
+      $('timeline_pan_left').onclick=()=>timelinePan(-1);
+      $('timeline_pan_right').onclick=()=>timelinePan(1);
+      tl.addEventListener('wheel',e=>{
+        if(e.ctrlKey||e.metaKey){
+          e.preventDefault();
+          timelineZoomBy(e.deltaY<0?TIMELINE_ZOOM_STEP:-TIMELINE_ZOOM_STEP);
+          return;
+        }
+        if(tl.scrollWidth>tl.clientWidth&&Math.abs(e.deltaY)>Math.abs(e.deltaX)){
+          const atLeft=tl.scrollLeft<=0&&e.deltaY<0;
+          const atRight=tl.scrollLeft>=tl.scrollWidth-tl.clientWidth-1&&e.deltaY>0;
+          if(!atLeft&&!atRight){e.preventDefault();tl.scrollLeft+=e.deltaY}
+        }
+      },{passive:false});
+      tl.addEventListener('keydown',e=>{
+        if(e.target!==tl)return;
+        if(e.key==='ArrowLeft'){e.preventDefault();timelinePan(-1)}
+        else if(e.key==='ArrowRight'){e.preventDefault();timelinePan(1)}
+        else if((e.ctrlKey||e.metaKey)&&(e.key==='+'||e.key==='=')){e.preventDefault();timelineZoomBy(TIMELINE_ZOOM_STEP)}
+        else if((e.ctrlKey||e.metaKey)&&e.key==='-'){e.preventDefault();timelineZoomBy(-TIMELINE_ZOOM_STEP)}
+        else if((e.ctrlKey||e.metaKey)&&e.key==='0'){e.preventDefault();applyTimelineZoom(TIMELINE_ZOOM_BASE)}
+      });
+    }
+    initTimelineViewport();
+
     $('rnd').onclick=e=>{e.preventDefault();$('seed').value=Math.floor(Math.random()*1e9)};
 
     const dot=k=>document.querySelector('.dot').className='dot '+(k||'');
@@ -8560,25 +9514,11 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     const STUDIO_CONFIG_SCHEMA=1;
     let DRIVE_CONFIG_STATUS={drive_connected:false,exists:false,config:null,error:''};
 
-    function renderIntegrationKeys(m=window.H3META||{}){
-      const k=m.integration_keys||{};
-      const rows=[
-        ['key_missinglink',!!k.missinglink,true],
-        ['key_openai',!!k.openai,false],
-        ['key_hf',!!k.huggingface,false],
-        ['key_civitai',!!k.civitai,false],
-      ];
-      for(const [id,on,required] of rows){
-        const el=$(id);if(!el)continue;
-        el.className='integrationstate '+(on?'ok':(required?'required':'optional'));
-        el.textContent=on?(required?'✓ REQUIRED · READY':'✓ OPTIONAL · ENABLED'):(required?'REQUIRED · MISSING':'OPTIONAL · NOT SET');
-      }
-    }
     function renderStorageState(state=window.H3META||{}){
       const mode=state.output_storage||'local',persistent=!!state.output_persistent;
       const a=$('storage_local'),b=$('storage_drive'),st=$('storage_status');
-      if(a)a.classList.toggle('active',mode==='local'&&!persistent);
-      if(b)b.classList.toggle('active',mode==='drive'||persistent);
+      if(a)a.checked=(mode==='local'&&!persistent);
+      if(b)b.checked=(mode==='drive'||persistent);
       if(st){
         st.innerHTML=persistent
           ? `<b style="color:#79d394">Persistent:</b> ${esc(state.output_label||'Google Drive')} · generated videos, timelines and history survive runtime resets.`
@@ -8587,7 +9527,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     }
     async function setOutputStorage(mode,{quiet=false,remember=true}={}){
       const a=$('storage_local'),b=$('storage_drive'),target=mode==='drive'?b:a;
-      if(target)target.classList.add('working');
+      if(a)a.disabled=true;if(b)b.disabled=true;
       try{
         const resp=await fetch('/api/storage',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,migrate:true})});
         const data=await _readJsonResponse(resp,'Output storage');
@@ -8598,7 +9538,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         const moved=Number(data.migrated_files||0);
         if(!quiet)say(`${mode==='drive'?'Google Drive':'local'} output storage active${moved?` · migrated ${moved} file(s)`:''}`);
         return data;
-      }finally{if(target)target.classList.remove('working')}
+      }finally{if(a)a.disabled=false;if(b)b.disabled=false}
     }
 
     function currentModelMode(){return $('input_mode').value||localStorage.getItem(MODEL_MODE_STORE_KEY)||'fl2va'}
@@ -8797,16 +9737,10 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
 
     function presetRecipe(profile=ACTIVE_MODEL_PROFILE,mode=currentModelMode(),kind=ACTIVE_PERF_PRESET){
       const label=activeModelLabel();
-      if(kind==='taomate'){
-        return {short:'TAOMATE',label,steps:3,summary:'FL2VA · TaoMate-H3 3-step · Euler / Simple · dense attention'};
-      }
-      if(kind==='ultra'){
-        return {short:'ULTRA',label,steps:4,summary:(mode==='ref2va'?'Ref2VA':'FL2VA')+' · 4-step Lightning · Euler / Simple · sparse attention 5%'};
-      }
-      if(kind==='fast'){
-        return {short:'FAST',label,steps:4,summary:(mode==='ref2va'?'Ref2VA':'FL2VA')+' · 4-step Lightning · Euler / Simple · dense attention'};
-      }
-      return {short:'QUALITY',label,steps:20,summary:(mode==='ref2va'?'Ref2VA':'FL2VA')+' · RES Multistep / Simple · 20 steps · dense attention'};
+      if(kind==='taomate')return {short:'TAOMATE',label,steps:3,summary:'3-step alternate accelerator'};
+      if(kind==='ultra')return {short:'ULTRA',label,steps:4,summary:'maximum speed · 4-step Lightning + 5% sparse'};
+      if(kind==='fast')return {short:'FAST',label,steps:4,summary:'recommended · 4-step Lightning'};
+      return {short:'QUALITY',label,steps:20,summary:'best quality · 20-step RES Multistep'};
     }
 
     function syncSpecialLoraUI(){
@@ -8815,22 +9749,28 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
 
     function syncPresetUI(){
       syncSpecialLoraUI();
-      const fast=presetRecipe(ACTIVE_MODEL_PROFILE,currentModelMode(),'fast');
-      const taomate=presetRecipe(ACTIVE_MODEL_PROFILE,currentModelMode(),'taomate');
-      const ultra=presetRecipe(ACTIVE_MODEL_PROFILE,currentModelMode(),'ultra');
-      const quality=presetRecipe(ACTIVE_MODEL_PROFILE,currentModelMode(),'quality');
+      const m=window.H3META||{};
+      const mode=currentModelMode();
+      const fast=presetRecipe(ACTIVE_MODEL_PROFILE,mode,'fast');
+      const taomate=presetRecipe(ACTIVE_MODEL_PROFILE,mode,'taomate');
+      const ultra=presetRecipe(ACTIVE_MODEL_PROFILE,mode,'ultra');
+      const quality=presetRecipe(ACTIVE_MODEL_PROFILE,mode,'quality');
       const active=ACTIVE_PERF_PRESET==='taomate'?taomate:(ACTIVE_PERF_PRESET==='ultra'?ultra:(ACTIVE_PERF_PRESET==='quality'?quality:fast));
-      $('fastpreset').classList.toggle('active',ACTIVE_PERF_PRESET==='fast');
-      $('taomatepreset').classList.toggle('active',ACTIVE_PERF_PRESET==='taomate');
-      $('ultrafastpreset').classList.toggle('active',ACTIVE_PERF_PRESET==='ultra');
-      $('qualitypreset').classList.toggle('active',ACTIVE_PERF_PRESET==='quality');
-      $('fastpreset').textContent=`FAST · ${fast.steps}`;
-      $('taomatepreset').textContent=`TAOMATE · ${taomate.steps}`;
-      $('ultrafastpreset').textContent=`ULTRA FAST · ${ultra.steps}`;
-      $('qualitypreset').textContent=`QUALITY · ${quality.steps}`;
-      $('preset_hint').innerHTML=
-        `<b>${active.label}</b> · ${currentModelMode()==='ref2va'?'REF2VA / REFERENCES':'CURRENT / KEYFRAMES'} · ${ACTIVE_PERF_PRESET==='ultra'?'ULTRA FAST':ACTIVE_PERF_PRESET.toUpperCase()}<br>`+
-        `${active.summary}<br><span style="color:#70737d">FAST is the default. ULTRA FAST adds 5% sparse attention on top of the 4-step Lightning recipe.</span>`;
+
+      const setPreset=(id,on,name,sub)=>{
+        const b=$(id);
+        b.classList.toggle('active',on);
+        b.innerHTML=`<span class="presetname">${name}</span><span class="presetsub">${sub}</span>`;
+      };
+      setPreset('fastpreset',ACTIVE_PERF_PRESET==='fast','FAST','Recommended');
+      setPreset('ultrafastpreset',ACTIVE_PERF_PRESET==='ultra','ULTRA','Max speed');
+      setPreset('qualitypreset',ACTIVE_PERF_PRESET==='quality','QUALITY','Best quality');
+      setPreset('taomatepreset',ACTIVE_PERF_PRESET==='taomate','TAOMATE','3-step alt');
+
+      const lightningAvailable=mode==='ref2va'?m.ref2va_lightning_available:m.lightning_available;
+      $('ultrafastpreset').disabled=(lightningAvailable===false);
+      $('taomatepreset').disabled=(mode!=='fl2va'||m.taomate_available===false);
+      $('preset_hint').innerHTML=`<b>${active.short}</b> · ${active.summary}`;
     }
 
     function _modelProfileState(){return (window.H3META||{}).model_profiles||{}}
@@ -9995,7 +10935,6 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         window.H3META=m;
         window.ADULT_ENABLED=!!m.adult_enabled;
         renderStorageState(m);
-        renderIntegrationKeys(m);
         syncAdultModeButton(m);
         if(firstMeta)ACTIVE_MODEL_PROFILE='stock_quality';
 
@@ -10063,26 +11002,6 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
 
         const arch=$('arch_label');
         if(arch)arch.textContent=(m.gpu_arch_label||m.gpu_profile||'AUTO GPU').toUpperCase();
-        const mh=$('modelhint');
-        if(mh){
-          const profileBlurb=m.lowvram_t4
-            ? '<b>T4 / 16GB LOW-VRAM STACK</b> · Q4_0 GGUF + Dynamic VRAM.'
-            : (m.a100_80
-              ? '<b>A100 80GB QUALITY STACK</b> · native SM80 quality path.'
-              : (m.a100_40
-                ? '<b>A100 40GB QUALITY STACK</b> · sequential TE→DiT→VAE handoff.'
-                : '<b>BLACKWELL SM120 QUALITY STACK</b> · CUDA13 quality path.'));
-          const storageLine=m.output_persistent
-            ? `<br><span style="color:#7cc38c">Output storage</span> · ${esc(m.output_label||'persistent storage')} · survives runtime reset`
-            : `<br><span style="color:#e0a36d"><b>Output storage</b></span> · ${esc(m.output_label||'/content/h3_out')} · TEMPORARY; runtime reset can erase generated videos`;
-          mh.innerHTML=profileBlurb
-            + `<br><span style="color:#9aa0aa">Residency</span> · ${m.lowvram_t4?'DYNAMIC VRAM / CPU↔GPU paging':(m.full_stack_residency?'FULL STACK RESIDENT':'PARTITIONED TE↔DiT handoff')} · ${m.physical_vram_gib||'?'} GiB physical`
-            + `<br><span style="color:#9aa0aa">Conditioning TE</span> · ${m.quality_text_encoder||'Qwen3-VL-32B'}`
-            + storageLine
-            + '<br>' + (m.ref2va_available
-              ? `<span style="color:#9aa0aa">Ref2VA available</span> · stock Ref2VA downloads on first use · ${m.ref2va_max_images||9} image / ${m.ref2va_max_videos||3} video / ${m.ref2va_max_audios||3} audio slots.`
-              : '<span style="color:#d99191">Ref2VA unavailable</span> · update ComfyUI to expose MiniMaxH3ReferenceToVideo.');
-        }
         return m;
       });
     }
@@ -10115,11 +11034,10 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         say('ready · Drive connected · default config · first generation will save preferences');
       }
       renderStorageState(window.H3META||m);
-      renderIntegrationKeys(window.H3META||m);
     }
     initializeStudio().catch(e=>{console.error(e);fail(String(e&&e.message?e.message:e))});
-    $('storage_local').onclick=async()=>{try{await setOutputStorage('local')}catch(e){await uiAlert(String(e&&e.message?e.message:e),'Output storage')}};
-    $('storage_drive').onclick=async()=>{try{await setOutputStorage('drive')}catch(e){await uiAlert(String(e&&e.message?e.message:e),'Google Drive storage')}};
+    $('storage_local').onchange=async()=>{if(!$('storage_local').checked)return;try{await setOutputStorage('local')}catch(e){renderStorageState(window.H3META||{});await uiAlert(String(e&&e.message?e.message:e),'Output storage')}};
+    $('storage_drive').onchange=async()=>{if(!$('storage_drive').checked)return;try{await setOutputStorage('drive')}catch(e){renderStorageState(window.H3META||{});await uiAlert(String(e&&e.message?e.message:e),'Google Drive storage')}};
     refreshStageState(true);
     refreshTimeline(true);
     $('project_menu_btn').onclick=()=>{$('project_popover').classList.toggle('show')};
@@ -10185,6 +11103,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         el.addEventListener('dragover',e=>{
           e.preventDefault();
           e.stopPropagation();
+          timelineAutoScrollFromPointer(e.clientX);
           const r=el.getBoundingClientRect();
           el.classList.toggle('drop-before',e.clientX<r.left+r.width/2);
           el.classList.toggle('drop-after',e.clientX>=r.left+r.width/2);
@@ -10214,6 +11133,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       // refreshTimeline() calls wireTimelineDnD repeatedly, and addEventListener()
       // used to stack duplicate drop callbacks on the persistent timeline node.
       tl.ondragover=e=>{
+        timelineAutoScrollFromPointer(e.clientX);
         if(e.dataTransfer && [...e.dataTransfer.types].includes('application/x-h3-history')){
           e.preventDefault();
           tl.classList.add('drop-target');
@@ -10244,6 +11164,75 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       say('active sequence changed');
     });
 
+    let CLIP_TRIM_SEGMENT=null;
+    function clipTrimFrameTime(seg,frameOneBased){
+      const total=Math.max(1,Number(seg?.source_frames||seg?.frames||1));
+      const dur=Math.max(.001,Number(seg?.source_duration||seg?.duration||0));
+      return Math.max(0,Math.min(dur,(Number(frameOneBased)-1)*(dur/total)));
+    }
+    function syncClipTrimEditor(changed=''){
+      const seg=CLIP_TRIM_SEGMENT;if(!seg)return;
+      const total=Math.max(1,Math.round(Number(seg.source_frames||seg.frames||1)));
+      const sn=$('clip_trim_start_num'),en=$('clip_trim_end_num'),sr=$('clip_trim_start'),er=$('clip_trim_end');
+      let start=Math.round(Number((changed==='start_range'?sr.value:sn.value)||1));
+      let end=Math.round(Number((changed==='end_range'?er.value:en.value)||total));
+      start=Math.max(1,Math.min(total,start));end=Math.max(1,Math.min(total,end));
+      if(start>end){if(changed.startsWith('start'))end=start;else start=end}
+      sn.value=sr.value=String(start);en.value=er.value=String(end);
+      sr.max=er.max=sn.max=en.max=String(total);
+      const selected=end-start+1;
+      const sourceDur=Math.max(.001,Number(seg.source_duration||seg.duration||0));
+      const seconds=sourceDur*(selected/total);
+      $('clip_trim_range').textContent=`Frames ${start}–${end} of ${total}`;
+      $('clip_trim_length').innerHTML=`<b>${seconds.toFixed(2)} s</b> selected · ${sourceDur.toFixed(2)} s source`;
+      const v=$('clip_trim_video');
+      if(changed.startsWith('start')){try{v.currentTime=clipTrimFrameTime(seg,start)}catch(e){}}
+      if(changed.startsWith('end')){try{v.currentTime=Math.min(sourceDur,clipTrimFrameTime(seg,end)+sourceDur/total)}catch(e){}}
+    }
+    function openClipTrim(segmentId){
+      const seg=((window.H3TIMELINE||{}).segments||[]).find(x=>String(x.segment_id||x.job)===String(segmentId));
+      if(!seg)return;
+      CLIP_TRIM_SEGMENT=seg;
+      const total=Math.max(1,Math.round(Number(seg.source_frames||seg.frames||1)));
+      const start=Math.max(1,Math.min(total,Number(seg.trim_start_frame??0)+1));
+      const end=Math.max(start,Math.min(total,Number(seg.trim_end_frame??(total-1))+1));
+      for(const id of ['clip_trim_start','clip_trim_end']){$(id).min='1';$(id).max=String(total)}
+      for(const id of ['clip_trim_start_num','clip_trim_end_num']){$(id).min='1';$(id).max=String(total)}
+      $('clip_trim_start').value=$('clip_trim_start_num').value=String(start);
+      $('clip_trim_end').value=$('clip_trim_end_num').value=String(end);
+      const v=$('clip_trim_video');v.src='/out/'+encodeURIComponent(seg.file);v.currentTime=clipTrimFrameTime(seg,start);
+      syncClipTrimEditor();
+      $('clip_trim_modal').classList.add('show');
+      setTimeout(()=>$('clip_trim_start_num').focus(),0);
+      mlTrack('notebook_h3_timeline_trim_opened',{action:'open',target:String(segmentId),meta:{source_frames:total,start_frame:start,end_frame:end}});
+    }
+    function closeClipTrim(){
+      $('clip_trim_modal').classList.remove('show');
+      const v=$('clip_trim_video');try{v.pause()}catch(e){}v.removeAttribute('src');v.load();CLIP_TRIM_SEGMENT=null;
+    }
+    $('clip_trim_close').onclick=closeClipTrim;$('clip_trim_cancel').onclick=closeClipTrim;
+    $('clip_trim_modal').addEventListener('click',e=>{if(e.target===$('clip_trim_modal'))closeClipTrim()});
+    document.addEventListener('keydown',e=>{if(e.key==='Escape'&&$('clip_trim_modal').classList.contains('show')){e.preventDefault();closeClipTrim()}});
+    $('clip_trim_start').addEventListener('input',()=>syncClipTrimEditor('start_range'));
+    $('clip_trim_end').addEventListener('input',()=>syncClipTrimEditor('end_range'));
+    $('clip_trim_start_num').addEventListener('input',()=>syncClipTrimEditor('start_num'));
+    $('clip_trim_end_num').addEventListener('input',()=>syncClipTrimEditor('end_num'));
+    $('clip_trim_reset').onclick=()=>{if(!CLIP_TRIM_SEGMENT)return;const total=Math.max(1,Number(CLIP_TRIM_SEGMENT.source_frames||CLIP_TRIM_SEGMENT.frames||1));$('clip_trim_start_num').value='1';$('clip_trim_end_num').value=String(total);syncClipTrimEditor('end_num')};
+    $('clip_trim_apply').onclick=async()=>{
+      const seg=CLIP_TRIM_SEGMENT;if(!seg)return;
+      syncClipTrimEditor();
+      const start=Math.max(1,Math.round(Number($('clip_trim_start_num').value||1)));
+      const end=Math.max(start,Math.round(Number($('clip_trim_end_num').value||start)));
+      const b=$('clip_trim_apply');b.disabled=true;const old=b.textContent;b.textContent='APPLYING…';
+      try{
+        const r=await(await fetch('/api/timeline/trim/'+encodeURIComponent(seg.segment_id||seg.job),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({start_frame:start-1,end_frame:end-1})})).json();
+        if(r.error){await uiAlert(r.error,'Trim clip');return}
+        mlTrack('notebook_h3_timeline_trim_applied',{action:'apply',target:String(seg.segment_id||seg.job),meta:{start_frame:start,end_frame:end,selected_frames:end-start+1},immediate:true});
+        closeClipTrim();await refreshTimeline(true);say(`clip trimmed · frames ${start}–${end}`);
+      }catch(e){await uiAlert(String(e?.message||e),'Trim clip')}
+      finally{b.disabled=false;b.textContent=old}
+    };
+
     async function refreshTimeline(quiet=false){
       let t;
       try{t=await (await fetch('/api/timeline')).json()}catch(e){if(!quiet)console.warn(e);return null}
@@ -10267,10 +11256,12 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         seqSelect.classList.remove('show');
       }
       if(!segs.length){$('timeline').innerHTML='<div class=timelineempty>Drop a History clip here or generate the first clip.</div>';wireTimelineDnD();return t}
-      $('timeline').innerHTML=segs.map((s,i)=>{const thumb=s.last_frame_file?`<img src="/out/${encodeURIComponent(s.last_frame_file)}?t=${t.updated||0}">`:'';const p=esc((s.prompt||'').slice(0,58));return `<div class=tclip data-segment="${esc(s.segment_id||s.job)}" data-file="${esc(s.file)}" title="Drag to move · ${esc(s.prompt||'')}"><span class=dragbadge>⠿ ${i+1}</span><div class=ttools><button class=recallprompt data-prompt="${esc(s.prompt||'')}" title="Restore full prompt">P</button><button class=tdelete data-segment="${esc(s.segment_id||s.job)}" title="Delete clip">⌫</button></div><div class=tthumb>${thumb}</div><div class=tinfo><b>${s.continued?'LAST-FRAME CONTINUITY':'SHOT'}</b> · ${Number(s.duration||0).toFixed(2)}s<br>${s.width||'?'}×${s.height||'?'} · seed ${s.seed??'?'}<br>${p||'—'}</div></div>`}).join('');
+      $('timeline').innerHTML=segs.map((s,i)=>{const thumb=s.last_frame_file?`<img src="/out/${encodeURIComponent(s.last_frame_file)}?t=${t.updated||0}">`:'';const p=esc((s.prompt||'').slice(0,58));const trim=s.trimmed?`<span class=ttrimmark> · FRAMES ${Number(s.trim_start_frame||0)+1}–${Number(s.trim_end_frame??((s.source_frames||1)-1))+1}/${Number(s.source_frames||s.frames||1)}</span>`:'';return `<div class="tclip ${s.trimmed?'trimmed':''}" data-segment="${esc(s.segment_id||s.job)}" data-file="${esc(s.timeline_file||s.file)}" title="Drag to move · click to preview · use ✂ to set in/out frames"><span class=dragbadge>⠿ ${i+1}</span><div class=ttools><button class=recallprompt data-prompt="${esc(s.prompt||'')}" title="Restore full prompt">P</button><button class=ttrim data-segment="${esc(s.segment_id||s.job)}" title="Set start and end frames">✂</button><button class=tdelete data-segment="${esc(s.segment_id||s.job)}" title="Delete clip">⌫</button></div><div class=tthumb>${thumb}</div><div class=tinfo><b>${s.continued?'LAST-FRAME CONTINUITY':'SHOT'}</b> · ${Number(s.duration||0).toFixed(2)}s${trim}<br>${s.width||'?'}×${s.height||'?'} · seed ${s.seed??'?'}<br>${p||'—'}</div></div>`}).join('');
       [...document.querySelectorAll('.tclip')].forEach(el=>el.addEventListener('click',e=>{if(!e.target.closest('button'))previewTimelineFile(el.dataset.file)}));
       [...document.querySelectorAll('.tclip .recallprompt')].forEach(b=>b.onclick=e=>{e.stopPropagation();restoreClipPrompt(b.dataset.prompt||'')});
+      [...document.querySelectorAll('.ttrim')].forEach(b=>b.onclick=e=>{e.stopPropagation();openClipTrim(b.dataset.segment)});
       [...document.querySelectorAll('.tdelete')].forEach(b=>b.onclick=e=>{e.stopPropagation();deleteTimelineClip(b.dataset.segment)});
+      applyTimelineZoom(TIMELINE_CLIP_WIDTH,{remember:false,preserveCenter:false});
       wireTimelineDnD();return t
     }
 
@@ -10456,7 +11447,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       ACTIVE_PERF_PRESET=kind;
       updateDur();syncPresetUI();renderNamedLoraRows(window.H3META||{});
       const r=presetRecipe(profile,mode,kind);
-      say(`${r.label} · ${kind==='ultra'?'ULTRA FAST':kind.toUpperCase()} · ${r.summary}`);
+      say(`${r.short} · ${r.summary}`);
     }
 
     $('fastpreset').onclick=e=>{e.preventDefault();applyPerformancePreset('fast')};
@@ -10490,6 +11481,8 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       fd.append('motion8_strength',String(motion8Submit));fd.append('lightning_strength',String(lightningSubmit));
       fd.append('lora','none');fd.append('lora_strength','0');fd.append('lora_stack_json',JSON.stringify(activeCreativeLoraStack()));
       fd.append('studio_config_json',JSON.stringify(buildStudioConfig()));
+      fd.append('model_profile',String(ACTIVE_MODEL_PROFILE||'stock_quality'));
+      fd.append('performance_preset',String(ACTIVE_PERF_PRESET||''));
       if(NEXT_SCENE_PENDING_TOKEN)fd.append('story_director_token',NEXT_SCENE_PENDING_TOKEN);
       fd.append('timeline_action',timelineAction);fd.append('input_mode',mode);fd.append('ref_image_size',$('ref_image_size').value);fd.append('action','0');fd.append('action_strength','0');fd.append('lightning',Math.abs(lightningSubmit)>1e-6?'1':'0');
       if(mode==='ref2va'){
@@ -10499,6 +11492,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       }else{
         for(const k of ['first_frame','last_frame'])if($(k).files[0])fd.append(k,$(k).files[0]);
       }
+      mlTrack('notebook_h3_generate_pressed',{action:'submit',target:'#go',meta:{...mlGenerationUiMeta(),timeline_action:timelineAction},immediate:true});
       dot('live');say(timelineAction==='continue'?'adding generation with previous last-frame continuity':(mode==='ref2va'?'adding Ref2VA generation to queue':'adding generation to queue'));
       const resp=await fetch('/api/generate',{method:'POST',body:fd});
       const r=await resp.json();
@@ -10512,7 +11506,16 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         say('adult request cancelled');
         return;
       }
-      if(r.error){fail(r.error);refreshTimeline(true);return}
+      if(r.error){
+        if(r.code==='free_limit_reached'){
+          mlRenderAccess(r);
+          mlShowUpgradeModal('free_limit');
+        }
+        mlTrack('notebook_h3_generate_rejected',{action:r.code||'error',target:'#go',meta:{code:r.code||'',message:String(r.error||'').slice(0,180)},immediate:true});
+        fail(r.error);refreshTimeline(true);return
+      }
+      if(r.access)mlRenderAccess(r.access);else mlRefreshAccess();
+      mlTrack('notebook_h3_generate_queued',{action:'queued',target:'#go',meta:{job_id:r.id||'',free_used:r.access?.used??null,free_remaining:r.access?.remaining??null},immediate:true});
       if(NEXT_SCENE_PENDING_TOKEN)NEXT_SCENE_PENDING_TOKEN='';
       job=r.id;poll(job);refreshQueue();
     }
@@ -10548,8 +11551,16 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         if(ok)return $('timeline_retry').click();
         say('adult retry cancelled');return;
       }
-      if(r.error){fail(r.error);refreshTimeline(true);return}
+      if(r.error){
+        if(r.code==='free_limit_reached'){
+          mlRenderAccess(r);
+          mlTrack('notebook_h3_upgrade_shown',{action:'retry_free_limit',target:'#ml_upgrade_link',meta:{free_used:r.used??5,free_remaining:0},immediate:true});
+        }
+        fail(r.error);refreshTimeline(true);return
+      }
+      if(r.access)mlRenderAccess(r.access);else mlRefreshAccess();
       $('seed').value=r.seed;
+      mlTrack('notebook_h3_retry_queued',{action:'retry',target:'#timeline_retry',meta:{job_id:r.id||'',free_used:r.access?.used??null,free_remaining:r.access?.remaining??null},immediate:true});
       job=r.id;poll(job);refreshQueue();
     };
     $('timeline_new_sequence').onclick=async()=>{
@@ -10613,6 +11624,10 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         $('vwrap').innerHTML=`<video controls autoplay src="/out/${previewFile}?t=${Date.now()}"></video>`;
         syncStageClear();
         $('meta').textContent=j.file+(j.active_sequence_name?` · ${j.active_sequence_name}`:'')+(j.note?` · ${j.note}`:'')+(j.story_director_canon_committed?` · canon committed ${j.story_director_audit_score||0}/100`:(j.story_director_review_required?` · director retry recommended ${j.story_director_audit_score||0}/100`:''));
+        mlTrack('notebook_h3_result_viewed',{action:'done',target:'video_output',meta:{job_id:jid,elapsed_s:j.secs??null,duration_s:j.duration??null,frames:j.frames??null},immediate:true});
+        if(!ML_ACCESS_STATE?.member && Number(ML_ACCESS_STATE?.remaining??1)<=0){
+          mlShowUpgradeModal('fifth_generation_complete');
+        }
         await refreshTimeline(true);
         await refreshHistory();
         await refreshQueue();
@@ -10620,10 +11635,12 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       }
 
       if(j.status==='cancelled'){
+        mlTrack('notebook_h3_result_viewed',{action:'cancelled',target:'generation',meta:{job_id:jid},immediate:true});
         await refreshQueue();
         return
       }
 
+      mlTrack('notebook_h3_result_viewed',{action:'error',target:'generation',meta:{job_id:jid,message:String(j.msg||'unknown error').slice(0,180)},immediate:true});
       if(jid===activeQueueJob||!activeQueueJob)fail(j.msg||'unknown error');
       refreshQueue();
     }
