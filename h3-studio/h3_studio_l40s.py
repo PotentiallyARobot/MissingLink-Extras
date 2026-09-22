@@ -11979,8 +11979,25 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     $('queue_clear').onclick=async()=>{await fetch('/api/queue/clear',{method:'POST'});refreshQueue();say('all waiting jobs cancelled · running job left alone')};
     setInterval(refreshQueue,900);setInterval(refreshHistory,1800);refreshQueue();refreshHistory();
 
+    async function presetMetadata(kind){
+      const mode=currentModelMode();
+      const key=kind==='taomate'?'taomate_available':
+        (mode==='ref2va'?'ref2va_lightning_available':'lightning_available');
+      let m=window.H3META;
+      try{
+        // Unknown metadata is not an unsupported accelerator. Wait for the
+        // server before changing steps, LoRAs or the sparse-attention budget.
+        if(!m || typeof m[key]!=='boolean')m=await loadMeta();
+        if(!m || typeof m[key]!=='boolean')throw new Error('Accelerator availability is missing from Studio metadata. Refresh the page after the updated Studio has started.');
+        return m;
+      }catch(e){
+        await uiAlert(String(e&&e.message?e.message:e),'Could not load preset availability');
+        return null;
+      }
+    }
     async function applyPerformancePreset(kind){
-      const m=window.H3META||{};
+      const m=await presetMetadata(kind);
+      if(!m)return;
       const profile=ACTIVE_MODEL_PROFILE;
       const mode=currentModelMode();
       const accelerated=(kind==='fast'||kind==='ultra');
@@ -12012,7 +12029,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         $('sparse_percent').value=0;$('sparse_slider').value=0;updateSparseUI('number');
       }else if(accelerated){
         const accelAvailable=mode==='ref2va'?m.ref2va_lightning_available:m.lightning_available;
-        if(!accelAvailable){
+        if(accelAvailable===false){
           // Low-VRAM/T4 currently has no matching Lightning package. Keep FAST selected
           // but use the best available dense base recipe instead of silently breaking.
           _setStrengthForKind('lightning',0,m);
