@@ -1,4 +1,86 @@
 # CUDA13 launcher: never replace Torch inside an already-running notebook.
+def _h3_restore_bucket(root, env):
+    import os, sys, json, pathlib, subprocess, tempfile, hashlib, tarfile, shutil
+    source = env.get('H3_CU130_BUCKET', 'hf://buckets/MissingLinkBuilder/wheels/h3-runtime/cu130-sm89/h3-20260921T210158Z-064cwh0w')
+    if source.lower() in ('off', '0', 'false'):
+        return False
+    marker = root / 'bucket-restored.json'
+    if marker.exists():
+        saved = json.loads(marker.read_text())
+        cache = pathlib.Path(env.get('H3_L40S_CACHE_DIR', '/content/.h3_l40s_cache'))
+        if (saved.get('source') == source and saved.get('python_tag') == sys.implementation.cache_tag
+                and all((root / p).is_dir() for p in ('runtime/torch', 'packages', 'toolkit'))
+                and all((cache / 'sage' / key / 'wheels').is_dir() for key in saved['sage_keys'])):
+            print('CUDA13: reusing restored bucket environment.', flush=True)
+            return True
+    if not env.get('HF_TOKEN'):
+        print('CUDA13: no HF_TOKEN available; bucket restore skipped, using installation fallback.', flush=True)
+        return False
+    print('CUDA13: restoring tested runtime and SM89 Sage from ' + source, flush=True)
+    client = root / 'bucket-client'
+    clean = env.copy()
+    for key in list(clean):
+        if key.startswith('PIP_') or key in ('PYTHONPATH', 'PYTHONHOME'):
+            clean.pop(key, None)
+    clean['PYTHONPATH'] = str(client)
+    probe = subprocess.run([sys.executable, '-c', 'from huggingface_hub import sync_bucket'],
+                           env=clean, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if probe.returncode:
+        subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '--upgrade', '--target', str(client),
+                        'huggingface_hub>=1.6.0'], env=clean, check=True)
+    download_code = '''import sys,json
+from huggingface_hub import sync_bucket
+sync_bucket(sys.argv[1],sys.argv[2],include=json.loads(sys.argv[3]),token=sys.stdin.read(),delete=False)
+'''
+    with tempfile.TemporaryDirectory(prefix='h3-bucket-', dir=root.parent) as temporary:
+        download = pathlib.Path(temporary) / 'download'
+        download.mkdir()
+        def fetch(names):
+            subprocess.run([sys.executable, '-c', download_code, source, str(download), json.dumps(names)],
+                           env=clean, input=env['HF_TOKEN'], text=True, check=True)
+        fetch(['manifest.json'])
+        meta = json.loads((download / 'manifest.json').read_text())
+        if (meta.get('python_tag') != sys.implementation.cache_tag or meta.get('machine') != 'x86_64'
+                or meta.get('torch') != '2.11.0+cu130' or meta.get('cuda') != '13.0'):
+            print('CUDA13: snapshot incompatible with this Python/runtime; using installation fallback.', flush=True)
+            return False
+        names = ['runtime.tar.gz', 'dependencies.tar.gz', 'cuda13-toolkit.tar.gz', 'sage-and-setup.tar.gz']
+        records = {item['file']: item for item in meta['archives']}
+        if any(name not in records for name in names):
+            raise RuntimeError('Bucket snapshot is missing required archives.')
+        fetch(names)
+        unpack = pathlib.Path(temporary) / 'unpack'
+        unpack.mkdir()
+        for name in names:
+            archive = download / name
+            with archive.open('rb') as stream:
+                digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+            if archive.stat().st_size != records[name]['bytes'] or digest != records[name]['sha256']:
+                raise RuntimeError('Bucket archive verification failed: ' + name)
+            print('CUDA13: verified; extracting ' + name, flush=True)
+            with tarfile.open(archive) as tar:
+                tar.extractall(unpack, filter='data')
+            archive.unlink()
+        restored = unpack / 'h3_ada_cu130'
+        # Replace private package trees instead of mixing versions from an earlier pip run.
+        for name in ('runtime', 'packages', 'toolkit'):
+            incoming = restored / name
+            if not incoming.is_dir():
+                raise RuntimeError('Incomplete runtime snapshot: ' + name)
+        for name in ('runtime', 'packages', 'toolkit'):
+            destination = root / name
+            if destination.exists():
+                destination.rename(pathlib.Path(temporary) / ('previous-' + name))
+            shutil.move(str(restored / name), str(destination))
+        for name in ('constraints.txt', 'dependencies.sha256', 'comfy-no-torch.txt'):
+            if (restored / name).is_file():
+                shutil.copy2(restored / name, root / name)
+        cache = pathlib.Path(env.get('H3_L40S_CACHE_DIR', '/content/.h3_l40s_cache'))
+        shutil.copytree(unpack / '.h3_l40s_cache' / 'sage', cache / 'sage', dirs_exist_ok=True)
+        marker.write_text(json.dumps(dict(source=source, python_tag=meta['python_tag'], sage_keys=meta['sage_keys'])))
+    print('CUDA13: bucket restore complete; using saved dependencies and compiled Sage.', flush=True)
+    return True
+
 def _h3_open_colab_ui(port):
     from google.colab import output
     from IPython.display import HTML, display
@@ -57,7 +139,12 @@ def _h3_launch_cuda13():
         if result.returncode:
             raise RuntimeError(title + '\n' + result.stdout[-12000:])
         return result
-    print('H3-ADA-CU130-TARGET-V2 · no venv / no ensurepip', flush=True)
+    print('H3-ADA-CU130-BUCKET-V3 · automatic HF restore · no venv', flush=True)
+    try:
+        bucket_ready = _h3_restore_bucket(root, env)
+    except Exception as error:
+        raise RuntimeError('CUDA13 bucket restore failed. Check HF_TOKEN/bucket access and retry. '
+                           'Set H3_CU130_BUCKET=off only to explicitly use the slower installation path.') from error
     target = root / 'runtime'
     extras = root / 'packages'
     target.mkdir(exist_ok=True)
@@ -73,6 +160,9 @@ def _h3_launch_cuda13():
         "import torch,torchvision,torchaudio; assert torch.__version__=='2.11.0+cu130'; assert torch.version.cuda=='13.0'"],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
     if not installed:
+        if bucket_ready:
+            raise RuntimeError('Restored Torch failed its import/version check; refusing to silently reinstall it. '
+                               'Set H3_CU130_BUCKET=off for installation fallback.')
         run(pip + ['install', '--upgrade', '--target', target, 'torch==2.11.0+cu130', 'torchvision==0.26.0+cu130',
             'torchaudio==2.11.0+cu130', '--index-url', 'https://download.pytorch.org/whl/cu130'],
             'install pinned Torch 2.11.0 + CUDA13 (cached on later launches)')
@@ -82,7 +172,9 @@ def _h3_launch_cuda13():
     import hashlib
     dep_key = hashlib.sha256((req.read_bytes() if req.exists() else b'no-comfy-yet') + b'ada-cu130-target-deps-v2').hexdigest()
     marker = root / 'dependencies.sha256'
-    if not marker.exists() or marker.read_text() != dep_key:
+    if bucket_ready:
+        print('CUDA13: using snapshot dependencies; skipping pip updates from changing Comfy requirements.', flush=True)
+    elif not marker.exists() or marker.read_text() != dep_key:
         if req.exists():
             import re
             filtered = root / 'comfy-no-torch.txt'
