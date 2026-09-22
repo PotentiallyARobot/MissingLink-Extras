@@ -4187,6 +4187,45 @@ if _CU130_CHILD:
             waveform = waveform.reshape(waveform.shape[-2], waveform.shape[-1])
         return {"waveform": waveform.unsqueeze(0).contiguous(), "sample_rate": int(sample_rate)}
 
+    # G4_CONTINUITY_V1
+    def _ref_guides(p, count):
+        result = []
+        for key, frame in (("ref_first_guide", 0), ("ref_last_guide", -1)):
+            index = int(p.get(key) or 0)
+            if not 0 <= index <= count:
+                raise ValueError(f"{key}: Picture {index} is not uploaded.")
+            if index:
+                result.append((index, frame))
+        return result
+
+    def _ref_tags(prompt, images, videos, audios):
+        counts = {"Picture": images, "Video": videos, "Audio": audios}
+        for kind, number in re.findall(r"<(Picture|Video|Audio)\s+(\d+)>", prompt):
+            if not 1 <= int(number) <= counts[kind]:
+                raise ValueError(f"<{kind} {number}> has no reference; available count: {counts[kind]}.")
+
+    def _ref_media_preflight(paths, kind):
+        total = 0.0
+        audio_count = 0
+        for path in paths:
+            proc = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                "format=duration:stream=codec_type,duration", "-of", "json", str(path)],
+                capture_output=True, text=True, timeout=20)
+            if proc.returncode:
+                raise ValueError(f"Cannot inspect reference {os.path.basename(path)}")
+            info = json.loads(proc.stdout)
+            streams = [x for x in info.get("streams", []) if x.get("codec_type") == kind]
+            if not streams:
+                raise ValueError(f"Reference has no {kind} stream.")
+            duration = float(streams[0].get("duration") or info.get("format", {}).get("duration") or 0)
+            if not 2.0 <= duration <= 15.05:
+                raise ValueError(f"Each {kind} reference must be 2–15 seconds; got {duration:.2f}s.")
+            total += duration
+            audio_count += int(any(x.get("codec_type") == "audio" for x in info.get("streams", [])))
+        if total > 15.05:
+            raise ValueError(f"Combined {kind} references exceed 15 seconds ({total:.2f}s).")
+        return audio_count
+
     def _load_reference_audio(path, required=True):
         last_err = None
         if torchaudio is not None:
@@ -4225,7 +4264,7 @@ if _CU130_CHILD:
             raise RuntimeError(f"Could not decode audio from {os.path.basename(path)}: {last_err}")
         return None
 
-    def _load_reference_video(path, target_fps=MODEL_FPS):
+    def _load_reference_video(path, target_fps=MODEL_FPS, include_audio=True):
         if av is None:
             raise RuntimeError("PyAV is required for Ref2VA video references but is not available in this runtime.")
         with av.open(path) as container:
@@ -4264,7 +4303,7 @@ if _CU130_CHILD:
                     idxs.append(pos)
             selected = [frames[i] for i in idxs]
         video = torch.from_numpy(np.stack(selected).astype(np.float32) / 255.0)
-        audio = _load_reference_audio(path, required=False)
+        audio = _load_reference_audio(path, required=False) if include_audio else None
         return video, audio
 
     def _frame_like_to_pil(frame):
@@ -5558,7 +5597,7 @@ if _CU130_CHILD:
                 ref_videos = {}
                 ref_video_audios = {}
                 for idx, path in enumerate(p.get("ref_videos") or [], start=1):
-                    frames, soundtrack = _load_reference_video(path)
+                    frames, soundtrack = _load_reference_video(path, include_audio=str(p.get("ref_video_audio", "1")) == "1")
                     ref_videos[f"ref_video_{idx}"] = frames
                     if soundtrack is not None:
                         ref_video_audios[f"ref_video_audio_{idx}"] = soundtrack
@@ -5575,7 +5614,18 @@ if _CU130_CHILD:
                     kw["ref_video_audios"] = ref_video_audios
                 if ref_audios:
                     kw["ref_audios"] = ref_audios
+                _ref_tags(p["prompt"], len(ref_images), len(ref_videos), len(ref_video_audios) + len(ref_audios))
                 positive, latent = call(REF2VA_NODE_NAME, **kw)
+                guides = _ref_guides(p, len(ref_images))
+                if guides and "MiniMaxH3AddGuide" not in N:
+                    raise RuntimeError("MiniMaxH3AddGuide is unavailable; requested anchors cannot be applied.")
+                for ref_index, frame_index in guides:
+                    guide_image = _prepare_frame(p["ref_images"][ref_index - 1], width, height, p.get("image_fit") or "cover")
+                    positive, = call("MiniMaxH3AddGuide", positive=positive, latent=latent,
+                        vae=vae, image=guide_image, frame_idx=frame_index)
+                    log(f"  Ref2VA timed guide: Picture {ref_index} -> frame {frame_index}")
+                j["ref_guides"] = [{"picture": i, "frame_idx": f} for i, f in guides]
+                log(f"  Ref2VA Audio labels: {len(ref_video_audios)} video soundtrack(s) first, then {len(ref_audios)} standalone references")
                 j["conditioning_mode"] = "ref2va"
                 j["ref_counts"] = {
                     "images": len(ref_images),
@@ -5937,49 +5987,63 @@ if _CU130_CHILD:
                 "continued_from_job": p.get("stage_source_job"),
                 "params": dict(p),
             }
-            with TIMELINE_LOCK:
-                seq = _find_sequence_unlocked(p.get("_target_sequence_id")) if p.get("_target_sequence_id") else _active_sequence_unlocked(create=True)
-                if seq is None:
-                    seq = _active_sequence_unlocked(create=True)
-                segs = list(seq.get("segments") or [])
-                if timeline_action == "retry" and segs:
-                    segs[-1] = entry
-                else:
-                    segs.append(entry)
-                seq["segments"] = segs
-                seq["updated"] = time.time()
-                TIMELINE_STATE["updated"] = time.time()
-                seq_id_for_stitch = seq.get("id")
-
-            stitch0 = time.perf_counter()
-            if len(segs) <= 1:
+            review_only = str(p.get("review_before_timeline") or "0") == "1"
+            entry["review_required"] = review_only
+            if review_only:
                 master_file = os.path.basename(dest)
-                stitch_ok, stitch_note = True, "single-segment sequence"
+                with TIMELINE_LOCK:
+                    seq = _find_sequence_unlocked(p.get("_target_sequence_id")) or {}
+                    timeline_count = len(seq.get("segments") or [])
+                    active_sequence_id = seq.get("id")
+                    active_sequence_name = seq.get("name") or "Sequence"
+                j["stitch_sec"] = 0.0
+                stitch_note = "Review take saved in History; timeline unchanged"
+                j["stitch_note"] = stitch_note
+                j["measured_total_sec"] = round(time.perf_counter() - _job_wall0, 3)
             else:
-                _set_job_stage(jid, "stitching timeline")
-                try:
-                    segment_paths = [_timeline_segment_media_path(s) for s in segs]
-                    master_name = f"timeline_{uuid.uuid4().hex[:10]}.mp4"
-                    master_path = os.path.join(OUT, master_name)
-                    stitch_ok, stitch_note = _concat_mp4_timeline(segment_paths, master_path)
-                    master_file = master_name if stitch_ok else os.path.basename(dest)
-                except Exception as _stitch_exc:
-                    stitch_ok, stitch_note = False, f"timeline stitch failed: {_stitch_exc}"
+                with TIMELINE_LOCK:
+                    seq = _find_sequence_unlocked(p.get("_target_sequence_id")) if p.get("_target_sequence_id") else _active_sequence_unlocked(create=True)
+                    if seq is None:
+                        seq = _active_sequence_unlocked(create=True)
+                    segs = list(seq.get("segments") or [])
+                    if timeline_action == "retry" and segs:
+                        segs[-1] = entry
+                    else:
+                        segs.append(entry)
+                    seq["segments"] = segs
+                    seq["updated"] = time.time()
+                    TIMELINE_STATE["updated"] = time.time()
+                    seq_id_for_stitch = seq.get("id")
+
+                stitch0 = time.perf_counter()
+                if len(segs) <= 1:
                     master_file = os.path.basename(dest)
-            j["stitch_sec"] = round(time.perf_counter() - stitch0, 3)
-            j["stitch_note"] = stitch_note
-            j["measured_total_sec"] = round(time.perf_counter() - _job_wall0, 3)
-            with TIMELINE_LOCK:
-                seq = _find_sequence_unlocked(p.get("_target_sequence_id")) if p.get("_target_sequence_id") else _active_sequence_unlocked(create=True)
-                if seq is None:
-                    seq = _active_sequence_unlocked(create=True)
-                seq["master_file"] = master_file
-                seq["updated"] = time.time()
-                TIMELINE_STATE["updated"] = time.time()
-                timeline_count = len(seq.get("segments") or [])
-                active_sequence_id = seq.get("id")
-                active_sequence_name = seq.get("name") or "Sequence"
-                _autosave_timeline_unlocked("generate")
+                    stitch_ok, stitch_note = True, "single-segment sequence"
+                else:
+                    _set_job_stage(jid, "stitching timeline")
+                    try:
+                        segment_paths = [_timeline_segment_media_path(s) for s in segs]
+                        master_name = f"timeline_{uuid.uuid4().hex[:10]}.mp4"
+                        master_path = os.path.join(OUT, master_name)
+                        stitch_ok, stitch_note = _concat_mp4_timeline(segment_paths, master_path)
+                        master_file = master_name if stitch_ok else os.path.basename(dest)
+                    except Exception as _stitch_exc:
+                        stitch_ok, stitch_note = False, f"timeline stitch failed: {_stitch_exc}"
+                        master_file = os.path.basename(dest)
+                j["stitch_sec"] = round(time.perf_counter() - stitch0, 3)
+                j["stitch_note"] = stitch_note
+                j["measured_total_sec"] = round(time.perf_counter() - _job_wall0, 3)
+                with TIMELINE_LOCK:
+                    seq = _find_sequence_unlocked(p.get("_target_sequence_id")) if p.get("_target_sequence_id") else _active_sequence_unlocked(create=True)
+                    if seq is None:
+                        seq = _active_sequence_unlocked(create=True)
+                    seq["master_file"] = master_file
+                    seq["updated"] = time.time()
+                    TIMELINE_STATE["updated"] = time.time()
+                    timeline_count = len(seq.get("segments") or [])
+                    active_sequence_id = seq.get("id")
+                    active_sequence_name = seq.get("name") or "Sequence"
+                    _autosave_timeline_unlocked("generate")
             history_row = dict(entry)
             history_row.update(history_id=uuid.uuid4().hex[:12], created=time.time(), status="done")
             with HISTORY_LOCK:
@@ -5987,11 +6051,12 @@ if _CU130_CHILD:
                 if len(HISTORY_STATE) > 300:
                     del HISTORY_STATE[:-300]
                 _save_history_unlocked()
-            _sync_stage_from_sequence(seq)
+            if not review_only:
+                _sync_stage_from_sequence(seq)
             # Story Director scenes remain pending until the ACTUAL H3 render passes a visual checkpoint audit.
             _director_render_audit = None
             try:
-                _director_render_audit = _postrender_story_director_finalize(jid, p, dest, entry)
+                _director_render_audit = None if review_only else _postrender_story_director_finalize(jid, p, dest, entry)
                 if _director_render_audit:
                     j["story_director_render_audit"] = _director_render_audit
                     j["story_director_audit_score"] = int(_director_render_audit.get("score") or 0)
@@ -7721,7 +7786,8 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
               "shift_video","shift_audio","sparse_percent","sampler_name","scheduler",
               "weight_dtype","lora","lora_strength","motion8","motion8_strength","action","action_strength","lightning",
               "lightning_strength","taomate","taomate_strength","unet", "use_stage_last", "timeline_action",
-              "input_mode", "ref_image_size", "model_profile", "performance_preset")}
+              "input_mode", "ref_image_size", "model_profile", "performance_preset",
+              "ref_first_guide", "ref_last_guide", "ref_video_audio", "review_before_timeline")}
         input_mode = (p.get("input_mode") or "fl2va").strip().lower()
         if input_mode not in {"fl2va", "ref2va"}:
             input_mode = "fl2va"
@@ -7855,6 +7921,19 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
             # studio Ref2VA uses the official MiniMax H3 reference checkpoint.
             if not p.get("unet"):
                 p["unet"] = REF2VA_DIT_FILE
+            try:
+                counts = []
+                for kind, limit in (("image", 9), ("video", 3), ("audio", 3)):
+                    slots = [i for i in range(1, limit + 1)
+                             if request.files.get(f"ref_{kind}_{i}") and request.files[f"ref_{kind}_{i}"].filename]
+                    if slots != list(range(1, len(slots) + 1)):
+                        raise ValueError(f"Fill {kind} slots consecutively from 1; gaps would change prompt labels.")
+                    counts.append(len(slots))
+                if sum(counts) > 12:
+                    raise ValueError("At most 12 reference files combined are supported.")
+                _ref_guides(p, counts[0])
+            except ValueError as exc:
+                return jsonify(error=str(exc)), 400
             ref_images = []
             ref_videos = []
             ref_audios = []
@@ -7884,6 +7963,14 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
             p["ref_images"] = ref_images
             p["ref_videos"] = ref_videos
             p["ref_audios"] = ref_audios
+            p["ref_video_audio"] = str(p.get("ref_video_audio") or "1")
+            try:
+                video_audio_count = _ref_media_preflight(ref_videos, "video")
+                _ref_media_preflight(ref_audios, "audio")
+                _ref_tags(p["prompt"], len(ref_images), len(ref_videos),
+                    len(ref_audios) + (video_audio_count if p["ref_video_audio"] == "1" else 0))
+            except (ValueError, subprocess.TimeoutExpired) as exc:
+                return jsonify(error=str(exc)), 400
         else:
             for k in ("first_frame","last_frame"):
                 f = request.files.get(k)
@@ -9093,6 +9180,10 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     </div>
 
     <div id=mode_panel_ref2va class=modepanel>
+      <div class=g2><div><label for=ref_first_guide>First-frame anchor</label><select id=ref_first_guide><option value="0">None</option><option value="1">Picture 1</option><option value="2">Picture 2</option><option value="3">Picture 3</option><option value="4">Picture 4</option><option value="5">Picture 5</option><option value="6">Picture 6</option><option value="7">Picture 7</option><option value="8">Picture 8</option><option value="9">Picture 9</option></select></div><div><label for=ref_last_guide>Last-frame anchor</label><select id=ref_last_guide><option value="0">None</option><option value="1">Picture 1</option><option value="2">Picture 2</option><option value="3">Picture 3</option><option value="4">Picture 4</option><option value="5">Picture 5</option><option value="6">Picture 6</option><option value="7">Picture 7</option><option value="8">Picture 8</option><option value="9">Picture 9</option></select></div></div>
+      <div class=hint>Apply pictures as timed guides at frame 0 and the final frame. Keep a stable identity picture and add shot compositions separately.</div>
+      <label><input id=ref_video_audio type=checkbox> Include reference-video soundtracks</label>
+      <div class=hint>Off keeps standalone voice samples numbered Audio 1, Audio 2, Audio 3. When on, video soundtracks occupy the first Audio numbers. Reuse the same clean voice reference for each character.</div>
       <label>Reference images</label>
       <div class=refimageslots>
         <div id=ref_image_slot_1 class="imageslot refslot" role=button tabindex=0 aria-label="Reference image slot 1"><img id=ref_image_preview_1 alt="Reference image 1"><div class=slotempty><b>REF IMAGE 1</b>click to upload</div><span class=slotbadge>P1</span><button id=ref_image_trash_1 class=slottrash type=button title="Clear reference image 1">⌫</button></div>
@@ -9114,7 +9205,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         <div class=reffilerow><div class=reffilerowhead><div class=reffilerowtitle>Reference Audio 2</div><div class=reffilename id=ref_audio_name_2>No audio selected</div></div><div class=reffileactions><button id=ref_audio_pick_2 class=inlinebtn type=button>CHOOSE</button><button id=ref_audio_clear_2 class="inlinebtn refclear" type=button>⌫ CLEAR</button></div></div>
         <div class=reffilerow><div class=reffilerowhead><div class=reffilerowtitle>Reference Audio 3</div><div class=reffilename id=ref_audio_name_3>No audio selected</div></div><div class=reffileactions><button id=ref_audio_pick_3 class=inlinebtn type=button>CHOOSE</button><button id=ref_audio_clear_3 class="inlinebtn refclear" type=button>⌫ CLEAR</button></div></div>
       </div>
-      <div class="hint refmodehint" id=ref2va_hint>Prompt labels follow slot order as <code>&lt;Picture 1&gt;</code>… <code>&lt;Video 1&gt;</code>… <code>&lt;Audio 1&gt;</code>. If a reference video contains audio, its soundtrack is forwarded automatically to the matching Ref2VA video-audio slot.</div>
+      <div class="hint refmodehint" id=ref2va_hint>Fill each reference type consecutively from slot 1. Missing prompt references are rejected. Maximum 12 files combined. Video/audio: 2–15s each and at most 15s per type. Use subject_definitions, summary, retention_analysis, detailed_description, overall_soundscape and non_diegetic_music sections. Mix one shared music track across the final edit.</div>
     </div>
 
     <div class=g2><div><label>Width</label><input id=width type=number value=768 step=32 min=32 autocomplete=off></div><div><label>Height</label><input id=height type=number value=768 step=32 min=32 autocomplete=off></div></div>
@@ -9124,6 +9215,8 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     <div class=hint><b>Motion pace:</b> 1.00× keeps native H3 timing. Higher values generate more model-time and retime it back to the requested duration, reducing the “slow-motion” feel without changing the final clip length.</div>
     <input id=use_stage_last type=hidden value=0>
     <input id=timeline_action type=hidden value=new>
+    <label><input id=review_before_timeline type=checkbox checked> Review take before adding to timeline</label>
+    <div class=hint>New takes stay in History. Play the full video with audio, then add accepted takes from History.</div>
 
     <div style="margin-top:11px;padding-top:9px;border-top:1px solid #24252a">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
@@ -11570,8 +11663,11 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       fd.append('model_profile',String(ACTIVE_MODEL_PROFILE||'stock_quality'));
       fd.append('performance_preset',String(ACTIVE_PERF_PRESET||''));
       if(NEXT_SCENE_PENDING_TOKEN)fd.append('story_director_token',NEXT_SCENE_PENDING_TOKEN);
+      fd.append('review_before_timeline',$('review_before_timeline').checked?'1':'0');
       fd.append('timeline_action',timelineAction);fd.append('input_mode',mode);fd.append('ref_image_size',$('ref_image_size').value);fd.append('action','0');fd.append('action_strength','0');fd.append('lightning',Math.abs(lightningSubmit)>1e-6?'1':'0');
       if(mode==='ref2va'){
+        for(const k of ['ref_first_guide','ref_last_guide'])fd.append(k,$(k).value);
+        fd.append('ref_video_audio',$('ref_video_audio').checked?'1':'0');
         for(let i=1;i<=9;i++) if($('ref_image_'+i).files[0]) fd.append('ref_image_'+i,$('ref_image_'+i).files[0]);
         for(let i=1;i<=3;i++) if($('ref_video_'+i).files[0]) fd.append('ref_video_'+i,$('ref_video_'+i).files[0]);
         for(let i=1;i<=3;i++) if($('ref_audio_'+i).files[0]) fd.append('ref_audio_'+i,$('ref_audio_'+i).files[0]);
