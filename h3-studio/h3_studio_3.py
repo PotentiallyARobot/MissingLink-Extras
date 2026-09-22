@@ -348,7 +348,7 @@ MISSING_LINK_UPGRADE_URL = (
 MISSING_LINK_TRIAL_URL = MISSING_LINK_SIGNIN_URL
 H3_FREE_RENDER_LIMIT = 15
 MISSING_LINK_AUTH_TTL_SEC = 120.0
-ML_DESIGN_VERSION = "h3-studio-2026-09-20-free15-v1"
+ML_DESIGN_VERSION = "h3-studio-2026-09-20-free15-subscribe-cta-v2"
 
 import hashlib as _ml_hashlib
 import json as _ml_json
@@ -3145,14 +3145,30 @@ if _CU130_CHILD:
     def _civitai_json(url, token=""):
         # CivitAI authentication is optional. Public API requests are made anonymously
         # when CIVITAI_API_KEY is absent; only a resource that CivitAI itself gates may
-        # reject that specific user-requested install.
+        # reject that specific user-requested install. Read the body ourselves so an
+        # upstream/proxy empty response produces a useful Studio error instead of a raw
+        # JSONDecodeError.
         headers = {"User-Agent":"Standalone-MiniMax-H3/1.0", "Accept":"application/json"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=45) as r:
-                return json.load(r)
+                raw = r.read()
+                status = int(getattr(r, "status", 200) or 200)
+                ctype = str(r.headers.get("Content-Type") or "")
+            if not raw or not raw.strip():
+                raise RuntimeError(
+                    f"CivitAI API returned an empty response (HTTP {status}) for {url}. "
+                    "Retry the request; if this is a civitai.red URL, keep the .red source URL so the Studio uses the mature-content API host."
+                )
+            try:
+                return json.loads(raw.decode("utf-8", "replace"))
+            except Exception as exc:
+                preview = raw[:500].decode("utf-8", "replace").replace("\n", " ").strip()
+                raise RuntimeError(
+                    f"CivitAI API returned non-JSON content (HTTP {status}, {ctype or 'unknown content type'}): {preview[:300]}"
+                ) from exc
         except urllib.error.HTTPError as e:
             if not token and int(getattr(e, "code", 0) or 0) in (401, 403):
                 raise RuntimeError(
@@ -3160,7 +3176,12 @@ if _CU130_CHILD:
                     "CIVITAI_API_KEY is optional and is not required to start or use MiniMax H3 Studio; "
                     "only this protected CivitAI download needs it."
                 ) from e
-            raise
+            try:
+                body = e.read(1200).decode("utf-8", "replace").replace("\n", " ").strip()
+            except Exception:
+                body = ""
+            detail = (": " + body[:500]) if body else ""
+            raise RuntimeError(f"CivitAI API request failed (HTTP {e.code}) for {url}{detail}") from e
 
     def _is_h3_version(v):
         v = v or {}
@@ -5677,6 +5698,13 @@ if _CU130_CHILD:
                 retry_p["_dense_restart_done"] = "1"
                 retry_p["_restart_from_sampler"] = _fallback_code
                 raise GenerationRestart(retry_p, _fallback_code, _msg) from _sparse_exc
+            finally:
+                # Job clones share the underlying H3 module. Restore object methods
+                # before another clone can capture this job's cube-order/FinalLayer
+                # closures. Keep weight patches and GPU residency intact. This must
+                # also run on cancellation, OOM and the clean dense-retry path.
+                torch.cuda.synchronize()
+                model.unpatch_model(unpatch_weights=False)
 
             torch.cuda.synchronize()
             j["sampling_sec"] = round(time.perf_counter() - t_sample0, 3)
@@ -8349,6 +8377,35 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
                 "Use a Hugging Face repo/URL or a CivitAI model/version/download URL."
             )
 
+        # IMPORTANT: civitai.red is not just a cosmetic alias. Mature-content model
+        # pages can be visible on .red while the corresponding .com API lookup is
+        # filtered/blocked or stalls behind an upstream proxy. Keep API inspection on
+        # the same CivitAI host the user supplied. browsingLevel=31 requests the full
+        # browsing set supported by the .red API.
+        civitai_base = "https://civitai.red" if host.endswith("civitai.red") else "https://civitai.com"
+
+        def _civitai_api_url(path):
+            url = civitai_base + str(path)
+            if civitai_base.endswith(".red"):
+                url += ("&" if "?" in url else "?") + "browsingLevel=31"
+            return url
+
+        def _same_civitai_download_host(download_url):
+            # CivitAI metadata may occasionally emit a civitai.com download URL even
+            # when the model was inspected on civitai.red. Preserve CDN/signed URLs,
+            # but rewrite only the first-party civitai.com host for .red sources.
+            if not download_url or not civitai_base.endswith(".red"):
+                return download_url
+            try:
+                d = urlsplit(str(download_url))
+                if (d.hostname or "").lower() in {"civitai.com", "www.civitai.com"}:
+                    netloc = "civitai.red" + ((":" + str(d.port)) if d.port else "")
+                    from urllib.parse import urlunsplit
+                    return urlunsplit((d.scheme or "https", netloc, d.path, d.query, d.fragment))
+            except Exception:
+                pass
+            return download_url
+
         q = parse_qs(parts.query)
         seg = [x for x in parts.path.split("/") if x]
         tok = _civitai_token()
@@ -8359,7 +8416,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         if len(seg) >= 4 and seg[:3] == ["api", "download", "models"]:
             preferred_version_id = int(seg[3])
             v = _civitai_json(
-                f"https://civitai.com/api/v1/model-versions/{preferred_version_id}",
+                _civitai_api_url(f"/api/v1/model-versions/{preferred_version_id}"),
                 tok,
             )
             versions = [v]
@@ -8367,7 +8424,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
 
         elif len(seg) >= 2 and seg[0] == "models":
             model_id = int(seg[1].split("-")[0])
-            model = _civitai_json(f"https://civitai.com/api/v1/models/{model_id}", tok)
+            model = _civitai_json(_civitai_api_url(f"/api/v1/models/{model_id}"), tok)
             versions = list(model.get("modelVersions") or [])
             requested = (q.get("modelVersionId") or [None])[0]
             if requested:
@@ -8400,6 +8457,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
                 if not filename.lower().endswith(".safetensors"):
                     continue
                 download_url = (fobj or {}).get("downloadUrl") or (v or {}).get("downloadUrl")
+                download_url = _same_civitai_download_host(download_url)
                 if not download_url:
                     continue
                 file_id = str((fobj or {}).get("id") or filename)
@@ -8414,7 +8472,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
                     "model_id": int((v or {}).get("modelId") or model_id or 0),
                     "download_url": download_url,
                     "friendly_source_url": (
-                        f"https://civitai.com/models/{int((v or {}).get('modelId') or model_id)}"
+                        f"{civitai_base}/models/{int((v or {}).get('modelId') or model_id)}"
                         f"?modelVersionId={version_id}"
                     ),
                 })
@@ -9120,12 +9178,17 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     <div class=hint>Paste an HF repo, full HF URL, direct .safetensors URL, or CivitAI model/version URL. The Studio discovers the files, shows download progress, then adds the LoRA as a card. OFF = 0.00 · ON = 1.00; numeric strength remains fully editable.</div>
     </div></details>
 
-    <div id=ml_access_card style="margin:10px 0 8px;border:1px solid #343019;background:#17150b;border-radius:8px;padding:9px">
-      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
-        <b id=ml_access_label style="font-size:9px;color:#f1d56d">Checking Notebook access…</b>
-        <a id=ml_upgrade_link href="https://missinglink.build/notebook-pro/start?source=h3-studio&model=minimax-h3&placement=free-limit" target="_blank" rel="noopener" style="display:none;font-size:8px;color:#E8A917;text-decoration:none;font-weight:800">START 7-DAY TRIAL →</a>
+    <div id=ml_access_card style="margin:10px 0 8px;border:1px solid #4a3b12;background:linear-gradient(135deg,#19170d,#121214);border-radius:10px;padding:11px;box-shadow:0 8px 26px rgba(0,0,0,.18)">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px">
+        <div style="min-width:0;flex:1">
+          <b id=ml_access_label style="display:block;font-size:9px;color:#f1d56d;letter-spacing:.04em">Checking Notebook access…</b>
+          <div id=ml_access_sub style="font-size:7.7px;line-height:1.45;color:#a2a4ab;margin-top:4px">15 free H3 generations · verified Gmail · no card required.</div>
+        </div>
+        <a id=ml_upgrade_link href="https://missinglink.build/notebook-pro/start?source=h3-studio&model=minimax-h3&placement=always-on-subscribe" target="_blank" rel="noopener" style="display:none;flex:0 0 auto;background:#E8A917;color:#09090B;text-decoration:none;font:800 8px 'JetBrains Mono',monospace;border-radius:7px;padding:8px 9px;white-space:nowrap;box-shadow:0 5px 16px rgba(232,169,23,.18)">SUBSCRIBE NOW →</a>
       </div>
-      <div id=ml_access_sub style="font-size:7.5px;color:#858892;margin-top:4px">15 free H3 generations · verified Gmail · no card required.</div>
+      <div id=ml_upgrade_pitch style="display:none;margin-top:8px;padding-top:8px;border-top:1px solid #292718;font-size:7.4px;line-height:1.5;color:#8f9198">
+        <b style="color:#ddd">Go unlimited with Notebook Pro.</b> Unlimited H3 generations + the full MissingLink notebook library. <span style="color:#f1d56d">7 days free</span>, then $20/month · cancel anytime.
+      </div>
     </div>
     <button id=go>+ ADD GENERATION TO QUEUE</button>
     <a class=footerlink href="https://missinglink.build/studio" target="_blank" rel="noopener">missinglink.build/studio</a>
@@ -9320,7 +9383,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         </div>
         <div style="font-size:12px;line-height:1.55;color:#a5a6ac;margin-top:9px">Notebook Pro unlocks unlimited H3 access and the full MissingLink notebook library.</div>
         <div style="margin-top:13px;padding:10px 11px;border:1px solid #292a30;border-radius:9px;background:#151518;font-size:11px;color:#d5d6da"><b style="color:#f1d56d">7-day free trial</b> · then $20/month · cancel anytime</div>
-        <a id=ml_upgrade_modal_cta href="https://missinglink.build/notebook-pro/start?source=h3-studio&model=minimax-h3&placement=free-limit" target="_blank" rel="noopener" style="display:block;margin-top:12px;background:#E8A917;color:#09090B;text-align:center;text-decoration:none;border-radius:9px;padding:11px 14px;font:800 11px 'JetBrains Mono',monospace">START 7-DAY FREE TRIAL →</a>
+        <a id=ml_upgrade_modal_cta href="https://missinglink.build/notebook-pro/start?source=h3-studio&model=minimax-h3&placement=free-limit" target="_blank" rel="noopener" style="display:block;margin-top:12px;background:#E8A917;color:#09090B;text-align:center;text-decoration:none;border-radius:9px;padding:11px 14px;font:800 11px 'JetBrains Mono',monospace">SUBSCRIBE NOW · START 7-DAY FREE TRIAL →</a>
         <button id=ml_upgrade_later type=button style="width:100%;margin-top:7px;background:transparent;border:0;color:#777a84;font-size:10px;padding:7px;cursor:pointer">Not now</button>
       </div>
     </div>
@@ -9330,7 +9393,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     const ML_UI_TELEMETRY_QUEUE=[];
     let ML_UI_TELEMETRY_TIMER=null;
     let ML_ACCESS_STATE=null;
-    const ML_UPGRADE_URL='https://missinglink.build/notebook-pro/start?source=h3-studio&model=minimax-h3&placement=free-limit';
+    const ML_UPGRADE_URL='https://missinglink.build/notebook-pro/start?source=h3-studio&model=minimax-h3&placement=always-on-subscribe';
     function mlSafeTarget(el){
       if(!el)return '';
       if(el.id)return '#'+el.id;
@@ -9370,16 +9433,39 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     }
     function mlRenderAccess(a){
       if(!a||!a.ok)return; ML_ACCESS_STATE=a;
-      const label=$('ml_access_label'),sub=$('ml_access_sub'),up=$('ml_upgrade_link');
+      const label=$('ml_access_label'),sub=$('ml_access_sub'),up=$('ml_upgrade_link'),
+            pitch=$('ml_upgrade_pitch'),card=$('ml_access_card');
       if(a.member){
-        if(label)label.textContent='Notebook Pro · UNLIMITED';
-        if(sub)sub.textContent='Your Notebook Pro access is active · all MissingLink notebooks unlocked.';
+        if(label)label.textContent='Notebook Pro · UNLIMITED H3';
+        if(sub)sub.textContent='Subscription active · unlimited H3 generations and the full MissingLink notebook library are unlocked.';
         if(up)up.style.display='none';
+        if(pitch)pitch.style.display='none';
+        if(card){card.style.borderColor='#24472d';card.style.background='linear-gradient(135deg,#101a13,#121214)'}
       }else{
-        const rem=Math.max(0,Number(a.remaining||0));
-        if(label)label.textContent=rem>0?rem+' OF 15 FREE H3 GENERATIONS LEFT':'YOUR 15 FREE H3 GENERATIONS ARE COMPLETE';
-        if(sub)sub.textContent=rem>0?'Starter access is tied to your verified Gmail · no card required.':'Start the 7-day Notebook Pro trial to keep generating and unlock all MissingLink notebooks.';
-        if(up){up.style.display=rem<=0?'inline':'none';up.href=a.upgrade_url||ML_UPGRADE_URL}
+        const rem=Math.max(0,Number(a.remaining??0));
+        if(label){
+          label.textContent=rem>0
+            ? `Starter · ${rem} of 15 free H3 generations left`
+            : 'Free generation limit reached · upgrade to continue';
+        }
+        if(sub){
+          if(rem<=0)sub.textContent='Keep creating without a generation cap. Subscribe now and unlock every MissingLink notebook.';
+          else if(rem<=3)sub.textContent=`Only ${rem} free generation${rem===1?'':'s'} left. Subscribe now so your workflow does not stop at the limit.`;
+          else if(rem<=7)sub.textContent=`${rem} free generations remain. Go unlimited anytime with Notebook Pro and unlock the full notebook library.`;
+          else sub.textContent='Enjoy your starter generations, or subscribe now for unlimited H3 and the full MissingLink notebook library.';
+        }
+        if(up){
+          up.style.display='inline-flex';
+          up.href=a.upgrade_url||ML_UPGRADE_URL;
+          up.textContent=rem<=0?'GO UNLIMITED NOW →':'SUBSCRIBE NOW →';
+        }
+        if(pitch)pitch.style.display='block';
+        if(card){
+          card.style.borderColor=rem<=3?'#76520d':'#4a3b12';
+          card.style.background=rem<=3
+            ? 'linear-gradient(135deg,#211907,#141214)'
+            : 'linear-gradient(135deg,#19170d,#121214)';
+        }
       }
     }
     function mlShowUpgradeModal(trigger='free_limit'){
@@ -9419,7 +9505,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       const el=e.target&&e.target.closest?e.target.closest('button,a,summary,input[type="checkbox"],input[type="radio"]'):null;
       if(!el)return;
       mlTrack('notebook_h3_click',{action:'activate',target:mlSafeTarget(el),meta:{tag:(el.tagName||'').toLowerCase()}});
-      if(el.id==='ml_upgrade_link')mlTrack('notebook_h3_upgrade_clicked',{action:'start_7_day_trial',target:'#ml_upgrade_link',
+      if(el.id==='ml_upgrade_link')mlTrack('notebook_h3_upgrade_clicked',{action:'subscribe_now',target:'#ml_upgrade_link',
         meta:{free_used:ML_ACCESS_STATE?.used??null,free_remaining:ML_ACCESS_STATE?.remaining??null},immediate:true});
     },true);
     document.addEventListener('change',e=>{const el=e.target;if(el&&('value' in el))mlTrack('notebook_h3_control_change',{action:'change',target:mlSafeTarget(el),meta:mlControlMeta(el)})},true);
@@ -10355,7 +10441,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
           headers:{'Content-Type':'application/json'},
           body:JSON.stringify({source,revision})
         });
-        const r=await resp.json();
+        const r=await _readJsonResponse(resp,'LoRA source inspection');
         if(!resp.ok||r.error)throw new Error(r.error||'Could not inspect LoRA source.');
         $('lora_source_type').value=(r.source_type||'unknown').toUpperCase();
         if(r.source_type==='hf'&&r.revision)$('lora_revision').value=r.revision;
@@ -10380,7 +10466,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     async function pollLoraDownload(id){
       while(true){
         const resp=await fetch('/api/loras/progress/'+encodeURIComponent(id),{cache:'no-store'});
-        const r=await resp.json();
+        const r=await _readJsonResponse(resp,'LoRA download status');
         if(!resp.ok)throw new Error(r.error||'LoRA download status failed.');
         const pct=r.pct==null?0:Math.max(0,Math.min(100,Number(r.pct)));
         $('lora_download_progress').style.width=pct+'%';
@@ -10407,7 +10493,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
           headers:{'Content-Type':'application/json'},
           body:JSON.stringify({source,revision,candidate_key})
         });
-        const r=await resp.json();
+        const r=await _readJsonResponse(resp,'LoRA download start');
         if(!resp.ok||r.error)throw new Error(r.error||'Could not start LoRA download.');
         const done=await pollLoraDownload(r.id);
         await loadMeta();
