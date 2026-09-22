@@ -1234,14 +1234,16 @@ if _CU130_CHILD:
     # loader correctly refused to run in that state.
     _aimdo_control = None
     _AIMDO_CONTROL_PREINIT = False
-    if LOWVRAM_T4_REQUESTED:
+    L40S_LAB_POLICY = os.environ.get("H3_L40S_LAB_POLICY", "1") == "1"
+    _lab_headroom = float(os.environ.get("H3_L40S_RESERVE_GIB", "2.0")) if L40S_LAB_POLICY else T4_RESERVE_VRAM_GIB
+    if LOWVRAM_T4_REQUESTED or L40S_LAB_POLICY:
         if COMFY_DIR not in sys.path:
             sys.path.insert(0, COMFY_DIR)
         try:
             import comfy.options as _pre_comfy_options
             _pre_comfy_options.enable_args_parsing(False)
             from comfy.cli_args import args as _pre_args
-            _pre_args.reserve_vram = T4_RESERVE_VRAM_GIB
+            _pre_args.reserve_vram = _lab_headroom
             if hasattr(_pre_args, "enable_dynamic_vram"):
                 _pre_args.enable_dynamic_vram = True
             if hasattr(_pre_args, "disable_dynamic_vram"):
@@ -1255,10 +1257,10 @@ if _CU130_CHILD:
             if hasattr(_pre_args, "cpu"):
                 _pre_args.cpu = False
             if hasattr(_pre_args, "lowvram"):
-                _pre_args.lowvram = True
+                _pre_args.lowvram = bool(LOWVRAM_T4_REQUESTED)
 
             import comfy_aimdo.control as _aimdo_control
-            _simple_headroom = int(T4_RESERVE_VRAM_GIB * 1024**3)
+            _simple_headroom = int(_lab_headroom * 1024**3)
             try:
                 _aimdo_control.init(
                     simple_vram_headroom=_simple_headroom,
@@ -1270,7 +1272,7 @@ if _CU130_CHILD:
                 except TypeError:
                     _aimdo_control.init()
             _AIMDO_CONTROL_PREINIT = True
-            log(f"  ✓ T4 DynamicVRAM controller pre-init complete · headroom {T4_RESERVE_VRAM_GIB:.1f} GiB")
+            log(f"  ✓ Ada/T4 DynamicVRAM controller pre-init complete · headroom {_lab_headroom:.1f} GiB")
         except Exception as _e:
             raise RuntimeError(
                 "Could not pre-initialize Comfy DynamicVRAM/Aimdo for the T4 profile. "
@@ -1499,7 +1501,10 @@ if _CU130_CHILD:
         return _invoke_patch_node(
             "H3MemoryOptimization", model=model,
             chunk_rows=max(256, L40S_CHUNK_ROWS // 2) if lower_memory else L40S_CHUNK_ROWS,
-            precision_mode="Auto", qkv_streaming_mode="Auto",
+            # Match the measured lab policy: LoRA patching can materialize native
+            # INT8 weights as float, which the streamed INT8 carrier cannot accept.
+            precision_mode="Auto", qkv_streaming_mode="Off",
+            mlp_memory="off" if L40S_LAB_POLICY else "auto",
             kitchen_v_memory_mode="Lower VRAM (slower)" if lower_memory else "Standard",
         )
 
@@ -1689,7 +1694,1497 @@ if _CU130_CHILD:
             log(f"  L40S Sage probe failed; using PyTorch SDPA: {str(exc)[-400:]}")
 
 
+    def _l40s_ensure_sparse_sage():
+        # Retained from the user's tested V73 lab: CUDA13.1 compiler fallback,
+        # SM89-only exports, vendor-header and linker smoke tests.
+        import os, sys, re, pathlib, shutil, subprocess
+        SPARGE_VERSION = "0.1.0"
+        SPARGE_BUCKET_ID = "MissingLinkBuilder/wheels"
+        cache_id = re.sub(r"[^A-Za-z0-9._+-]+", "-", f"cp{sys.version_info.major}{sys.version_info.minor}-{torch.__version__}-{torch.version.cuda}-sm89")
+        target = pathlib.Path(os.environ.get("H3_L40S_CACHE_DIR", "/content/.h3_l40s_cache")) / "sparge" / cache_id / "site"
+        target.mkdir(parents=True, exist_ok=True)
+        sys.path.insert(0, str(target))
+        os.environ["PYTHONPATH"] = str(target) + os.pathsep + os.environ.get("PYTHONPATH", "")
+        import importlib
+        import importlib.metadata
+
+        cap = torch.cuda.get_device_capability(0)
+        if cap != (8, 9):
+            return False, f"V43 Sparse Sage SM89 test requires L4/SM89, got {cap}"
+
+        required_kernels = (
+            "qk_int8_sv_f8_accum_f16_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold",
+            "qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold",
+        )
+
+        def _probe():
+            try:
+                importlib.invalidate_caches()
+                import spas_sage_attn
+                from spas_sage_attn import _qattn, _fused
+
+                kernel_names = [
+                    name for name in required_kernels
+                    if callable(getattr(_qattn, name, None))
+                ]
+                if not kernel_names:
+                    return False, "spas_sage_attn._qattn has no required SM89 sparse kernel"
+
+                # The SM89-only wheel should import without needing Ampere/SM80
+                # wrapper symbols. H3 needs at least one threshold FP8-V kernel.
+                sm89_threshold_exports = (
+                    "qk_int8_sv_f8_accum_f16_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold",
+                    "qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold",
+                )
+                if not any(callable(getattr(_qattn, n, None)) for n in sm89_threshold_exports):
+                    return False, "SM89 FP8-V threshold exports missing from _qattn"
+
+                for name in ("transpose_pad_permute_cuda", "scale_fuse_quant_cuda"):
+                    if not callable(getattr(_fused, name, None)):
+                        return False, f"spas_sage_attn._fused missing {name}"
+
+                try:
+                    version = importlib.metadata.version("spas-sage-attn")
+                except Exception:
+                    version = getattr(spas_sage_attn, "__version__", "unknown")
+
+                return True, (
+                    f"version={version} | kernel={kernel_names[0]} | "
+                    f"qattn={getattr(_qattn, '__file__', 'loaded')}"
+                )
+            except Exception as exc:
+                return False, repr(exc)
+
+        ok, note = _probe()
+        if ok:
+            log(f"  âœ“ Sparse Sage package present | {note}")
+            return True, "already installed"
+
+        target.mkdir(parents=True, exist_ok=True)
+
+        # 1) Optional HF wheel cache.
+        hf_token = (os.environ.get("HF_TOKEN") or "").strip()
+        if not hf_token:
+            try:
+                from google.colab import userdata
+                hf_token = (userdata.get("HF_TOKEN") or "").strip()
+            except Exception:
+                hf_token = ""
+
+        safe = lambda value: re.sub(r"[^A-Za-z0-9._+-]+", "-", str(value)).strip("-")
+        prefix = (
+            f"spargeattn-{SPARGE_VERSION}/"
+            f"cuda_{safe(torch.version.cuda)}_sm89_"
+            f"torch_{safe(torch.__version__)}"
+        )
+
+        if hf_token:
+            log(
+                f"  â†“ Sparse Sage missing; trying HF bucket: "
+                f"hf://buckets/{SPARGE_BUCKET_ID}/{prefix}/"
+            )
+            try:
+                try:
+                    from huggingface_hub import list_bucket_tree, download_bucket_files
+                except Exception:
+                    hr = subprocess.run(
+                        [
+                            sys.executable, "-m", "pip", "install", "-q", "-U",
+                            "huggingface_hub>=1.5.0",
+                        ],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                    )
+                    if hr.returncode:
+                        raise RuntimeError(hr.stdout[-3000:])
+                    importlib.invalidate_caches()
+                    from huggingface_hub import list_bucket_tree, download_bucket_files
+
+                items = [
+                    item
+                    for item in list_bucket_tree(
+                        bucket_id=SPARGE_BUCKET_ID,
+                        prefix=prefix,
+                        recursive=True,
+                        token=hf_token,
+                    )
+                    if getattr(item, "type", None) == "file"
+                    and str(getattr(item, "path", "")).endswith(f"-cp{sys.version_info.major}{sys.version_info.minor}-cp{sys.version_info.major}{sys.version_info.minor}-linux_x86_64.whl")
+                ]
+                if items:
+                    py_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+                    items.sort(
+                        key=lambda item: (
+                            f"-{py_tag}-{py_tag}-" in str(item.path),
+                            "linux_x86_64" in str(item.path),
+                        ),
+                        reverse=True,
+                    )
+                    chosen = items[0]
+                    wheel_dir = pathlib.Path("/content/h3_prebuilt_wheels")
+                    wheel_dir.mkdir(parents=True, exist_ok=True)
+                    wheel_path = wheel_dir / pathlib.PurePosixPath(chosen.path).name
+
+                    download_bucket_files(
+                        bucket_id=SPARGE_BUCKET_ID,
+                        files=[(chosen, wheel_path)],
+                        token=hf_token,
+                        raise_on_missing_files=True,
+                    )
+
+                    ir = subprocess.run(
+                        [
+                            sys.executable, "-m", "pip", "install",
+                            "--no-cache-dir", "--no-deps", "--upgrade",
+                            "--target", str(target), str(wheel_path),
+                        ],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                    )
+                    if ir.returncode:
+                        raise RuntimeError(ir.stdout[-4000:])
+
+                    importlib.invalidate_caches()
+                    for key in list(sys.modules):
+                        if key == "spas_sage_attn" or key.startswith("spas_sage_attn."):
+                            sys.modules.pop(key, None)
+
+                    ok, note = _probe()
+                    if ok:
+                        log(f"  âœ“ Sparse Sage HF wheel installed | {note}")
+                        return True, f"HF bucket wheel {chosen.path}"
+                    raise RuntimeError("HF Sparge wheel probe failed: " + note)
+
+                log("  â†³ no matching Sparge wheel in HF bucket; source build required")
+            except Exception as exc:
+                log(f"  âš  HF Sparge wheel unavailable: {exc!r}")
+                log("    continuing with one-time SM89 source build")
+
+        local_wheels = sorted((target.parent / "wheels").glob("spas_sage_attn-*.whl"))
+        if local_wheels:
+            subprocess.run([sys.executable, "-m", "pip", "install", "--no-deps", "--upgrade", "--target", str(target), str(local_wheels[-1])], check=True)
+            ok, note = _probe()
+            if ok:
+                return True, note
+            raise RuntimeError("Cached Sparse Sage wheel failed validation: " + note)
+
+        # 2) One-time isolated CUDA 13 compiler setup.
+        compiler_root = pathlib.Path("/content/h3_cuda131_compiler_pkgs_v44")
+        compiler_root.mkdir(parents=True, exist_ok=True)
+
+        nvcc_hits = [p for p in compiler_root.glob("nvidia/**/bin/nvcc") if p.is_file()]
+        system_nvcc = shutil.which("nvcc")
+        if system_nvcc:
+            vr = subprocess.run(
+                [system_nvcc, "--version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            # V44 intentionally does not reuse CUDA 13.0.x here: that compiler/header
+            # stack produced the CCCL <cmath> FP_NORMAL/isgreater failure in V43.
+            if "release 13.1" in (vr.stdout or ""):
+                nvcc_hits.insert(0, pathlib.Path(system_nvcc))
+
+        if not nvcc_hits:
+            log("  â†“ installing isolated CUDA 13.1.2 compiler for SpargeAttention")
+            cr = subprocess.run(
+                [
+                    sys.executable, "-m", "pip", "install",
+                    "--no-cache-dir", "--upgrade",
+                    "--target", str(compiler_root),
+                    "--extra-index-url", "https://pypi.nvidia.com",
+                    "cuda-toolkit[nvcc,cccl,crt,cudart,nvjitlink,nvvm]==13.1.2",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            if cr.returncode:
+                raise RuntimeError(
+                    "CUDA 13.1.2 compiler install for SpargeAttention failed:\n"
+                    + cr.stdout[-6000:]
+                )
+            nvcc_hits = [p for p in compiler_root.glob("nvidia/**/bin/nvcc") if p.is_file()]
+
+        if not nvcc_hits:
+            raise RuntimeError("No CUDA 13.1 nvcc available for SpargeAttention build")
+
+        nvcc = nvcc_hits[0].resolve()
+        cuda_home = nvcc.parent.parent
+
+        build_env = os.environ.copy()
+        build_env["CUDA_HOME"] = str(cuda_home)
+        build_env["CUDA_PATH"] = str(cuda_home)
+        build_env["CUDACXX"] = str(nvcc)
+        build_env["PATH"] = (
+            str(cuda_home / "bin") + ":"
+            + str(pathlib.Path(shutil.which("ninja") or "/usr/local/bin/ninja").parent)
+            + ":" + build_env.get("PATH", "")
+        )
+        build_env["TORCH_CUDA_ARCH_LIST"] = "8.9"
+        build_env["MAX_JOBS"] = os.environ.get("H3_SPARGE_MAX_JOBS", "4")
+
+        try:
+            drv = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=driver_version",
+                    "--format=csv,noheader",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+            driver_version = (drv.stdout or "").strip().splitlines()[0]
+            log(f"  NVIDIA driver      : {driver_version}")
+            try:
+                driver_major = int(driver_version.split(".", 1)[0])
+            except Exception:
+                driver_major = 0
+            if driver_major and driver_major < 580:
+                raise RuntimeError(
+                    f"CUDA 13.x minor compatibility requires NVIDIA r580+, got {driver_version}"
+                )
+        except FileNotFoundError:
+            log("  NVIDIA driver      : nvidia-smi unavailable; continuing because torch cu130 is active")
+        build_env["EXT_PARALLEL"] = os.environ.get("H3_SPARGE_EXT_PARALLEL", "2")
+
+        nv = subprocess.run(
+            [str(nvcc), "--version"],
+            env=build_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if nv.returncode or "release 13.1" not in (nv.stdout or ""):
+            raise RuntimeError("Sparge CUDA 13.1 nvcc qualification failed:\n" + (nv.stdout or ""))
+
+        log(f"  Sparge build nvcc : {nvcc}")
+        log(f"  Sparge CUDA_HOME  : {cuda_home}")
+        log("  Sparge toolkit    : CUDA 13.1.2 compiler/header stack")
+        log("  Torch runtime     : 2.11.0+cu130 (CUDA 13.x minor-compatible)")
+        log("  Sparge arch       : SM89 cubin only Â· no PTX")
+
+        # V48: PyTorch's ATen/cuda/CUDAContextLight.h includes vendor development
+        # headers even when Sparge itself does not call those libraries directly:
+        #   cusparse.h, cublas_v2.h, cublasLt.h, cusolverDn.h.
+        #
+        # The V44-V47 compiler tree intentionally contained only core CUDA pieces,
+        # so _fused compilation stopped at the first missing header (cusparse.h).
+        vendor_header_specs = {
+            "cusparse": "cusparse.h",
+            "cublas": "cublas_v2.h",
+            "cusolver": "cusolverDn.h",
+        }
+        vendor_extra_headers = {
+            "cublas": ("cublasLt.h",),
+        }
+
+        def _find_vendor_header(component, header):
+            # NVIDIA's pip component wheels do not guarantee that a --target
+            # installation will always materialize under one rigid
+            # nvidia/<component>/include layout.  Discover the actual header path
+            # instead of encoding package-internal directory assumptions.
+            candidates = []
+
+            # First choice: the isolated CUDA 13.1 compiler/development tree.
+            if compiler_root.exists():
+                for p in compiler_root.rglob(header):
+                    if not p.is_file():
+                        continue
+                    rp = p.resolve()
+                    s = str(rp).replace("\\", "/").lower()
+                    # Prefer paths whose ancestry names the requested component,
+                    # but keep every exact-header hit as a fallback.
+                    score = 0 if component.lower() in s else 1
+                    candidates.append((score, len(str(rp)), rp))
+
+            # Diagnostic fallback only: if the component wheel was installed into
+            # an unexpected shared NVIDIA package tree, allow the private cu130
+            # target to provide the header rather than failing on layout alone.
+            if target.exists():
+                for p in target.rglob(header):
+                    if not p.is_file():
+                        continue
+                    rp = p.resolve()
+                    s = str(rp).replace("\\", "/").lower()
+                    score = 2 if component.lower() in s else 3
+                    candidates.append((score, len(str(rp)), rp))
+
+            if not candidates:
+                return None
+
+            candidates.sort(key=lambda item: (item[0], item[1], str(item[2])))
+            return candidates[0][2]
+
+        missing_components = [
+            component
+            for component, header in vendor_header_specs.items()
+            if _find_vendor_header(component, header) is None
+        ]
+
+        if missing_components:
+            # Install the complete vendor-header trio documented by NVIDIA rather
+            # than only the currently-missing subset.  This is idempotent and makes
+            # resumed sessions deterministic.
+            extras = "cublas,cusolver,cusparse"
+            log(
+                "  â†“ installing CUDA 13.1.2 vendor dev headers required by PyTorch ATen: "
+                "cublas, cusolver, cusparse"
+            )
+            vr = subprocess.run(
+                [
+                    sys.executable, "-m", "pip", "install",
+                    "--no-cache-dir", "--upgrade",
+                    "--target", str(compiler_root),
+                    "--extra-index-url", "https://pypi.nvidia.com",
+                    f"cuda-toolkit[{extras}]==13.1.2",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            if vr.returncode:
+                raise RuntimeError(
+                    "CUDA 13.1 vendor development-header install failed:\n"
+                    + (vr.stdout or "")[-8000:]
+                )
+            install_tail = (vr.stdout or "")[-2500:].strip()
+            if install_tail:
+                log("  CUDA vendor install tail:")
+                for _line in install_tail.splitlines()[-12:]:
+                    log("    " + _line)
+
+        vendor_include_dirs = []
+        for component, header in vendor_header_specs.items():
+            found = _find_vendor_header(component, header)
+            if found is None:
+                # Give a compact view of what NVIDIA component directories actually
+                # exist so a future failure is actionable in one log.
+                nvidia_dirs = []
+                for base in (compiler_root, target):
+                    nroot = base / "nvidia"
+                    if nroot.is_dir():
+                        for child in sorted(nroot.iterdir()):
+                            if child.is_dir():
+                                nvidia_dirs.append(str(child))
+                raise RuntimeError(
+                    "CUDA vendor header still missing after install/discovery: "
+                    f"{component}/{header}\n"
+                    "Visible NVIDIA component dirs:\n  "
+                    + "\n  ".join(nvidia_dirs[:80])
+                )
+            inc = found.parent.resolve()
+            value = str(inc)
+            normalized_inc = value.replace("\\", "/")
+            if "/cccl/cuda/std/detail/" in normalized_inc:
+                raise RuntimeError(
+                    f"Refusing internal CCCL implementation directory as vendor include: {inc}"
+                )
+            if value not in vendor_include_dirs:
+                vendor_include_dirs.append(value)
+            log(f"  âœ“ CUDA vendor header: {header} -> {inc}")
+            for extra_header in vendor_extra_headers.get(component, ()):
+                extra_path = inc / extra_header
+                if not extra_path.is_file():
+                    raise RuntimeError(
+                        f"CUDA 13.1 vendor header missing: {component}/{extra_header}"
+                    )
+                log(f"  âœ“ CUDA vendor header: {extra_header} -> {inc}")
+
+        # CUDA header policy â€” V45 FIX.
+        #
+        # V44 recursively globbed nvidia/**/include and therefore also captured
+        # CCCL's INTERNAL implementation directory:
+        #
+        #   CUDA_HOME/include/cccl/cuda/std/detail/libcxx/include
+        #
+        # as a top-level -I.  That changes system/header lookup order and caused
+        # __fmaf_rn / atomicCAS / FP_NORMAL / isgreater to vanish.
+        #
+        # CUDAExtension already knows how to add CUDA_HOME/include.  We pass that
+        # same ONE public include root to Sparge's explicit include_dirs and nothing
+        # nested beneath it.
+        cuda_include = (cuda_home / "include").resolve()
+        if not cuda_include.is_dir():
+            raise RuntimeError(f"CUDA include root missing: {cuda_include}")
+
+        include_dirs = [str(cuda_include)] + list(vendor_include_dirs)
+        build_env["H3_EXTRA_CUDA_INCLUDES"] = os.pathsep.join(include_dirs)
+
+        internal_cccl = "cuda/std/detail/libcxx/include"
+        if any(internal_cccl in p.replace("\\", "/") for p in include_dirs):
+            raise RuntimeError(
+                "Internal CCCL libc++ directory leaked into top-level include path"
+            )
+
+        log(f"  CUDA include root  : {cuda_include}")
+        log("  CUDA include policy: core public root + cuBLAS/cuSPARSE/cuSOLVER public roots")
+
+        # Fast smoke compile before Sparge generates/builds 145 template units.
+        # This deliberately exercises the symbols that failed in V44.
+        smoke_dir = pathlib.Path("/content/h3_sparge_cuda_smoke_v51")
+        smoke_dir.mkdir(parents=True, exist_ok=True)
+        smoke_src = smoke_dir / "headers_sm89.cu"
+        smoke_bin = smoke_dir / "headers_sm89"
+        smoke_src.write_text(r"""
+    #include <cuda_runtime.h>
+    #include <cuda_fp16.h>
+    #include <cuda_bf16.h>
+    #include <cuda/std/cmath>
+
+    __global__ void h3_smoke(unsigned int* p, float* out) {
+        float y = __fmaf_rn(1.25f, 2.0f, 1.0f);
+        unsigned int bits = __float_as_uint(y);
+        atomicCAS(p, 0u, bits);
+        __nv_bfloat16 b = __float2bfloat16_rn(y);
+        out[0] = __bfloat162float(b);
+    }
+
+    int main() {
+        return cuda::std::isnormal(1.0f) ? 0 : 2;
+    }
+    """)
+
+        smoke_cmd = [
+            str(nvcc),
+            "-std=c++17",
+            "-O2",
+            "-arch=sm_89",
+            "-I", str(cuda_include),
+            str(smoke_src),
+            "-o", str(smoke_bin),
+        ]
+        smoke = subprocess.run(
+            smoke_cmd,
+            env=build_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if smoke.returncode:
+            raise RuntimeError(
+                "CUDA header/intrinsic smoke compile failed before Sparge build:\\n"
+                + (smoke.stdout or "")[-10000:]
+            )
+
+        log("  âœ“ CUDA header smoke: runtime + fp16 + bf16 + cuda::std::cmath")
+
+        # PyTorch ATen CUDAContext compile smoke. This exercises the full vendor
+        # header set that fused.cu sees before we spend time on Sparge templates.
+        aten_smoke_src = smoke_dir / "aten_cuda_context_sm89.cu"
+        aten_smoke_obj = smoke_dir / "aten_cuda_context_sm89.o"
+        aten_smoke_src.write_text(r"""
+    #include <ATen/cuda/CUDAContext.h>
+    __global__ void h3_aten_smoke() {}
+    """)
+        torch_include = target / "torch" / "include"
+        torch_api_include = torch_include / "torch" / "csrc" / "api" / "include"
+        aten_cmd = [
+            str(nvcc),
+            "-std=c++17",
+            "-O2",
+            "-arch=sm_89",
+            "-c",
+            str(aten_smoke_src),
+            "-o", str(aten_smoke_obj),
+            "-I", str(torch_include),
+            "-I", str(torch_api_include),
+        ]
+        for inc in include_dirs:
+            aten_cmd += ["-I", str(inc)]
+        aten_smoke = subprocess.run(
+            aten_cmd,
+            env=build_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if aten_smoke.returncode:
+            raise RuntimeError(
+                "PyTorch ATen CUDAContext header smoke failed before Sparge build:\n"
+                + (aten_smoke.stdout or "")[-10000:]
+            )
+        log("  âœ“ ATen CUDAContext smoke: cuBLAS + cuSPARSE + cuSOLVER headers resolved")
+
+        # Link/runtime roots.
+        libdirs = []
+        runtime_extra = pathlib.Path("/content/h3_cuda130_runtime_extra_v23")
+
+        # V46 CUDART LINK FIX -------------------------------------------------
+        # Find the real CUDA runtime shared object.  Prefer the CUDA 13.1 compiler
+        # tree used for this extension build, then fall back to the private cu130
+        # Torch target if needed.
+        cudart_candidates = []
+        for base in (compiler_root, target, runtime_extra):
+            if base.exists():
+                for p in base.rglob("libcudart.so*"):
+                    if p.is_file():
+                        cudart_candidates.append(p.resolve())
+
+        if not cudart_candidates:
+            raise RuntimeError(
+                "Could not locate any libcudart.so* under CUDA 13.1 compiler "
+                "or private cu130 runtime trees"
+            )
+
+        # Prefer CUDA 13.1 build-tree libcudart; otherwise use the first usable one.
+        cudart_candidates.sort(
+            key=lambda p: (
+                0 if str(p).startswith(str(compiler_root.resolve())) else 1,
+                0 if p.name == "libcudart.so" else 1,
+                len(str(p)),
+            )
+        )
+        cudart_real = cudart_candidates[0]
+
+        cudart_link_dir = pathlib.Path("/content/h3_sparge_cudart_link_v51")
+        cudart_link_dir.mkdir(parents=True, exist_ok=True)
+        cudart_link = cudart_link_dir / "libcudart.so"
+        try:
+            if cudart_link.exists() or cudart_link.is_symlink():
+                cudart_link.unlink()
+        except FileNotFoundError:
+            pass
+        cudart_link.symlink_to(cudart_real)
+
+        if not cudart_link.exists():
+            raise RuntimeError(
+                f"Failed to create libcudart linker shim: {cudart_link} -> {cudart_real}"
+            )
+
+        log(f"  CUDART real       : {cudart_real}")
+        log(f"  CUDART linker shim: {cudart_link}")
+        libdirs.append(str(cudart_link_dir.resolve()))
+        # CUDA 13.1 build libraries are discovered first. Torch's cu130 runtime
+        # libraries remain available afterwards; CUDA 13.x preserves ABI compatibility.
+        for base in (compiler_root, target, runtime_extra):
+            if base.exists():
+                for pat in ("nvidia/**/lib", "nvidia/**/lib64"):
+                    for libdir in base.glob(pat):
+                        if libdir.is_dir():
+                            value = str(libdir.resolve())
+                            if value not in libdirs:
+                                libdirs.append(value)
+        if libdirs:
+            # Also pass these directly to CUDAExtension.library_dirs.  Relying only
+            # on LIBRARY_PATH/LDFLAGS proved insufficient for the V45 final link.
+            build_env["H3_EXTRA_CUDA_LIBDIRS"] = os.pathsep.join(libdirs)
+
+            prefix_libs = ":".join(libdirs)
+            build_env["LIBRARY_PATH"] = prefix_libs + (
+                (":" + build_env["LIBRARY_PATH"]) if build_env.get("LIBRARY_PATH") else ""
+            )
+            build_env["LD_LIBRARY_PATH"] = prefix_libs + (
+                (":" + build_env["LD_LIBRARY_PATH"]) if build_env.get("LD_LIBRARY_PATH") else ""
+            )
+            build_env["LDFLAGS"] = (
+                " ".join(f"-L{x}" for x in libdirs)
+                + " " + build_env.get("LDFLAGS", "")
+            ).strip()
+
+        # Fast host-link smoke using the same -lcudart name CUDAExtension requests.
+        link_smoke_src = pathlib.Path("/content/h3_sparge_cuda_smoke_v51/link_cudart.cpp")
+        link_smoke_bin = pathlib.Path("/content/h3_sparge_cuda_smoke_v51/link_cudart")
+        link_smoke_src.write_text("int main(){return 0;}\n")
+        _link_smoke_text = link_smoke_src.read_text()
+        if "\\n" in _link_smoke_text:
+            raise RuntimeError(
+                "V47 internal error: host-link smoke source contains literal \\n"
+            )
+        link_cmd = [
+            shutil.which("g++") or "g++",
+            str(link_smoke_src),
+            f"-L{cudart_link_dir}",
+            "-lcudart",
+            "-o", str(link_smoke_bin),
+        ]
+        link_smoke = subprocess.run(
+            link_cmd,
+            env=build_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if link_smoke.returncode:
+            raise RuntimeError(
+                "CUDART host-link smoke failed before Sparge build:\\n"
+                + (link_smoke.stdout or "")[-8000:]
+            )
+        log("  âœ“ CUDART link smoke: g++ resolved -lcudart")
+
+        # 3) Upstream source, trimmed to SM89 only.
+        src_dir = pathlib.Path("/content/SpargeAttn_sm89")
+        shutil.rmtree(src_dir, ignore_errors=True)
+
+        gr = subprocess.run(
+            [
+                "git", "clone", "--depth", "1",
+                "https://github.com/thu-ml/SpargeAttn.git",
+                str(src_dir),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if gr.returncode:
+            raise RuntimeError("SpargeAttention clone failed:\n" + gr.stdout[-5000:])
+
+        setup_py = src_dir / "setup.py"
+        setup_text = setup_py.read_text()
+
+        setup_text = setup_text.replace(
+            'run_instantiations("csrc/qattn/instantiations_sm80")\n', '', 1
+        )
+        setup_text = setup_text.replace(
+            'run_instantiations("csrc/qattn/instantiations_sm90")\n', '', 1
+        )
+
+        # CUDA 13.x hardening: upstream carries "-Xcompiler", "-include,cassert".
+        # That workaround was for older toolchains and has a reported CUDA 13
+        # redefinition failure.  Remove it before building on CUDA 13.1.
+        setup_text = setup_text.replace(
+            '    "-Xcompiler", "-include,cassert", # fix error occurs when compiling for SM90+ with newer CUDA toolkits\n',
+            '',
+            1,
+        )
+        setup_text = setup_text.replace(
+            '    "-Xcompiler", "-include,cassert",\n',
+            '',
+            1,
+        )
+        if '"-include,cassert"' in setup_text:
+            raise RuntimeError(
+                "V49 expected to remove upstream -include,cassert for CUDA 13.x"
+            )
+
+        old_sources = (
+            'sources = [\n'
+            '    "csrc/qattn/pybind.cpp",\n'
+            '    "csrc/qattn/qk_int_sv_f16_cuda_sm80.cu",\n'
+            '    "csrc/qattn/qk_int_sv_f8_cuda_sm89.cu",\n'
+            '] + get_instantiations("csrc/qattn/instantiations_sm80") + '
+            'get_instantiations("csrc/qattn/instantiations_sm89")\n'
+        )
+        new_sources = (
+            'sources = [\n'
+            '    "csrc/qattn/pybind.cpp",\n'
+            '    "csrc/qattn/qk_int_sv_f8_cuda_sm89.cu",\n'
+            '] + get_instantiations("csrc/qattn/instantiations_sm89")\n'
+        )
+        if old_sources not in setup_text:
+            raise RuntimeError(
+                "Upstream SpargeAttention setup.py changed: expected source block not found"
+            )
+        setup_text = setup_text.replace(old_sources, new_sources, 1)
+
+        marker = "ext_modules = []\n"
+        if marker not in setup_text:
+            raise RuntimeError(
+                "Upstream SpargeAttention setup.py changed: ext_modules marker not found"
+            )
+        setup_text = setup_text.replace(
+            marker,
+            'BUILD_INCLUDE_DIRS = [x for x in '
+            'os.environ.get("H3_EXTRA_CUDA_INCLUDES", "").split(os.pathsep) if x]\n'
+            'BUILD_LIBRARY_DIRS = [x for x in '
+            'os.environ.get("H3_EXTRA_CUDA_LIBDIRS", "").split(os.pathsep) if x]\n'
+            'ext_modules = []\n',
+            1,
+        )
+        setup_text = setup_text.replace(
+            'qattn_extension = CUDAExtension(\n'
+            '    name="spas_sage_attn._qattn",\n'
+            '    sources=sources,\n',
+            'qattn_extension = CUDAExtension(\n'
+            '    name="spas_sage_attn._qattn",\n'
+            '    sources=sources,\n'
+            '    include_dirs=BUILD_INCLUDE_DIRS,\n'
+            '    library_dirs=BUILD_LIBRARY_DIRS,\n',
+            1,
+        )
+        setup_text = setup_text.replace(
+            'fused_extension = CUDAExtension(\n'
+            '    name="spas_sage_attn._fused",\n'
+            '    sources=["csrc/fused/pybind.cpp", "csrc/fused/fused.cu"],\n',
+            'fused_extension = CUDAExtension(\n'
+            '    name="spas_sage_attn._fused",\n'
+            '    sources=["csrc/fused/pybind.cpp", "csrc/fused/fused.cu"],\n'
+            '    include_dirs=BUILD_INCLUDE_DIRS,\n'
+            '    library_dirs=BUILD_LIBRARY_DIRS,\n',
+            1,
+        )
+
+        # Fail-fast build order: fused is tiny and exercises ATen/vendor headers;
+        # qattn is the expensive 145-instantiation extension.
+        fused_append = 'ext_modules.append(fused_extension)\n'
+        if fused_append not in setup_text:
+            raise RuntimeError("Could not find fused extension append in Sparge setup.py")
+        setup_text = setup_text.replace(
+            fused_append,
+            fused_append + 'ext_modules = [fused_extension, qattn_extension]\n',
+            1,
+        )
+
+        setup_py.write_text(setup_text)
+
+        # V51: trim pybind exports to match the SM89-only source list.
+        pybind_cpp = src_dir / "csrc" / "qattn" / "pybind.cpp"
+        pybind_text = pybind_cpp.read_text()
+
+        sm80_bindings = (
+            '  m.def("qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf_with_pv_threshold", '
+            '&qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf_with_pv_threshold);\n',
+            '  m.def("qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf", '
+            '&qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf);\n',
+        )
+        removed_sm80_bindings = 0
+        for binding in sm80_bindings:
+            if binding in pybind_text:
+                pybind_text = pybind_text.replace(binding, "", 1)
+                removed_sm80_bindings += 1
+
+        if removed_sm80_bindings != 2:
+            raise RuntimeError(
+                "Upstream Sparge pybind.cpp changed: expected two unconditional "
+                f"SM80 bindings, removed {removed_sm80_bindings}"
+            )
+
+        # SM89 H3 requires both FP8-V threshold exports to remain available.
+        required_sm89_bindings = (
+            "qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold",
+            "qk_int8_sv_f8_accum_f16_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold",
+        )
+        for symbol in required_sm89_bindings:
+            if symbol not in pybind_text:
+                raise RuntimeError(
+                    f"SM89-required Sparge pybind export missing before build: {symbol}"
+                )
+
+        pybind_cpp.write_text(pybind_text)
+        log("  Sparge pybind     : SM80 exports removed; SM89 FP8-V exports retained")
+
+        # 4) Build a stable wheel, then install it.
+        wheel_dir = (target.parent / "wheels")
+        wheel_dir.mkdir(parents=True, exist_ok=True)
+        for old_wheel in wheel_dir.glob("spas_sage_attn-*.whl"):
+            old_wheel.unlink()
+
+        log("  â†“ building SpargeAttention SM89 wheel (one-time compile)")
+        wr = subprocess.run(
+            [
+                sys.executable, "-m", "pip", "wheel",
+                "-v", "--no-cache-dir", "--no-build-isolation", "--no-deps",
+                "-w", str(wheel_dir), str(src_dir),
+            ],
+            env=build_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if wr.returncode:
+            build_log = wr.stdout or ""
+            # Keep the first CUDA diagnostic as well as the tail. Ninja output can be
+            # enormous because Sparge generates many instantiations.
+            first_error = ""
+            for marker in (
+                " error:",
+                "fatal error:",
+                "FAILED:",
+            ):
+                pos = build_log.find(marker)
+                if pos >= 0:
+                    start = max(0, build_log.rfind("\n", 0, pos - 1200))
+                    first_error = build_log[start:pos + 5000]
+                    break
+            raise RuntimeError(
+                "SpargeAttention SM89 CUDA-13.1 wheel build failed:\n"
+                + (first_error + "\n--- BUILD TAIL ---\n" if first_error else "")
+                + build_log[-12000:]
+            )
+
+        wheels = sorted(
+            wheel_dir.glob("spas_sage_attn-*.whl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not wheels:
+            raise RuntimeError("SpargeAttention build finished but produced no wheel")
+
+        wheel_path = wheels[0]
+        log(f"  âœ“ Sparge wheel built: {wheel_path}")
+
+        ir = subprocess.run(
+            [
+                sys.executable, "-m", "pip", "install",
+                "--no-cache-dir", "--no-deps", "--upgrade",
+                "--target", str(target), str(wheel_path),
+            ],
+            env=build_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if ir.returncode:
+            raise RuntimeError(
+                "SpargeAttention wheel install failed:\n" + ir.stdout[-6000:]
+            )
+
+        # Make the runtime linker paths visible before importing the new extension.
+        if build_env.get("LD_LIBRARY_PATH"):
+            os.environ["LD_LIBRARY_PATH"] = build_env["LD_LIBRARY_PATH"]
+        os.environ["CUDA_HOME"] = str(cuda_home)
+        os.environ["CUDA_PATH"] = str(cuda_home)
+
+        importlib.invalidate_caches()
+        for key in list(sys.modules):
+            if key == "spas_sage_attn" or key.startswith("spas_sage_attn."):
+                sys.modules.pop(key, None)
+
+        ok, note = _probe()
+        if not ok:
+            raise RuntimeError(
+                "SpargeAttention built/installed but SM89 probe failed: " + note
+            )
+
+        log(f"  âœ“ Sparse Sage SM89 ready | {note}")
+        return True, str(wheel_path)
+
+
+    """V73 lab's fixed projection topology, scoped to one sampler invocation."""
+    import torch
+    from contextlib import contextmanager
+    V70_FIXED_TOPOLOGY = {"qkv": (4,1), "fc1": (4,1), "fc2": (3,2), "out_proj": (1,1)}
+    V68_STATIC_CONFIGS = {"qkv": 0, "fc1": 0, "fc2": 13, "out_proj": 13}
+    _V68_WORKER_STREAMS = {}
+    _V67_SPLIT_LIB = None
+    _V67_SPLIT_FN = None
+    _LAB_NATIVE_COUNTS = {}
+    def _resolve_compile_target(patcher):
+        """Locate MiniMaxH3Model inside a Comfy ModelPatcher."""
+        probes = [
+            ("model.diffusion_model", lambda p: (p.model, "diffusion_model", p.model.diffusion_model)),
+            ("model.model.diffusion_model", lambda p: (p.model.model, "diffusion_model", p.model.model.diffusion_model)),
+            ("diffusion_model", lambda p: (p, "diffusion_model", p.diffusion_model)),
+        ]
+        for path, fn in probes:
+            try:
+                parent, attr, mod = fn(patcher)
+                if isinstance(mod, torch.nn.Module):
+                    return parent, attr, mod, path
+            except Exception:
+                pass
+        raise RuntimeError("Could not locate H3 diffusion module inside ModelPatcher")
+
+    def _v65_cuda_backend():
+        from comfy_kitchen.backends import cuda as _cuda
+        required = (
+            "_C",
+            "_wrap_for_dlpack",
+            "quantize_int8_rowwise_convrot64",
+        )
+        missing = [name for name in required if not hasattr(_cuda, name)]
+        if missing:
+            raise RuntimeError(
+                "V65 requires Comfy-Kitchen CUDA internals: " + ", ".join(missing)
+            )
+        ext = _cuda._C
+        for symbol in (
+            "cutlass_int8_dequant_config",
+            "benchmark_cutlass_int8_dequant_config",
+        ):
+            if ext is None or not hasattr(ext, symbol):
+                raise RuntimeError(
+                    f"installed Comfy-Kitchen CUDA extension lacks {symbol}"
+                )
+        return _cuda
+
+    def _v65_dtype_code(dtype):
+        if dtype == torch.float32:
+            return 0
+        if dtype == torch.float16:
+            return 1
+        if dtype == torch.bfloat16:
+            return 2
+        raise TypeError(f"V65 unsupported output dtype: {dtype}")
+
+    def _v65_prepare_weight_scale(scale, n):
+        scale = scale.reshape(-1)
+        if int(scale.numel()) == 1:
+            return scale.expand(int(n)).contiguous()
+        if int(scale.numel()) != int(n):
+            raise RuntimeError(
+                f"V65 expected scalar or N={n} weight scales, got {scale.numel()}"
+            )
+        return scale.contiguous()
+
+    def _v65_call_config(
+        cuda_backend,
+        qx,
+        weight_qdata,
+        x_scale,
+        weight_scale,
+        out,
+        config,
+    ):
+        ok = cuda_backend._C.cutlass_int8_dequant_config(
+            cuda_backend._wrap_for_dlpack(qx),
+            cuda_backend._wrap_for_dlpack(weight_qdata),
+            cuda_backend._wrap_for_dlpack(x_scale),
+            cuda_backend._wrap_for_dlpack(weight_scale),
+            cuda_backend._wrap_for_dlpack(out),
+            _v65_dtype_code(out.dtype),
+            int(config),
+            torch.cuda.current_stream(out.device).cuda_stream,
+        )
+        if not ok:
+            raise RuntimeError(f"CUTLASS config {config} rejected this shape")
+        return out
+
+    def _v67_load_strided_launcher():
+        global _V67_SPLIT_LIB, _V67_SPLIT_FN
+        import ctypes
+
+        if _V67_SPLIT_FN is not None:
+            return _V67_SPLIT_FN
+
+        cuda_backend = _v65_cuda_backend()
+        module_path = (
+            getattr(cuda_backend, "_module_path", None)
+            or getattr(cuda_backend._C, "__file__", None)
+        )
+        if not module_path:
+            raise RuntimeError("cannot resolve Comfy-Kitchen CUDA extension path")
+
+        lib = ctypes.CDLL(str(module_path))
+        try:
+            fn = lib.launch_cutlass_int8_dequant_strided
+        except AttributeError as exc:
+            raise RuntimeError(
+                "installed Comfy-Kitchen _C does not export "
+                "launch_cutlass_int8_dequant_strided"
+            ) from exc
+
+        fn.argtypes = [
+            ctypes.c_void_p,  # A
+            ctypes.c_void_p,  # B
+            ctypes.c_void_p,  # x scales
+            ctypes.c_void_p,  # w scales
+            ctypes.c_void_p,  # bias
+            ctypes.c_void_p,  # D
+            ctypes.c_longlong,  # M
+            ctypes.c_longlong,  # N
+            ctypes.c_longlong,  # K
+            ctypes.c_longlong,  # output_stride
+            ctypes.c_int,       # out dtype
+            ctypes.c_void_p,    # stream
+        ]
+        fn.restype = ctypes.c_bool
+        _V67_SPLIT_LIB = lib
+        _V67_SPLIT_FN = fn
+        return fn
+
+    def _v68_workers(device, count):
+        count = max(1, int(count))
+        device_index = int(device.index or 0)
+        key = (device_index, count)
+        streams = _V68_WORKER_STREAMS.get(key)
+        if streams is None:
+            streams = [
+                torch.cuda.Stream(device=device_index)
+                for _ in range(count)
+            ]
+            _V68_WORKER_STREAMS[key] = streams
+        return streams
+
+    def _v68_call_strided_on_stream(
+        qx,
+        weight_qdata,
+        x_scale,
+        weight_scale,
+        out,
+        *,
+        output_col_offset,
+        stream,
+    ):
+        """
+        Same Comfy-Kitchen strided CUTLASS entry point used by V67, but launch on an
+        explicit CUDA stream. Inputs are prepared on the caller/current stream
+        before the ready event, and output slices are disjoint.
+        """
+        import ctypes
+
+        fn = _v67_load_strided_launcher()
+        m, k = map(int, qx.shape)
+        n = int(weight_qdata.shape[0])
+        if int(weight_qdata.shape[1]) != k:
+            raise RuntimeError(
+                f"V68 strided K mismatch: A={tuple(qx.shape)}, "
+                f"B={tuple(weight_qdata.shape)}"
+            )
+        offset = int(output_col_offset)
+        if offset < 0 or offset + n > int(out.shape[1]):
+            raise RuntimeError("V68 strided output slice out of bounds")
+
+        d_ptr = int(out.data_ptr()) + offset * out.element_size()
+        ok = bool(
+            fn(
+                ctypes.c_void_p(int(qx.data_ptr())),
+                ctypes.c_void_p(int(weight_qdata.data_ptr())),
+                ctypes.c_void_p(int(x_scale.data_ptr())),
+                ctypes.c_void_p(int(weight_scale.data_ptr())),
+                ctypes.c_void_p(0),
+                ctypes.c_void_p(d_ptr),
+                m,
+                n,
+                k,
+                int(out.shape[1]),
+                2,  # BF16
+                ctypes.c_void_p(int(stream.cuda_stream)),
+            )
+        )
+        if not ok:
+            raise RuntimeError(
+                f"V68 strided CUTLASS rejected M={m} N={n} K={k}"
+            )
+
+    def _v68_run_topology(
+        qx,
+        weight_qdata,
+        x_scale,
+        weight_scale,
+        out,
+        *,
+        role,
+        split_count,
+        concurrency,
+    ):
+        """
+        Run one output-row topology.
+
+        split_count=1 preserves the established V65 explicit full-GEMM config.
+        split_count>1 uses Comfy-Kitchen's strided split launcher.
+        concurrency>1 distributes independent output-row chunks over independent
+        compute streams, then inserts completion events into the caller stream.
+        """
+        cuda_backend = _v65_cuda_backend()
+        qx = qx.contiguous()
+        wq = weight_qdata.contiguous()
+        m, k = map(int, qx.shape)
+        total_n = int(wq.shape[0])
+        xs = x_scale.reshape(m, 1).contiguous()
+        ws = _v65_prepare_weight_scale(weight_scale, total_n)
+
+        split_count = int(split_count)
+        concurrency = max(1, min(int(concurrency), split_count))
+
+        if split_count == 1:
+            _v65_call_config(
+                cuda_backend,
+                qx,
+                wq,
+                xs,
+                ws,
+                out,
+                int(V68_STATIC_CONFIGS[role]),
+            )
+            return out
+
+        if total_n % split_count:
+            raise ValueError(
+                f"V68 split_count={split_count} does not divide N={total_n}"
+            )
+
+        chunk_n = total_n // split_count
+
+        # Prepare all views/scales on the caller stream before worker launches.
+        chunks = []
+        for part in range(split_count):
+            n0 = part * chunk_n
+            n1 = n0 + chunk_n
+            w_part = wq[n0:n1]
+            if not w_part.is_contiguous():
+                w_part = w_part.contiguous()
+            ws_part = ws[n0:n1] if ws.numel() != 1 else ws
+            if not ws_part.is_contiguous():
+                ws_part = ws_part.contiguous()
+            chunks.append((n0, w_part, ws_part))
+
+        if concurrency <= 1:
+            current = torch.cuda.current_stream(qx.device)
+            for n0, w_part, ws_part in chunks:
+                _v68_call_strided_on_stream(
+                    qx,
+                    w_part,
+                    xs,
+                    ws_part,
+                    out,
+                    output_col_offset=n0,
+                    stream=current,
+                )
+            return out
+
+        current = torch.cuda.current_stream(qx.device)
+        ready = torch.cuda.Event()
+        ready.record(current)
+
+        workers = _v68_workers(qx.device, concurrency)
+        used = [False] * concurrency
+        for part, (n0, w_part, ws_part) in enumerate(chunks):
+            wi = part % concurrency
+            stream = workers[wi]
+            if not used[wi]:
+                stream.wait_event(ready)
+                used[wi] = True
+            _v68_call_strided_on_stream(
+                qx,
+                w_part,
+                xs,
+                ws_part,
+                out,
+                output_col_offset=n0,
+                stream=stream,
+            )
+
+        # Record one event after the last launch queued on each used worker and make
+        # the caller stream wait before the carrier is consumed by the next op.
+        done_events = []
+        for wi, stream in enumerate(workers):
+            if not used[wi]:
+                continue
+            done = torch.cuda.Event()
+            done.record(stream)
+            current.wait_event(done)
+            done_events.append(done)
+
+        return out
+
+    def _v70_projection_linear(
+        x,
+        weight_qdata,
+        weight_scale,
+        *,
+        role,
+        input_act=None,
+        tune_configs=False,
+    ):
+        cuda_backend = _v65_cuda_backend()
+
+        original_shape = tuple(x.shape)
+        x2d = x.reshape(-1, x.shape[-1]).contiguous()
+
+        # Keep Comfy-Kitchen's exact production activation quantizer. FC2 therefore
+        # retains the existing fused SwiGLU + ConvRot path unchanged.
+        qx, x_scale = cuda_backend.quantize_int8_rowwise_convrot64(
+            x2d,
+            256,
+            input_act=input_act,
+        )
+
+        m, k = map(int, qx.shape)
+        total_n = int(weight_qdata.shape[0])
+
+        if int(weight_qdata.shape[1]) != k:
+            raise RuntimeError(
+                f"V70 {role} K mismatch: "
+                f"qx={tuple(qx.shape)} "
+                f"W={tuple(weight_qdata.shape)}"
+            )
+
+        wq = weight_qdata.contiguous()
+        ws = _v65_prepare_weight_scale(
+            weight_scale,
+            total_n,
+        )
+
+        out2d = torch.empty(
+            (m, total_n),
+            device=x.device,
+            dtype=x.dtype,
+        )
+
+        split_count, concurrency = V70_FIXED_TOPOLOGY[role]
+
+        _LAB_NATIVE_COUNTS[role] = _LAB_NATIVE_COUNTS.get(role, 0) + 1
+        _v68_run_topology(qx, wq, x_scale, ws, out2d, role=role,
+                           split_count=int(split_count), concurrency=int(concurrency))
+
+        return out2d.reshape(
+            *original_shape[:-1],
+            total_n,
+        )
+
+    def _v70_install_policy(
+        model_patcher,
+        *,
+        tune_configs,
+    ):
+        import comfy.ops as _ops
+        from comfy.quant_ops import (
+            QuantizedTensor,
+            TensorWiseINT8Layout,
+        )
+
+        _, _, dit, _ = _resolve_compile_target(
+            model_patcher
+        )
+
+        restores = []
+        fc2_roles = {}
+        counts = {
+            "qkv": 0,
+            "fc1": 0,
+            "fc2": 0,
+            "out_proj": 0,
+        }
+
+        def plain_convrot(weight):
+            if (
+                not isinstance(
+                    weight,
+                    QuantizedTensor,
+                )
+                or getattr(
+                    weight,
+                    "_layout_cls",
+                    None,
+                ) != "TensorWiseINT8Layout"
+                or getattr(
+                    weight._params,
+                    "transposed",
+                    False,
+                )
+                or not getattr(
+                    weight._params,
+                    "convrot",
+                    False,
+                )
+                or int(
+                    getattr(
+                        weight._params,
+                        "convrot_groupsize",
+                        0,
+                    )
+                ) != 256
+            ):
+                return None
+
+            return (
+                TensorWiseINT8Layout
+                .get_plain_tensors(weight)
+            )
+
+        def wrap_module(module, role):
+            original = module.forward
+
+            def forward(x, *args, **kwargs):
+                if args or kwargs or x.dtype != torch.bfloat16:
+                    return original(
+                        x,
+                        *args,
+                        **kwargs,
+                    )
+
+                _ops.run_every_op()
+
+                weight = bias = handle = None
+
+                try:
+                    weight, bias, handle = (
+                        _ops.cast_bias_weight(
+                            module,
+                            x,
+                            offloadable=True,
+                            compute_dtype=x.dtype,
+                            want_requant=True,
+                        )
+                    )
+
+                    parts = plain_convrot(weight)
+
+                    if (
+                        parts is None
+                        or bias is not None
+                    ):
+                        return (
+                            torch.nn.functional
+                            .linear(
+                                x,
+                                weight,
+                                bias,
+                            )
+                        )
+
+                    qdata, scale = parts
+
+                    return _v70_projection_linear(
+                        x,
+                        qdata,
+                        scale,
+                        role=role,
+                        input_act=None,
+                        tune_configs=tune_configs,
+                    )
+
+                finally:
+                    if weight is not None:
+                        _ops.uncast_bias_weight(
+                            module,
+                            weight,
+                            bias,
+                            handle,
+                        )
+
+            module.forward = forward
+
+            restores.append(
+                lambda m=module, f=original:
+                    setattr(
+                        m,
+                        "forward",
+                        f,
+                    )
+            )
+
+            counts[role] += 1
+
+        for block in getattr(
+            dit,
+            "blocks",
+            (),
+        ):
+            wrap_module(
+                block.attn.qkv_proj,
+                "qkv",
+            )
+            wrap_module(
+                block.attn.out_proj,
+                "out_proj",
+            )
+            wrap_module(
+                block.mlp.fc1,
+                "fc1",
+            )
+
+            fc2_roles[
+                id(block.mlp.fc2)
+            ] = block.mlp.fc2
+            counts["fc2"] += 1
+
+        original_linear_input_act = (
+            _ops.linear_input_act
+        )
+
+        def linear_input_act(
+            linear,
+            x,
+            input_act,
+        ):
+            if (
+                id(linear) not in fc2_roles
+                or input_act != "swiglu"
+                or x.dtype != torch.bfloat16
+            ):
+                return original_linear_input_act(
+                    linear,
+                    x,
+                    input_act,
+                )
+
+            weight = bias = handle = None
+
+            try:
+                weight, bias, handle = (
+                    _ops.cast_bias_weight(
+                        linear,
+                        x,
+                        offloadable=True,
+                        compute_dtype=x.dtype,
+                        want_requant=True,
+                    )
+                )
+
+                parts = plain_convrot(weight)
+
+                if (
+                    parts is None
+                    or bias is not None
+                ):
+                    return (
+                        torch.nn.functional
+                        .linear(
+                            _ops.INPUT_ACT_EAGER[
+                                input_act
+                            ](x),
+                            weight,
+                            bias,
+                        )
+                    )
+
+                qdata, scale = parts
+
+                return _v70_projection_linear(
+                    x,
+                    qdata,
+                    scale,
+                    role="fc2",
+                    input_act=input_act,
+                    tune_configs=tune_configs,
+                )
+
+            finally:
+                if weight is not None:
+                    _ops.uncast_bias_weight(
+                        linear,
+                        weight,
+                        bias,
+                        handle,
+                    )
+
+        _ops.linear_input_act = (
+            linear_input_act
+        )
+
+        restores.append(
+            lambda:
+                setattr(
+                    _ops,
+                    "linear_input_act",
+                    original_linear_input_act,
+                )
+        )
+
+        def restore():
+            for fn in reversed(restores):
+                try:
+                    fn()
+                except Exception:
+                    pass
+
+        return counts, restore
+
+    @contextmanager
+    def projection_policy(model):
+        _v67_load_strided_launcher()  # Fail before changing model methods.
+        _LAB_NATIVE_COUNTS.clear()
+        counts, restore = _v70_install_policy(model, tune_configs=False)
+        print("LAB fixed projection topology:", counts, flush=True)
+        try:
+            yield
+        finally:
+            restore()
+            print("LAB native projection calls:", dict(_LAB_NATIVE_COUNTS), flush=True)
+
     _l40s_select_attention()
+    if L40S_LAB_POLICY:
+        _sparge_ok, _sparge_note = _l40s_ensure_sparse_sage()
+        if not _sparge_ok:
+            raise RuntimeError("Lab Sparse Sage unavailable: " + str(_sparge_note))
+
 
     # ── 1. Weights ─────────────────────────────────────────────────────────────
     from huggingface_hub import hf_hub_download, HfApi, hf_hub_url
@@ -2257,8 +3752,9 @@ if _CU130_CHILD:
         "highvram": _bw_highvram,
         "gpu_only": False,
         "normalvram": bool((not LOWVRAM_T4_PROFILE) and (not _bw_highvram)),
-        "enable_dynamic_vram": bool(LOWVRAM_T4_PROFILE),
-        "disable_dynamic_vram": True,
+        "enable_dynamic_vram": bool(LOWVRAM_T4_PROFILE or L40S_LAB_POLICY),
+        "disable_dynamic_vram": not bool(LOWVRAM_T4_PROFILE or L40S_LAB_POLICY),
+        "async_offload": 2 if L40S_LAB_POLICY else getattr(args, "async_offload", None),
     }.items():
         if hasattr(args, _name):
             setattr(args, _name, _value)
@@ -2301,8 +3797,10 @@ if _CU130_CHILD:
 
     import nodes, folder_paths, comfy.utils
     import comfy.model_management as mm
+    if L40S_LAB_POLICY:
+        mm.NUM_STREAMS = 2
 
-    if LOWVRAM_T4_PROFILE:
+    if LOWVRAM_T4_PROFILE or L40S_LAB_POLICY:
         import comfy.memory_management as _cmm
         import comfy.model_patcher as _cmp
         if not bool(getattr(_cmm, "aimdo_enabled", False)):
@@ -2331,7 +3829,7 @@ if _CU130_CHILD:
 
         if not bool(getattr(_cmm, "aimdo_enabled", False)):
             raise RuntimeError("DynamicVRAM did not become active; refusing to start the T4 UI.")
-        log("  ✓ Comfy DynamicVRAM ACTIVE · Aimdo enabled · Dynamic GGUF loader may page weights")
+        log("  ✓ Comfy DynamicVRAM ACTIVE · Aimdo enabled · weights loaded on demand")
 
     log(f"  vram state: {mm.vram_state} · reserve {RESERVE_VRAM} GB · GPU profile={GPU_PROFILE} · LOWVRAM={LOWVRAM}")
     log(f"  attention active -> {ATTN_BACKEND} (selected before H3 module import)")
@@ -2412,7 +3910,7 @@ if _CU130_CHILD:
             log("  ✓ sparse production backend -> H3SparseAttention available on SM80; dense fallback is PyTorch SDPA")
             log("  ✓ A100 path -> quality DiT retained; 40GB uses smaller TE + safe handoff, 80GB can stay resident")
         else:
-            log("  L40S: staged TE → DiT → VAE; H3 memory optimization and AUTO sparse resolver")
+            log("  L40S: staged TE → DiT → VAE; active optimization policy logged per generation")
 
     def call(name, **kw):
         cls = N[name]
@@ -2479,6 +3977,12 @@ if _CU130_CHILD:
         if pct <= 0:
             return base_model, 0.0
         budget = pct / 100.0
+        if L40S_LAB_POLICY:
+            return _invoke_patch_node(
+                "H3SparseAttentionAdvanced", model=base_model, video_budget=budget,
+                backend="Sparse Sage", early_schedule="Ramp",
+                early_steps=4, early_kv=0.50, late_steps=0, late_kv=0.50,
+            ), budget
 
         # Current production schema:
         #   model, video_budget, denser_early_late_steps
@@ -3107,7 +4611,7 @@ if _CU130_CHILD:
         mm.unload_all_models()
         if not _load_resident_patcher(clip, "conditioning TE", TEXT_ENCODER_GIB, mandatory=True):
             raise RuntimeError("L40S text encoder preload failed.")
-        note = f"conditioning encoder ready; {_resident_free_gib():.1f} GiB free; DiT/VAEs cached in host memory"
+        note = f"conditioning encoder prepared; {_resident_free_gib():.1f} GiB free; DiT/VAEs cached in host memory"
         log(f"  {reason}: {note}")
         return True, note
 
@@ -3117,7 +4621,7 @@ if _CU130_CHILD:
             ok, note = _preload_model_residency(DIT_FILE, reason="startup")
             PROG["stage"] = "ready"
             if ok:
-                log(f"  ✓ active base model is HOT before UI launch · {note}")
+                log(f"  ✓ active base model prepared before UI launch · {note}")
             return bool(ok)
         except Exception as e:
             PROG["stage"] = "ready"
@@ -4514,12 +6018,13 @@ if _CU130_CHILD:
             if sparse_pct > 0:
                 _set_job_stage(jid, "applying sparse attention")
                 model, sparse_budget = _apply_sparse_attention(model, sparse_pct)
-                log(f"  sparse attention -> {sparse_pct:.1f}% flat video budget · AUTO backend (checkpoint-safe)")
+                log(f"  sparse attention -> {sparse_pct:.1f}% target budget · " +
+                    ("Sparse Sage · four-step 50%→target ramp" if L40S_LAB_POLICY else "flat AUTO"))
             else:
                 sparse_budget = 0.0
                 log("  sparse attention -> OFF / dense")
             j["sparse_percent"] = round(sparse_pct, 3)
-            j["sparse_backend_policy"] = "auto" if sparse_pct > 0 else "dense"
+            j["sparse_backend_policy"] = ("sparse_sage_lab_ramp" if L40S_LAB_POLICY else "auto") if sparse_pct > 0 else "dense"
             j["sparse_percent_effective"] = round(sparse_pct, 3)
             j["sparse_backend_policy_effective"] = j["sparse_backend_policy"]
 
@@ -4529,7 +6034,7 @@ if _CU130_CHILD:
             j["requested_final_sec"] = round(requested_sec, 3)
             log(f"  length -> {n_frames} legal frames ({actual_sec:.2f}s model time; requested final {requested_sec:.2f}s)")
             log(f"  render config -> {p.get('width')}x{p.get('height')} | steps={p.get('steps')} | "
-                f"Lightning={p.get('lightning','0')} | extras={len(p.get('extra_loras') or [])} | attention={ATTN_BACKEND} | sparse={sparse_pct:.1f}%/AUTO | LOWVRAM={LOWVRAM} | motion_pace={p.get('playback_speed','1.0')}x | prompt={p.get('prompt_source','raw_local')}")
+                f"Lightning={p.get('lightning','0')} | extras={len(p.get('extra_loras') or [])} | attention={ATTN_BACKEND} | sparse={sparse_pct:.1f}%/{j["sparse_backend_policy"]} | LOWVRAM={LOWVRAM} | motion_pace={p.get('playback_speed','1.0')}x | prompt={p.get('prompt_source','raw_local')}")
             if n_frames > 362:
                 log("  ⚠ long H3 clip: more than 362 model frames; sampling and VAE decode can be substantially slower/more memory-heavy")
             width, height = int(p["width"]), int(p["height"])
@@ -4631,6 +6136,11 @@ if _CU130_CHILD:
 
             model, compile_active = _l40s_compile_patch(model, p)
             j["l40s_compile"] = compile_active
+            if L40S_LAB_POLICY:
+                model.model_options = dict(model.model_options)
+                model.model_options["transformer_options"] = dict(
+                    model.model_options.get("transformer_options", {}), prefetch_dynamic_vbars=True)
+                log("LAB POLICY: DynamicVRAM + 2 streams + prefetch + Sparse Sage ramp + MLP off")
             guider,  = call("BasicGuider", model=model, conditioning=positive)
             sampler, = call("KSamplerSelect", sampler_name=p["sampler_name"])
             sigmas,  = call("BasicScheduler", model=model, scheduler=p["scheduler"],
@@ -4644,8 +6154,10 @@ if _CU130_CHILD:
             torch.cuda.synchronize()
             t_sample0 = time.perf_counter()
             try:
-                samples = call("SamplerCustomAdvanced", noise=noise, guider=guider,
-                               sampler=sampler, sigmas=sigmas, latent_image=latent)[0]
+                from contextlib import nullcontext
+                with projection_policy(model) if L40S_LAB_POLICY else nullcontext():
+                    samples = call("SamplerCustomAdvanced", noise=noise, guider=guider,
+                                   sampler=sampler, sigmas=sigmas, latent_image=latent)[0]
             except torch.cuda.OutOfMemoryError as _oom_exc:
                 # NEVER resume sampling with the same latent after an OOM. CUDA/Comfy
                 # may have partially touched buffers before raising. Rebuild every
