@@ -3167,17 +3167,818 @@ if _CU130_CHILD:
 
         return counts, restore
 
+
+    # Restored from the V73 winner retained in h3_v82_seed.py.
+    # CUDA math is unchanged; QKV only. FC1 remains stock modulation + V70 projection.
+    import os, re, sys, subprocess
+    from pathlib import Path
+    V72_FIXED_TOPOLOGY = V70_FIXED_TOPOLOGY
+    V73_THREADS = 256
+    _V73_LIB = _V73_FN = None
+    _V73_BUILD_REPORT = {}
+    _V73_ACTIVE_ROLES = {'qkv'}
+    _V73_ROLE_VERIFIED = {'qkv': False, 'fc1': False}
+    _V73_REPORTS = {}
+    _V73_ENABLED = os.environ.get('H3_V73_QKV_COMPACTION', '1') == '1'
+
+    def _v73_supported(h, shift, scale, segments):
+        if h.dtype != torch.bfloat16 or not h.is_cuda or not h.is_contiguous():
+            return False
+        d = int(h.shape[-1])
+        # Bound dynamic shared memory to the default 48 KiB per block.
+        if d <= 0 or d % 256 or (d + 512) * 4 > 49152:
+            return False
+        if shift.ndim != 2 or scale.ndim != 2 or shift.shape[-1] != d or scale.shape[-1] != d:
+            return False
+        if not isinstance(segments, (list, tuple)):
+            return False
+        covered = 0
+        for a, b, row in segments:
+            if not all(isinstance(v, int) for v in (a, b, row)):
+                return False
+            if a != covered or b <= a or row < 0 or row >= min(shift.shape[0], scale.shape[0]):
+                return False
+            covered = b
+        return covered == h.numel() // d
+
+    def _v71_nvcc_version(path):
+        try:
+            rr = subprocess.run(
+                [str(path), "--version"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            out = rr.stdout or ""
+            m = re.search(r"release\s+(\d+)\.(\d+)", out)
+            if m:
+                return (int(m.group(1)), int(m.group(2))), out
+        except Exception:
+            pass
+        return None, ""
+
+    def _v71_find_nvcc13():
+        import shutil
+        candidates = []
+        direct = shutil.which("nvcc")
+        if direct:
+            candidates.append(Path(direct))
+        roots = [
+            Path('/content/h3_ada_cu130'),
+            Path('/content/h3_sparge_cuda_compiler'),
+            Path("/content/h3_v71_cuda_compiler"),
+            Path("/content/h3_cuda130_compiler_pkgs_v23"),
+            Path("/content/h3_cuda131_compiler_pkgs_v44"),
+            Path("/content/h3_cu130_target_v23"),
+            Path("/content/h3_cu130_target_v35"),
+            Path(sys.prefix),
+        ]
+        for root in roots:
+            if not root.exists():
+                continue
+            candidates.extend(p for p in root.glob("**/bin/nvcc") if p.is_file())
+
+        seen = set()
+        accepted, rejected = [], []
+        for p in candidates:
+            try:
+                rp = p.resolve()
+            except Exception:
+                rp = p
+            s = str(rp)
+            if s in seen:
+                continue
+            seen.add(s)
+            ver, out = _v71_nvcc_version(rp)
+            if ver and ver[0] == 13:
+                accepted.append((rp, ver, out))
+            else:
+                rejected.append((rp, ver, out))
+        return accepted, rejected
+
+    def _v71_ensure_nvcc13():
+        accepted, rejected = _v71_find_nvcc13()
+        if accepted:
+            p, ver, _ = accepted[0]
+            return p, {
+                "installed_now": False,
+                "version": list(ver),
+                "accepted": [str(x[0]) for x in accepted],
+                "rejected": [
+                    {"path": str(x[0]), "version": None if x[1] is None else list(x[1])}
+                    for x in rejected
+                ],
+            }
+
+        target = Path("/content/h3_v71_cuda_compiler")
+        target.mkdir(parents=True, exist_ok=True)
+        print("[V71 CUDA] CUDA-13 nvcc not found; installing isolated compiler")
+        cmd = [
+            sys.executable, "-m", "pip", "install",
+            "--no-cache-dir", "--upgrade",
+            "--target", str(target),
+            "--extra-index-url", "https://pypi.nvidia.com",
+            "cuda-toolkit[nvcc,cccl,cudart]==13.0.2",
+            "nvidia-nvvm==13.0.88",
+            "nvidia-cuda-crt==13.0.88",
+            "nvidia-nvjitlink==13.0.88",
+        ]
+        rr = subprocess.run(
+            cmd, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        if rr.stdout:
+            print(rr.stdout[-12000:])
+        if rr.returncode:
+            raise RuntimeError("V71 CUDA-13 compiler installation failed")
+
+        accepted, rejected = _v71_find_nvcc13()
+        if not accepted:
+            raise RuntimeError(
+                "V71 installed CUDA-13 compiler packages but no CUDA-13 nvcc was found"
+            )
+        p, ver, _ = accepted[0]
+        return p, {
+            "installed_now": True,
+            "version": list(ver),
+            "accepted": [str(x[0]) for x in accepted],
+            "rejected": [
+                {"path": str(x[0]), "version": None if x[1] is None else list(x[1])}
+                for x in rejected
+            ],
+        }
+
+    def _v71_segment_row(vecs, row, dtype, device):
+        if isinstance(row, torch.Tensor):
+            raise RuntimeError("V71 does not fuse tensor-valued modulation row maps")
+        return vecs[int(row)].to(device=device, dtype=dtype).contiguous()
+
+    def _v71_plain_convrot(weight):
+        from comfy.quant_ops import QuantizedTensor, TensorWiseINT8Layout
+        if (
+            not isinstance(weight, QuantizedTensor)
+            or getattr(weight, "_layout_cls", None) != "TensorWiseINT8Layout"
+            or getattr(weight._params, "transposed", False)
+            or not getattr(weight._params, "convrot", False)
+            or int(getattr(weight._params, "convrot_groupsize", 0)) != 256
+        ):
+            return None
+        return TensorWiseINT8Layout.get_plain_tensors(weight)
+
+    class _V72DeferredMod:
+        __slots__ = ("normed", "shift", "scale", "segments")
+
+        def __init__(self, normed, shift, scale, segments):
+            self.normed = normed
+            self.shift = shift
+            self.scale = scale
+            self.segments = segments
+
+        @property
+        def shape(self):
+            return self.normed.shape
+
+        @property
+        def dtype(self):
+            return self.normed.dtype
+
+        @property
+        def device(self):
+            return self.normed.device
+
+    def _v72_materialize_stock(obj, original_mod):
+        # Stock helper mutates the RMSNorm carrier in place. This path is only used
+        # if the one-time exactness gate rejects the custom kernel.
+        return original_mod(
+            obj.normed,
+            obj.shift,
+            obj.scale,
+            obj.segments,
+        )
+
+    def _v72_project_with_weight(
+        qx,
+        x_scale,
+        weight,
+        *,
+        role,
+        out_dtype,
+    ):
+        parts = _v71_plain_convrot(weight)
+        if parts is None:
+            raise RuntimeError(f"V72 {role}: projection weight is not ConvRot INT8")
+
+        qdata, wscale = parts
+        # Do not force a copy: keep the exact resident VBAR tensor whenever already
+        # contiguous. .contiguous() is a no-op in that normal case.
+        if not qdata.is_contiguous():
+            qdata = qdata.contiguous()
+
+        n = int(qdata.shape[0])
+        ws = _v65_prepare_weight_scale(wscale, n)
+        m = int(qx.shape[0])
+
+        out = torch.empty((m, n), device=qx.device, dtype=out_dtype)
+        split_count, concurrency = V72_FIXED_TOPOLOGY[role]
+
+        _v68_run_topology(
+            qx.contiguous(),
+            qdata,
+            x_scale.reshape(-1, 1).contiguous(),
+            ws,
+            out,
+            role=role,
+            split_count=int(split_count),
+            concurrency=int(concurrency),
+        )
+        return out
+
+    def _v73_cuda_source():
+        return r"""
+    #include <cuda_runtime.h>
+    #include <cuda_bf16.h>
+    #include <stdint.h>
+    #include <cmath>
+
+    namespace {
+    constexpr int GROUP = 256;
+    constexpr int WARP = 32;
+
+    __device__ __forceinline__ float b2f(__nv_bfloat16 v) {
+        return __bfloat162float(v);
+    }
+    __device__ __forceinline__ __nv_bfloat16 f2b(float v) {
+        return __float2bfloat16_rn(v);
+    }
+    __device__ __forceinline__ float warp_max(float v) {
+        for (int off = 16; off > 0; off >>= 1) {
+            v = fmaxf(v, __shfl_down_sync(0xffffffff, v, off));
+        }
+        return v;
+    }
+    __device__ __forceinline__ float h4(int d, float x0, float x1, float x2, float x3) {
+        switch (d) {
+            case 0: return  x0 + x1 + x2 - x3;
+            case 1: return  x0 + x1 - x2 + x3;
+            case 2: return  x0 - x1 + x2 + x3;
+            default:return -x0 + x1 + x2 + x3;
+        }
+    }
+
+    template<int WARPS>
+    __device__ __forceinline__ float block_max(float v, float* warp_smem, float* block_smem) {
+        const int lane = threadIdx.x & 31;
+        const int wid = threadIdx.x >> 5;
+        v = warp_max(v);
+        if (lane == 0) warp_smem[wid] = v;
+        __syncthreads();
+
+        if (wid == 0) {
+            float total = lane < WARPS ? warp_smem[lane] : 0.0f;
+            total = warp_max(total);
+            if (lane == 0) *block_smem = total;
+        }
+        __syncthreads();
+        return *block_smem;
+    }
+
+    template<int BT>
+    __global__ void fused_adaln_convrot_q_inplace(
+        const __nv_bfloat16* __restrict__ normed_base,
+        const __nv_bfloat16* __restrict__ scale,
+        const __nv_bfloat16* __restrict__ shift,
+        int8_t* __restrict__ q_base,
+        float* __restrict__ qscale,
+        int row_start,
+        int D)
+    {
+        constexpr int WARPS = BT / WARP;
+        constexpr int GIF = BT / GROUP;
+
+        extern __shared__ float smem[];
+        float* row_buf = smem;
+        float* tmp = row_buf + D;
+
+        __shared__ float warp_smem[WARPS];
+        __shared__ float block_smem;
+
+        const int row = row_start + static_cast<int>(blockIdx.x);
+        const int tid = threadIdx.x;
+        const int64_t src_off = static_cast<int64_t>(row) * D;
+        const int64_t dst_off = static_cast<int64_t>(row) * D;
+
+        for (int i = tid; i < D; i += BT) {
+            const float hv = b2f(normed_base[src_off + i]);
+            const float sv = b2f(scale[i]);
+            const float sh = b2f(shift[i]);
+
+            const __nv_bfloat16 factor_b = f2b(1.0f + sv);
+            const __nv_bfloat16 mul_b = f2b(hv * b2f(factor_b));
+            const __nv_bfloat16 out_b = f2b(b2f(mul_b) + sh);
+            row_buf[i] = b2f(out_b);
+        }
+        __syncthreads();
+
+        const int n_groups = D / GROUP;
+        const int sub = tid / GROUP;
+        const int i = tid % GROUP;
+        float* buf0 = tmp + sub * (2 * GROUP);
+        float* buf1 = buf0 + GROUP;
+        const int iters = (n_groups + GIF - 1) / GIF;
+
+        for (int it = 0; it < iters; ++it) {
+            const int g = it * GIF + sub;
+            const bool active = g < n_groups;
+            float* src = active ? (row_buf + g * GROUP) : buf0;
+            float* dst = active ? buf0 : buf1;
+
+            #pragma unroll
+            for (int stage = 0; stage < 4; ++stage) {
+                const int s = (stage == 0) ? 1 : (stage == 1) ? 4 : (stage == 2) ? 16 : 64;
+                const int d = (i / s) & 3;
+                const int base = i - d * s;
+                const float v = 0.5f * h4(
+                    d,
+                    src[base],
+                    src[base + s],
+                    src[base + 2 * s],
+                    src[base + 3 * s]);
+                dst[i] = v;
+                __syncthreads();
+                float* t = src; src = dst; dst = t;
+            }
+        }
+
+        float abs_max = 0.0f;
+        for (int col = tid; col < D; col += BT) {
+            abs_max = fmaxf(abs_max, fabsf(row_buf[col]));
+        }
+        abs_max = block_max<WARPS>(abs_max, warp_smem, &block_smem);
+
+        const float finite_absmax = fminf(abs_max, 3.38953139e38f);
+        const float scale_f = fmaxf(finite_absmax * (1.0f / 127.0f), 1.0e-30f);
+        if (tid == 0) qscale[row] = scale_f;
+        __syncthreads();
+
+        const float scale_t = b2f(f2b(scale_f));
+        for (int col = tid; col < D; col += BT) {
+            const float value_t = b2f(f2b(row_buf[col]));
+            const float div_t = b2f(f2b(value_t / scale_t));
+            float r = nearbyintf(div_t);
+            r = fminf(127.0f, fmaxf(-128.0f, r));
+            q_base[dst_off + col] = static_cast<int8_t>(r);
+        }
+    }
+
+    template<int BT>
+    bool launch_impl(
+        const void* normed_base,
+        const void* scale,
+        const void* shift,
+        void* q_base,
+        void* qscale,
+        int64_t row_start,
+        int64_t row_count,
+        int64_t D,
+        cudaStream_t stream)
+    {
+        if (D <= 0 || row_count <= 0 || (D % GROUP) != 0) return false;
+        constexpr int GIF = BT / GROUP;
+        const size_t shmem = static_cast<size_t>(D + GIF * 2 * GROUP) * sizeof(float);
+        fused_adaln_convrot_q_inplace<BT>
+            <<<static_cast<unsigned int>(row_count), BT, shmem, stream>>>(
+                static_cast<const __nv_bfloat16*>(normed_base),
+                static_cast<const __nv_bfloat16*>(scale),
+                static_cast<const __nv_bfloat16*>(shift),
+                static_cast<int8_t*>(q_base),
+                static_cast<float*>(qscale),
+                static_cast<int>(row_start),
+                static_cast<int>(D));
+        return cudaGetLastError() == cudaSuccess;
+    }
+    }
+
+    extern "C" bool v73_fused_adaln_convrot_q_inplace(
+        const void* normed_base,
+        const void* scale,
+        const void* shift,
+        void* q_base,
+        void* qscale,
+        int64_t row_start,
+        int64_t row_count,
+        int64_t D,
+        int config,
+        cudaStream_t stream)
+    {
+        switch (config) {
+            case 0: return launch_impl<256>(normed_base,scale,shift,q_base,qscale,row_start,row_count,D,stream);
+            case 1: return launch_impl<512>(normed_base,scale,shift,q_base,qscale,row_start,row_count,D,stream);
+            case 2: return launch_impl<768>(normed_base,scale,shift,q_base,qscale,row_start,row_count,D,stream);
+            default: return false;
+        }
+    }
+    """
+
+    def _v73_prepare_library():
+        global _V73_LIB, _V73_FN, _V73_BUILD_REPORT
+        if _V73_FN is not None:
+            return _V73_BUILD_REPORT
+
+        import ctypes
+        import hashlib
+
+        cap = torch.cuda.get_device_capability(0)
+        if cap != (8, 9):
+            raise RuntimeError(f"V73 is L4/SM89-only; detected {cap}")
+
+        build = Path("/content/h3_v73_inplace_compact_build")
+        build.mkdir(parents=True, exist_ok=True)
+        cu = build / "v73_inplace_compact.cu"
+        so = build / "libh3_v73_inplace_compact_sm89.so"
+        stamp = build / "build.sha256"
+
+        source = _v73_cuda_source()
+        cu.write_text(source)
+        fingerprint = hashlib.sha256(source.encode()).hexdigest()
+
+        nvcc, nvcc_report = _v71_ensure_nvcc13()
+        ver, _ = _v71_nvcc_version(nvcc)
+        if not ver or ver[0] != 13:
+            raise RuntimeError(f"V73 refused non-CUDA13 nvcc: {nvcc}")
+
+        compile_needed = (
+            not so.is_file()
+            or not stamp.is_file()
+            or stamp.read_text().strip() != fingerprint
+        )
+        compile_tail = ""
+
+        if compile_needed:
+            cmd = [
+                str(nvcc),
+                "-std=c++17",
+                "-O3",
+                "-shared",
+                "-Xcompiler=-fPIC",
+                "-gencode=arch=compute_89,code=sm_89",
+                str(cu),
+                "-o", str(so),
+            ]
+            print("[V73 CUDA] compiling in-place BF16→INT8 compact fused prequant")
+            rr = subprocess.run(
+                cmd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            compile_tail = (rr.stdout or "")[-12000:]
+            if rr.returncode:
+                print(compile_tail)
+                raise RuntimeError("V73 in-place CUDA compilation failed")
+            stamp.write_text(fingerprint)
+
+        lib = ctypes.CDLL(str(so))
+        fn = lib.v73_fused_adaln_convrot_q_inplace
+        fn.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_longlong,
+            ctypes.c_longlong,
+            ctypes.c_longlong,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        fn.restype = ctypes.c_bool
+
+        _V73_LIB = lib
+        _V73_FN = fn
+        _V73_BUILD_REPORT = {
+            "available": True,
+            "library": str(so),
+            "nvcc": str(nvcc),
+            "nvcc_version": list(ver),
+            "nvcc_setup": nvcc_report,
+            "fingerprint": fingerprint,
+            "compiled_now": bool(compile_needed),
+            "compile_tail": compile_tail[-3000:],
+        }
+        return _V73_BUILD_REPORT
+
+    def _v73_alias_int8(storage_owner, n, d):
+        # Alias the first n*d bytes of the BF16 storage as a contiguous INT8 tensor.
+        q = torch.empty((0,), device=storage_owner.device, dtype=torch.int8)
+        q.set_(
+            storage_owner.untyped_storage(),
+            0,
+            (int(n), int(d)),
+            (int(d), 1),
+        )
+        return q
+
+    def _v73_safe_chunks(n):
+        # [0,1), [1,2), [2,4), [4,8), ... ; every chunk after the first obeys b<=2a.
+        out = []
+        if n <= 0:
+            return out
+        out.append((0, 1))
+        a = 1
+        while a < n:
+            b = min(n, 2 * a)
+            out.append((a, b))
+            a = b
+        return out
+
+    def _v73_launch_range(h2d, scale_vec, shift_vec, q, s, row_start, row_count, threads):
+        import ctypes
+        if _V73_FN is None:
+            _v73_prepare_library()
+
+        cfg = {256: 0, 512: 1, 768: 2}[int(threads)]
+        ok = bool(
+            _V73_FN(
+                ctypes.c_void_p(int(h2d.data_ptr())),
+                ctypes.c_void_p(int(scale_vec.data_ptr())),
+                ctypes.c_void_p(int(shift_vec.data_ptr())),
+                ctypes.c_void_p(int(q.data_ptr())),
+                ctypes.c_void_p(int(s.data_ptr())),
+                int(row_start),
+                int(row_count),
+                int(h2d.shape[1]),
+                cfg,
+                ctypes.c_void_p(int(torch.cuda.current_stream(h2d.device).cuda_stream)),
+            )
+        )
+        if not ok:
+            raise RuntimeError(
+                f"V73 in-place launch failed rows={row_start}:{row_start+row_count}"
+            )
+
+    def _v73_quant_deferred_inplace(obj, *, threads):
+        h = obj.normed
+        if h.dtype != torch.bfloat16 or not h.is_cuda:
+            raise TypeError("V73 in-place fused quant requires CUDA BF16 RMSNorm output")
+
+        d = int(h.shape[-1])
+        h2d = h.reshape(-1, d).contiguous()
+        if h2d.storage_offset() != 0:
+            h2d = h2d.clone()
+        n = int(h2d.shape[0])
+
+        # q aliases h2d storage, so there is NO extra ~158 MiB activation allocation.
+        q = _v73_alias_int8(h2d, n, d)
+        s = torch.empty((n, 1), device=h.device, dtype=torch.float32)
+
+        segments = [(int(a), int(b), row) for a, b, row in obj.segments]
+        seg_i = 0
+
+        for ca, cb in _v73_safe_chunks(n):
+            while seg_i < len(segments) and segments[seg_i][1] <= ca:
+                seg_i += 1
+
+            j = seg_i
+            cursor = ca
+            while cursor < cb:
+                if j >= len(segments):
+                    raise RuntimeError("V73 modulation segments ended early")
+                sa, sb, row = segments[j]
+                lo = max(cursor, sa)
+                hi = min(cb, sb)
+                if hi <= lo:
+                    j += 1
+                    continue
+
+                sv = _v71_segment_row(obj.scale, row, h.dtype, h.device)
+                sh = _v71_segment_row(obj.shift, row, h.dtype, h.device)
+
+                _v73_launch_range(
+                    h2d,
+                    sv,
+                    sh,
+                    q,
+                    s,
+                    lo,
+                    hi - lo,
+                    int(threads),
+                )
+                cursor = hi
+                if cursor >= sb:
+                    j += 1
+
+        return q, s
+
+    def _v73_verify_role_once(obj, role, weight, original_mod):
+        if _V73_ROLE_VERIFIED[role]:
+            return True
+
+        cuda_backend = _v65_cuda_backend()
+
+        stock_h = obj.normed.clone()
+        stock_h = original_mod(
+            stock_h,
+            obj.shift,
+            obj.scale,
+            obj.segments,
+        )
+        q_ref, s_ref = cuda_backend.quantize_int8_rowwise_convrot64(
+            stock_h.reshape(-1, stock_h.shape[-1]).contiguous(),
+            256,
+            input_act=None,
+        )
+
+        # Candidate needs a clone because it intentionally destroys/compacts its BF16 input storage.
+        cand_obj = _V72DeferredMod(
+            obj.normed.clone(),
+            obj.shift,
+            obj.scale,
+            obj.segments,
+        )
+        q_c, s_c = _v73_quant_deferred_inplace(
+            cand_obj,
+            threads=V73_THREADS,
+        )
+        torch.cuda.synchronize()
+
+        q_exact = bool(torch.equal(q_ref, q_c))
+        s_exact = bool(torch.equal(s_ref, s_c))
+        carrier_exact = False
+        carrier_max_abs = None
+
+        if q_exact and s_exact:
+            carrier_exact = True
+            carrier_max_abs = 0.0
+        else:
+            ref = _v72_project_with_weight(
+                q_ref, s_ref, weight,
+                role=role, out_dtype=obj.normed.dtype,
+            )
+            cand = _v72_project_with_weight(
+                q_c, s_c, weight,
+                role=role, out_dtype=obj.normed.dtype,
+            )
+            torch.cuda.synchronize()
+            carrier_exact = bool(torch.equal(ref, cand))
+            carrier_max_abs = float(
+                (ref.float() - cand.float()).abs().max().item()
+            )
+            del ref, cand
+
+        _V73_ROLE_VERIFIED[role] = bool(q_exact and s_exact and carrier_exact)
+        _V73_REPORTS[f"{role}_exactness"] = {
+            "q_exact": q_exact,
+            "scale_exact": s_exact,
+            "carrier_exact": carrier_exact,
+            "carrier_max_abs": carrier_max_abs,
+            "threads": int(V73_THREADS),
+        }
+
+        print(
+            f"[V73 verify] {role}: q={q_exact} scale={s_exact} "
+            f"carrier={carrier_exact} max_abs={carrier_max_abs}"
+        )
+
+        del stock_h, q_ref, s_ref, q_c, s_c, cand_obj
+        torch.cuda.empty_cache()
+        return _V73_ROLE_VERIFIED[role]
+
+    def _v73_install_policy(model_patcher):
+        import comfy.ops as _ops
+        import comfy.ldm.minimax.model as _minimax_model
+
+        _, _, dit, _ = _resolve_compile_target(model_patcher)
+        blocks = list(getattr(dit, 'blocks', ()))
+        if not blocks or any(not callable(getattr(getattr(getattr(b, 'attn', None), 'qkv_proj', None), 'forward', None))
+                             or not callable(getattr(getattr(getattr(b, 'mlp', None), 'fc1', None), 'forward', None)) for b in blocks):
+            raise RuntimeError('V73: unsupported MiniMax block layout')
+        restores = []
+        original_mod = _minimax_model._mod_scale_shift
+
+        def deferred_mod(h, shift, scale, segments):
+            if not _v73_supported(h, shift, scale, segments):
+                return original_mod(h, shift, scale, segments)
+            return _V72DeferredMod(h, shift, scale, segments)
+
+        _minimax_model._mod_scale_shift = deferred_mod
+        restores.append(
+            lambda: setattr(_minimax_model, "_mod_scale_shift", original_mod)
+        )
+
+        counts = {"qkv": 0, "fc1": 0}
+
+        def wrap(module, role):
+            fallback_forward = module.forward
+
+            def forward(x, *args, **kwargs):
+                if not isinstance(x, _V72DeferredMod):
+                    return fallback_forward(x, *args, **kwargs)
+
+                if role not in _V73_ACTIVE_ROLES:
+                    stock_x = _v72_materialize_stock(x, original_mod)
+                    return fallback_forward(stock_x, *args, **kwargs)
+
+                if args or kwargs:
+                    stock_x = _v72_materialize_stock(x, original_mod)
+                    return fallback_forward(stock_x, *args, **kwargs)
+
+                _ops.run_every_op()
+
+                weight = bias = handle = None
+                try:
+                    # Weight FIRST, then compact the already-existing BF16 RMSNorm carrier in place.
+                    weight, bias, handle = _ops.cast_bias_weight(
+                        module,
+                        x.normed,
+                        offloadable=True,
+                        compute_dtype=x.normed.dtype,
+                        want_requant=True,
+                    )
+
+                    if bias is not None or _v71_plain_convrot(weight) is None:
+                        stock_x = _v72_materialize_stock(x, original_mod)
+                        return torch.nn.functional.linear(stock_x, weight, bias)
+
+                    if not _V73_ROLE_VERIFIED[role]:
+                        if not _v73_verify_role_once(
+                            x,
+                            role,
+                            weight,
+                            original_mod,
+                        ):
+                            stock_x = _v72_materialize_stock(x, original_mod)
+                            return torch.nn.functional.linear(stock_x, weight, bias)
+
+                    qx, xs = _v73_quant_deferred_inplace(
+                        x,
+                        threads=V73_THREADS,
+                    )
+                    out = _v72_project_with_weight(
+                        qx,
+                        xs,
+                        weight,
+                        role=role,
+                        out_dtype=x.normed.dtype,
+                    )
+                    return out.reshape(
+                        *x.normed.shape[:-1],
+                        int(out.shape[-1]),
+                    )
+
+                finally:
+                    if weight is not None:
+                        _ops.uncast_bias_weight(
+                            module,
+                            weight,
+                            bias,
+                            handle,
+                        )
+
+            module.forward = forward
+            restores.append(
+                lambda m=module, f=fallback_forward:
+                    setattr(m, "forward", f)
+            )
+            counts[role] += 1
+
+        for block in blocks:
+            wrap(block.attn.qkv_proj, "qkv")
+            wrap(block.mlp.fc1, "fc1")
+
+        def restore():
+            for fn in reversed(restores):
+                try:
+                    fn()
+                except Exception:
+                    pass
+
+        return counts, restore
+
+
     @contextmanager
     def projection_policy(model):
-        _v67_load_strided_launcher()  # Fail before changing model methods.
+        _v67_load_strided_launcher()
         _LAB_NATIVE_COUNTS.clear()
+        if _V73_ENABLED:
+            _v73_prepare_library()  # Fail before mutating model methods.
         counts, restore = _v70_install_policy(model, tune_configs=False)
-        print("LAB fixed projection topology:", counts, flush=True)
+        compact_restore = None
+        print('LAB fixed projection topology:', counts, flush=True)
         try:
+            if _V73_ENABLED:
+                compact_counts, compact_restore = _v73_install_policy(model)
+                print('V73 QKV-only compact prequant:', compact_counts, flush=True)
             yield
         finally:
+            if compact_restore is not None:
+                compact_restore()
             restore()
-            print("LAB native projection calls:", dict(_LAB_NATIVE_COUNTS), flush=True)
+            print('LAB native projection calls:', dict(_LAB_NATIVE_COUNTS), flush=True)
+            if _V73_ENABLED:
+                print('V73 exactness:', dict(_V73_REPORTS), flush=True)
+
+    if L40S_LAB_POLICY and _V73_ENABLED:
+        _v73_prepare_library()
 
     _l40s_select_attention()
     if L40S_LAB_POLICY:
@@ -6212,6 +7013,14 @@ if _CU130_CHILD:
                 retry_p["_dense_restart_done"] = "1"
                 retry_p["_restart_from_sampler"] = _fallback_code
                 raise GenerationRestart(retry_p, _fallback_code, _msg) from _sparse_exc
+            finally:
+                # Job clones share the underlying H3 module. Restore object methods
+                # before another clone can capture this job's cube-order/FinalLayer
+                # closures. Keep weight patches and GPU residency intact. This must
+                # also run on cancellation, OOM and the clean dense-retry path.
+                torch.cuda.synchronize()
+                model.unpatch_model(unpatch_weights=False)
+
 
             torch.cuda.synchronize()
             j["sampling_sec"] = round(time.perf_counter() - t_sample0, 3)
