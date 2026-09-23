@@ -166,6 +166,12 @@ def segment_image(image, prompt):
     try:
         checkpoint = sam_checkpoint()
         model = build_sam3_image_model(device="cpu", checkpoint_path=checkpoint, load_from_HF=False)
+        # Upstream precomputes positional encodings on CUDA when available,
+        # even for a CPU model. They are plain cache entries, not buffers.
+        from sam3.model.position_encoding import PositionEmbeddingSine
+        for module in model.modules():
+            if isinstance(module, PositionEmbeddingSine):
+                module.cache.clear()
     except Exception as exc:
         if "gated" in str(exc).lower() or "403" in str(exc):
             raise RuntimeError("SAM model access is not approved. Request access at huggingface.co/facebook/sam3 using the account for your Colab HF_TOKEN, then retry. You can paint or upload a mask meanwhile.") from exc
