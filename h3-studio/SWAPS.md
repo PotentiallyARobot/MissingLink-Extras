@@ -49,11 +49,12 @@ Real SAM inference and live paid image generation require the configured Colab
 runtime and credentials; unit tests do not establish visual swap quality.
 # MissingLink SAM bucket
 
-The loader checks the public `MissingLinkBuilder/wheels` bucket for
-`models/sam3/manifest.json`. Until that package is published, it falls back to
-the official `facebook/sam3` download and requires approved model access.
+The loader checks `MissingLinkBuilder/wheels` for `models/sam3/manifest.json`
+using the runtime's existing HF credentials. The bucket is private; users
+without bucket access automatically download the pinned public AEmotionStudio
+image checkpoint instead. Neither path requires Meta's model-access approval.
 Bucket downloads include the original SAM license and verify SHA256 checksums
-before loading a checkpoint. An HF token is not sent for public bucket reads.
+before loading a checkpoint. Public mirror reads explicitly send no HF token.
 
 With bucket write access, run `python h3-studio/publish_sam_bucket.py` with the
 normal HF token. Add `--model sam3.1` to publish the video tracking checkpoint.

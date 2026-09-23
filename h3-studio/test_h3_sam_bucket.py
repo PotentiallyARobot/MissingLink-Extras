@@ -31,11 +31,11 @@ class BucketTests(unittest.TestCase):
                 Path(local).write_bytes(content)
         self.api.download_bucket_files.side_effect = download
 
-    def test_anonymous_download_includes_license_and_reuses_valid_weights(self):
+    def test_bucket_download_includes_license_and_reuses_valid_weights(self):
         result = Path(sam_checkpoint())
         self.assertEqual(result.read_bytes(), b"test weights")
         self.assertTrue(result.with_name("LICENSE").exists())
-        self.hub.HfApi.assert_called_with(token=False)
+        self.hub.HfApi.assert_called_with()
         self.api.download_bucket_files.reset_mock()
         sam_checkpoint()
         self.assertEqual(self.api.download_bucket_files.call_count, 1)
@@ -46,10 +46,12 @@ class BucketTests(unittest.TestCase):
             sam_checkpoint()
         self.assertFalse((Path(self.temp.name) / self.revision / "sam3.pt").exists())
 
-    def test_unpublished_mirror_uses_authorized_official_download(self):
+    def test_inaccessible_bucket_uses_ungated_public_mirror(self):
         self.api.download_bucket_files.side_effect = FileNotFoundError()
-        self.assertEqual(sam_checkpoint(), "official.pt")
-        self.hub.hf_hub_download.assert_called_once_with("facebook/sam3", "sam3.pt")
+        with patch("h3_swaps.public_sam_checkpoint", return_value="public.pt") as fallback:
+            self.assertEqual(sam_checkpoint(), "public.pt")
+            fallback.assert_called_once_with(Path(self.temp.name))
+        self.hub.hf_hub_download.assert_not_called()
 
     def test_manifest_cannot_escape_cache_directory(self):
         self.manifest["revision"] = "../escape"

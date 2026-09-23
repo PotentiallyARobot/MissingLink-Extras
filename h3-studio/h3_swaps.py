@@ -74,20 +74,42 @@ def composite(original, generated, mask):
     return Image.composite(generated.convert("RGB"), original.convert("RGB"), mask)
 
 
+def public_sam_checkpoint(root):
+    """Ungated, pinned fallback for users without private bucket access."""
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+    import torch
+    source = "AEmotionStudio/sam3"
+    revision = "5eac5d508135b2f19adc3ef095efb7d393236f75"
+    directory = root / ("public-" + revision)
+    directory.mkdir(exist_ok=True)
+    for name in ("LICENSE", "config.json", "sam3.safetensors"):
+        downloaded = hf_hub_download(source, name, revision=revision,
+                                     local_dir=str(directory), token=False)
+    checkpoint = directory / "sam3.pt"
+    if not checkpoint.exists():
+        weights = load_file(downloaded, device="cpu")
+        if not any(key.startswith("detector.") for key in weights):
+            raise ValueError("Invalid SAM image checkpoint keys")
+        partial = checkpoint.with_suffix(".partial")
+        torch.save(weights, partial)
+        partial.replace(checkpoint)
+    return str(checkpoint)
+
+
 def sam_checkpoint():
-    """Prefer the licensed MissingLink mirror once its manifest is published."""
-    from huggingface_hub import HfApi, hf_hub_download
+    """Prefer MissingLink's licensed package, with an ungated public fallback."""
+    from huggingface_hub import HfApi
     bucket = "MissingLinkBuilder/wheels"
     root = Path(os.environ.get("H3_SAM_CACHE", "/content/h3_sam_weights"))
     root.mkdir(parents=True, exist_ok=True)
-    api = HfApi(token=False)
+    api = HfApi()
     manifest_path = root / "manifest.json"
     try:
         api.download_bucket_files(bucket, files=[("models/sam3/manifest.json", str(manifest_path))])
     except Exception as exc:
-        # A missing mirror or older Hub client must not prevent approved HF use.
-        print(f"SAM bucket unavailable ({type(exc).__name__}); using official source.")
-        return hf_hub_download("facebook/sam3", "sam3.pt")
+        print(f"SAM bucket unavailable ({type(exc).__name__}); using public mirror.")
+        return public_sam_checkpoint(root)
     manifest = json.loads(manifest_path.read_text())
     revision = manifest.get("revision", "")
     if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
