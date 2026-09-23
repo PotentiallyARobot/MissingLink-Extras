@@ -13,6 +13,7 @@ function controls(){
   $('generate').disabled=busy||!original||!referenceBlob||!hasMask||!keyReady;
 }
 function resetResult(){outputFile='';outputUrl='';$('result').hidden=true;$('before').checked=false}
+function preview(kind,blob){const img=$(kind+'-preview');if(img.dataset.url)URL.revokeObjectURL(img.dataset.url);delete img.dataset.url;img.removeAttribute('src');img.hidden=!blob;img.parentElement.classList.toggle('loaded',!!blob);if(blob){img.dataset.url=URL.createObjectURL(blob);img.src=img.dataset.url}}
 function remember(){undo.push(mctx.getImageData(0,0,mask.width,mask.height));if(undo.length>8)undo.shift()}
 function refreshMask(){hasMask=mctx.getImageData(0,0,mask.width,mask.height).data.some((v,i)=>i%4===0&&v>=128);resetResult();controls();render()}
 function render(){
@@ -37,13 +38,13 @@ async function job(url,form){
 async function action(task){busy=true;drawing=false;controls();try{await task()}catch(e){status(e.message,true)}finally{busy=false;controls()}}
 $('original').onchange=()=>action(async()=>{
   // Clear first so a rejected upload cannot leave a stale mask paired with a new filename.
-  if(original)original.close();original=null;originalBlob=null;hasMask=false;undo=[];candidates=[];$('candidate').hidden=$('candidate-label').hidden=true;resetResult();$('canvas').hidden=true;$('empty').hidden=false;
+  if(original)original.close();original=null;originalBlob=null;preview('original',null);hasMask=false;undo=[];candidates=[];$('candidate').hidden=$('candidate-label').hidden=true;resetResult();$('canvas').hidden=true;$('empty').hidden=false;
   const loaded=await normalized($('original').files[0]);original=loaded.img;originalBlob=loaded.blob;
   canvas.width=mask.width=original.width;canvas.height=mask.height=original.height;mctx.fillStyle='black';mctx.fillRect(0,0,mask.width,mask.height);
   $('canvas').hidden=false;$('empty').hidden=true;$('dimensions').textContent=`${original.width} × ${original.height} · purple = replace`;
-  render();status('Select with SAM, paint directly, or upload a mask.');
+  preview('original',originalBlob);render();status('Select with SAM, paint directly, or upload a mask.');
 });
-$('reference').onchange=()=>action(async()=>{referenceBlob=null;$('reference-preview').hidden=true;resetResult();const loaded=await normalized($('reference').files[0]);referenceBlob=loaded.blob;loaded.img.close();const img=$('reference-preview');if(img.dataset.url)URL.revokeObjectURL(img.dataset.url);img.dataset.url=URL.createObjectURL(referenceBlob);img.src=img.dataset.url;img.hidden=false;status('Replacement reference loaded.')});
+$('reference').onchange=()=>action(async()=>{referenceBlob=null;preview('reference',null);resetResult();const loaded=await normalized($('reference').files[0]);referenceBlob=loaded.blob;loaded.img.close();preview('reference',referenceBlob);status('Replacement reference loaded.')});
 $('kind').onchange=()=>{$('target').value=targets[$('kind').value];resetResult()};
 $('overlay').onchange=render;$('brush').oninput=()=>{$('brush-value').value=$('brush').value};
 function tool(value){erase=value;$('paint').classList.toggle('selected',!value);$('erase').classList.toggle('selected',value);$('paint').setAttribute('aria-pressed',String(!value));$('erase').setAttribute('aria-pressed',String(value))}

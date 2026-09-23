@@ -5,8 +5,10 @@
 <main>
 <aside>
 <section><h2><span>01</span> Your images</h2>
-<label for="original">Original image</label><input id="original" type="file" accept="image/png,image/jpeg,image/webp">
-<label for="reference">Replacement reference</label><input id="reference" type="file" accept="image/png,image/jpeg,image/webp"><img id="reference-preview" alt="Replacement reference" hidden>
+<div class="image-pair">
+<div><label for="original">Original image</label><div class="image-slot"><input id="original" type="file" accept="image/png,image/jpeg,image/webp" aria-label="Original image"><img id="original-preview" alt="Original image preview" hidden><span class="upload-empty"><b>＋</b>Add original</span><span class="replace-image">Change image</span></div></div>
+<div><label for="reference">Replacement reference</label><div class="image-slot"><input id="reference" type="file" accept="image/png,image/jpeg,image/webp" aria-label="Replacement reference"><img id="reference-preview" alt="Replacement reference preview" hidden><span class="upload-empty"><b>＋</b>Add reference</span><span class="replace-image">Change image</span></div></div>
+</div>
 <p class="hint">Still images only. PNG, JPEG or WebP, up to 20 MB / 16 MP each.</p></section>
 <section><h2><span>02</span> Select the region</h2>
 <label for="kind">Swap type</label><select id="kind"><option value="face">Face</option><option value="head">Head + hair</option><option value="body">Body / person</option><option value="clothing">Clothing</option><option value="custom">Custom</option></select>
@@ -23,7 +25,7 @@
 <label for="quality">Quality</label><select id="quality"><option value="low">Draft</option><option value="medium" selected>Standard</option><option value="high">High</option></select>
 <p class="hint">Generate sends both images and the mask to OpenAI using your API key. API charges apply. SAM selection runs locally on CPU and may take several minutes.</p>
 <button id="generate" class="primary" disabled>GENERATE SWAP</button></section>
-<details><summary>Setup & model information</summary><p id="setup">Checking configuration…</p><p>SAM 3.1 adds video tracking; this image-only editor uses Meta's SAM 3 image predictor. Run the optional SAM setup cell in the notebook and grant HF_TOKEN access to facebook/sam3. You can also paint or upload a mask.</p><p>Set OPENAI_API_KEY in Colab Secrets and enable notebook access. Your key stays on the server. Video replacement is not included.</p><button id="refresh">REFRESH STATUS</button></details>
+<details><summary>Setup & model information</summary><p id="setup">Checking configuration…</p><p>SAM 3.1 adds video tracking; this image-only editor uses Meta's SAM 3 image predictor. SAM dependencies install automatically on first use. Grant HF_TOKEN access to facebook/sam3 to download the model. You can also paint or upload a mask.</p><p>Set OPENAI_API_KEY in Colab Secrets and enable notebook access. Your key stays on the server. Video replacement is not included.</p><button id="refresh">REFRESH STATUS</button></details>
 </aside>
 <article>
 <div class="toolbar"><div><span class="eyebrow">MASK WORKSPACE</span><p id="dimensions">Start with an original image</p></div><label class="check"><input type="checkbox" id="overlay" checked> Show mask</label></div>

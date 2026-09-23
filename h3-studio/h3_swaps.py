@@ -74,6 +74,15 @@ def composite(original, generated, mask):
 
 def segment_image(image, prompt):
     """CPU keeps SAM independent of H3's resident GPU models and queue."""
+    dependency_dir = os.environ.get("H3_SWAPS_DEPS", "/content/h3_swaps_deps")
+    if dependency_dir not in sys.path:
+        sys.path.append(dependency_dir)
+    importlib.invalidate_caches()
+    if importlib.util.find_spec("sam3") is None:
+        import subprocess
+        subprocess.run([sys.executable, str(Path(__file__).with_name("setup_swaps.py"))],
+                       check=True, timeout=600)
+        importlib.invalidate_caches()
     try:
         import torch
         from sam3 import build_sam3_image_model
@@ -88,7 +97,12 @@ def segment_image(image, prompt):
             os.environ["HF_TOKEN"] = token
     except Exception:
         pass
-    model = build_sam3_image_model(device="cpu")
+    try:
+        model = build_sam3_image_model(device="cpu")
+    except Exception as exc:
+        if "gated" in str(exc).lower() or "403" in str(exc):
+            raise RuntimeError("SAM model access is not approved. Request access at huggingface.co/facebook/sam3 using the account for your Colab HF_TOKEN, then retry. You can paint or upload a mask meanwhile.") from exc
+        raise
     processor = Sam3Processor(model, device="cpu", confidence_threshold=0.35)
     with torch.inference_mode():
         state = processor.set_image(image)
