@@ -174,6 +174,8 @@ def segment_image(image, prompt):
                 module.cache.clear()
             if isinstance(getattr(module, "coord_cache", None), dict):
                 module.coord_cache.clear()
+                module.compilable_cord_cache = None
+                module.compilable_stored_size = None
     except Exception as exc:
         if "gated" in str(exc).lower() or "403" in str(exc):
             raise RuntimeError("SAM model access is not approved. Request access at huggingface.co/facebook/sam3 using the account for your Colab HF_TOKEN, then retry. You can paint or upload a mask meanwhile.") from exc
