@@ -17,7 +17,7 @@
 <label id="candidate-label" for="candidate" hidden>Choose a detected region</label><select id="candidate" hidden></select>
 <div class="row"><button id="paint" class="selected" aria-pressed="true">PAINT</button><button id="erase" aria-pressed="false">ERASE</button><button id="undo" disabled>UNDO</button><button id="clear" disabled>CLEAR</button></div>
 <label for="brush">Brush size <output id="brush-value">32</output> px</label><input id="brush" type="range" min="2" max="160" value="32">
-<label for="mask-upload">Or upload a mask (white = replace)</label><input id="mask-upload" type="file" accept="image/png,image/jpeg,image/webp" disabled>
+<label for="mask-upload">Or upload a mask (white = replace)</label><div class="image-slot mask-slot"><input id="mask-upload" type="file" accept="image/png,image/jpeg,image/webp" aria-label="Upload a mask" disabled><img id="mask-preview" alt="Uploaded mask preview" hidden><span class="upload-empty">＋ Add mask</span><span class="replace-image">Change mask</span></div>
 <div class="two"><div><label for="grow">Expand, px</label><input id="grow" type="number" min="0" max="32" value="0"></div><div><label for="feather">Feather inward, px</label><input id="feather" type="number" min="0" max="32" value="3"></div></div>
 <p class="hint">Paint on the image to correct the mask. Expansion is applied on generation; set it to 0 to keep changes inside the painted area.</p></section>
 <section><h2><span>03</span> Make the swap</h2>

@@ -38,7 +38,7 @@ async function job(url,form){
 async function action(task){busy=true;drawing=false;controls();try{await task()}catch(e){status(e.message,true)}finally{busy=false;controls()}}
 $('original').onchange=()=>action(async()=>{
   // Clear first so a rejected upload cannot leave a stale mask paired with a new filename.
-  if(original)original.close();original=null;originalBlob=null;preview('original',null);hasMask=false;undo=[];candidates=[];$('candidate').hidden=$('candidate-label').hidden=true;resetResult();$('canvas').hidden=true;$('empty').hidden=false;
+  if(original)original.close();original=null;originalBlob=null;preview('original',null);preview('mask',null);hasMask=false;undo=[];candidates=[];$('candidate').hidden=$('candidate-label').hidden=true;resetResult();$('canvas').hidden=true;$('empty').hidden=false;
   const loaded=await normalized($('original').files[0]);original=loaded.img;originalBlob=loaded.blob;
   canvas.width=mask.width=original.width;canvas.height=mask.height=original.height;mctx.fillStyle='black';mctx.fillRect(0,0,mask.width,mask.height);
   $('canvas').hidden=false;$('empty').hidden=true;$('dimensions').textContent=`${original.width} × ${original.height} · purple = replace`;
@@ -58,7 +58,7 @@ canvas.onpointerup=endStroke;canvas.onpointercancel=endStroke;canvas.onlostpoint
 $('undo').onclick=()=>{if(!undo.length)return;mctx.putImageData(undo.pop(),0,0);refreshMask()};
 $('clear').onclick=()=>{remember();mctx.fillStyle='black';mctx.fillRect(0,0,mask.width,mask.height);refreshMask()};
 async function applyMask(blob){const img=await imageOf(blob);try{if(img.width!==mask.width||img.height!==mask.height)throw Error('Mask dimensions must match the original image.');remember();mctx.fillStyle='black';mctx.fillRect(0,0,mask.width,mask.height);mctx.drawImage(img,0,0);const d=mctx.getImageData(0,0,mask.width,mask.height);for(let i=0;i<d.data.length;i+=4){const v=(d.data[i]+d.data[i+1]+d.data[i+2])/3>=128?255:0;d.data[i]=d.data[i+1]=d.data[i+2]=v;d.data[i+3]=255}mctx.putImageData(d,0,0);refreshMask()}finally{img.close()}}
-$('mask-upload').onchange=()=>action(async()=>{const loaded=await normalized($('mask-upload').files[0]);loaded.img.close();await applyMask(loaded.blob);status('Mask loaded. White regions will be replaced.')});
+$('mask-upload').onchange=()=>action(async()=>{preview('mask',null);const loaded=await normalized($('mask-upload').files[0]);loaded.img.close();await applyMask(loaded.blob);preview('mask',loaded.blob);status('Mask loaded. White regions will be replaced.')});
 $('segment').onclick=()=>action(async()=>{if(!$('target').value.trim())throw Error('Describe the region SAM should select.');status('Finding regions with SAM on CPU. First use downloads the model; this can take several minutes.');const f=new FormData();f.append('original',originalBlob,'original.png');f.append('target',$('target').value.trim());const r=await job('/api/swaps/mask',f);candidates=r.candidates;$('candidate').replaceChildren(...candidates.map((c,i)=>new Option(`Region ${i+1} · ${Math.round(c.score*100)}%`,i)));$('candidate').hidden=$('candidate-label').hidden=false;await chooseCandidate();status(`Found ${candidates.length} region(s). Choose the right one, then refine with the brush.`)});
 async function chooseCandidate(){const c=candidates[Number($('candidate').value)];if(c){const raw=Uint8Array.from(atob(c.png),x=>x.charCodeAt(0));await applyMask(new Blob([raw],{type:'image/png'}))}}
 $('candidate').onchange=()=>action(chooseCandidate);
