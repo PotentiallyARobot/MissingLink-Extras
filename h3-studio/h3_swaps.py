@@ -336,24 +336,50 @@ def register_swaps(app, *, output_dir, api_key, image_request, model="gpt-image-
 
 def inject_swaps(page):
     """Add an independent editor workspace without changing H3 conditioning state."""
-    button = '<button id="tab_swaps" class="modetab" type="button">SWAPS / EDIT</button>'
     anchor = '<button id=tab_ref2va class=modetab type=button>REF2VA · REFERENCES</button>'
     if anchor not in page:
         raise RuntimeError("Cannot locate H3 workflow tabs for the Swaps editor.")
-    page = page.replace(anchor, anchor + button, 1)
     integration = r'''<style>
-    #h3-swaps-workspace{position:fixed;inset:58px 10px 10px;z-index:1100;background:#111218;border:1px solid #353642;border-radius:12px;overflow:hidden;display:none}
+    :root{--studio-header-height:64px}
+    #studio-header{height:var(--studio-header-height);box-sizing:border-box;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:10px 18px;border-bottom:1px solid var(--line);background:#0c0c0e}
+    #studio-header .brand{margin:0;flex-shrink:0}
+    #studio-header nav{display:flex;gap:4px;padding:4px;border:1px solid var(--line);border-radius:10px;background:#141418}
+    #studio-header button{width:auto;margin:0;padding:9px 16px;font-size:11px;background:transparent;color:#a0a1a9;border:1px solid transparent;border-radius:7px}
+    #studio-header button[aria-pressed=true]{background:var(--accent);color:#111;border-color:var(--accent)}
+    #studio-header button:focus-visible,.slotedit:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+    body>.wrap,body>.wrap>.main{height:calc(100dvh - var(--studio-header-height))}
+    #h3-swaps-workspace{position:fixed;inset:calc(var(--studio-header-height) + 8px) 10px 10px;z-index:1100;background:#111218;border:1px solid var(--line);border-radius:12px;overflow:hidden;display:none}
     #h3-swaps-workspace iframe{width:100%;height:100%;border:0}
     #h3-swaps-close{position:absolute;right:15px;top:12px;width:auto;padding:8px 12px;z-index:2}
-    </style><section id="h3-swaps-workspace" aria-label="Swaps and image editing"><button id="h3-swaps-close" type="button">BACK TO H3 ×</button><iframe title="Swaps / Edit" src="/swaps/panel.html"></iframe></section>
+    .imageslot .slotedit{display:none;position:absolute;bottom:6px;right:6px;width:auto;margin:0;padding:5px 7px;border:1px solid #55513e;border-radius:5px;background:#151513ee;color:var(--accent);font-size:8px;z-index:2}
+    .imageslot.has-image .slotedit{display:block}
+    @media(max-width:850px){body>.wrap{height:auto}body>.wrap>.main{height:auto}}
+    @media(max-width:600px){:root{--studio-header-height:108px}#studio-header{flex-direction:column;align-items:stretch;gap:8px;padding:10px 12px}#studio-header .brand{font-size:11px}#studio-header nav{justify-content:center}#studio-header button{flex:1;padding:7px 10px}#h3-swaps-workspace{left:4px;right:4px}}
+    </style><header id="studio-header"><nav aria-label="Studio workspace"><button id="tab_video" type="button" aria-pressed="true">VIDEO STUDIO</button><button id="tab_swaps" type="button" aria-pressed="false">SWAPS / EDIT</button></nav></header>
+    <section id="h3-swaps-workspace" aria-label="Swaps and image editing"><button id="h3-swaps-close" type="button">BACK TO VIDEO ×</button><iframe title="Swaps / Edit" src="/swaps/panel.html"></iframe></section>
     <script>
-    (()=>{const panel=document.getElementById('h3-swaps-workspace'),button=document.getElementById('tab_swaps');
-      const close=()=>{panel.style.display='none';button.classList.remove('active');button.setAttribute('aria-selected','false')};
-      button.onclick=()=>{panel.style.display='block';button.classList.add('active');button.setAttribute('aria-selected','true')};
+    (()=>{const panel=document.getElementById('h3-swaps-workspace'),button=document.getElementById('tab_swaps'),video=document.getElementById('tab_video'),header=document.getElementById('studio-header'),wrap=document.querySelector('body>.wrap'),frame=panel.querySelector('iframe');
+      const brand=document.querySelector('.brand');if(brand)header.prepend(brand);document.body.prepend(header);
+      let ready=false,pending=null,returnFocus=button;
+      const close=()=>{panel.style.display='none';wrap.inert=false;button.setAttribute('aria-pressed','false');video.setAttribute('aria-pressed','true');returnFocus.focus()};
+      const open=()=>{returnFocus=document.activeElement;panel.style.display='block';wrap.inert=true;button.setAttribute('aria-pressed','true');video.setAttribute('aria-pressed','false');document.getElementById('h3-swaps-close').focus()};
+      const deliver=()=>{if(ready&&pending){frame.contentWindow.postMessage({type:'h3-swap-original',blob:pending},location.origin);pending=null}};
+      button.onclick=open;video.onclick=close;
       document.getElementById('h3-swaps-close').onclick=close;
-      document.addEventListener('keydown',e=>{if(e.key==='Escape')close()});
+      document.addEventListener('keydown',e=>{if(e.key==='Escape'&&panel.style.display==='block')close()});
+      for(const slot of document.querySelectorAll('.imageslot')){
+        const img=slot.querySelector('img');if(!img)continue;
+        const edit=document.createElement('button');edit.type='button';edit.className='slotedit';edit.textContent='EDIT / SWAP';edit.setAttribute('aria-label','Edit / Swap '+img.alt.toLowerCase());
+        edit.addEventListener('keydown',e=>e.stopPropagation());
+        edit.onclick=async e=>{e.preventDefault();e.stopPropagation();if(!slot.classList.contains('has-image'))return;edit.disabled=true;
+          try{const response=await fetch(img.src);if(!response.ok)throw Error('Could not load the selected image');pending=await response.blob();open();deliver()}
+          catch(err){say(String(err))}finally{edit.disabled=false}};
+        slot.append(edit);
+      }
       window.addEventListener('message',async e=>{
-        if(e.origin!==location.origin||e.source!==panel.querySelector('iframe').contentWindow)return;
+        if(e.origin!==location.origin||e.source!==frame.contentWindow)return;
+        if(e.data?.type==='h3-swap-ready'){ready=true;deliver()}
+        if(e.data?.type==='h3-swap-close')close();
         if(e.data?.type==='h3-swap-frame'&&/^swap_[a-f0-9]{32}\.png$/.test(e.data.file)&&['first','last'].includes(e.data.kind)){
           try{await assignOutFileToFrame(e.data.file,e.data.kind);close();say('Edited image assigned to '+e.data.kind+' frame')}
           catch(err){panel.querySelector('iframe').contentWindow.postMessage({type:'h3-swap-error',error:String(err)},location.origin)}

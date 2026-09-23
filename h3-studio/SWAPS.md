@@ -1,7 +1,8 @@
 # Swaps / Edit
 
-The H3 Studio adds a Swaps / Edit workspace next to the existing Keyframes and
-References buttons. Version 1 edits still images, then hands the result to H3 as
+The Studio header switches between Video Studio and Swaps / Edit. Keyframes and
+References remain inside Video Studio. Loaded image previews offer an **Edit / Swap**
+shortcut that opens the editor with that image. Version 1 edits still images, then hands the result to H3 as
 a first or last frame. It does not edit existing video footage.
 
 1. Launch the updated full Extras checkout with `h3_studio_3.py`.

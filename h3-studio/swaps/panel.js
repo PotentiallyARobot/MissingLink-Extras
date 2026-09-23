@@ -36,14 +36,15 @@ async function job(url,form){
   for(;;){await new Promise(r=>setTimeout(r,1500));const r=await fetch('/api/swaps/jobs/'+data.job);if(!r.ok)throw Error('Could not retrieve job status.');const result=await r.json();if(result.status==='error')throw Error(result.error);if(result.status==='done')return result}
 }
 async function action(task){busy=true;drawing=false;controls();try{await task()}catch(e){status(e.message,true)}finally{busy=false;controls()}}
-$('original').onchange=()=>action(async()=>{
+async function loadOriginal(file){
   // Clear first so a rejected upload cannot leave a stale mask paired with a new filename.
   if(original)original.close();original=null;originalBlob=null;preview('original',null);preview('mask',null);hasMask=false;undo=[];candidates=[];$('candidate').hidden=$('candidate-label').hidden=true;resetResult();$('canvas').hidden=true;$('empty').hidden=false;
-  const loaded=await normalized($('original').files[0]);original=loaded.img;originalBlob=loaded.blob;
+  const loaded=await normalized(file);original=loaded.img;originalBlob=loaded.blob;
   canvas.width=mask.width=original.width;canvas.height=mask.height=original.height;mctx.fillStyle='black';mctx.fillRect(0,0,mask.width,mask.height);
   $('canvas').hidden=false;$('empty').hidden=true;$('dimensions').textContent=`${original.width} × ${original.height} · purple = replace`;
   preview('original',originalBlob);render();status('Select with SAM, paint directly, or upload a mask.');
-});
+}
+$('original').onchange=()=>action(()=>loadOriginal($('original').files[0]));
 $('reference').onchange=()=>action(async()=>{referenceBlob=null;preview('reference',null);resetResult();const loaded=await normalized($('reference').files[0]);referenceBlob=loaded.blob;loaded.img.close();preview('reference',referenceBlob);status('Replacement reference loaded.')});
 $('kind').onchange=()=>{$('target').value=targets[$('kind').value];resetResult()};
 $('overlay').onchange=render;$('brush').oninput=()=>{$('brush-value').value=$('brush').value};
@@ -65,5 +66,14 @@ $('candidate').onchange=()=>action(chooseCandidate);
 $('generate').onclick=()=>action(async()=>{resetResult();status('Generating the replacement. This may take a few minutes…');const f=new FormData();f.append('original',originalBlob,'original.png');f.append('reference',referenceBlob,'reference.png');f.append('mask',await blobOf(mask),'mask.png');for(const id of ['kind','instruction','grow','feather','quality'])f.append(id,$(id).value);const r=await job('/api/swaps/edit',f);outputFile=r.file;outputUrl='/out/'+encodeURIComponent(r.file);$('result-image').src=outputUrl;$('download').href=outputUrl;$('download').download=r.file;$('result').hidden=false;status('Swap ready. Compare the original, then download or send it into H3.');$('result').scrollIntoView({behavior:'smooth',block:'start'})});
 let beforeUrl='';$('before').onchange=()=>{if(beforeUrl)URL.revokeObjectURL(beforeUrl);beforeUrl='';if($('before').checked){beforeUrl=URL.createObjectURL(originalBlob);$('result-image').src=beforeUrl}else $('result-image').src=outputUrl};
 for(const kind of ['first','last'])$(kind).onclick=()=>{if(outputFile)parent.postMessage({type:'h3-swap-frame',file:outputFile,kind},location.origin)};
-window.addEventListener('message',e=>{if(e.origin===location.origin&&e.source===parent&&e.data?.type==='h3-swap-error')status(e.data.error,true)});
+window.addEventListener('message',e=>{
+  if(e.origin!==location.origin||e.source!==parent)return;
+  if(e.data?.type==='h3-swap-error')status(e.data.error,true);
+  if(e.data?.type==='h3-swap-original'&&e.data.blob instanceof Blob){
+    if(busy){status('Wait for the current operation to finish, then use Edit / Swap again.',true);return}
+    action(()=>loadOriginal(e.data.blob));
+  }
+});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')parent.postMessage({type:'h3-swap-close'},location.origin)});
+parent.postMessage({type:'h3-swap-ready'},location.origin);
 $('refresh').onclick=configuration;configuration();controls();
