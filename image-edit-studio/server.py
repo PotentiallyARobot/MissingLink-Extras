@@ -7,6 +7,7 @@ import io, os, sys, json, math, uuid, time, base64, subprocess
 import threading, asyncio, queue
 from pathlib import Path
 from PIL import Image, ImageFilter
+from image_inputs import decode_image, validate_inputs, output_size, resize_image
 import torch
 import uvicorn
 from fastapi import FastAPI, Request
@@ -66,6 +67,25 @@ gpu_sem = threading.Semaphore(1)
 wait_list_lock = threading.Lock()
 wait_list = []
 _gen_progress = {}  # job_id -> latest progress event (polling fallback)
+_job_cancel = {}
+
+class GenerationCancelled(Exception):
+    pass
+
+def check_cancel(job_id):
+    event = _job_cancel.get(job_id)
+    if event is not None and event.is_set():
+        raise GenerationCancelled("Generation cancelled.")
+
+class JobEvents(queue.Queue):
+    def __init__(self, job_id):
+        super().__init__()
+        self.job_id = job_id
+
+    def put(self, event, *args, **kwargs):
+        if event is not None:
+            _gen_progress[self.job_id] = event
+        return super().put(event, *args, **kwargs)
 
 # ---- LoRA state ----
 lora_lock = threading.Lock()
@@ -84,8 +104,7 @@ def img_to_b64(img):
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 def b64_to_img(data):
-    if data.startswith("data:"): _, data = data.split(",", 1)
-    return Image.open(io.BytesIO(base64.b64decode(data))).convert("RGB")
+    return decode_image(data)
 
 # ---- Generation ----
 def run_generation_blocking(job_id, body, images, event_q):
@@ -93,18 +112,19 @@ def run_generation_blocking(job_id, body, images, event_q):
     try:
         pos = get_queue_position(job_id)
         if pos > 0: event_q.put({"type": "queue", "position": pos, "queue_length": get_queue_length()})
+        check_cancel(job_id)
         while not gpu_sem.acquire(timeout=1.0):
+            check_cancel(job_id)
             pos = get_queue_position(job_id)
             if pos > 0: event_q.put({"type": "queue", "position": pos, "queue_length": get_queue_length()})
         try:
+            check_cancel(job_id)
             if not pipeline or not status["ready"]:
                 event_q.put({"type": "error", "error": "Model still loading."}); return
 
             # Normalize all images to same size to avoid token/feature mismatch
-            w = body.get("width") or 512
-            h = body.get("height") or 512
-            w, h = int(w), int(h)
-            images = [img.resize((w, h), Image.LANCZOS) for img in images]
+            w, h = output_size(images[0], body)
+            images = [resize_image(img, (w, h), body.get("resize_mode", "auto")) for img in images]
 
             # Default to Lightning 4-step settings
             default_steps = MODEL_CONFIG.get("num_inference_steps", 4)
@@ -129,6 +149,7 @@ def run_generation_blocking(job_id, body, images, event_q):
             gen_start = time.time()
 
             def step_cb(po, si, ts, ck):
+                check_cancel(job_id)
                 el = time.time() - gen_start
                 ps = round(el / (si + 1), 2)
                 rem = round(ps * (total_steps - si - 1), 1)
@@ -141,6 +162,7 @@ def run_generation_blocking(job_id, body, images, event_q):
 
             print(f"🎨 Generating: steps={steps}, cfg={cfg}, batch={pk.get('num_images_per_prompt',1)}")
             result = pipeline(**pk)
+            check_cancel(job_id)
             out_images = result.images
 
             mask_b64 = body.get("mask")
@@ -151,7 +173,7 @@ def run_generation_blocking(job_id, body, images, event_q):
                 orig = images[0]; comp = []
                 for oi in out_images:
                     or2 = orig.resize(oi.size, Image.LANCZOS) if orig.size != oi.size else orig
-                    comp.append(Image.composite(oi, or2, mi.resize(oi.size, Image.LANCZOS)))
+                    comp.append(Image.composite(oi, or2, resize_image(mi, oi.size, body.get("resize_mode", "auto"))))
                 out_images = comp
 
             ob = [img_to_b64(i) for i in out_images]
@@ -163,7 +185,8 @@ def run_generation_blocking(job_id, body, images, event_q):
             event_q.put({"type": "done", "progress": 100, "results": ob, "history_entry": entry, "elapsed": et})
 
         except Exception as e:
-            import traceback; traceback.print_exc()
+            if not isinstance(e, GenerationCancelled):
+                import traceback; traceback.print_exc()
             # ── VRAM cleanup: if generation crashes mid-forward,
             #    modules may be stuck on GPU causing OOM on next try ──
             import gc
@@ -177,15 +200,18 @@ def run_generation_blocking(job_id, body, images, event_q):
                 torch.cuda.empty_cache()
                 gc.collect()
                 torch.cuda.empty_cache()
-                print("🧹 GPU memory cleaned up after error")
+                print("🧹 GPU memory cleaned up after interrupted generation")
             except Exception as ce:
                 print(f"⚠ Cleanup warning: {ce}")
-            event_q.put({"type": "error", "error": str(e)})
+            event_q.put({"type": "cancelled" if isinstance(e, GenerationCancelled) else "error", "error": str(e)})
         finally:
             gpu_sem.release()
+    except GenerationCancelled:
+        event_q.put({"type": "cancelled", "error": "Queued generation cancelled."})
     finally:
         with wait_list_lock:
             if job_id in wait_list: wait_list.remove(job_id)
+        _job_cancel.pop(job_id, None)
         event_q.put(None)
 
 # ---- Compatibility patches for Nunchaku + diffusers ----
@@ -440,7 +466,7 @@ def _lora_unload_thread():
 STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], expose_headers=["X-Job-ID"])
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 @app.get("/", response_class=HTMLResponse)
@@ -453,18 +479,30 @@ async def health():
 
 @app.post("/api/generate")
 async def api_generate(request: Request):
-    body = await request.json()
-    imgs_d = body.get("images", {})
-    images = [b64_to_img(imgs_d[k]) for k in sorted(imgs_d.keys(), key=lambda k: int(k))]
+    try:
+        body = await request.json()
+        images = validate_inputs(body)
+    except (ValueError, TypeError) as exc:
+        message = str(exc)
+        async def invalid():
+            yield f"data: {json.dumps({'type':'error','error':message})}\n\n"
+        return StreamingResponse(invalid(), media_type="text/event-stream", status_code=400)
     if not images:
         async def e(): yield f"data: {json.dumps({'type':'error','error':'Upload at least one image.'})}\n\n"
         return StreamingResponse(e(), media_type="text/event-stream")
     if not pipeline or not status["ready"]:
         async def e(): yield f"data: {json.dumps({'type':'error','error':'Model still loading.'})}\n\n"
         return StreamingResponse(e(), media_type="text/event-stream")
-    jid = str(uuid.uuid4()); eq = queue.Queue()
+    jid = str(uuid.uuid4()); eq = JobEvents(jid)
+    _job_cancel[jid] = threading.Event()
 
     # Store progress in a dict so polling can access it too
+    # Completed results include images; retain only the latest 50 jobs.
+    for old_id, progress in list(_gen_progress.items()):
+        if len(_gen_progress) < 50:
+            break
+        if progress.get("type") in ("done", "error", "cancelled"):
+            _gen_progress.pop(old_id, None)
     _gen_progress[jid] = {"type": "progress", "step": 0, "total": 0, "progress": 0}
 
     threading.Thread(target=run_generation_blocking, args=(jid, body, images, eq), daemon=True).start()
@@ -488,16 +526,20 @@ async def api_generate(request: Request):
                     lt = time.time()
                 await asyncio.sleep(0.15); continue
             if ev is None:
-                # Store final state for polling fallback
-                _gen_progress[jid] = {"type": "done"}
                 break
-            # Update polling state
-            _gen_progress[jid] = ev
             lt = time.time()
             yield _SSE_PAD + f"data: {json.dumps(ev)}\n\n"
     return StreamingResponse(stream(), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
-                 "X-Accel-Buffering": "no", "Content-Type": "text/event-stream"})
+                 "X-Accel-Buffering": "no", "Content-Type": "text/event-stream", "X-Job-ID": jid})
+
+@app.post("/api/cancel/{job_id}")
+async def api_cancel(job_id: str):
+    event = _job_cancel.get(job_id)
+    if event is None:
+        return {"ok": False, "state": _gen_progress.get(job_id, {}).get("type", "unknown")}
+    event.set()
+    return {"ok": True, "state": "cancelling"}
 
 @app.get("/api/queue")
 async def api_queue():

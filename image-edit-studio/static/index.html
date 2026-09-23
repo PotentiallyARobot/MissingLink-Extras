@@ -57,8 +57,9 @@
     <input type="hidden" id="gs" value="1"/>
     <div class="fg"><label>Steps</label><input type="range" id="steps" min="1" max="80" step="1" value="4" oninput="rv('stV',this.value)"/><span class="rv" id="stV">4</span></div>
     <div class="fg"><label>Batch</label><input type="range" id="batch" min="1" max="4" step="1" value="1" oninput="rv('baV',this.value)"/><span class="rv" id="baV">1</span></div>
-    <div class="fg"><label>Width</label><input type="number" id="w" value="512" min="256" step="64" style="width:70px"/></div>
-    <div class="fg"><label>Height</label><input type="number" id="h" value="512" min="256" step="64" style="width:70px"/></div>
+    <div class="fg"><label for="resizeMode">Image sizing</label><select id="resizeMode" title="Auto preserves the first image's proportions at about 512×512 total pixels. Other modes use Width and Height."><option value="auto">Auto · preserve proportions</option><option value="fit">Fit · pad to size</option><option value="crop">Crop to size</option><option value="stretch">Stretch to size</option></select></div>
+    <div class="fg"><label>Width (manual modes)</label><input type="number" id="w" value="512" min="64" max="2048" step="64" style="width:70px"/></div>
+    <div class="fg"><label>Height (manual modes)</label><input type="number" id="h" value="512" min="64" max="2048" step="64" style="width:70px"/></div>
     <div class="fg"><label>Seed</label><input type="number" id="seed" value="-1" style="width:100px"/><span style="font-size:.65rem;color:var(--dim)">-1=random</span></div>
     <input type="hidden" id="msl" value="0"/>
   </div></div>

@@ -303,6 +303,7 @@ function hideProgress() {
 
 // ========== GENERATE ==========
 let genAC = null;
+let activeGenJobId = null, stopRequested = false;
 async function gen() {
     if (generating) return;
     const filled = S.filter(s => s.du); if (!filled.length) { toast('Upload at least one image', 1); return }
@@ -313,14 +314,32 @@ async function gen() {
         true_cfg_scale: parseFloat($('cfg').value),
         num_inference_steps: parseInt($('steps').value), num_images_per_prompt: parseInt($('batch').value),
         width: parseInt($('w').value) || 512, height: parseInt($('h').value) || 512,
+        resize_mode: $('resizeMode').value,
         seed: parseInt($('seed').value),
         mask: maskDU || null, mask_blur: parseInt($('maskBlur').value) || 0
     };
+    activeGenJobId = null; stopRequested = false;
     genAC = new AbortController(); setG(1);
     let _genJobId = null;
     let _pollTimer = null;
+    let terminalHandled = false;
+    const finish = d => {
+        if (terminalHandled) return;
+        terminalHandled = true;
+        if (d.type === 'done') {
+            $('gpf').style.opacity = '1';
+            showR(d.results); rH();
+            toast('Done!' + (d.elapsed ? ' in ' + d.elapsed + 's' : ''));
+        } else if (d.type === 'cancelled') toast('Generation cancelled');
+        else toast(d.error || 'Generation failed', 1);
+    };
     try {
         const resp = await fetch(API + '/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params), signal: genAC.signal });
+        if (!resp.body || (!resp.ok && !resp.headers.get('Content-Type')?.includes('text/event-stream'))) {
+            throw new Error('Generation request failed (' + resp.status + '). Check the server logs.');
+        }
+        activeGenJobId = resp.headers.get('X-Job-ID');
+        if (activeGenJobId && stopRequested) await stopGen();
 
         // Try to extract job_id from a custom header (set by server)
         // Also start a polling fallback that updates UI even if SSE is buffered by Colab proxy
@@ -329,6 +348,12 @@ async function gen() {
             try {
                 const pr = await fetch(API + '/api/gen_progress/' + jid, { signal: AbortSignal.timeout(3000) });
                 const pd = await pr.json();
+                if (activeGenJobId !== jid || terminalHandled) return;
+                if (['done', 'error', 'cancelled'].includes(pd.type)) {
+                    finish(pd);
+                    genAC?.abort(); // Worker has already finished; unblock a buffered SSE read.
+                    return;
+                }
                 if (pd.type === 'progress') {
                     $('pill').textContent = 'RUNNING'; $('pill').className = 'pill run';
                     if (pd.indeterminate || pd.progress < 0) {
@@ -349,6 +374,10 @@ async function gen() {
             } catch(e) {}
         };
 
+        if (activeGenJobId) {
+            _genJobId = activeGenJobId;
+            _pollTimer = setInterval(() => _pollProgress(_genJobId), 1500);
+        }
         const reader = resp.body.getReader(); const dec = new TextDecoder(); let buf = '';
         while (true) {
             const { done, value } = await reader.read(); if (done) break;
@@ -357,10 +386,18 @@ async function gen() {
                 if (!line.startsWith('data: ')) continue;
                 try {
                     const d = JSON.parse(line.slice(6));
-                    if (d.type === 'error') throw new Error(d.error);
+                    if (['done', 'error', 'cancelled'].includes(d.type)) {
+                        finish(d);
+                        await reader.cancel();
+                        return;
+                    }
                     else if (d.type === 'init' && d.job_id) {
                         // Got job_id — start polling fallback for Colab proxy buffering
                         _genJobId = d.job_id;
+                        if (!activeGenJobId) {
+                            activeGenJobId = d.job_id;
+                            if (stopRequested) await stopGen();
+                        }
                         if (!_pollTimer) {
                             _pollTimer = setInterval(() => _pollProgress(_genJobId), 1500);
                         }
@@ -372,11 +409,6 @@ async function gen() {
                         $('gpf').style.width = '0%';
                         $('gsl').textContent = `⏳ Queue: ${d.position}/${d.queue_length}`;
                         $('pill').textContent = 'QUEUED'; $('pill').className = 'pill loading';
-                    } else if (d.type === 'done') {
-                        hideProgress();
-                        $('gpf').style.opacity = '1';
-                        showR(d.results); rH();
-                        toast('Done!' + (d.elapsed ? ' in ' + d.elapsed + 's' : ''));
                     } else if (d.type === 'progress') {
                         $('pill').textContent = 'RUNNING'; $('pill').className = 'pill run';
                         if (d.indeterminate || d.progress < 0) {
@@ -396,15 +428,34 @@ async function gen() {
                 } catch (pe) { if (pe.message && !pe.message.includes('JSON')) throw pe }
             }
         }
-    } catch (e) { if (e.name === 'AbortError') toast('Stopped'); else toast(e.message, 1) }
-    finally { if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; } genAC = null; setG(0); hideProgress() }
+        if (!terminalHandled) throw new Error('Connection ended before a result arrived. Check History before retrying.');
+    } catch (e) { if (!terminalHandled) toast(e.message, 1) }
+    finally { if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; } genAC = null; activeGenJobId = null; stopRequested = false; setG(0); hideProgress() }
 }
-function stopGen() { if (genAC) { genAC.abort(); genAC = null } }
+async function stopGen() {
+    if (!generating) return;
+    stopRequested = true;
+    $('stopBtn').textContent = 'Stopping…';
+    if (!activeGenJobId) return; // Submission is still in flight; cancel once its ID arrives.
+    try {
+        const response = await fetch(API + '/api/cancel/' + activeGenJobId, { method: 'POST', signal: AbortSignal.timeout(10000) });
+        if (!response.ok) throw new Error('Could not stop the job. Try Stop again.');
+        const result = await response.json();
+        if (!result.ok && !['done', 'error', 'cancelled'].includes(result.state)) {
+            throw new Error('Job was not found. Check the server logs.');
+        }
+        $('genDetail').textContent = 'Stopping at the next sampling step…';
+    } catch (e) {
+        $('stopBtn').textContent = '■ Stop';
+        toast(e.message, 1);
+    }
+}
 function setG(on) {
     generating = !!on;
     $('genBtn').disabled = on;
     $('genBtn').textContent = on ? 'GENERATING...' : '⚡ Generate';
     $('stopBtn').style.display = on ? 'inline-block' : 'none';
+    $('stopBtn').textContent = '■ Stop';
     if (on) {
         $('pill').className = 'pill run'; $('pill').textContent = 'RUNNING';
         $('gpf').style.width = '0%'; $('gsl').textContent = 'Starting...';
