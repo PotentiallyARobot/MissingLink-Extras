@@ -171,11 +171,13 @@ def segment_image(image, prompt):
             raise RuntimeError("SAM model access is not approved. Request access at huggingface.co/facebook/sam3 using the account for your Colab HF_TOKEN, then retry. You can paint or upload a mask meanwhile.") from exc
         raise
     processor = Sam3Processor(model, device="cpu", confidence_threshold=0.35)
-    with torch.inference_mode():
+    # SAM's backbone emits bfloat16 features; CPU projections need matching
+    # autocast too. Keep it scoped to this job, never H3's generation thread.
+    with torch.inference_mode(), torch.autocast("cpu", dtype=torch.bfloat16):
         state = processor.set_image(image)
         result = processor.set_text_prompt(state=state, prompt=prompt)
         masks = result["masks"].detach().cpu().numpy()
-        scores = result["scores"].detach().cpu().numpy().reshape(-1)
+        scores = result["scores"].detach().float().cpu().numpy().reshape(-1)
     order = scores.argsort()[::-1][:12]
     return [(Image.fromarray((masks[i].reshape(image.height, image.width) > 0).astype("uint8") * 255),
              float(scores[i])) for i in order]

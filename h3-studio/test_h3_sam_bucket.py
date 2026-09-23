@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from h3_swaps import sam_checkpoint
+from h3_swaps import sam_checkpoint, public_sam_checkpoint
 
 
 class BucketTests(unittest.TestCase):
@@ -57,6 +57,25 @@ class BucketTests(unittest.TestCase):
         self.manifest["revision"] = "../escape"
         with self.assertRaisesRegex(ValueError, "Invalid SAM bucket revision"):
             sam_checkpoint()
+
+    def test_public_fallback_uses_pinned_anonymous_download_and_atomic_conversion(self):
+        safe = types.SimpleNamespace(load_file=Mock(return_value={"detector.weight": "tensor"}))
+        torch = types.SimpleNamespace(save=Mock(side_effect=lambda weights, path: Path(path).write_bytes(b"converted")))
+        with patch.dict(sys.modules, {"safetensors.torch": safe, "torch": torch}):
+            result = Path(public_sam_checkpoint(Path(self.temp.name)))
+            self.assertEqual(result.read_bytes(), b"converted")
+            public_sam_checkpoint(Path(self.temp.name))
+        torch.save.assert_called_once()
+        for call in self.hub.hf_hub_download.call_args_list:
+            self.assertEqual(call.args[0], "AEmotionStudio/sam3")
+            self.assertIs(call.kwargs["token"], False)
+            self.assertEqual(len(call.kwargs["revision"]), 40)
+
+    def test_public_fallback_rejects_incompatible_weights(self):
+        safe = types.SimpleNamespace(load_file=Mock(return_value={"detector_model.weight": "wrong format"}))
+        with patch.dict(sys.modules, {"safetensors.torch": safe, "torch": Mock()}):
+            with self.assertRaisesRegex(ValueError, "checkpoint keys"):
+                public_sam_checkpoint(Path(self.temp.name))
 
 
 if __name__ == "__main__":
