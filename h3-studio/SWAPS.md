@@ -6,8 +6,7 @@ a first or last frame. It does not edit existing video footage.
 
 1. Launch the updated full Extras checkout with `h3_studio_3.py`.
 2. Add `OPENAI_API_KEY` in Colab Secrets (enable notebook access), or the environment.
-3. Optional automatic masks: accept access to `facebook/sam3` on Hugging Face,
-   set `HF_TOKEN`, run the notebook's optional SAM setup cell, then launch/restart
+3. Automatic masks: run the notebook's SAM setup cell, then launch/restart
    Studio. `python setup_swaps.py` installs the extra packages separately without
    replacing torch, torchvision, or numpy. Manual masks need no SAM installation.
 4. Open **Swaps / Edit**, upload the original and a replacement reference, choose
@@ -23,7 +22,7 @@ a first or last frame. It does not edit existing video footage.
   mask are sent to OpenAI; API billing is separate from H3 access.
 - SAM 3.1 is a video tracking release. Still-image masks use the official SAM 3
   image predictor. It runs on CPU to avoid colliding with H3's GPU residency or
-  queue. First use downloads gated weights and can be slow. This implementation
+  queue. First use downloads public bucket weights and can be slow. This implementation
   has not been benchmarked for SAM inference latency on Colab.
 - Face/head/clothing options provide selection prompts and editing instructions;
   they are not specialized identity encoders or a guarantee of exact likeness.
@@ -56,9 +55,13 @@ the official `facebook/sam3` download and requires approved model access.
 Bucket downloads include the original SAM license and verify SHA256 checksums
 before loading a checkpoint. An HF token is not sent for public bucket reads.
 
-Once the publishing account has approved Meta model access and bucket write
-access, run `python h3-studio/publish_sam_bucket.py` with its normal HF token.
-This downloads the official checkpoint, config and license at one exact
-revision, uploads the complete package under `models/sam3/<revision>/`, and
+With bucket write access, run `python h3-studio/publish_sam_bucket.py` with the
+normal HF token. Add `--model sam3.1` to publish the video tracking checkpoint.
+Public downloads come from `AEmotionStudio/sam3` and `AEmotionStudio/sam3.1`;
+no source-access approval or read token is needed. The image safetensors are
+converted without changing tensor names or values to the official builder's
+torch checkpoint format. The original safetensors, config and license are
+included alongside hashes and exact mirror provenance. The script checks source
+LFS hashes, uploads the package under `models/<model>/<revision>/`, and
 publishes the manifest pointer last. It does not change bucket visibility.
 Redistribution remains under Meta's SAM License, included with the files.

@@ -13,5 +13,5 @@ subprocess.check_call([
     "einops", "pycocotools", "decord", "wcwidth",
 ])
 print("SAM image dependencies installed. Restart the Studio to activate them.")
-print("Accept access to https://huggingface.co/facebook/sam3 and set HF_TOKEN in Colab Secrets.")
+print("SAM weights download automatically from the public MissingLink bucket on first use.")
 print("Set OPENAI_API_KEY for replacement generation. Manual masks work without SAM.")
