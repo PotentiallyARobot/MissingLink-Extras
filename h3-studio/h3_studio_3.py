@@ -605,6 +605,13 @@ def _ml_telemetry_async(event, *, action="", target="", meta=None, active_ms=0):
            "meta": dict(meta or {}), "active_ms": active_ms}
     _ml_threading.Thread(target=lambda: _ml_post_activity([row]), daemon=True, name="h3-telemetry").start()
 
+def _ml_observe(event, **kwargs):
+    """New diagnostic hooks must never interrupt setup, generation or HTTP replies."""
+    try:
+        _ml_telemetry_async(event, **kwargs)
+    except Exception:
+        pass
+
 def _ml_reserve_generation(p=None, *, origin="generate"):
     """Persist one H3 generation dispatch against this verified identity."""
     ok, error = _validate_missinglink_token(force=True)
@@ -3777,6 +3784,10 @@ if _CU130_CHILD:
             j["total"] = 0
         if old != stage:
             log(f"  ↳ job {jid} stage → {stage}")
+            _ml_observe(
+                "notebook_h3_generation_stage", action=str(stage), target="generation",
+                meta={"job_id": jid, "stage": str(stage)},
+            )
 
     def _job_cancel_requested(jid=None):
         if jid is None:
@@ -6258,6 +6269,16 @@ if _CU130_CHILD:
             ).start()
         return ("", 204)
 
+    @app.after_request
+    def _ml_report_api_failure(response):
+        # Record the failed operation, never request bodies, prompts or tokens.
+        if request.path.startswith("/api/") and request.path != "/api/ml/activity" and response.status_code >= 400:
+            _ml_observe(
+                "notebook_h3_api_failed", action="http_error", target=request.path,
+                meta={"status": response.status_code, "method": request.method},
+            )
+        return response
+
     @app.before_request
     def _missinglink_ui_gate():
         # Startup already validated the key. Re-check on a short TTL so revoked keys
@@ -7069,7 +7090,7 @@ Additional user Auto Prompt instructions:
         chunks.append(f"--{boundary}--\r\n".encode())
         return boundary, b"".join(chunks)
 
-    def _openai_image_request(*, key, model, prompt, width, height, quality, reference_path=None, reference_paths=None):
+    def _openai_image_request(*, key, model, prompt, width, height, quality, reference_path=None, reference_paths=None, mask_path=None):
         size = f"{width}x{height}"
         headers = {
             "Authorization": "Bearer " + key,
@@ -7087,6 +7108,13 @@ Additional user Auto Prompt instructions:
                 buf = io.BytesIO()
                 img.save(buf, format="PNG")
                 edit_files.append(("image[]", f"reference_{idx}.png", "image/png", buf.getvalue()))
+            if mask_path:
+                with Image.open(mask_path) as edit_mask:
+                    if edit_mask.mode != "RGBA" or edit_mask.size != Image.open(refs[0]).size:
+                        raise ValueError("Edit mask must be RGBA and match the first image dimensions.")
+                    mask_buf = io.BytesIO()
+                    edit_mask.save(mask_buf, format="PNG")
+                    edit_files.append(("mask", "mask.png", "image/png", mask_buf.getvalue()))
             fields = {
                 "model": model,
                 "prompt": prompt,
@@ -11828,8 +11856,29 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     }
     </script></body></html>"""
 
+    # The optional editor lives alongside the script in the Extras checkout.
+    # Isolated Colab child scripts can live in /tmp, so retain the checkout lookup.
+    _swaps_root = next((p for p in [
+        os.path.dirname(os.path.abspath(globals().get("__file__", "h3_studio_3.py"))),
+        os.getcwd(), "/content/MissingLink-Extras/h3-studio",
+    ] if os.path.isfile(os.path.join(p, "h3_swaps.py"))), None)
+    if _swaps_root is None:
+        raise RuntimeError("Missing Swaps editor files. Update the full MissingLink-Extras checkout.")
+    import importlib.util as _swaps_importlib
+    _swaps_spec = _swaps_importlib.spec_from_file_location("h3_swaps", os.path.join(_swaps_root, "h3_swaps.py"))
+    _swaps_module = _swaps_importlib.module_from_spec(_swaps_spec)
+    _swaps_spec.loader.exec_module(_swaps_module)
+    _swaps_module.register_swaps(app, output_dir=lambda: OUT, api_key=_openai_api_key,
+                                  image_request=_openai_image_request)
+    PAGE = _swaps_module.inject_swaps(PAGE)
+
     @app.get("/")
     def index(): return Response(PAGE, mimetype="text/html")
+
+    _ml_observe(
+        "notebook_h3_setup_completed", action="ready_to_serve", target="colab_runtime",
+        meta={"gpu_profile": str(GPU_PROFILE), "gpu_name": str(gpu)},
+    )
 
     # ── 7. Serve + launch ──────────────────────────────────────────────────────
     if os.environ.get("H3_UI_BLOCKING_CHILD") == "1":

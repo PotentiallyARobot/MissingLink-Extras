@@ -851,6 +851,13 @@ def _ml_telemetry_async(event, *, action="", target="", meta=None, active_ms=0):
            "meta": dict(meta or {}), "active_ms": active_ms}
     _ml_threading.Thread(target=lambda: _ml_post_activity([row]), daemon=True, name="h3-telemetry").start()
 
+def _ml_observe(event, **kwargs):
+    """New diagnostic hooks must never interrupt setup, generation or HTTP replies."""
+    try:
+        _ml_telemetry_async(event, **kwargs)
+    except Exception:
+        pass
+
 def _ml_reserve_generation(p=None, *, origin="generate"):
     """Persist one H3 generation dispatch against this verified identity."""
     ok, error = _validate_missinglink_token(force=True)
@@ -5081,6 +5088,10 @@ if _CU130_CHILD:
             j["total"] = 0
         if old != stage:
             log(f"  ↳ job {jid} stage → {stage}")
+            _ml_observe(
+                "notebook_h3_generation_stage", action=str(stage), target="generation",
+                meta={"job_id": jid, "stage": str(stage)},
+            )
 
     def _job_cancel_requested(jid=None):
         if jid is None:
@@ -5337,8 +5348,8 @@ if _CU130_CHILD:
             )
         else:
             log(
-                f"  VRAM policy -> preload DiT and keep as many auxiliary models resident as headroom permits; "
-                f"minimum free target {STARTUP_PARTIAL_MIN_FREE_GIB:.1f} GiB"
+                "  VRAM policy -> prepare conditioning first; startup warm-up exercises sampling/decode, "
+                "then prepares the DiT with DynamicVRAM headroom"
             )
 
     def _resident_free_gib():
@@ -5420,14 +5431,14 @@ if _CU130_CHILD:
     def _preload_default_gpu_stack():
         try:
             ok, note = _preload_model_residency(DIT_FILE, reason="startup")
-            PROG["stage"] = "ready"
+            PROG["stage"] = "startup model preparation"
             if ok:
-                log(f"  ✓ active base model prepared before UI launch · {note}")
+                log(f"  ✓ model wrappers prepared; generation warm-up still pending · {note}")
             return bool(ok)
         except Exception as e:
-            PROG["stage"] = "ready"
+            PROG["stage"] = "startup model preparation"
             log(f"  ⚠ startup GPU preload warning: {e}")
-            log("    UI will still start; Comfy will retry model loading on GENERATE.")
+            log("    Startup warm-up will retry loading and must succeed before reporting warm-ready.")
             return False
 
     if LOWVRAM_T4_PROFILE:
@@ -6752,7 +6763,7 @@ if _CU130_CHILD:
                 pass
             GPU_LOCK.release()
 
-    def _generate(jid, p):
+    def _generate(jid, p, *, startup_warmup=False):
         global CUDA_CONTEXT_POISONED
         j = JOBS[jid]
         try:
@@ -7121,7 +7132,8 @@ if _CU130_CHILD:
 
             stage_first_png = stage_last_png = None
             try:
-                stage_first_png, stage_last_png = _save_stage_frame_pair(jid, images)
+                if not startup_warmup:
+                    stage_first_png, stage_last_png = _save_stage_frame_pair(jid, images)
                 if stage_last_png:
                     log(f"  ✓ staged continuation frame: {os.path.basename(stage_last_png)}")
             except Exception as _e:
@@ -7133,6 +7145,12 @@ if _CU130_CHILD:
             audio,  = call("VAEDecodeAudio", samples=samples, vae=avae)
             torch.cuda.synchronize()
             j["audio_decode_sec"] = round(time.perf_counter() - t_adec0, 3)
+
+            if startup_warmup:
+                # Exercise the real generation/decode path, but never export a file,
+                # modify the timeline/history, or submit a user generation reservation.
+                j.update(status="done", measured_total_sec=round(time.perf_counter() - _job_wall0, 3))
+                return
 
             if FULL_STACK_RESIDENCY:
                 # If the model manager moved anything during VAE decode, restore it
@@ -7368,7 +7386,7 @@ if _CU130_CHILD:
             )
             j.update(status="error", msg=head + "\n" + tb[-1200:] + extra)
         finally:
-            PROG["stage"] = "ready"
+            PROG["stage"] = "startup warm-up" if startup_warmup else "ready"
             gc.collect()
             if not CUDA_CONTEXT_POISONED:
                 try:
@@ -7512,6 +7530,16 @@ if _CU130_CHILD:
                 daemon=True, name="h3-ui-telemetry",
             ).start()
         return ("", 204)
+
+    @app.after_request
+    def _ml_report_api_failure(response):
+        # Record the failed operation, never request bodies, prompts or tokens.
+        if request.path.startswith("/api/") and request.path != "/api/ml/activity" and response.status_code >= 400:
+            _ml_observe(
+                "notebook_h3_api_failed", action="http_error", target=request.path,
+                meta={"status": response.status_code, "method": request.method},
+            )
+        return response
 
     @app.before_request
     def _missinglink_ui_gate():
@@ -8048,6 +8076,7 @@ if _CU130_CHILD:
             sparse_available=bool(SPARSE_NODE_NAME), sparse_node=SPARSE_NODE_NAME or "", sparse_default_percent=DEFAULT_SPARSE_PERCENT,
             attention_backend=ATTN_BACKEND, torch_version=torch.__version__, torch_cuda=str(torch.version.cuda),
             startup_gpu_preloaded=bool(STARTUP_GPU_PRELOADED), fast_startup=bool(FAST_STARTUP),
+            startup_warmup=dict(STARTUP_WARMUP),
             full_stack_residency=bool(FULL_STACK_RESIDENCY), full_stack_weights_gib=round(_full_stack_weights_gib,2),
             full_stack_required_gib=round(_full_stack_required_gib,2), physical_vram_gib=round(_physical_vram_gib,2),
             h3opt_commit=_h3opt_commit[:12] if _h3opt_commit else "", ref2va_available=bool(REF2VA_NODE_NAME), ref2va_node=REF2VA_NODE_NAME or "",
@@ -13076,6 +13105,84 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     @app.get("/")
     def index(): return Response(PAGE, mimetype="text/html")
 
+    # A real warm-up uses the same model, sampler, Sparse-Sage schedule and decoders
+    # as an Ultra Fast text-only job. Run synchronously before opening the server.
+    STARTUP_WARMUP = {"status": "pending", "profile": "768x768 / 175 frames / 4-step Lightning"}
+
+    def _run_startup_warmup():
+        global STARTUP_GPU_PRELOADED, QUEUE_ACTIVE_JOB
+        enabled = os.environ.get("H3_STARTUP_WARMUP", "1") == "1"
+        if not enabled or LOWVRAM_T4_PROFILE:
+            STARTUP_WARMUP.update(status="skipped", reason="disabled" if not enabled else "T4 profile")
+            PROG.update(stage="ready (cold generation path)", cur=0, total=0)
+            log("  Startup warm-up SKIPPED: the first render can still initialize kernels and load models.")
+            return
+
+        jid = "_startup_warmup"
+        p = dict(weight_dtype="default", unet=DIT_FILE, lora="none", lora_strength=0.0,
+                 action="0", lightning="1", lightning_strength=LIGHTNING_STRENGTH,
+                 taomate="0", extra_loras=[], shift_video="1.0", shift_audio="1.0",
+                 sparse_percent="5" if L40S_LAB_POLICY else "0",
+                 width="768", height="768", length_mode="frames", frames="175",
+                 playback_speed="1.0", steps="4", sampler_name="euler", scheduler="simple",
+                 denoise="1.0", seed="42", input_mode="fl2va", _l40s_no_compile="1",
+                 prompt="A small weathered robot walks through a sunlit desert town. Soft wind, quiet mechanical footsteps, no dialogue.")
+        started = time.perf_counter()
+        STARTUP_WARMUP.update(status="running")
+        PROG.update(stage="startup warm-up", cur=0, total=4)
+        log("  STARTUP WARM-UP: 768x768, 175 frames, four-step Lightning + video/audio decode.")
+        log("  This uses GPU time now; the UI opens after it succeeds. No test clip is saved.")
+        JOBS[jid] = dict(status="running", t0=time.time(), stage="startup warm-up")
+        QUEUE_ACTIVE_JOB = jid
+        try:
+            # No silent dense/compile restart: fail visibly if the intended path fails.
+            _generate(jid, p, startup_warmup=True)
+            result = JOBS[jid]
+            if result.get("status") != "done" or CUDA_CONTEXT_POISONED:
+                raise RuntimeError(result.get("msg") or "Startup generation did not complete")
+            if L40S_LAB_POLICY and _V73_ENABLED and not _V73_ROLE_VERIFIED.get("qkv"):
+                raise RuntimeError("V73 QKV compaction did not pass its exactness gate during warm-up")
+            for key in ("conditioning_sec", "sampling_sec", "video_decode_sec", "audio_decode_sec"):
+                STARTUP_WARMUP[key] = result.get(key)
+
+            # Decode needs the card on L4. Afterwards restore the selected DiT to
+            # Comfy's GPU registry; DynamicVRAM still decides what fits physically.
+            PROG["stage"] = "startup preparing DiT after decode"
+            model, clip, vae, avae, _ = get_models(
+                "default", "none", 0.0, action=False, lightning=True,
+                lightning_strength=LIGHTNING_STRENGTH, unet=DIT_FILE)
+            if FULL_STACK_RESIDENCY:
+                if not _pin_persistent_stack(model, clip, vae, avae, reason="startup warm-up complete"):
+                    raise RuntimeError("Could not restore model residency after warm-up")
+            else:
+                _selective_te_evict_keep_dit(model)
+            torch.cuda.synchronize()
+            free, total = torch.cuda.mem_get_info()
+            STARTUP_GPU_PRELOADED = True
+            STARTUP_WARMUP.update(status="done", seconds=round(time.perf_counter() - started, 3),
+                                  gpu_used_gib=round((total-free)/1024**3, 2))
+            PROG.update(stage="ready", cur=0, total=0)
+            log(f"  WARM-READY: {STARTUP_WARMUP['seconds']:.1f}s startup warm-up; "
+                f"{STARTUP_WARMUP['gpu_used_gib']:.1f} GiB GPU used; DiT prepared.")
+            log("  New prompts still require conditioning; different shapes/LoRAs can require additional warming.")
+        except Exception as exc:
+            STARTUP_GPU_PRELOADED = False
+            STARTUP_WARMUP.update(status="failed", error=str(exc),
+                                  seconds=round(time.perf_counter() - started, 3))
+            PROG["stage"] = "startup warm-up failed"
+            log(f"  STARTUP WARM-UP FAILED: {exc}")
+            raise RuntimeError("H3 startup warm-up failed; UI was not marked ready. See the traceback above.") from exc
+        finally:
+            QUEUE_ACTIVE_JOB = None
+            JOBS.pop(jid, None)
+
+    _run_startup_warmup()
+
+    _ml_observe(
+        "notebook_h3_setup_completed", action="ready_to_serve", target="colab_runtime",
+        meta={"gpu_profile": str(GPU_PROFILE), "gpu_name": str(gpu)},
+    )
+
     # ── 7. Serve + launch ──────────────────────────────────────────────────────
     L40S_READY_SECONDS = time.perf_counter() - _l40s_boot_started
     log(f"  L40S startup to UI-ready: {L40S_READY_SECONDS:.2f}s (includes setup/downloads on first launch)")
@@ -13149,7 +13256,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         if FULL_STACK_RESIDENCY:
             log("  ✓ Residency: full DiT + conditioning TE + video/audio VAEs kept warm.")
         else:
-            log("  ✓ L40S staged residency: conditioning encoder preloaded; DiT/VAEs retained in host cache.")
+            log("  ✓ Staged residency: see startup warm-up status; DynamicVRAM retains only what fits.")
     else:
         if LOWVRAM_T4_PROFILE:
             log(f"  ✓ T4/LOW-VRAM model: {T4_DIT_FILE} · Dynamic VRAM demand paging by design.")
