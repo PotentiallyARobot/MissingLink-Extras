@@ -7109,8 +7109,8 @@ Additional user Auto Prompt instructions:
                 img.save(buf, format="PNG")
                 edit_files.append(("image[]", f"reference_{idx}.png", "image/png", buf.getvalue()))
             if mask_path:
-                with Image.open(mask_path) as edit_mask:
-                    if edit_mask.mode != "RGBA" or edit_mask.size != Image.open(refs[0]).size:
+                with Image.open(mask_path) as edit_mask, Image.open(refs[0]) as edit_original:
+                    if edit_mask.mode != "RGBA" or edit_mask.size != edit_original.size:
                         raise ValueError("Edit mask must be RGBA and match the first image dimensions.")
                     mask_buf = io.BytesIO()
                     edit_mask.save(mask_buf, format="PNG")
