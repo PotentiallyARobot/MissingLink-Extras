@@ -6,6 +6,8 @@ image predictor. No video replacement is advertised by this module.
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import importlib.util
 import io
 import os
@@ -72,6 +74,48 @@ def composite(original, generated, mask):
     return Image.composite(generated.convert("RGB"), original.convert("RGB"), mask)
 
 
+def sam_checkpoint():
+    """Prefer the licensed MissingLink mirror once its manifest is published."""
+    from huggingface_hub import HfApi, hf_hub_download
+    bucket = "MissingLinkBuilder/wheels"
+    root = Path(os.environ.get("H3_SAM_CACHE", "/content/h3_sam_weights"))
+    root.mkdir(parents=True, exist_ok=True)
+    api = HfApi(token=False)
+    manifest_path = root / "manifest.json"
+    try:
+        api.download_bucket_files(bucket, files=[("models/sam3/manifest.json", str(manifest_path))])
+    except Exception as exc:
+        # A missing mirror or older Hub client must not prevent approved HF use.
+        print(f"SAM bucket unavailable ({type(exc).__name__}); using official source.")
+        return hf_hub_download("facebook/sam3", "sam3.pt")
+    manifest = json.loads(manifest_path.read_text())
+    revision = manifest.get("revision", "")
+    if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
+        raise ValueError("Invalid SAM bucket revision.")
+    prefix = f"models/sam3/{revision}"
+    if manifest.get("source") != "facebook/sam3" or manifest.get("prefix") != prefix:
+        raise ValueError("Invalid SAM bucket source.")
+    directory = root / revision
+    directory.mkdir(exist_ok=True)
+    for name in ("LICENSE", "config.json", "sam3.pt"):
+        path = directory / name
+        expected = manifest["files"][name]
+        def valid():
+            if not path.is_file() or path.stat().st_size != expected["size"]:
+                return False
+            with path.open("rb") as stream:
+                return hashlib.file_digest(stream, "sha256").hexdigest() == expected["sha256"]
+        if not valid():
+            partial = directory / (name + ".partial")
+            api.download_bucket_files(bucket, files=[(f"{prefix}/{name}", str(partial))])
+            with partial.open("rb") as stream:
+                digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            if partial.stat().st_size != expected["size"] or digest != expected["sha256"]:
+                raise ValueError(f"SAM bucket checksum mismatch: {name}")
+            partial.replace(path)
+    return str(directory / "sam3.pt")
+
+
 def segment_image(image, prompt):
     """CPU keeps SAM independent of H3's resident GPU models and queue."""
     dependency_dir = os.environ.get("H3_SWAPS_DEPS", "/content/h3_swaps_deps")
@@ -98,7 +142,8 @@ def segment_image(image, prompt):
     except Exception:
         pass
     try:
-        model = build_sam3_image_model(device="cpu")
+        checkpoint = sam_checkpoint()
+        model = build_sam3_image_model(device="cpu", checkpoint_path=checkpoint, load_from_HF=False)
     except Exception as exc:
         if "gated" in str(exc).lower() or "403" in str(exc):
             raise RuntimeError("SAM model access is not approved. Request access at huggingface.co/facebook/sam3 using the account for your Colab HF_TOKEN, then retry. You can paint or upload a mask meanwhile.") from exc

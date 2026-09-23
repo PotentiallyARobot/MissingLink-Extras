@@ -48,3 +48,17 @@ downloads. They cover mask polarity, exact preservation outside the mask,
 provider errors, concurrency, invalid inputs, assets, and tab integration.
 Real SAM inference and live paid image generation require the configured Colab
 runtime and credentials; unit tests do not establish visual swap quality.
+# MissingLink SAM bucket
+
+The loader checks the public `MissingLinkBuilder/wheels` bucket for
+`models/sam3/manifest.json`. Until that package is published, it falls back to
+the official `facebook/sam3` download and requires approved model access.
+Bucket downloads include the original SAM license and verify SHA256 checksums
+before loading a checkpoint. An HF token is not sent for public bucket reads.
+
+Once the publishing account has approved Meta model access and bucket write
+access, run `python h3-studio/publish_sam_bucket.py` with its normal HF token.
+This downloads the official checkpoint, config and license at one exact
+revision, uploads the complete package under `models/sam3/<revision>/`, and
+publishes the manifest pointer last. It does not change bucket visibility.
+Redistribution remains under Meta's SAM License, included with the files.
