@@ -7120,11 +7120,12 @@ Additional user Auto Prompt instructions:
                 "prompt": prompt,
                 "size": size,
                 "quality": quality,
-                "input_fidelity": "high",
                 "output_format": "png",
                 "background": "opaque",
                 "n": "1",
             }
+            if model in {"gpt-image-1", "gpt-image-1.5"}:
+                fields["input_fidelity"] = "high"
             boundary, body = _multipart_body(fields, edit_files)
             headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
             url = "https://api.openai.com/v1/images/edits"
