@@ -17,3 +17,4 @@ try:
 except Exception:
     traceback.print_exc()
     print("\n❌ Launch failed. Check the error above.")
+    raise  # Keep the Colab cell failed so a broken launch cannot look successful.
