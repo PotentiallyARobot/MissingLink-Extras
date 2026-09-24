@@ -366,6 +366,7 @@ _ML_AUTH_STATE = {
     "remaining": H3_FREE_RENDER_LIMIT, "access_mode": "",
 }
 _ML_TELEMETRY_VISITOR_ID = None
+_ML_AUTH_CHECK_LOCK = _ml_threading.Lock()
 
 def _read_missinglink_token():
     token = (_os.environ.get("MISSING_LINK_TOKEN") or "").strip()
@@ -454,6 +455,17 @@ def _ml_apply_notebook_state(data):
     )
 
 def _validate_missinglink_token(*, force=False):
+    # Coalesce concurrent panel polls; cache failures briefly without granting access.
+    with _ML_AUTH_CHECK_LOCK:
+        age = _ml_time.monotonic() - float(_ML_AUTH_STATE.get("checked") or 0.0)
+        if not force and _ML_AUTH_STATE.get("checked") and age < 10:
+            return bool(_ML_AUTH_STATE.get("ok")), str(_ML_AUTH_STATE.get("error") or "")
+        result = _validate_missinglink_token_uncached(force=force)
+        if not result[0]:
+            _ML_AUTH_STATE["checked"] = _ml_time.monotonic()
+        return result
+
+def _validate_missinglink_token_uncached(*, force=False):
     """Validate Notebook identity/API key without consuming a generation."""
     now = _ml_time.monotonic()
     if (not force and _ML_AUTH_STATE.get("ok") and
@@ -6273,6 +6285,12 @@ if _CU130_CHILD:
     def _ml_report_api_failure(response):
         # Record the failed operation, never request bodies, prompts or tokens.
         if request.path.startswith("/api/") and request.path != "/api/ml/activity" and response.status_code >= 400:
+            if request.method == "POST" and request.path in {"/api/generate", "/api/timeline/retry_last"}:
+                _ml_observe(
+                    "notebook_h3_generation_rejected", action="rejected_before_queue", target=request.path,
+                    meta={"status": response.status_code, "request_id": _ml_uuid.uuid4().hex,
+                          "code": (response.get_json(silent=True) or {}).get("code", "request_rejected")},
+                )
             _ml_observe(
                 "notebook_h3_api_failed", action="http_error", target=request.path,
                 meta={"status": response.status_code, "method": request.method},
@@ -6284,6 +6302,9 @@ if _CU130_CHILD:
         # Startup already validated the key. Re-check on a short TTL so revoked keys
         # and expired trials do not leave a notebook UI unlocked indefinitely.
         global ML_OK, ML_AUTH_ERROR
+        # The access endpoint performs its own forced validation for explicit recovery.
+        if request.path == "/api/ml/access":
+            return None
         ML_OK, ML_AUTH_ERROR = _validate_missinglink_token(force=False)
         if ML_OK:
             return None
@@ -9511,6 +9532,39 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     </div>
     <script>
     const $=i=>document.getElementById(i);
+    // Pause network polling after an auth rejection; never replay generation POSTs.
+    const mlNativeFetch=window.fetch.bind(window);
+    let mlAuthPaused=false;
+    function mlShowAuthRecovery(){
+      if(document.getElementById('ml_auth_recovery'))return;
+      const panel=document.createElement('div');panel.id='ml_auth_recovery';
+      panel.setAttribute('role','alert');
+      panel.style.cssText='position:fixed;top:12px;left:5%;width:90%;z-index:99999;background:#252018;color:#fff;padding:16px;box-sizing:border-box;border:1px solid #e8a917';
+      const message=document.createElement('p');
+      message.textContent='MissingLink access could not be verified. Background requests are paused. Check access to reconnect; if your code changed, update MISSING_LINK_TOKEN in Colab Secrets and rerun the notebook cell. No generation will be resubmitted automatically.';
+      const retry=document.createElement('button');retry.textContent='Check access and reconnect';
+      retry.onclick=async()=>{
+        retry.disabled=true;
+        try{
+          const response=await mlNativeFetch('/api/ml/access',{cache:'no-store',signal:AbortSignal.timeout(35000)});
+          const access=await response.json();
+          if(response.ok&&access.ok){window.location.reload();return}
+          message.textContent=access.error||'Access is still unavailable. Check your MissingLink code in Colab Secrets, then rerun the notebook cell.';
+        }catch(e){message.textContent='Could not reach the access service. Your current work has not been resubmitted. Try checking access again.'}
+        finally{retry.disabled=false}
+      };
+      panel.append(message,retry);document.body.prepend(panel);
+    }
+    window.fetch=async(input,init)=>{
+      const url=new URL(typeof input==='string'?input:input.url,window.location.href);
+      const localApi=url.origin===window.location.origin&&url.pathname.startsWith('/api/');
+      if(localApi&&mlAuthPaused)throw new Error('MissingLink access paused. Use Check access and reconnect.');
+      const response=await mlNativeFetch(input,init);
+      if(localApi&&response.status===401){
+        mlAuthPaused=true;mlShowAuthRecovery();
+      }
+      return response;
+    };
 
     const ML_UI_TELEMETRY_QUEUE=[];
     let ML_UI_TELEMETRY_TIMER=null;
@@ -9539,6 +9593,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       return m;
     }
     function mlTrack(event,{action='',target='',meta={},active_ms=0,immediate=false}={}){
+      if(mlAuthPaused)return; // Rejected submissions are recorded by the server.
       ML_UI_TELEMETRY_QUEUE.push({event:String(event||'').slice(0,64),surface:'notebook:h3',
         action:String(action||'').slice(0,100),target:String(target||'').slice(0,220),
         active_ms:Number(active_ms||0),meta:meta&&typeof meta==='object'?meta:{}});
