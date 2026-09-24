@@ -492,7 +492,7 @@ subprocess.check_call([
     "tqdm",
     "Pillow",
     "numpy",
-    "huggingface_hub[hf_xet]>=1.6.0",
+    "huggingface_hub[hf_xet]>=1.6.0,<2.0",
     "comfy-kitchen",
 ])
 
