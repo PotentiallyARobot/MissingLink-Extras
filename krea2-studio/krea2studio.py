@@ -1499,6 +1499,34 @@ def unload_models():
         pass
 
 
+
+def cleanup_generation_memory(label="post-generation"):
+    """Release transient Comfy/Krea2 edit state between queued jobs."""
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+
+    try:
+        model_management.unload_all_models()
+    except Exception as e:
+        print("[memory] cleanup unload warning:", repr(e), flush=True)
+
+    try:
+        model_management.soft_empty_cache()
+    except Exception:
+        pass
+
+    gc.collect()
+
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    gpu_stats(label)
+
+
 def gpu_stats(label):
 
     try:
@@ -2485,6 +2513,16 @@ def instruction_edit(
         model=patched_model,
     )
 
+    # Krea2EditModelPatch clones the model and its wrapper closes over the
+    # source latent / fitted pixel cache. Drop those references BEFORE VAE
+    # decode so the first edit cannot leave edit-only VRAM live into the next.
+    patched_model = None
+    source_latent = None
+    target_latent = None
+    positive = None
+    negative = None
+    cleanup_generation_memory("instruction edit pre-decode cleanup")
+
     generated = vae_decode(sampled)
     if generated.size != source.size:
         generated = generated.resize(source.size, Image.Resampling.LANCZOS)
@@ -2516,6 +2554,12 @@ def instruction_edit(
     )
 
     history_gallery, history_files = history_snapshot()
+
+    # Nothing returned from this function needs CUDA tensors.
+    sampled = None
+    generated = None
+    cleanup_generation_memory("instruction edit final cleanup")
+
     return (
         path,
         seed,
@@ -2979,6 +3023,16 @@ def inpaint(
         scheduler=scheduler,
         model=patched_model,
     )
+
+    # Krea2EditModelPatch clones the model and its wrapper closes over the
+    # source latent / fitted pixel cache. Drop those references BEFORE VAE
+    # decode so the first edit cannot leave edit-only VRAM live into the next.
+    patched_model = None
+    source_latent = None
+    target_latent = None
+    positive = None
+    negative = None
+    cleanup_generation_memory("inpaint pre-decode cleanup")
 
     generated = vae_decode(sampled)
     if generated.size != work_source.size:
@@ -6519,6 +6573,12 @@ def _job_worker():
                     job["updated"] = time.time()
 
             finally:
+                # Always recover VRAM after success, cancellation, or OOM so a
+                # failed edit cannot poison the next queued generation.
+                try:
+                    cleanup_generation_memory("job boundary cleanup")
+                except Exception as cleanup_error:
+                    print("[memory] post-job cleanup warning:", repr(cleanup_error), flush=True)
                 reset_stop()
                 CURRENT_JOB_ID = None
                 with JOB_LOCK:
