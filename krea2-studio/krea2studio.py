@@ -5888,18 +5888,34 @@ def _lora_download_worker(download_id, source, revision_hint, candidate_key):
     temp_root = None
     downloaded = 0
     try:
+        # Resolve/validate the pasted source inside the background worker so the
+        # browser POST returns immediately. The progress endpoint reports this
+        # stage instead of leaving DOWNLOAD + ADD looking frozen.
+        with LORA_DOWNLOAD_LOCK:
+            LORA_DOWNLOADS[download_id].update(
+                status="running",
+                stage="resolving source",
+            )
+
         inspected = _inspect_lora_source(source, revision_hint)
+        if not candidate_key:
+            candidate_key = inspected.get("preferred_key") or ""
+            if not candidate_key and len(inspected.get("candidates") or []) == 1:
+                candidate_key = inspected["candidates"][0]["key"]
+            if not candidate_key and inspected.get("candidates"):
+                candidate_key = inspected["candidates"][0]["key"]
+
         selected = next(
             (
                 x
-                for x in inspected["candidates"]
+                for x in inspected.get("candidates") or []
                 if x.get("key") == candidate_key
             ),
             None,
         )
         if selected is None:
             raise RuntimeError(
-                "The selected LoRA file is no longer available from that source."
+                "No downloadable SafeTensors LoRA could be selected from that source."
             )
 
         installed_name = _safe_lora_name(selected["filename"])
@@ -5908,10 +5924,21 @@ def _lora_download_worker(download_id, source, revision_hint, candidate_key):
         if expected and expected > MAX_USER_LORA_BYTES:
             raise RuntimeError("LoRA exceeds the 4 GiB Studio limit.")
 
+        free_bytes = shutil.disk_usage("/content").free
+        if expected and free_bytes < expected + 512 * 1024**2:
+            raise RuntimeError(
+                "Not enough disk space. Need about "
+                + _format_bytes(expected + 512 * 1024**2)
+                + ", have "
+                + _format_bytes(free_bytes)
+                + "."
+            )
+
         with LORA_DOWNLOAD_LOCK:
             LORA_DOWNLOADS[download_id].update(
                 status="running",
                 stage="downloading",
+                candidate_key=candidate_key,
                 filename=installed_name,
                 total_bytes=expected,
                 source_type=selected["source_type"],
@@ -6741,72 +6768,45 @@ def api_loras_install():
     source = str(body.get("source") or body.get("url") or "").strip()
     revision = str(body.get("revision") or "main").strip() or "main"
     candidate_key = str(body.get("candidate_key") or "").strip()
-    try:
-        inspected = _inspect_lora_source(source, revision)
-        if not candidate_key:
-            candidate_key = inspected.get("preferred_key") or ""
-            if not candidate_key and len(inspected["candidates"]) == 1:
-                candidate_key = inspected["candidates"][0]["key"]
+    filename_hint = Path(str(body.get("filename") or "")).name
+    if not source:
+        return _json_error("Paste a Hugging Face or CivitAI source first.", 400)
 
-        selected = next(
-            (
-                x
-                for x in inspected["candidates"]
-                if x.get("key") == candidate_key
-            ),
-            None,
-        )
-        if selected is None:
-            raise ValueError(
-                "Choose a LoRA file returned by CHECK SOURCE."
-            )
+    # IMPORTANT: do not inspect CivitAI/Hugging Face synchronously here. That made
+    # the button appear frozen while the remote API was resolving the source.
+    # Queue immediately and let the worker resolve + validate + download while the
+    # browser polls /api/loras/progress/<id>.
+    download_id = uuid.uuid4().hex[:12]
+    with LORA_DOWNLOAD_LOCK:
+        LORA_DOWNLOADS[download_id] = {
+            "id": download_id,
+            "status": "queued",
+            "stage": "resolving source",
+            "error": "",
+            "source": source,
+            "revision": revision,
+            "candidate_key": candidate_key,
+            "filename": filename_hint,
+            "downloaded_bytes": 0,
+            "total_bytes": 0,
+            "speed_bps": 0.0,
+            "started": time.time(),
+            "file": "",
+        }
 
-        size = int(selected.get("size") or 0)
-        if size and size > MAX_USER_LORA_BYTES:
-            raise ValueError("LoRA exceeds the 4 GiB Studio limit.")
+    threading.Thread(
+        target=_lora_download_worker,
+        args=(download_id, source, revision, candidate_key),
+        daemon=True,
+        name=f"krea2-lora-download-{download_id}",
+    ).start()
 
-        free_bytes = shutil.disk_usage("/content").free
-        if size and free_bytes < size + 512 * 1024**2:
-            raise RuntimeError(
-                "Not enough disk space. Need about "
-                + _format_bytes(size + 512 * 1024**2)
-                + ", have "
-                + _format_bytes(free_bytes)
-                + "."
-            )
-
-        download_id = uuid.uuid4().hex[:12]
-        with LORA_DOWNLOAD_LOCK:
-            LORA_DOWNLOADS[download_id] = {
-                "id": download_id,
-                "status": "queued",
-                "stage": "queued",
-                "error": "",
-                "source": source,
-                "revision": revision,
-                "candidate_key": candidate_key,
-                "filename": selected["filename"],
-                "downloaded_bytes": 0,
-                "total_bytes": size,
-                "speed_bps": 0.0,
-                "started": time.time(),
-                "file": "",
-            }
-
-        threading.Thread(
-            target=_lora_download_worker,
-            args=(download_id, source, revision, candidate_key),
-            daemon=True,
-            name=f"krea2-lora-download-{download_id}",
-        ).start()
-
-        return jsonify(
-            ok=True,
-            id=download_id,
-            filename=selected["filename"],
-        )
-    except Exception as exc:
-        return _json_error(exc, 400)
+    return jsonify(
+        ok=True,
+        id=download_id,
+        filename=filename_hint,
+        queued=True,
+    ), 202
 
 
 @app.get("/api/loras/progress/<download_id>")
@@ -7472,6 +7472,21 @@ a{color:inherit}
 .status.good{color:var(--good)}.status.bad{color:var(--bad)}
 .actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}
 .actions a{display:inline-flex;align-items:center;text-decoration:none;border-radius:7px;background:#25262c;color:#d3d4d8;border:1px solid #34353d;padding:8px 10px;font-weight:800;font-size:9px}
+/* H3-style generation footer: membership card directly above a full-width primary generate button. */
+#t_generate,#i_generate,#e_generate,#in_generate,#b_generate{width:100%;min-height:48px;font-size:13px;letter-spacing:.2px}
+#ml_access_card.ml-action-card{margin:10px 0 8px!important;width:100%;box-sizing:border-box}
+.progress.indeterminate{position:relative;overflow:hidden}
+.progress.indeterminate i{width:28%!important;position:absolute;left:-28%;animation:mlLoraIndeterminate 1.05s linear infinite}
+@keyframes mlLoraIndeterminate{from{left:-28%}to{left:100%}}
+/* H3-style primary generation actions span the full left sidebar width. */
+#t_generate,#i_generate,#e_generate,#in_generate,#b_generate{display:block;width:100%;padding:12px 12px;font-size:11px;letter-spacing:.4px}
+#b_stop{width:100%}
+.lora-inline-installer{margin-top:10px;padding:10px;border:1px solid #2d2e34;border-radius:8px;background:#0b0b0d;display:flex;flex-direction:column;gap:0}
+.lora-inline-installer.hidden{display:none!important}
+.lora-inline-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px}
+.lora-inline-title{font-family:var(--font-mono);font-size:9px;font-weight:800;letter-spacing:1px;color:#c8c9d0}
+.lora-install-actions{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.15fr);gap:7px}
+.lora-install-actions button{width:100%}
 .hidden{display:none!important}
 .preview{width:100%;min-height:190px;background:#080809;border:1px dashed #34353d;border-radius:8px;display:flex;align-items:center;justify-content:center;overflow:hidden}
 .preview img{max-width:100%;max-height:380px;object-fit:contain}
@@ -7997,10 +8012,33 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
           <div class="card">
             <div class="cardtitle">LoRA Manager</div>
             <div class="cardbody">
-              <div class="sectionhint">H3-style LoRA install: paste an HF repo, full Hugging Face URL, direct HF <b>.safetensors</b> file URL, or Civitai model/version URL. The Studio discovers available files, shows download progress, validates SafeTensors, then adds the installed LoRA to the active rack at strength 1.00 when space is available.</div>
+              <div class="sectionhint">H3-style LoRA install: paste an HF repo, full Hugging Face URL, direct HF <b>.safetensors</b> file URL, or Civitai model/version URL. Krea2 discovers the files, shows live download progress, validates SafeTensors, then adds the installed LoRA to the active rack at strength 1.00 when space is available.</div>
               <div class="actions">
                 <button id="l_add" type="button">+ ADD LORA</button>
                 <button id="l_refresh" class="secondary" type="button">REFRESH</button>
+              </div>
+              <div id="lora_install_inline" class="lora-inline-installer hidden">
+                <div class="lora-inline-head">
+                  <div class="lora-inline-title">ADD LORA</div>
+                  <button id="lora_install_hide" class="secondary" type="button">HIDE</button>
+                </div>
+                <label>Source</label>
+                <input id="lora_source" type="text" placeholder="HF owner/repo · full HF URL · direct HF .safetensors URL · Civitai model/version URL" autocomplete="off">
+                <div class="split">
+                  <div><label>HF revision</label><input id="lora_revision" type="text" value="main" autocomplete="off"></div>
+                  <div><label>Detected source</label><input id="lora_source_type" type="text" value="not checked" readonly></div>
+                </div>
+                <label>Detected LoRA name</label>
+                <input id="lora_detected_name" type="text" value="Paste a source URL" readonly>
+                <label>LoRA file</label>
+                <select id="lora_candidate" disabled><option value="">CHECK SOURCE first</option></select>
+                <div class="actions lora-install-actions">
+                  <button id="lora_check_source" class="secondary" type="button">CHECK SOURCE</button>
+                  <button id="lora_download_btn" type="button" disabled>DOWNLOAD + ADD</button>
+                </div>
+                <div class="progress"><i id="lora_download_progress"></i></div>
+                <div id="lora_download_text" class="status">Paste the source URL and Krea2 will inspect it automatically, detect the LoRA filename, and preselect the best SafeTensors file.</div>
+                <div class="sectionhint">This panel stays inline so you can keep watching the Stage while the download runs. CIVITAI_API_KEY is read from Colab userdata automatically; HF_TOKEN is only needed for gated/private Hugging Face files.</div>
               </div>
               <div id="l_status" class="status">Loading LoRA library…</div>
             </div>
@@ -8057,52 +8095,6 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
         <pre id="console_stage" class="stageview console-stage stagepanel">Console output will appear here.</pre>
       </div>
     </main>
-  </div>
-</div>
-
-<div id="lora_install_modal" class="auto-modal hidden" aria-hidden="true">
-  <div class="auto-modal-shell" style="height:min(470px,calc(100vh - 24px));width:min(680px,calc(100vw - 24px))" role="dialog" aria-modal="true" aria-labelledby="lora_install_title">
-    <div class="auto-modal-head">
-      <span id="lora_install_title" class="auto-modal-title">ADD LORA</span>
-      <button id="lora_install_close" type="button" class="auto-modal-close">×</button>
-    </div>
-    <div class="auto-modal-body" style="overflow-y:auto">
-      <label>Source</label>
-      <input id="lora_source" type="text" placeholder="HF owner/repo · full HF URL · direct HF .safetensors URL · Civitai model/version URL" autocomplete="off">
-      <div class="split">
-        <div><label>HF revision</label><input id="lora_revision" type="text" value="main" autocomplete="off"></div>
-        <div><label>Detected source</label><input id="lora_source_type" type="text" value="not checked" readonly></div>
-      </div>
-      <label>Detected LoRA name</label>
-      <input id="lora_detected_name" type="text" value="Paste a source URL" readonly>
-      <label>LoRA file</label>
-      <select id="lora_candidate" disabled><option value="">CHECK SOURCE first</option></select>
-      <div class="actions">
-        <button id="lora_check_source" class="secondary" type="button">CHECK SOURCE</button>
-        <button id="lora_download_btn" type="button" disabled>DOWNLOAD + ADD</button>
-      </div>
-      <div class="progress"><i id="lora_download_progress"></i></div>
-      <div id="lora_download_text" class="status">Paste the source URL and Krea2 will inspect it automatically, detect the LoRA filename, and preselect the best SafeTensors file.</div>
-      <div class="auto-modal-help">HF_TOKEN is only needed for private/gated Hugging Face files. CIVITAI_API_KEY is read automatically from Colab Secrets/userdata; there is no CivitAI token field to fill in.</div>
-    </div>
-  </div>
-</div>
-
-<div id="ml_upgrade_modal" class="auto-modal hidden" aria-hidden="true">
-  <div class="auto-modal-shell" style="height:auto;max-width:450px" role="dialog" aria-modal="true" aria-labelledby="ml_upgrade_title">
-    <div class="auto-modal-head">
-      <span class="auto-modal-title">15 FREE GENERATIONS COMPLETE</span>
-      <button id="ml_upgrade_close" type="button" class="auto-modal-close">×</button>
-    </div>
-    <div class="auto-modal-body" style="overflow-y:auto">
-      <div id="ml_upgrade_title" style="font-size:20px;line-height:1.15;font-weight:800;color:#f2f2f3;margin:8px 0 4px">Keep creating for 7 days free.</div>
-      <div style="font-size:12px;line-height:1.55;color:#a5a6ac;margin-top:4px">Notebook Pro unlocks unlimited Krea2 generations and the full MissingLink notebook library.</div>
-      <div style="margin-top:13px;padding:10px 11px;border:1px solid #292a30;border-radius:9px;background:#151518;font-size:11px;color:#d5d6da"><b style="color:#f1d56d">7-day free trial</b> · cancel anytime</div>
-      <div class="auto-modal-actions">
-        <button id="ml_upgrade_later" type="button" class="secondary">Not now</button>
-        <a id="ml_upgrade_modal_cta" href="https://missinglink.build/notebook-pro/start?source=krea2-studio&model=krea2&placement=free-limit" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;justify-content:center;min-width:220px;height:36px;padding:0 12px;background:#E8A917;color:#09090B;text-decoration:none;border-radius:6px;font:800 9px var(--font-mono)">START 7-DAY FREE TRIAL →</a>
-      </div>
-    </div>
   </div>
 </div>
 
@@ -8412,22 +8404,122 @@ $('l_save_stack').onclick=async()=>{
   try{const stack=activeLoraStackFromUI();const d=await fetchJson('/api/loras/active',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({loras:stack})});renderLoraLibrary(d.items||[],4);setStatus('l_status','Active LoRA stack saved for new jobs.','good')}catch(e){setStatus('l_status',e.message,'bad')}
 };
 
-function openLoraInstallModal(){
-  const m=$('lora_install_modal');if(!m)return;
-  m.classList.remove('hidden');m.setAttribute('aria-hidden','false');
+function openLoraInstallInline(){
+  const panel=$('lora_install_inline');if(!panel)return;
+  panel.classList.remove('hidden');
   if(!$('lora_source')?.value.trim()&&$('lora_detected_name'))$('lora_detected_name').value='Paste a source URL';
   setTimeout(()=>$('lora_source')?.focus(),0);
 }
-function closeLoraInstallModal(){
-  const m=$('lora_install_modal');if(!m)return;
-  m.classList.add('hidden');m.setAttribute('aria-hidden','true');
+function closeLoraInstallInline(){
+  const panel=$('lora_install_inline');if(!panel)return;
+  panel.classList.add('hidden');
 }
-$('l_add').onclick=e=>{e.preventDefault();openLoraInstallModal()};
-$('lora_install_close').onclick=closeLoraInstallModal;
-$('lora_install_modal').addEventListener('click',e=>{if(e.target===$('lora_install_modal'))closeLoraInstallModal()});
+$('l_add').onclick=e=>{e.preventDefault();openLoraInstallInline()};
+$('lora_install_hide').onclick=e=>{e.preventDefault();closeLoraInstallInline()};
 
 let loraInspectTimer=null;
 let loraLastInspected='';
+let loraDownloadPollTimer=null;
+let loraActiveDownloadId='';
+function setLoraDownloadBusy(on){
+  const busy=!!on;
+  const hasSource=!!$('lora_source')?.value.trim();
+  if($('lora_download_btn'))$('lora_download_btn').disabled=busy||!hasSource;
+  if($('lora_check_source'))$('lora_check_source').disabled=busy;
+  /* Do not disable + ADD LORA or the rest of the Studio while a download runs. */
+}
+function loraProgressWidth(pct){
+  const bar=$('lora_download_progress');
+  if(!bar)return;
+  const v=Number(pct);
+  bar.style.width=Number.isFinite(v)?Math.max(0,Math.min(100,v))+'%':'0%';
+}
+async function pollLoraDownload(downloadId){
+  clearTimeout(loraDownloadPollTimer);
+  loraActiveDownloadId=downloadId||'';
+  const tick=async()=>{
+    try{
+      const d=await fetchJson('/api/loras/progress/'+encodeURIComponent(downloadId),{cache:'no-store'});
+      const pct=(d.pct===null||d.pct===undefined||d.pct==='')?NaN:Number(d.pct);
+      if(d.status==='done'){
+        $('lora_download_progress')?.parentElement?.classList.remove('indeterminate');
+        loraProgressWidth(100);
+        if(d.items)renderLoraLibrary(d.items||[],4);
+        renderLoraStage();
+        setStatus('lora_download_text','Installed '+String(d.file||d.filename||'LoRA')+' · added to active stack.','good');
+        setStatus('l_status','LoRA installed · active stack updated.','good');
+        await refreshLoras();
+        setLoraDownloadBusy(false);
+        loraActiveDownloadId='';
+        return;
+      }
+      if(d.status==='error'){
+        $('lora_download_progress')?.parentElement?.classList.remove('indeterminate');
+        loraProgressWidth(d.pct||0);
+        setStatus('lora_download_text',String(d.error||'LoRA download failed.'),'bad');
+        setStatus('l_status',String(d.error||'LoRA download failed.'),'bad');
+        setLoraDownloadBusy(false);
+        loraActiveDownloadId='';
+        return;
+      }
+      if(Number.isFinite(pct)){
+        $('lora_download_progress')?.parentElement?.classList.remove('indeterminate');
+        loraProgressWidth(pct);
+      }
+      let message='';
+      if(d.status==='queued'||d.stage==='resolving source'){
+        message='Resolving source and selecting the SafeTensors LoRA…';
+      }else{
+        const stage=(d.stage||d.status||'downloading');
+        const done=d.downloaded_text||'0 B';
+        const total=d.total_text||'unknown';
+        const speed=d.speed_text?(' · '+d.speed_text):'';
+        const pctTxt=Number.isFinite(pct)?(' · '+pct.toFixed(1)+'%'):'';
+        message=stage.charAt(0).toUpperCase()+stage.slice(1)+' · '+done+' / '+total+speed+pctTxt;
+      }
+      setStatus('lora_download_text',message,'');
+      loraDownloadPollTimer=setTimeout(tick,700);
+    }catch(e){
+      setStatus('lora_download_text',String(e.message||e),'bad');
+      setStatus('l_status',String(e.message||e),'bad');
+      setLoraDownloadBusy(false);
+      loraActiveDownloadId='';
+    }
+  };
+  await tick();
+}
+async function startLoraDownload(){
+  openLoraInstallInline();
+  const source=$('lora_source').value.trim();
+  const revision=$('lora_revision').value.trim()||'main';
+  const candidate_key=$('lora_candidate').value||'';
+  const filename=$('lora_candidate')?.selectedOptions?.[0]?.dataset?.filename||$('lora_detected_name')?.value||'';
+  if(!source){
+    setStatus('lora_download_text','Paste a Hugging Face or CivitAI source first.','bad');
+    return;
+  }
+  try{
+    loraProgressWidth(0);
+    $('lora_download_progress')?.parentElement?.classList.add('indeterminate');
+    setLoraDownloadBusy(true);
+    setStatus('lora_download_text','Queued · resolving source now…','');
+    setStatus('l_status','LoRA download started in the background. You can keep using Krea2 Studio.','good');
+    const r=await fetchJson('/api/loras/install',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({source,revision,candidate_key,filename})
+    });
+    if(r.filename&&$('lora_detected_name'))$('lora_detected_name').value=r.filename;
+    pollLoraDownload(r.id);
+  }catch(err){
+    $('lora_download_progress')?.parentElement?.classList.remove('indeterminate');
+    setStatus('lora_download_text',String(err.message||err),'bad');
+    setStatus('l_status',String(err.message||err),'bad');
+    setLoraDownloadBusy(false);
+  }
+}
+$('lora_download_btn').onclick=async e=>{e.preventDefault();await startLoraDownload()};
+
 function updateDetectedLoraName(){
   const select=$('lora_candidate');
   const opt=select?.selectedOptions?.[0];
@@ -8445,7 +8537,7 @@ async function inspectLoraSource({force=false}={}){
   const signature=source+'\n'+revision;
   if(!force&&signature===loraLastInspected)return;
   $('lora_check_source').disabled=true;
-  $('lora_download_btn').disabled=true;
+  $('lora_download_btn').disabled=!!loraActiveDownloadId;
   $('lora_candidate').disabled=true;
   $('lora_download_progress').style.width='0%';
   if($('lora_detected_name'))$('lora_detected_name').value='Detecting…';
@@ -8470,7 +8562,7 @@ async function inspectLoraSource({force=false}={}){
     });
     if(r.preferred_key&&[...select.options].some(x=>x.value===r.preferred_key))select.value=r.preferred_key;
     const count=(r.candidates||[]).length;
-    select.disabled=!count;$('lora_download_btn').disabled=!count;
+    select.disabled=!count;$('lora_download_btn').disabled=!!loraActiveDownloadId||!source;
     if(r.detected_name&&$('lora_detected_name'))$('lora_detected_name').value=r.detected_name;
     updateDetectedLoraName();
     const detected=$('lora_detected_name')?.value||'';
@@ -8483,7 +8575,9 @@ async function inspectLoraSource({force=false}={}){
     if($('lora_detected_name'))$('lora_detected_name').value='Detection failed';
     setStatus('lora_download_text',String(err.message||err),'bad');
   }finally{
-    $('lora_check_source').disabled=false;
+    if(!$('lora_check_source'))return;
+    $('lora_check_source').disabled=!!loraActiveDownloadId;
+    $('lora_download_btn').disabled=!!loraActiveDownloadId||!$('lora_source').value.trim();
   }
 }
 function scheduleLoraInspect(delay=180){
@@ -8492,8 +8586,14 @@ function scheduleLoraInspect(delay=180){
 }
 $('lora_check_source').onclick=async e=>{e.preventDefault();await inspectLoraSource({force:true})};
 $('lora_candidate').addEventListener('change',updateDetectedLoraName);
-$('lora_source').addEventListener('paste',()=>scheduleLoraInspect(120));
-$('lora_source').addEventListener('change',()=>scheduleLoraInspect(0));
+function loraSourceChanged(delay=180){
+  openLoraInstallInline();
+  if(!loraActiveDownloadId)$('lora_download_btn').disabled=!$('lora_source').value.trim();
+  scheduleLoraInspect(delay);
+}
+$('lora_source').addEventListener('input',()=>loraSourceChanged(260));
+$('lora_source').addEventListener('paste',()=>setTimeout(()=>loraSourceChanged(120),0));
+$('lora_source').addEventListener('change',()=>loraSourceChanged(0));
 $('lora_source').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();inspectLoraSource({force:true})}});
 
 // ====================================================================
@@ -8794,11 +8894,24 @@ function activateStage(tab){
   const stage=$(activeStageId); if(stage) stage.classList.add('active');
   syncStageToolbar();
 }
+const ML_GENERATE_BY_TAB={text:'t_generate',image:'i_generate',edit:'e_generate',inpaint:'in_generate',batch:'b_generate'};
+function placeAccessCard(tab){
+  const card=$('ml_access_card');if(!card)return;
+  const genId=ML_GENERATE_BY_TAB[tab];
+  if(!genId){card.style.display='none';return}
+  const button=$(genId);
+  const row=button?.closest('.actions');
+  if(!row||!row.parentNode){card.style.display='';return}
+  card.classList.add('ml-action-card');
+  card.style.display='';
+  row.parentNode.insertBefore(card,row);
+}
 function switchStudioTab(tab){
   const previousTab=activeStudioTab;
   if(previousTab==='batch' && tab!=='batch') setStageEmpty('b_gallery');
   document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.tab===tab));
   document.querySelectorAll('.controlpanel').forEach(x=>x.classList.toggle('active',x.id==='panel_'+tab));
+  placeAccessCard(tab);
   activateStage(tab);
   if(tab==='loras') refreshLoras();
   if(tab==='console') refreshConsole(true);
