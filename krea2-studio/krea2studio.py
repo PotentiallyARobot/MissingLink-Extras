@@ -42,7 +42,7 @@
 #
 # OPTIONAL
 #   HF_TOKEN
-#   CIVITAI_TOKEN
+#   CIVITAI_API_KEY
 #
 # GPU
 #   Auto-configures for NVIDIA T4 or L4
@@ -124,132 +124,206 @@ except Exception:
     HF_TOKEN = None
 
 try:
-    CIVITAI_TOKEN = userdata.get("CIVITAI_TOKEN")
+    # Match H3 Studio: the CivitAI credential comes from Colab userdata.
+    # There is no browser/API-token field to fill in.
+    CIVITAI_API_KEY = userdata.get("CIVITAI_API_KEY")
 except Exception:
-    CIVITAI_TOKEN = None
+    CIVITAI_API_KEY = None
 
 print("✓ MISSING_LINK_TOKEN loaded")
 print("✓ OPENAI_API_KEY loaded")
 
 if HF_TOKEN:
     print("✓ HF_TOKEN loaded")
-if CIVITAI_TOKEN:
-    print("✓ CIVITAI_TOKEN loaded")
+if CIVITAI_API_KEY:
+    print("✓ CIVITAI_API_KEY loaded from Colab Secrets")
 
 
 # =====================================================================
-# MISSINGLINK ACCESS GATE · FAIL CLOSED BEFORE CUDA / MODEL DOWNLOADS
+# MISSINGLINK NOTEBOOK ACCESS · GOOGLE IDENTITY + 15 FREE KREA2 GENERATIONS
 # =====================================================================
-# ACCESS-CONTROL INVARIANT — DO NOT REMOVE, BYPASS, CACHE-FOREVER, OR "SIMPLIFY".
-# This is product entitlement enforcement, not optional telemetry or UI polish.
-# Any refactor must preserve ALL enforcement layers below and remain fail-closed:
-#   1) notebook startup validation before expensive/model work,
-#   2) child-process startup validation,
-#   3) forced validation on initial UI/API metadata load,
-#   4) forced validation on job submission and GPU execution,
-#   5) periodic entitlement watchdog that cancels active/queued work,
-#   6) final validation immediately before Colab exposes the UI port.
-# If validation cannot be completed, access MUST be denied.
+# MISSING_LINK_TOKEN may be either:
+#   1) a Google-verified MissingLink Notebook starter code, or
+#   2) an active paid/legacy MissingLink API key.
+#
+# Free Krea2 usage is counted server-side against the verified MissingLink user.
+# Reopening Colab does not reset the allowance. After 15 free Krea2 generations,
+# Notebook Pro is required; the upgrade flow starts with a 7-day free trial.
 # =====================================================================
 
-MISSINGLINK_ACCESS_CONTROL_SENTINEL = "ML-ENTITLEMENT-V1-FAIL-CLOSED"
+MISSING_LINK_BASE_URL = (
+    os.environ.get("MISSING_LINK_BASE_URL")
+    or "https://missinglink.build"
+).rstrip("/")
+MISSING_LINK_NOTEBOOK_ME_URL = (
+    MISSING_LINK_BASE_URL + "/api/notebook/me?engine=krea2"
+)
+MISSING_LINK_AUTH_URL = (
+    os.environ.get("MISSING_LINK_AUTH_URL")
+    or MISSING_LINK_BASE_URL + "/api/cache-token"
+).strip()
+MISSING_LINK_SIGNIN_URL = (
+    MISSING_LINK_BASE_URL
+    + "/get-token?source=krea2-studio&model=krea2&placement=free-access"
+)
+MISSING_LINK_UPGRADE_URL = (
+    MISSING_LINK_BASE_URL
+    + "/notebook-pro/start?source=krea2-studio&model=krea2&placement=free-limit"
+)
+MISSING_LINK_TRIAL_URL = MISSING_LINK_UPGRADE_URL
+KREA2_FREE_RENDER_LIMIT = 15
+MISSINGLINK_ACCESS_CONTROL_SENTINEL = "ML-NOTEBOOK-FREE15-V1"
 
 import urllib.request as _ml_urlreq
 import urllib.error as _ml_urlerr
 
-MISSING_LINK_AUTH_URL = (
-    os.environ.get("MISSING_LINK_AUTH_URL")
-    or "https://missinglink.build/api/cache-token"
-).strip()
-MISSING_LINK_TRIAL_URL = "https://www.missinglink.build/pricing.html"
+_ML_PARENT_AUTH_STATE = {
+    "ok": False,
+    "member": False,
+    "email": "",
+    "used": 0,
+    "remaining": KREA2_FREE_RENDER_LIMIT,
+    "access_mode": "",
+    "error": "not checked",
+}
 
 
-def _missinglink_entitlement_active(data):
-    """Treat explicit inactive subscription/access signals as a hard denial."""
-    if not isinstance(data, dict) or data.get("ok") is not True:
-        return False
+def _ml_parent_headers(token):
+    token = str(token or "").strip()
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "MissingLink-Krea2-Notebook/15free",
+    }
+    if token:
+        headers["Authorization"] = "Bearer " + token
+        headers["x-api-key"] = token
+    return headers
 
-    for key in (
-        "active",
-        "subscription_active",
-        "access_active",
-        "entitled",
-        "subscription_valid",
-    ):
-        if key in data and data.get(key) is not True:
-            return False
 
-    status = str(
-        data.get("subscription_status")
-        or data.get("access_status")
-        or data.get("entitlement_status")
-        or ""
-    ).strip().lower()
+def _ml_parent_json_request(url, token, timeout=15):
+    req = _ml_urlreq.Request(
+        url,
+        headers=_ml_parent_headers(token),
+        method="GET",
+    )
+    with _ml_urlreq.urlopen(req, timeout=timeout) as resp:
+        status = int(getattr(resp, "status", 200) or 200)
+        raw = resp.read(262144)
+    try:
+        data = json.loads(raw.decode("utf-8", "replace")) if raw else {}
+    except Exception:
+        data = {}
+    return status, data
 
-    if status in {
-        "inactive", "expired", "cancelled", "canceled", "revoked",
-        "disabled", "past_due", "unpaid", "suspended", "none",
-    }:
-        return False
 
-    return True
+def _ml_parent_apply_notebook_state(data):
+    member = bool(data.get("member"))
+    try:
+        used = max(0, int(data.get("used") or 0))
+    except Exception:
+        used = 0
+    _ML_PARENT_AUTH_STATE.update(
+        ok=True,
+        member=member,
+        email=str(data.get("email") or ""),
+        used=used,
+        remaining=(-1 if member else max(0, KREA2_FREE_RENDER_LIMIT - used)),
+        access_mode=(
+            "gmail_starter"
+            if data.get("starter")
+            else ("notebook_google" if data.get("email") else "notebook_token")
+        ),
+        error="",
+    )
 
 
 def validate_missinglink_access(token):
-    req = _ml_urlreq.Request(
-        MISSING_LINK_AUTH_URL,
-        headers={
-            "x-api-key": token,
-            "Accept": "application/json",
-            "User-Agent": "MissingLink-Krea2-Colab/1.0",
-        },
-        method="GET",
-    )
+    """Validate Notebook identity without consuming a Krea2 generation."""
+    token = str(token or "").strip()
+    if not token:
+        msg = (
+            "MISSING_LINK_TOKEN is not set. Get a free Google-verified starter code at "
+            + MISSING_LINK_SIGNIN_URL
+        )
+        _ML_PARENT_AUTH_STATE.update(ok=False, error=msg)
+        return False, msg
 
+    notebook_error = ""
     try:
-        with _ml_urlreq.urlopen(req, timeout=15) as resp:
-            status = int(getattr(resp, "status", 200) or 200)
-            raw = resp.read(65536)
-
-        try:
-            data = json.loads(
-                raw.decode("utf-8", "replace")
-            ) if raw else {}
-        except Exception:
-            data = {}
-
-        if 200 <= status < 300 and _missinglink_entitlement_active(data):
+        status, data = _ml_parent_json_request(
+            MISSING_LINK_NOTEBOOK_ME_URL,
+            token,
+            timeout=15,
+        )
+        if 200 <= status < 300 and data.get("ok") is True:
+            _ml_parent_apply_notebook_state(data)
             return True, ""
-
-        return False, f"MissingLink rejected this API key (HTTP {status})."
-
+        notebook_error = "Notebook identity was rejected."
     except _ml_urlerr.HTTPError as exc:
-        return False, f"MissingLink rejected this API key (HTTP {exc.code})."
-
+        notebook_error = f"Notebook identity was rejected (HTTP {exc.code})."
     except Exception as exc:
-        return (
-            False,
-            "Could not validate the MissingLink API key: "
-            f"{type(exc).__name__}: {exc}",
+        notebook_error = (
+            "Notebook identity check failed: "
+            f"{type(exc).__name__}: {exc}"
         )
 
+    # Compatibility path for existing paid/legacy API keys.
+    try:
+        status, data = _ml_parent_json_request(
+            MISSING_LINK_AUTH_URL,
+            token,
+            timeout=15,
+        )
+        if 200 <= status < 300 and isinstance(data, dict) and data.get("ok") is True:
+            _ML_PARENT_AUTH_STATE.update(
+                ok=True,
+                member=True,
+                email="",
+                used=0,
+                remaining=-1,
+                access_mode="legacy_paid_api_key",
+                error="",
+            )
+            return True, ""
+    except Exception:
+        pass
 
-# SECURITY / LICENSING CHECKPOINT A — REQUIRED.
-# Do not replace this with a cached/local-only check. It intentionally validates
-# entitlement before CUDA/model initialization so inactive accounts cannot launch.
-_ml_ok, _ml_error = validate_missinglink_access(
-    MISSING_LINK_TOKEN
-)
+    _ML_PARENT_AUTH_STATE.update(ok=False, error=notebook_error)
+    return False, notebook_error
 
-if not _ml_ok:
-    raise RuntimeError(
-        "An active MissingLink subscription is required before this notebook can run.\n"
-        + _ml_error
-        + "\nStart a trial / get access: "
-        + MISSING_LINK_TRIAL_URL
-    )
 
-print("✓ MissingLink API key validated · product access granted")
+def _require_parent_notebook_access():
+    ok, error = validate_missinglink_access(MISSING_LINK_TOKEN)
+    if not ok:
+        raise RuntimeError(
+            "MissingLink notebook sign-in is required before this notebook can run.\n"
+            + (error or "Identity validation failed.")
+            + "\nGet 15 free Krea2 generations (no card required): "
+            + MISSING_LINK_SIGNIN_URL
+        )
+
+    state = dict(_ML_PARENT_AUTH_STATE)
+    if not state.get("member") and int(state.get("remaining") or 0) <= 0:
+        raise RuntimeError(
+            f"Your {KREA2_FREE_RENDER_LIMIT} free Krea2 generations are complete.\n"
+            "Start the 7-day Notebook Pro trial to keep generating and unlock "
+            "the full MissingLink notebook library.\n"
+            + MISSING_LINK_UPGRADE_URL
+        )
+
+    if state.get("member"):
+        print("✓ MissingLink Notebook Pro verified · unlimited Krea2 generations")
+    else:
+        print(
+            "✓ MissingLink starter verified · "
+            f"{state.get('remaining', KREA2_FREE_RENDER_LIMIT)} of "
+            f"{KREA2_FREE_RENDER_LIMIT} free Krea2 generations remaining"
+        )
+    return state
+
+
+# ACCESS CHECKPOINT A — before CUDA/model downloads.
+_ML_PARENT_ACCESS = _require_parent_notebook_access()
 
 # =====================================================================
 # STOP OLD APPLICATIONS
@@ -843,7 +917,7 @@ from datetime import datetime
 from urllib.parse import urlparse
 
 import requests
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, HfApi
 from safetensors import safe_open
 
 # =====================================================================
@@ -1131,12 +1205,17 @@ def _safe_lora_name(value):
     return name
 
 
-def _validate_user_lora_file(path):
+def _validate_safetensors_payload(path):
+    """Validate SafeTensors CONTENT regardless of a temporary filename suffix.
+
+    Downloads are written atomically to names such as
+    ``foo.safetensors.<job>.part``. Checking Path.suffix on those temporary
+    files incorrectly reports "only .safetensors files are allowed" even when
+    the downloaded payload is a perfectly valid SafeTensors LoRA.
+    """
     path = Path(path)
     if not path.is_file():
         return False, "file is missing"
-    if path.suffix.lower() != ".safetensors":
-        return False, "only .safetensors files are allowed"
     size = path.stat().st_size
     if size < 4096:
         return False, "file is unexpectedly small"
@@ -1149,6 +1228,14 @@ def _validate_user_lora_file(path):
     except Exception as exc:
         return False, f"invalid SafeTensors file: {exc}"
     return True, "ok"
+
+
+def _validate_user_lora_file(path):
+    """Validate an installed user LoRA and require the final .safetensors name."""
+    path = Path(path)
+    if path.suffix.lower() != ".safetensors":
+        return False, "only .safetensors files are allowed"
+    return _validate_safetensors_payload(path)
 
 
 def _installed_user_loras():
@@ -4438,6 +4525,23 @@ def generate_adaptive_batch(
 
             prompt = prompts[index]
 
+            allowed, access = _ml_reserve_generation(
+                {
+                    "kind": "batch",
+                    "mode": "adaptive_batch",
+                    "prompt": prompt,
+                    "width": width,
+                    "height": height,
+                    "seed": (-1 if base_seed < 0 else base_seed + index),
+                    "lightning_enabled": lightning_enabled,
+                    "lightning_strength": lightning_strength,
+                    "extra_loras": extra_loras,
+                },
+                origin="adaptive_batch",
+            )
+            if not allowed:
+                raise FreeGenerationLimitError(access)
+
             seed = (
                 -1
                 if base_seed < 0
@@ -4705,25 +4809,46 @@ import urllib.error as _urlerr
 import traceback as _traceback
 
 APP_PORT = int(os.environ.get("MISSINGLINK_UI_PORT", "7860"))
+
+MISSING_LINK_BASE_URL = (
+    os.environ.get("MISSING_LINK_BASE_URL")
+    or "https://missinglink.build"
+).rstrip("/")
+MISSING_LINK_NOTEBOOK_ME_URL = (
+    MISSING_LINK_BASE_URL + "/api/notebook/me?engine=krea2"
+)
+MISSING_LINK_NOTEBOOK_RENDER_URL = (
+    MISSING_LINK_BASE_URL + "/api/notebook/render"
+)
 MISSING_LINK_AUTH_URL = (
     os.environ.get("MISSING_LINK_AUTH_URL")
-    or "https://missinglink.build/api/cache-token"
+    or MISSING_LINK_BASE_URL + "/api/cache-token"
 ).strip()
-MISSING_LINK_TRIAL_URL = "https://www.missinglink.build/pricing.html"
-MISSING_LINK_AUTH_TTL_SEC = 30.0
+MISSING_LINK_SIGNIN_URL = (
+    MISSING_LINK_BASE_URL
+    + "/get-token?source=krea2-studio&model=krea2&placement=free-access"
+)
+MISSING_LINK_UPGRADE_URL = (
+    MISSING_LINK_BASE_URL
+    + "/notebook-pro/start?source=krea2-studio&model=krea2&placement=free-limit"
+)
+MISSING_LINK_TRIAL_URL = MISSING_LINK_UPGRADE_URL
+KREA2_FREE_RENDER_LIMIT = 15
+MISSING_LINK_AUTH_TTL_SEC = 120.0
 MISSING_LINK_WATCHDOG_SEC = 45.0
-
-# ACCESS-CONTROL INVARIANT — REQUIRED PRODUCT ENFORCEMENT.
-# Do not remove or collapse the entitlement layers in this child process. The UI,
-# request API, queue, GPU worker, and watchdog intentionally re-check access at
-# different times to remain fail-closed if entitlement changes during a session.
-MISSINGLINK_ACCESS_CONTROL_SENTINEL = "ML-ENTITLEMENT-V1-FAIL-CLOSED"
+MISSINGLINK_ACCESS_CONTROL_SENTINEL = "ML-NOTEBOOK-FREE15-V1"
 
 _ML_ACCESS_REVOKED = threading.Event()
+_ML_AUTH_CHECK_LOCK = threading.Lock()
 _ML_AUTH_STATE = {
     "ok": False,
     "checked": 0.0,
     "error": "not checked",
+    "member": False,
+    "email": "",
+    "used": 0,
+    "remaining": KREA2_FREE_RENDER_LIMIT,
+    "access_mode": "",
 }
 
 
@@ -4731,148 +4856,354 @@ def _missinglink_token():
     return (os.environ.get("MISSING_LINK_TOKEN") or "").strip()
 
 
-def _missinglink_entitlement_active(data):
-    """Fail closed on explicit inactive subscription/access state."""
-    if not isinstance(data, dict) or data.get("ok") is not True:
-        return False
+def _ml_headers(token=None, *, json_body=False):
+    tok = str(token or _missinglink_token()).strip()
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "MissingLink-Krea2-Notebook/15free",
+    }
+    if tok:
+        headers["Authorization"] = "Bearer " + tok
+        headers["x-api-key"] = tok
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    return headers
 
-    for key in (
-        "active",
-        "subscription_active",
-        "access_active",
-        "entitled",
-        "subscription_valid",
-    ):
-        if key in data and data.get(key) is not True:
-            return False
 
-    status = str(
-        data.get("subscription_status")
-        or data.get("access_status")
-        or data.get("entitlement_status")
-        or ""
-    ).strip().lower()
+def _ml_json_request(url, *, method="GET", body=None, timeout=15):
+    data = None
+    if body is not None:
+        data = json.dumps(body, separators=(",", ":")).encode("utf-8")
+    req = _urlreq.Request(
+        url,
+        data=data,
+        headers=_ml_headers(json_body=body is not None),
+        method=method,
+    )
+    with _urlreq.urlopen(req, timeout=timeout) as resp:
+        status = int(getattr(resp, "status", 200) or 200)
+        raw = resp.read(262144)
+    try:
+        payload = json.loads(raw.decode("utf-8", "replace")) if raw else {}
+    except Exception:
+        payload = {}
+    return status, payload
 
-    if status in {
-        "inactive", "expired", "cancelled", "canceled", "revoked",
-        "disabled", "past_due", "unpaid", "suspended", "none",
-    }:
-        return False
 
-    return True
+def _ml_public_access_state():
+    remaining = _ML_AUTH_STATE.get("remaining")
+    if remaining is None:
+        remaining = KREA2_FREE_RENDER_LIMIT
+    return {
+        "ok": bool(_ML_AUTH_STATE.get("ok")),
+        "member": bool(_ML_AUTH_STATE.get("member")),
+        "email": str(_ML_AUTH_STATE.get("email") or ""),
+        "used": int(_ML_AUTH_STATE.get("used") or 0),
+        "free_limit": KREA2_FREE_RENDER_LIMIT,
+        "remaining": int(remaining),
+        "access_mode": str(_ML_AUTH_STATE.get("access_mode") or ""),
+        "signin_url": MISSING_LINK_SIGNIN_URL,
+        "upgrade_url": MISSING_LINK_UPGRADE_URL,
+    }
+
+
+def _ml_apply_notebook_state(data):
+    member = bool(data.get("member"))
+    try:
+        used = max(0, int(data.get("used") or 0))
+    except Exception:
+        used = 0
+    _ML_AUTH_STATE.update(
+        ok=True,
+        checked=time.monotonic(),
+        error="",
+        member=member,
+        email=str(data.get("email") or ""),
+        used=used,
+        remaining=(-1 if member else max(0, KREA2_FREE_RENDER_LIMIT - used)),
+        access_mode=(
+            "gmail_starter"
+            if data.get("starter")
+            else ("notebook_google" if data.get("email") else "notebook_token")
+        ),
+    )
 
 
 def _validate_missinglink_token(force=False):
-    now = time.monotonic()
+    """Validate Notebook identity/API key without consuming a generation."""
+    with _ML_AUTH_CHECK_LOCK:
+        now = time.monotonic()
+        age = now - float(_ML_AUTH_STATE.get("checked") or 0.0)
+        if (
+            not force
+            and _ML_AUTH_STATE.get("checked")
+            and age < 10.0
+        ):
+            return bool(_ML_AUTH_STATE.get("ok")), str(_ML_AUTH_STATE.get("error") or "")
 
-    if (
-        not force
-        and _ML_AUTH_STATE.get("ok")
-        and now - float(_ML_AUTH_STATE.get("checked") or 0.0)
-        < MISSING_LINK_AUTH_TTL_SEC
-    ):
-        return True, ""
+        if (
+            not force
+            and _ML_AUTH_STATE.get("ok")
+            and age < MISSING_LINK_AUTH_TTL_SEC
+        ):
+            return True, ""
 
-    token = _missinglink_token()
+        token = _missinglink_token()
+        if not token:
+            msg = (
+                "MISSING_LINK_TOKEN is not available to the Studio process. "
+                "Get a free starter code at " + MISSING_LINK_SIGNIN_URL
+                + ", add it to Colab Secrets, enable notebook access, and rerun."
+            )
+            _ML_AUTH_STATE.update(ok=False, checked=now, error=msg)
+            _ML_ACCESS_REVOKED.set()
+            return False, msg
 
-    if not token:
-        msg = (
-            "MISSING_LINK_TOKEN is not available to the MissingLink Studio process. "
-            "Add a valid key to Colab Secrets and rerun the notebook."
-        )
+        notebook_error = ""
+        try:
+            status, data = _ml_json_request(
+                MISSING_LINK_NOTEBOOK_ME_URL,
+                timeout=15,
+            )
+            if 200 <= status < 300 and data.get("ok") is True:
+                _ml_apply_notebook_state(data)
+                _ML_ACCESS_REVOKED.clear()
+                return True, ""
+            notebook_error = "Notebook identity was rejected."
+        except _urlerr.HTTPError as exc:
+            notebook_error = f"Notebook identity was rejected (HTTP {exc.code})."
+        except Exception as exc:
+            notebook_error = (
+                "Notebook identity check failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        # Compatibility for existing paid/legacy MissingLink API keys.
+        try:
+            status, data = _ml_json_request(
+                MISSING_LINK_AUTH_URL,
+                timeout=15,
+            )
+            if 200 <= status < 300 and isinstance(data, dict) and data.get("ok") is True:
+                _ML_AUTH_STATE.update(
+                    ok=True,
+                    checked=now,
+                    error="",
+                    member=True,
+                    email="",
+                    used=0,
+                    remaining=-1,
+                    access_mode="legacy_paid_api_key",
+                )
+                _ML_ACCESS_REVOKED.clear()
+                return True, ""
+        except Exception:
+            pass
+
         _ML_AUTH_STATE.update(
             ok=False,
             checked=now,
-            error=msg,
+            error=notebook_error,
         )
         _ML_ACCESS_REVOKED.set()
-        return False, msg
+        return False, notebook_error
 
-    req = _urlreq.Request(
-        MISSING_LINK_AUTH_URL,
-        headers={
-            "x-api-key": token,
-            "Accept": "application/json",
-            "User-Agent": "MissingLink-Krea2-Studio/1.0",
-        },
-        method="GET",
-    )
 
+def _ml_generation_settings(params=None, *, origin="generate"):
+    params = dict(params or {})
+    out = {
+        "origin": str(origin or "generate")[:40],
+        "prompt_chars": len(str(params.get("prompt") or params.get("instruction") or "")),
+        "kind": str(params.get("kind") or params.get("mode") or "")[:40],
+    }
+    for key in (
+        "width", "height", "steps", "cfg", "seed", "denoise",
+        "max_side", "lightning_enabled", "lightning_strength",
+    ):
+        if key in params:
+            value = params.get(key)
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                out[key] = value
+    extra_loras = params.get("extra_loras")
+    if isinstance(extra_loras, (list, tuple)):
+        out["lora_count"] = min(12, len(extra_loras))
+    return out
+
+
+def _ml_reserve_generation(params=None, *, origin="generate"):
+    """Persist one Krea2 generation dispatch against this verified identity."""
+    ok, error = _validate_missinglink_token(force=True)
+    if not ok:
+        return False, {
+            "ok": False,
+            "error": error or "MissingLink access required.",
+            "code": "missinglink_auth_required",
+            "signin_url": MISSING_LINK_SIGNIN_URL,
+        }
+
+    if (
+        not _ML_AUTH_STATE.get("member")
+        and int(_ML_AUTH_STATE.get("used") or 0) >= KREA2_FREE_RENDER_LIMIT
+    ):
+        return False, {
+            "ok": False,
+            "error": (
+                f"Your {KREA2_FREE_RENDER_LIMIT} free Krea2 generations are used. "
+                "Start the 7-day Notebook Pro trial to keep generating."
+            ),
+            "code": "free_limit_reached",
+            **_ml_public_access_state(),
+        }
+
+    request_body = {
+        "engine": "krea2",
+        "surface": "krea2_studio",
+        "model": "krea2",
+        "origin": str(origin or "generate"),
+        "settings": _ml_generation_settings(params, origin=origin),
+    }
     try:
-        with _urlreq.urlopen(req, timeout=15) as resp:
-            status = int(getattr(resp, "status", 200) or 200)
-            raw = resp.read(65536)
-
-        try:
-            data = json.loads(
-                raw.decode("utf-8", "replace")
-            ) if raw else {}
-        except Exception:
-            data = {}
-
-        if 200 <= status < 300 and _missinglink_entitlement_active(data):
-            _ML_AUTH_STATE.update(
-                ok=True,
-                checked=now,
-                error="",
+        status, data = _ml_json_request(
+            MISSING_LINK_NOTEBOOK_RENDER_URL,
+            method="POST",
+            body=request_body,
+            timeout=15,
+        )
+        if 200 <= status < 300 and data.get("ok") is True:
+            _ML_AUTH_STATE["member"] = bool(
+                data.get("member", _ML_AUTH_STATE.get("member"))
             )
-            _ML_ACCESS_REVOKED.clear()
-            return True, ""
+            if not _ML_AUTH_STATE.get("member"):
+                try:
+                    used = max(
+                        int(_ML_AUTH_STATE.get("used") or 0) + 1,
+                        int(data.get("used") or 0),
+                    )
+                except Exception:
+                    used = int(_ML_AUTH_STATE.get("used") or 0) + 1
+                _ML_AUTH_STATE["used"] = used
+                _ML_AUTH_STATE["remaining"] = max(
+                    0,
+                    KREA2_FREE_RENDER_LIMIT - used,
+                )
+            else:
+                _ML_AUTH_STATE["remaining"] = -1
+            _ML_AUTH_STATE["checked"] = time.monotonic()
+            return True, _ml_public_access_state()
 
-        msg = f"MissingLink rejected this API key (HTTP {status})."
+        if data.get("error") == "free_limit_reached":
+            _ML_AUTH_STATE["used"] = max(
+                KREA2_FREE_RENDER_LIMIT,
+                int(data.get("used") or KREA2_FREE_RENDER_LIMIT),
+            )
+            _ML_AUTH_STATE["remaining"] = 0
+            return False, {
+                "ok": False,
+                "error": (
+                    f"Your {KREA2_FREE_RENDER_LIMIT} free Krea2 generations are used. "
+                    "Start the 7-day Notebook Pro trial to keep generating."
+                ),
+                "code": "free_limit_reached",
+                **_ml_public_access_state(),
+            }
+        raise RuntimeError(str(data.get("error") or f"HTTP {status}"))
 
     except _urlerr.HTTPError as exc:
-        msg = f"MissingLink rejected this API key (HTTP {exc.code})."
-
+        try:
+            payload = json.loads(exc.read().decode("utf-8", "replace"))
+        except Exception:
+            payload = {}
+        if exc.code == 402 or payload.get("error") == "free_limit_reached":
+            _ML_AUTH_STATE["used"] = max(
+                KREA2_FREE_RENDER_LIMIT,
+                int(payload.get("used") or KREA2_FREE_RENDER_LIMIT),
+            )
+            _ML_AUTH_STATE["remaining"] = 0
+            return False, {
+                "ok": False,
+                "error": (
+                    f"Your {KREA2_FREE_RENDER_LIMIT} free Krea2 generations are used. "
+                    "Start the 7-day Notebook Pro trial to keep generating."
+                ),
+                "code": "free_limit_reached",
+                **_ml_public_access_state(),
+            }
+        if _ML_AUTH_STATE.get("member"):
+            return True, _ml_public_access_state()
+        return False, {
+            "ok": False,
+            "error": (
+                "Could not verify the free-generation allowance "
+                f"(HTTP {exc.code}). Try again."
+            ),
+            "code": "quota_check_failed",
+        }
     except Exception as exc:
-        msg = (
-            "Could not validate the MissingLink API key: "
-            f"{type(exc).__name__}: {exc}"
-        )
-
-    _ML_AUTH_STATE.update(
-        ok=False,
-        checked=now,
-        error=msg,
-    )
-    _ML_ACCESS_REVOKED.set()
-    return False, msg
+        if _ML_AUTH_STATE.get("member"):
+            return True, _ml_public_access_state()
+        return False, {
+            "ok": False,
+            "error": (
+                "Could not verify the free-generation allowance: "
+                f"{type(exc).__name__}. Try again."
+            ),
+            "code": "quota_check_failed",
+        }
 
 
-# SECURITY / LICENSING CHECKPOINT B — REQUIRED CHILD STARTUP VALIDATION.
-# This must remain a forced remote entitlement check. Failure means the Flask
-# Studio must not start serving a usable application.
+class FreeGenerationLimitError(RuntimeError):
+    def __init__(self, payload):
+        self.payload = dict(payload or {})
+        super().__init__(self.payload.get("error") or "Krea2 generation access required.")
+
+
+# ACCESS CHECKPOINT B — child startup identity validation.
 _ml_ok, _ml_error = _validate_missinglink_token(force=True)
-
 if not _ml_ok:
     raise RuntimeError(
-        "An active MissingLink subscription is required before the Studio can start.\n"
-        + _ml_error
-        + "\nGet access: "
-        + MISSING_LINK_TRIAL_URL
+        "MissingLink notebook sign-in is required before the Studio can start.\n"
+        + (_ml_error or "Identity validation failed.")
+        + "\nGet 15 free Krea2 generations: "
+        + MISSING_LINK_SIGNIN_URL
+    )
+
+_start_state = _ml_public_access_state()
+if not _start_state.get("member") and int(_start_state.get("remaining") or 0) <= 0:
+    raise RuntimeError(
+        f"Your {KREA2_FREE_RENDER_LIMIT} free Krea2 generations are complete.\n"
+        "Start the 7-day Notebook Pro trial to keep generating.\n"
+        + MISSING_LINK_UPGRADE_URL
     )
 
 
 def _require_missinglink_access(context="Studio operation", force=True):
-    """Fail closed unless MissingLink confirms current entitlement.
-
-    ACCESS-CONTROL INVARIANT: callers protecting paid operations must keep
-    ``force=True`` unless a deliberately short-lived request cache is sufficient.
-    Do not convert failures into warnings or best-effort continuation.
-    """
+    """Require a valid Notebook identity; generation quota is enforced separately."""
     ok, error = _validate_missinglink_token(force=force)
     if not ok:
         raise RuntimeError(
-            f"An active MissingLink subscription is required for {context}. "
-            + (error or "Access validation failed.")
-            + " Get access: "
-            + MISSING_LINK_TRIAL_URL
+            f"MissingLink notebook access is required for {context}. "
+            + (error or "Identity validation failed.")
+            + " Sign in: "
+            + MISSING_LINK_SIGNIN_URL
         )
     return True
 
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 128 * 1024 * 1024
+
+
+@app.get("/api/ml/access")
+def api_ml_access():
+    ok, error = _validate_missinglink_token(force=True)
+    if not ok:
+        return jsonify(
+            ok=False,
+            error=error or "MissingLink notebook access is not valid.",
+            code="missinglink_auth_required",
+            signin_url=MISSING_LINK_SIGNIN_URL,
+        ), 401
+    return jsonify(**_ml_public_access_state())
 
 # =====================================================================
 # REQUIRED USER TERMS / RESPONSIBLE-USE ACKNOWLEDGEMENT
@@ -4917,6 +5248,12 @@ JOB_INPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _json_error(message, status=400):
+    if isinstance(message, FreeGenerationLimitError):
+        payload = dict(message.payload or {})
+        payload["ok"] = False
+        code = str(payload.get("code") or "")
+        http_status = 402 if code == "free_limit_reached" else 503
+        return jsonify(**payload), http_status
     return jsonify(
         ok=False,
         error=str(message),
@@ -4954,7 +5291,7 @@ def _atomic_copy_validated_lora(source_path, destination_name):
     partial = destination.with_name(destination.name + ".part")
     partial.unlink(missing_ok=True)
     shutil.copy2(source_path, partial)
-    valid, reason = _validate_user_lora_file(partial)
+    valid, reason = _validate_safetensors_payload(partial)
     if not valid:
         partial.unlink(missing_ok=True)
         raise RuntimeError(f"Downloaded LoRA failed validation: {reason}")
@@ -4982,7 +5319,7 @@ def _install_huggingface_lora(repo_id, filename, revision=""):
 
 def _civitai_headers(token=""):
     headers = {"User-Agent": "MissingLink-Krea2-Studio/1.0", "Accept": "application/json"}
-    token = str(token or "").strip() or (os.environ.get("CIVITAI_TOKEN") or "").strip()
+    token = str(token or "").strip() or _civitai_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return headers
@@ -5047,13 +5384,720 @@ def _install_civitai_lora(version_id, token=""):
                     if total > MAX_USER_LORA_BYTES:
                         raise RuntimeError("Civitai LoRA exceeds the 4 GiB Studio limit.")
                     handle.write(chunk)
-        valid, reason = _validate_user_lora_file(partial)
+        valid, reason = _validate_safetensors_payload(partial)
         if not valid:
             raise RuntimeError(f"Downloaded Civitai LoRA failed validation: {reason}")
         os.replace(partial, destination)
     finally:
         partial.unlink(missing_ok=True)
     return destination
+
+
+
+# =====================================================================
+# H3-STYLE ADD LORA · SOURCE DISCOVERY + BACKGROUND DOWNLOAD PROGRESS
+# =====================================================================
+
+LORA_DOWNLOADS = {}
+LORA_DOWNLOAD_LOCK = threading.Lock()
+
+
+def _format_bytes(value):
+    value = float(value or 0)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024.0 or unit == "TiB":
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+
+
+def _hf_token():
+    return (
+        (os.environ.get("HF_TOKEN") or "")
+        or (os.environ.get("HUGGINGFACE_TOKEN") or "")
+    ).strip()
+
+
+def _civitai_token():
+    """Read CIVITAI_API_KEY automatically; never require a browser token field."""
+    token = (os.environ.get("CIVITAI_API_KEY") or "").strip()
+    if token:
+        return token
+    try:
+        from google.colab import userdata as _civitai_userdata
+        token = (_civitai_userdata.get("CIVITAI_API_KEY") or "").strip()
+    except Exception:
+        token = ""
+    if token:
+        os.environ["CIVITAI_API_KEY"] = token
+    return token
+
+
+def _parse_hf_source(value, revision_hint="main"):
+    from urllib.parse import urlsplit, unquote
+
+    raw = str(value or "").strip()
+    revision_hint = str(revision_hint or "main").strip() or "main"
+    if not raw:
+        raise ValueError("Enter a Hugging Face repository or URL.")
+
+    if "://" not in raw:
+        repo_id = raw.strip().strip("/")
+        if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo_id):
+            raise ValueError(
+                "Hugging Face input must be owner/repository or a huggingface.co URL."
+            )
+        return {
+            "repo_id": repo_id,
+            "revision": revision_hint,
+            "filename": "",
+            "source": raw,
+        }
+
+    parts = urlsplit(raw)
+    host = (parts.hostname or "").lower()
+    if host not in {
+        "huggingface.co", "www.huggingface.co", "hf.co", "www.hf.co"
+    }:
+        raise ValueError("That URL is not a Hugging Face URL.")
+
+    seg = [unquote(x) for x in parts.path.split("/") if x]
+    if len(seg) < 2:
+        raise ValueError("Hugging Face URL does not contain an owner/repository.")
+
+    repo_id = f"{seg[0]}/{seg[1]}"
+    if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo_id):
+        raise ValueError(
+            "Could not read a valid owner/repository from that Hugging Face URL."
+        )
+
+    revision = revision_hint
+    filename = ""
+    if len(seg) >= 4 and seg[2] in {"tree", "blob", "resolve"}:
+        revision = seg[3] or revision_hint
+        if seg[2] in {"blob", "resolve"} and len(seg) >= 5:
+            filename = "/".join(seg[4:]).lstrip("/")
+
+    return {
+        "repo_id": repo_id,
+        "revision": revision,
+        "filename": filename,
+        "source": raw,
+    }
+
+
+def _hf_repo_candidates(repo_id, revision="main"):
+    repo_id = str(repo_id or "").strip().strip("/")
+    revision = str(revision or "main").strip() or "main"
+    if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo_id):
+        raise ValueError("HF repo must look like owner/repository.")
+
+    info = HfApi(token=_hf_token() or None).model_info(
+        repo_id,
+        revision=revision,
+        files_metadata=True,
+    )
+    rows = []
+    for sib in getattr(info, "siblings", []) or []:
+        name = str(getattr(sib, "rfilename", "") or "")
+        if not name.lower().endswith(".safetensors"):
+            continue
+        size = int(getattr(sib, "size", 0) or 0)
+        if not size:
+            lfs = getattr(sib, "lfs", None)
+            try:
+                size = (
+                    int((lfs or {}).get("size") or 0)
+                    if isinstance(lfs, dict)
+                    else int(getattr(lfs, "size", 0) or 0)
+                )
+            except Exception:
+                size = 0
+        rows.append({"filename": name, "size": size})
+
+    rows.sort(key=lambda x: (x["size"], x["filename"]), reverse=True)
+    return rows
+
+
+def _civitai_json(url, token=""):
+    headers = {
+        "User-Agent": "MissingLink-Krea2-LoRA/2",
+        "Accept": "application/json",
+    }
+    token = str(token or "").strip()
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    response = requests.get(url, headers=headers, timeout=(20, 60))
+    if response.status_code in {401, 403} and not token:
+        raise RuntimeError(
+            "This CivitAI resource requires authentication. "
+            "Add CIVITAI_API_KEY in Colab Secrets and retry."
+        )
+    response.raise_for_status()
+    if not response.content:
+        raise RuntimeError("CivitAI returned an empty response.")
+    try:
+        return response.json()
+    except Exception as exc:
+        preview = response.text[:300].replace("\n", " ").strip()
+        raise RuntimeError(
+            "CivitAI returned non-JSON content: " + preview
+        ) from exc
+
+
+def _lora_candidate_size(file_obj):
+    try:
+        size_kb = float((file_obj or {}).get("sizeKB") or 0)
+        if size_kb > 0:
+            return int(size_kb * 1024)
+    except Exception:
+        pass
+    try:
+        return int((file_obj or {}).get("size") or 0)
+    except Exception:
+        return 0
+
+
+def _inspect_lora_source(source, revision_hint="main"):
+    from urllib.parse import urlsplit, parse_qs, urlunsplit
+
+    raw = str(source or "").strip()
+    revision_hint = str(revision_hint or "main").strip() or "main"
+    if not raw:
+        raise ValueError("Paste a Hugging Face or CivitAI source.")
+
+    parsed_url = urlsplit(raw) if "://" in raw else None
+    hf_like = (
+        "://" not in raw
+        or (parsed_url.hostname or "").lower()
+        in {"huggingface.co", "www.huggingface.co", "hf.co", "www.hf.co"}
+    )
+    if hf_like:
+        parsed = _parse_hf_source(raw, revision_hint)
+        rows = _hf_repo_candidates(parsed["repo_id"], parsed["revision"])
+        candidates = [
+            {
+                "key": "hf::" + row["filename"],
+                "source_type": "hf",
+                "label": row["filename"],
+                "filename": row["filename"],
+                "size": int(row.get("size") or 0),
+                "repo_id": parsed["repo_id"],
+                "revision": parsed["revision"],
+            }
+            for row in rows
+        ]
+        preferred = parsed.get("filename") or ""
+        if preferred and preferred not in {x["filename"] for x in candidates}:
+            preferred = ""
+        preferred_item = next(
+            (item for item in candidates if item.get("filename") == preferred),
+            candidates[0] if candidates else None,
+        )
+        return {
+            "source_type": "hf",
+            "normalized_source": parsed["repo_id"],
+            "revision": parsed["revision"],
+            "preferred_key": ("hf::" + preferred) if preferred else (preferred_item.get("key") if len(candidates) == 1 and preferred_item else ""),
+            "detected_name": str((preferred_item or {}).get("filename") or ""),
+            "candidates": candidates,
+        }
+
+    parts = urlsplit(raw)
+    host = (parts.hostname or "").lower()
+    if host not in {
+        "civitai.com", "www.civitai.com", "civitai.red", "www.civitai.red"
+    }:
+        raise ValueError(
+            "Use a Hugging Face repo/URL or a CivitAI model/version/download URL."
+        )
+
+    civitai_base = (
+        "https://civitai.red"
+        if host.endswith("civitai.red")
+        else "https://civitai.com"
+    )
+
+    def api_url(path):
+        url = civitai_base + str(path)
+        if civitai_base.endswith(".red"):
+            url += ("&" if "?" in url else "?") + "browsingLevel=31"
+        return url
+
+    def same_download_host(download_url):
+        if not download_url or not civitai_base.endswith(".red"):
+            return download_url
+        try:
+            d = urlsplit(str(download_url))
+            if (d.hostname or "").lower() in {"civitai.com", "www.civitai.com"}:
+                return urlunsplit(
+                    (
+                        d.scheme or "https",
+                        "civitai.red" + ((":" + str(d.port)) if d.port else ""),
+                        d.path,
+                        d.query,
+                        d.fragment,
+                    )
+                )
+        except Exception:
+            pass
+        return download_url
+
+    q = parse_qs(parts.query)
+    seg = [x for x in parts.path.split("/") if x]
+    token = _civitai_token()
+    versions = []
+    model_id = 0
+    preferred_version_id = 0
+
+    if len(seg) >= 4 and seg[:3] == ["api", "download", "models"]:
+        preferred_version_id = int(seg[3])
+        version = _civitai_json(
+            api_url(f"/api/v1/model-versions/{preferred_version_id}"),
+            token,
+        )
+        versions = [version]
+        model_id = int(version.get("modelId") or 0)
+
+    elif len(seg) >= 2 and seg[0] == "models":
+        model_id = int(seg[1].split("-")[0])
+        model = _civitai_json(api_url(f"/api/v1/models/{model_id}"), token)
+        versions = list(model.get("modelVersions") or [])
+        requested = (q.get("modelVersionId") or [None])[0]
+        if requested:
+            preferred_version_id = int(requested)
+            versions = [
+                v for v in versions
+                if int((v or {}).get("id") or 0) == preferred_version_id
+            ]
+            if not versions:
+                raise ValueError(
+                    f"CivitAI modelVersionId {requested} was not found."
+                )
+        else:
+            versions.sort(
+                key=lambda v: (
+                    str((v or {}).get("createdAt") or ""),
+                    int((v or {}).get("id") or 0),
+                ),
+                reverse=True,
+            )
+    else:
+        raise ValueError(
+            "CivitAI source must be a model page or /api/download/models/<versionId> URL."
+        )
+
+    candidates = []
+    for version in versions:
+        version_id = int((version or {}).get("id") or 0)
+        version_name = str(
+            (version or {}).get("name") or f"Version {version_id}"
+        )
+        for fobj in (version or {}).get("files") or []:
+            filename = os.path.basename(str((fobj or {}).get("name") or ""))
+            fmt = str(
+                (fobj or {}).get("format")
+                or ((fobj or {}).get("metadata") or {}).get("format")
+                or ""
+            ).lower()
+            if not (
+                filename.lower().endswith(".safetensors")
+                or fmt == "safetensor"
+            ):
+                continue
+            pickle_scan = str((fobj or {}).get("pickleScanResult") or "").lower()
+            virus_scan = str((fobj or {}).get("virusScanResult") or "").lower()
+            if pickle_scan in {"danger", "error"} or virus_scan in {"danger", "error"}:
+                continue
+
+            download_url = (
+                (fobj or {}).get("downloadUrl")
+                or (version or {}).get("downloadUrl")
+            )
+            download_url = same_download_host(download_url)
+            if not download_url:
+                continue
+
+            file_id = str((fobj or {}).get("id") or filename)
+            candidates.append(
+                {
+                    "key": f"civitai::{version_id}::{file_id}",
+                    "source_type": "civitai",
+                    "label": f"{version_name} · {filename}",
+                    "filename": filename,
+                    "size": _lora_candidate_size(fobj),
+                    "version_id": version_id,
+                    "model_id": int((version or {}).get("modelId") or model_id or 0),
+                    "download_url": download_url,
+                    "primary": bool((fobj or {}).get("primary")),
+                }
+            )
+
+    if not candidates:
+        raise ValueError("No safe .safetensors LoRA files were found for that source.")
+
+    preferred_key = ""
+    target_version = preferred_version_id or int(candidates[0].get("version_id") or 0)
+    if target_version:
+        version_candidates = [
+            item for item in candidates
+            if int(item.get("version_id") or 0) == target_version
+        ]
+        preferred_item = next(
+            (item for item in version_candidates if item.get("primary")),
+            version_candidates[0] if version_candidates else None,
+        )
+        if preferred_item:
+            preferred_key = preferred_item["key"]
+
+    preferred_item = next(
+        (item for item in candidates if item.get("key") == preferred_key),
+        candidates[0] if candidates else None,
+    )
+    return {
+        "source_type": "civitai",
+        "normalized_source": raw,
+        "revision": "",
+        "preferred_key": preferred_key,
+        "detected_name": str((preferred_item or {}).get("filename") or ""),
+        "candidates": candidates,
+    }
+
+
+class _SilentTqdmSink:
+    def write(self, value):
+        return len(str(value or ""))
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+
+def _configure_hf_xet_downloads():
+    try:
+        host_ram = (
+            int(os.sysconf("SC_PHYS_PAGES"))
+            * int(os.sysconf("SC_PAGE_SIZE"))
+        )
+    except Exception:
+        host_ram = 0
+    try:
+        free_disk = shutil.disk_usage("/content").free
+    except Exception:
+        free_disk = 0
+
+    if host_ram >= 64 * 1024**3:
+        os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
+        mode = "Xet high-performance"
+    else:
+        concurrency = "16" if host_ram >= 24 * 1024**3 else "8"
+        os.environ.setdefault("HF_XET_FIXED_DOWNLOAD_CONCURRENCY", concurrency)
+        mode = f"Xet {concurrency}-stream"
+
+    if free_disk >= 16 * 1024**3:
+        os.environ.setdefault(
+            "HF_XET_CHUNK_CACHE_SIZE_BYTES",
+            str(8 * 1024**3),
+        )
+    return mode
+
+
+def _make_hf_progress_tqdm(download_id, expected_size=0):
+    from tqdm.auto import tqdm as _TqdmBase
+
+    class _StudioHfTqdm(_TqdmBase):
+        def __init__(self, *args, **kwargs):
+            kwargs["file"] = _SilentTqdmSink()
+            kwargs.setdefault("mininterval", 0.15)
+            kwargs.setdefault("miniters", 1)
+            super().__init__(*args, **kwargs)
+            self._ml_started = time.time()
+            self._ml_last_push = 0.0
+            self._ml_push(force=True)
+
+        def _ml_push(self, force=False):
+            now = time.time()
+            if not force and now - self._ml_last_push < 0.15:
+                return
+            done = max(0, int(float(getattr(self, "n", 0) or 0)))
+            total = (
+                max(0, int(float(getattr(self, "total", 0) or 0)))
+                or int(expected_size or 0)
+            )
+            elapsed = max(0.001, now - self._ml_started)
+            try:
+                rate = (getattr(self, "format_dict", {}) or {}).get("rate")
+            except Exception:
+                rate = None
+            speed = float(rate or (done / elapsed if done else 0.0))
+            with LORA_DOWNLOAD_LOCK:
+                job = LORA_DOWNLOADS.get(download_id)
+                if job is not None:
+                    job.update(
+                        downloaded_bytes=done,
+                        total_bytes=max(
+                            int(job.get("total_bytes") or 0),
+                            total,
+                        ),
+                        speed_bps=speed,
+                        stage="downloading",
+                    )
+            self._ml_last_push = now
+
+        def update(self, n=1):
+            result = super().update(n)
+            self._ml_push()
+            return result
+
+        def close(self):
+            try:
+                self._ml_push(force=True)
+            finally:
+                return super().close()
+
+    return _StudioHfTqdm
+
+
+def _activate_installed_lora(filename):
+    filename = _safe_lora_name(filename)
+    if filename in RESERVED_LORAS:
+        return
+    with _EXTRA_LORA_LOCK:
+        existing = next(
+            (x for x in ACTIVE_EXTRA_LORAS if x.get("name") == filename),
+            None,
+        )
+        if existing is not None:
+            existing["strength"] = 1.0
+            return
+        if len(ACTIVE_EXTRA_LORAS) >= MAX_USER_LORAS_PER_JOB:
+            # Match the H3 rack behavior: install succeeds, but do not silently
+            # evict an existing active LoRA when the rack is already full.
+            return
+        ACTIVE_EXTRA_LORAS.append(
+            {"name": filename, "strength": 1.0}
+        )
+
+
+def _lora_download_worker(download_id, source, revision_hint, candidate_key):
+    from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
+    started = time.time()
+    part = None
+    temp_root = None
+    downloaded = 0
+    try:
+        inspected = _inspect_lora_source(source, revision_hint)
+        selected = next(
+            (
+                x
+                for x in inspected["candidates"]
+                if x.get("key") == candidate_key
+            ),
+            None,
+        )
+        if selected is None:
+            raise RuntimeError(
+                "The selected LoRA file is no longer available from that source."
+            )
+
+        installed_name = _safe_lora_name(selected["filename"])
+        destination = LORA_DIR_RUNTIME / installed_name
+        expected = int(selected.get("size") or 0)
+        if expected and expected > MAX_USER_LORA_BYTES:
+            raise RuntimeError("LoRA exceeds the 4 GiB Studio limit.")
+
+        with LORA_DOWNLOAD_LOCK:
+            LORA_DOWNLOADS[download_id].update(
+                status="running",
+                stage="downloading",
+                filename=installed_name,
+                total_bytes=expected,
+                source_type=selected["source_type"],
+            )
+
+        if selected["source_type"] == "hf":
+            token = _hf_token() or None
+            transport = _configure_hf_xet_downloads()
+            temp_root = str(
+                ROOT / ".missinglink_krea2_hf_lora_downloads" / download_id
+            )
+            shutil.rmtree(temp_root, ignore_errors=True)
+            Path(temp_root).mkdir(parents=True, exist_ok=True)
+            ProgressTqdm = _make_hf_progress_tqdm(
+                download_id,
+                expected,
+            )
+            with LORA_DOWNLOAD_LOCK:
+                LORA_DOWNLOADS[download_id]["transport"] = transport
+            try:
+                src_path = Path(
+                    hf_hub_download(
+                        repo_id=selected["repo_id"],
+                        filename=selected["filename"],
+                        revision=selected["revision"],
+                        token=token,
+                        local_dir=temp_root,
+                        tqdm_class=ProgressTqdm,
+                    )
+                )
+            except Exception as exc:
+                low = str(exc).lower()
+                if not token and any(
+                    x in low for x in ("401", "403", "gated", "private")
+                ):
+                    raise RuntimeError(
+                        "This Hugging Face file is private or gated. "
+                        "Add HF_TOKEN in Colab Secrets and retry."
+                    ) from exc
+                raise
+
+            downloaded = src_path.stat().st_size
+            valid, reason = _validate_user_lora_file(src_path)
+            if not valid:
+                raise RuntimeError(
+                    "Downloaded LoRA failed SafeTensors validation: " + reason
+                )
+            partial = destination.with_name(
+                destination.name + f".{download_id}.part"
+            )
+            partial.unlink(missing_ok=True)
+            shutil.copy2(src_path, partial)
+            valid, reason = _validate_safetensors_payload(partial)
+            if not valid:
+                raise RuntimeError(
+                    "Copied LoRA failed SafeTensors validation: " + reason
+                )
+            os.replace(partial, destination)
+            part = None
+
+        else:
+            part = destination.with_name(
+                destination.name + f".{download_id}.part"
+            )
+            part.unlink(missing_ok=True)
+
+            url = str(selected["download_url"])
+            token = _civitai_token()
+            headers = {
+                "User-Agent": "MissingLink-Krea2-LoRA/2",
+                "Accept": "application/octet-stream",
+            }
+            if token:
+                parsed = urlsplit(url)
+                query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+                query["token"] = token
+                url = urlunsplit(
+                    (
+                        parsed.scheme,
+                        parsed.netloc,
+                        parsed.path,
+                        urlencode(query),
+                        parsed.fragment,
+                    )
+                )
+                headers["Authorization"] = "Bearer " + token
+
+            with requests.get(
+                url,
+                headers=headers,
+                stream=True,
+                allow_redirects=True,
+                timeout=(30, 300),
+            ) as response:
+                if response.status_code in {401, 403} and not token:
+                    raise RuntimeError(
+                        "This CivitAI file requires authentication. "
+                        "Add CIVITAI_API_KEY in Colab Secrets and retry."
+                    )
+                response.raise_for_status()
+                announced = int(response.headers.get("Content-Length") or 0)
+                total = expected or announced
+                if total and total > MAX_USER_LORA_BYTES:
+                    raise RuntimeError("LoRA exceeds the 4 GiB Studio limit.")
+                with LORA_DOWNLOAD_LOCK:
+                    LORA_DOWNLOADS[download_id]["total_bytes"] = total
+
+                with open(part, "wb") as handle:
+                    for chunk in response.iter_content(
+                        chunk_size=4 * 1024 * 1024
+                    ):
+                        if not chunk:
+                            continue
+                        handle.write(chunk)
+                        downloaded += len(chunk)
+                        if downloaded > MAX_USER_LORA_BYTES:
+                            raise RuntimeError(
+                                "LoRA exceeds the 4 GiB Studio limit."
+                            )
+                        elapsed = max(0.001, time.time() - started)
+                        with LORA_DOWNLOAD_LOCK:
+                            LORA_DOWNLOADS[download_id].update(
+                                downloaded_bytes=downloaded,
+                                total_bytes=max(
+                                    total,
+                                    int(
+                                        LORA_DOWNLOADS[download_id].get(
+                                            "total_bytes"
+                                        )
+                                        or 0
+                                    ),
+                                ),
+                                speed_bps=downloaded / elapsed,
+                                stage="downloading",
+                            )
+
+            valid, reason = _validate_safetensors_payload(part)
+            if not valid:
+                raise RuntimeError(
+                    "Downloaded CivitAI LoRA failed validation: " + reason
+                )
+            os.replace(part, destination)
+            part = None
+
+        _activate_installed_lora(installed_name)
+        elapsed = max(0.001, time.time() - started)
+        with LORA_DOWNLOAD_LOCK:
+            LORA_DOWNLOADS[download_id].update(
+                status="done",
+                stage="done",
+                downloaded_bytes=downloaded,
+                total_bytes=downloaded,
+                speed_bps=0.0,
+                file=installed_name,
+                active=any(
+                    x.get("name") == installed_name
+                    for x in ACTIVE_EXTRA_LORAS
+                ),
+                items=_installed_user_loras(),
+            )
+        print(
+            f"[LORA] installed {installed_name} · "
+            f"{downloaded / elapsed / 1024**2:.1f} MiB/s average",
+            flush=True,
+        )
+
+    except Exception as exc:
+        try:
+            if part is not None:
+                Path(part).unlink(missing_ok=True)
+        except Exception:
+            pass
+        with LORA_DOWNLOAD_LOCK:
+            job = LORA_DOWNLOADS.get(download_id)
+            if job is not None:
+                job.update(
+                    status="error",
+                    stage="error",
+                    error=str(exc),
+                    speed_bps=0.0,
+                )
+        print("[LORA] install failed:", repr(exc), flush=True)
+    finally:
+        if temp_root:
+            shutil.rmtree(temp_root, ignore_errors=True)
+
 
 
 def _pil_upload(storage, mode="RGB"):
@@ -5116,6 +6160,7 @@ def _job_public(job):
         "finished", "cancel_requested", "thumb", "error", "result",
         "status_text", "planning_notes", "review_text", "prompt_table",
         "gallery", "zip", "paths", "batch_current", "batch_total",
+        "code", "access",
     )
     return {key: job.get(key) for key in keys}
 
@@ -5128,8 +6173,8 @@ def _active_job_count():
 
 
 def _submit_job(kind, params, *, label, mode, thumb=None, batch_total=0):
-    # SECURITY / LICENSING CHECKPOINT C — REQUIRED BEFORE ANY QUEUED PAID WORK.
-    # Keep this forced check even though request middleware also validates access.
+    # Identity is required for every queued operation. Single-image jobs reserve one
+    # Krea2 generation here; adaptive batches reserve one generation per image.
     _require_missinglink_access("job submission", force=True)
     params = dict(params or {})
     with _EXTRA_LORA_LOCK:
@@ -5140,6 +6185,18 @@ def _submit_job(kind, params, *, label, mode, thumb=None, batch_total=0):
                 f"Queue is full ({JOB_MAX_ACTIVE} active/queued jobs). "
                 "Cancel a job or wait for one to finish."
             )
+
+    if kind != "batch":
+        reserve_params = dict(params)
+        reserve_params["kind"] = kind
+        allowed, access = _ml_reserve_generation(
+            reserve_params,
+            origin=f"{kind}_submit",
+        )
+        if not allowed:
+            raise FreeGenerationLimitError(access)
+
+    with JOB_LOCK:
         jid = uuid.uuid4().hex[:12]
         now = time.time()
         JOBS[jid] = {
@@ -5419,7 +6476,18 @@ def _job_worker():
                     if job.get("cancel_requested") or STOP_EVENT.is_set() or isinstance(exc, BatchStopped):
                         job.update(status="cancelled", stage="Cancelled", detail="Generation cancelled.", status_text="Cancelled.")
                     else:
-                        job.update(status="error", stage="Error", detail=str(exc), error=f"{type(exc).__name__}: {exc}")
+                        if isinstance(exc, FreeGenerationLimitError):
+                            payload = dict(exc.payload or {})
+                            job.update(
+                                status="error",
+                                stage="Membership required",
+                                detail=str(payload.get("error") or exc),
+                                error=str(payload.get("error") or exc),
+                                code=str(payload.get("code") or "free_limit_reached"),
+                                access=payload,
+                            )
+                        else:
+                            job.update(status="error", stage="Error", detail=str(exc), error=f"{type(exc).__name__}: {exc}")
                     job["finished"] = time.time()
                     job["updated"] = time.time()
 
@@ -5442,7 +6510,7 @@ threading.Thread(
 
 
 def _missinglink_entitlement_watchdog():
-    """Stop active/queued work if entitlement disappears or cannot be verified.
+    """Stop active/queued work if Notebook identity disappears or cannot be verified.
 
     SECURITY / LICENSING CHECKPOINT E — REQUIRED CONTINUOUS ENFORCEMENT.
     This intentionally treats validation failure as loss of access and cancels
@@ -5455,7 +6523,7 @@ def _missinglink_entitlement_watchdog():
             continue
 
         print(
-            "[ACCESS] MissingLink entitlement lost; stopping all Studio work: "
+            "[ACCESS] MissingLink Notebook identity lost; stopping all Studio work: "
             + str(error),
             flush=True,
         )
@@ -5490,7 +6558,7 @@ def _missinglink_request_gate():
     # SECURITY / LICENSING CHECKPOINT F — REQUIRED REQUEST GATE.
     # Every browser/API request passes through here. The initial HTML/UI load and
     # startup metadata handshake always revalidate
-    # entitlement instead of relying on the short-lived cache.
+    # Notebook identity instead of relying on the short-lived cache.
     force = request.path in {"/", "/api/meta"}
     ok, error = _validate_missinglink_token(force=force)
     if ok:
@@ -5498,9 +6566,9 @@ def _missinglink_request_gate():
     if request.path.startswith("/api/"):
         return jsonify(
             ok=False,
-            error=error or "MissingLink API key is not valid.",
+            error=error or "MissingLink Notebook identity is not valid.",
             code="missinglink_auth_required",
-            trial_url=MISSING_LINK_TRIAL_URL,
+            signin_url=MISSING_LINK_SIGNIN_URL,
         ), 401
     return Response(
         "<!doctype html><meta charset='utf-8'>"
@@ -5508,9 +6576,9 @@ def _missinglink_request_gate():
         "<style>body{font:15px system-ui;background:#09090b;color:#ededf0;padding:48px;max-width:760px;margin:auto}"
         "a{color:#E8A917}code{background:#151519;padding:2px 5px;border-radius:4px}</style>"
         "<h1>MissingLink access required</h1>"
-        f"<p>{error or 'Your MissingLink API key is not valid.'}</p>"
+        f"<p>{error or 'Your MissingLink Notebook identity is not valid.'}</p>"
         "<p>Add a valid <code>MISSING_LINK_TOKEN</code> in Colab Secrets with notebook access enabled, then rerun the notebook.</p>"
-        f"<p><a href='{MISSING_LINK_TRIAL_URL}' target='_blank'>Get MissingLink access</a></p>",
+        f"<p><a href='{MISSING_LINK_SIGNIN_URL}' target='_blank'>Get 15 free Krea2 generations</a></p>",
         status=401,
         mimetype="text/html",
     )
@@ -5551,7 +6619,7 @@ def api_terms_accept():
     if body.get("output_responsibility") is not True:
         return _json_error("You must acknowledge that MissingLink is the execution/orchestration layer and that you are responsible for your prompts, model choices, output review, and use of generated results.", 400)
     if body.get("membership_and_controls") is not True:
-        return _json_error("You must acknowledge that continued use requires an active MissingLink membership and that membership, entitlement, access-control, responsible-use, and safety mechanisms may not be bypassed, disabled, removed, altered, or interfered with.", 400)
+        return _json_error("You must acknowledge that continued use after the free-generation allowance requires MissingLink Notebook Pro and that identity, quota, membership, access-control, responsible-use, and safety mechanisms may not be bypassed, disabled, removed, altered, or interfered with.", 400)
     if body.get("agree") is not True:
         return _json_error("You must explicitly agree to the responsible-use terms.", 400)
     response = jsonify(ok=True, accepted=True, version=TERMS_VERSION)
@@ -5592,7 +6660,7 @@ def api_meta():
         model=MODEL_NAME, steps=STEPS, cfg=CFG, sampler=SAMPLER_NAME,
         scheduler=SCHEDULER, attention="PyTorch SDPA", max_batch=MAX_BATCH_IMAGES,
         key_valid=True, queue_max=JOB_MAX_ACTIVE, low_vram_mode=LOW_VRAM_MODE,
-        missinglink_required=True, entitlement_mode="fail_closed",
+        missinglink_required=True, entitlement_mode="free15_then_notebook_pro",
         openai_available=bool(OPENAI_API_KEY),
         gpu_profile=GPU_PROFILE,
         defaults={
@@ -5646,12 +6714,119 @@ def api_loras_install_civitai():
     try:
         path = _install_civitai_lora(
             body.get("version_id"),
-            body.get("token") or "",
+            _civitai_token(),
         )
         return jsonify(ok=True, name=path.name, items=_installed_user_loras())
     except Exception as exc:
         _traceback.print_exc()
         return _json_error(exc, 400)
+
+
+
+@app.post("/api/loras/inspect")
+def api_loras_inspect():
+    body = request.get_json(silent=True) or {}
+    source = str(body.get("source") or body.get("url") or "").strip()
+    revision = str(body.get("revision") or "main").strip() or "main"
+    try:
+        result = _inspect_lora_source(source, revision)
+        return jsonify(ok=True, **result)
+    except Exception as exc:
+        return _json_error(exc, 400)
+
+
+@app.post("/api/loras/install")
+def api_loras_install():
+    body = request.get_json(silent=True) or {}
+    source = str(body.get("source") or body.get("url") or "").strip()
+    revision = str(body.get("revision") or "main").strip() or "main"
+    candidate_key = str(body.get("candidate_key") or "").strip()
+    try:
+        inspected = _inspect_lora_source(source, revision)
+        if not candidate_key:
+            candidate_key = inspected.get("preferred_key") or ""
+            if not candidate_key and len(inspected["candidates"]) == 1:
+                candidate_key = inspected["candidates"][0]["key"]
+
+        selected = next(
+            (
+                x
+                for x in inspected["candidates"]
+                if x.get("key") == candidate_key
+            ),
+            None,
+        )
+        if selected is None:
+            raise ValueError(
+                "Choose a LoRA file returned by CHECK SOURCE."
+            )
+
+        size = int(selected.get("size") or 0)
+        if size and size > MAX_USER_LORA_BYTES:
+            raise ValueError("LoRA exceeds the 4 GiB Studio limit.")
+
+        free_bytes = shutil.disk_usage("/content").free
+        if size and free_bytes < size + 512 * 1024**2:
+            raise RuntimeError(
+                "Not enough disk space. Need about "
+                + _format_bytes(size + 512 * 1024**2)
+                + ", have "
+                + _format_bytes(free_bytes)
+                + "."
+            )
+
+        download_id = uuid.uuid4().hex[:12]
+        with LORA_DOWNLOAD_LOCK:
+            LORA_DOWNLOADS[download_id] = {
+                "id": download_id,
+                "status": "queued",
+                "stage": "queued",
+                "error": "",
+                "source": source,
+                "revision": revision,
+                "candidate_key": candidate_key,
+                "filename": selected["filename"],
+                "downloaded_bytes": 0,
+                "total_bytes": size,
+                "speed_bps": 0.0,
+                "started": time.time(),
+                "file": "",
+            }
+
+        threading.Thread(
+            target=_lora_download_worker,
+            args=(download_id, source, revision, candidate_key),
+            daemon=True,
+            name=f"krea2-lora-download-{download_id}",
+        ).start()
+
+        return jsonify(
+            ok=True,
+            id=download_id,
+            filename=selected["filename"],
+        )
+    except Exception as exc:
+        return _json_error(exc, 400)
+
+
+@app.get("/api/loras/progress/<download_id>")
+def api_loras_progress(download_id):
+    with LORA_DOWNLOAD_LOCK:
+        job = dict(LORA_DOWNLOADS.get(download_id) or {})
+    if not job:
+        return _json_error("Unknown LoRA download.", 404)
+
+    total = int(job.get("total_bytes") or 0)
+    done = int(job.get("downloaded_bytes") or 0)
+    speed = float(job.get("speed_bps") or 0.0)
+    pct = (done / total * 100.0) if total > 0 else None
+    job.update(
+        pct=pct,
+        downloaded_text=_format_bytes(done),
+        total_text=_format_bytes(total) if total else "unknown",
+        speed_text=(_format_bytes(speed) + "/s") if speed > 0 else "",
+    )
+    return jsonify(ok=True, **job)
 
 
 @app.post("/api/loras/delete")
@@ -5772,7 +6947,7 @@ def api_text_to_image():
             },
             label="Text → Image", mode="txt2img",
         )
-        return jsonify(ok=True, id=jid, queued=True), 202
+        return jsonify(ok=True, id=jid, queued=True, access=_ml_public_access_state()), 202
     except Exception as exc:
         return _json_error(exc, 409 if "Queue is full" in str(exc) else 400)
 
@@ -5802,7 +6977,7 @@ def api_image_to_image():
             },
             label="Image → Image", mode="img2img", thumb=_input_url(source_path),
         )
-        return jsonify(ok=True, id=jid, queued=True), 202
+        return jsonify(ok=True, id=jid, queued=True, access=_ml_public_access_state()), 202
     except Exception as exc:
         return _json_error(exc, 409 if "Queue is full" in str(exc) else 400)
 
@@ -5836,7 +7011,7 @@ def api_instruction_edit():
             },
             label="Instruction Edit", mode="edit", thumb=_input_url(source_path),
         )
-        return jsonify(ok=True, id=jid, queued=True), 202
+        return jsonify(ok=True, id=jid, queued=True, access=_ml_public_access_state()), 202
     except Exception as exc:
         return _json_error(exc, 409 if "Queue is full" in str(exc) else 400)
 
@@ -5881,7 +7056,7 @@ def api_inpaint():
             },
             label="Inpaint", mode="inpaint", thumb=_input_url(source_path),
         )
-        return jsonify(ok=True, id=jid, queued=True), 202
+        return jsonify(ok=True, id=jid, queued=True, access=_ml_public_access_state()), 202
     except Exception as exc:
         return _json_error(exc, 409 if "Queue is full" in str(exc) else 400)
 
@@ -5941,11 +7116,26 @@ def api_batch_start():
         "lightning_strength": _float_value(request.form.get("lightning_strength"), 1.0, 0.0, 1.5),
     }
     try:
+        _validate_missinglink_token(force=True)
+        access = _ml_public_access_state()
+        if not access.get("member"):
+            remaining = max(0, int(access.get("remaining") or 0))
+            if image_count > remaining:
+                raise FreeGenerationLimitError({
+                    "ok": False,
+                    "error": (
+                        f"This batch requests {image_count} Krea2 generations, but only "
+                        f"{remaining} of your {KREA2_FREE_RENDER_LIMIT} free generations remain. "
+                        "Reduce the batch size or start the 7-day Notebook Pro trial."
+                    ),
+                    "code": "free_limit_reached",
+                    **access,
+                })
         jid = _submit_job(
             "batch", params, label=f"Adaptive Batch · {image_count}", mode="batch",
             thumb=_input_url(reference_path), batch_total=image_count,
         )
-        return jsonify(ok=True, id=jid, queued=True), 202
+        return jsonify(ok=True, id=jid, queued=True, access=_ml_public_access_state()), 202
     except Exception as exc:
         return _json_error(exc, 409 if "Queue is full" in str(exc) else 400)
 
@@ -6483,6 +7673,17 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
         <button class="tab" data-tab="console">CONSOLE</button>
       </nav>
 
+      <div id="ml_access_card" style="margin:8px 10px 0;border:1px solid #4a3b12;background:linear-gradient(135deg,#19170d,#121214);border-radius:9px;padding:9px 10px;box-shadow:0 8px 26px rgba(0,0,0,.18)">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px">
+          <div style="min-width:0;flex:1">
+            <b id="ml_access_label" style="display:block;font:700 9px var(--font-mono);color:#f1d56d;letter-spacing:.03em">Checking Notebook access…</b>
+            <div id="ml_access_sub" style="font-size:8px;line-height:1.45;color:#a2a4ab;margin-top:3px">15 free Krea2 generations · verified Google identity · no card required.</div>
+          </div>
+          <a id="ml_upgrade_link" href="https://missinglink.build/notebook-pro/start?source=krea2-studio&model=krea2&placement=always-on-subscribe" target="_blank" rel="noopener" style="display:none;flex:0 0 auto;background:#E8A917;color:#09090B;text-decoration:none;font:800 8px var(--font-mono);border-radius:6px;padding:7px 8px;white-space:nowrap">SUBSCRIBE →</a>
+        </div>
+        <div id="ml_upgrade_pitch" style="display:none;margin-top:7px;padding-top:7px;border-top:1px solid #292718;font-size:7.6px;line-height:1.45;color:#8f9198"><b style="color:#ddd">Notebook Pro goes unlimited.</b> Start with a <span style="color:#f1d56d">7-day free trial</span> and unlock the full MissingLink notebook library.</div>
+      </div>
+
       <div class="sidebar-scroll">
         <section id="panel_text" class="controlpanel active">
           <div class="card">
@@ -6795,37 +7996,21 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
           <div class="card">
             <div class="cardtitle">LoRA Manager</div>
             <div class="cardbody">
-              <div class="sectionhint">Install additional Krea-compatible LoRAs from Hugging Face or Civitai. Only <b>.safetensors</b> files are accepted. Up to four user LoRAs can be active per queued job. The active stack is snapshotted when you submit a job.</div>
-              <details open>
-                <summary>Hugging Face</summary>
-                <div class="inside">
-                  <label>Repository ID</label><input id="l_hf_repo" placeholder="owner/repository">
-                  <label>SafeTensors filename</label><input id="l_hf_file" placeholder="my_lora.safetensors">
-                  <label>Revision · optional</label><input id="l_hf_revision" placeholder="main, tag, branch, or commit">
-                  <div class="minihint">Uses the notebook's HF_TOKEN when available, including gated/private repos you are authorized to access.</div>
-                  <div class="actions"><button id="l_hf_install" type="button">INSTALL FROM HUGGING FACE</button></div>
-                </div>
-              </details>
-              <details>
-                <summary>Civitai</summary>
-                <div class="inside">
-                  <label>Model version ID</label><input id="l_civitai_version" type="number" min="1" placeholder="e.g. 2514310">
-                  <label>Civitai API token · optional</label><input id="l_civitai_token" type="password" autocomplete="off" placeholder="Uses CIVITAI_TOKEN secret if left blank">
-                  <div class="minihint">The Studio queries the model-version API, selects a SafeTensors LoRA file, and rejects dangerous/error scan results or non-SafeTensors formats.</div>
-                  <div class="actions"><button id="l_civitai_install" type="button">INSTALL FROM CIVITAI</button></div>
-                </div>
-              </details>
+              <div class="sectionhint">H3-style LoRA install: paste an HF repo, full Hugging Face URL, direct HF <b>.safetensors</b> file URL, or Civitai model/version URL. The Studio discovers available files, shows download progress, validates SafeTensors, then adds the installed LoRA to the active rack at strength 1.00 when space is available.</div>
+              <div class="actions">
+                <button id="l_add" type="button">+ ADD LORA</button>
+                <button id="l_refresh" class="secondary" type="button">REFRESH</button>
+              </div>
               <div id="l_status" class="status">Loading LoRA library…</div>
             </div>
           </div>
           <div class="card">
             <div class="cardtitle">Installed LoRAs · Active Stack</div>
             <div class="cardbody">
-              <div class="sectionhint">Check a LoRA to activate it for <b>newly submitted</b> jobs and set its model strength. Built-in acceleration/edit LoRAs are managed by their existing controls and cannot be deleted here.</div>
+              <div class="sectionhint">Check a LoRA to activate it for <b>newly submitted</b> jobs and set its model strength. Up to four user LoRAs are snapshotted into each queued job. Built-in acceleration/edit LoRAs stay managed by their existing controls.</div>
               <div id="lora_list" class="lora-list"><div class="empty">Loading…</div></div>
               <div class="actions">
                 <button id="l_save_stack" type="button">SAVE ACTIVE STACK</button>
-                <button id="l_refresh" class="secondary" type="button">REFRESH</button>
               </div>
             </div>
           </div>
@@ -6887,6 +8072,52 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
   </div>
 </div>
 
+<div id="lora_install_modal" class="auto-modal hidden" aria-hidden="true">
+  <div class="auto-modal-shell" style="height:min(470px,calc(100vh - 24px));width:min(680px,calc(100vw - 24px))" role="dialog" aria-modal="true" aria-labelledby="lora_install_title">
+    <div class="auto-modal-head">
+      <span id="lora_install_title" class="auto-modal-title">ADD LORA</span>
+      <button id="lora_install_close" type="button" class="auto-modal-close">×</button>
+    </div>
+    <div class="auto-modal-body" style="overflow-y:auto">
+      <label>Source</label>
+      <input id="lora_source" type="text" placeholder="HF owner/repo · full HF URL · direct HF .safetensors URL · Civitai model/version URL" autocomplete="off">
+      <div class="split">
+        <div><label>HF revision</label><input id="lora_revision" type="text" value="main" autocomplete="off"></div>
+        <div><label>Detected source</label><input id="lora_source_type" type="text" value="not checked" readonly></div>
+      </div>
+      <label>Detected LoRA name</label>
+      <input id="lora_detected_name" type="text" value="Paste a source URL" readonly>
+      <label>LoRA file</label>
+      <select id="lora_candidate" disabled><option value="">CHECK SOURCE first</option></select>
+      <div class="actions">
+        <button id="lora_check_source" class="secondary" type="button">CHECK SOURCE</button>
+        <button id="lora_download_btn" type="button" disabled>DOWNLOAD + ADD</button>
+      </div>
+      <div class="progress"><i id="lora_download_progress"></i></div>
+      <div id="lora_download_text" class="status">Paste the source URL and Krea2 will inspect it automatically, detect the LoRA filename, and preselect the best SafeTensors file.</div>
+      <div class="auto-modal-help">HF_TOKEN is only needed for private/gated Hugging Face files. CIVITAI_API_KEY is read automatically from Colab Secrets/userdata; there is no CivitAI token field to fill in.</div>
+    </div>
+  </div>
+</div>
+
+<div id="ml_upgrade_modal" class="auto-modal hidden" aria-hidden="true">
+  <div class="auto-modal-shell" style="height:auto;max-width:450px" role="dialog" aria-modal="true" aria-labelledby="ml_upgrade_title">
+    <div class="auto-modal-head">
+      <span class="auto-modal-title">15 FREE GENERATIONS COMPLETE</span>
+      <button id="ml_upgrade_close" type="button" class="auto-modal-close">×</button>
+    </div>
+    <div class="auto-modal-body" style="overflow-y:auto">
+      <div id="ml_upgrade_title" style="font-size:20px;line-height:1.15;font-weight:800;color:#f2f2f3;margin:8px 0 4px">Keep creating for 7 days free.</div>
+      <div style="font-size:12px;line-height:1.55;color:#a5a6ac;margin-top:4px">Notebook Pro unlocks unlimited Krea2 generations and the full MissingLink notebook library.</div>
+      <div style="margin-top:13px;padding:10px 11px;border:1px solid #292a30;border-radius:9px;background:#151518;font-size:11px;color:#d5d6da"><b style="color:#f1d56d">7-day free trial</b> · cancel anytime</div>
+      <div class="auto-modal-actions">
+        <button id="ml_upgrade_later" type="button" class="secondary">Not now</button>
+        <a id="ml_upgrade_modal_cta" href="https://missinglink.build/notebook-pro/start?source=krea2-studio&model=krea2&placement=free-limit" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;justify-content:center;min-width:220px;height:36px;padding:0 12px;background:#E8A917;color:#09090B;text-decoration:none;border-radius:6px;font:800 9px var(--font-mono)">START 7-DAY FREE TRIAL →</a>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div id="terms_modal" class="terms-modal hidden" aria-hidden="true">
   <div class="terms-shell" role="dialog" aria-modal="true" aria-labelledby="terms_title">
     <div id="terms_title" class="terms-title">18+ · RESPONSIBLE USE AGREEMENT</div>
@@ -6898,7 +8129,7 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
       <div class="terms-item"><strong>No minors or non-consensual intimate content.</strong> I will not create, possess, solicit, facilitate, or distribute sexual/exploitative content involving minors or ambiguous-age persons, or non-consensual intimate imagery / sexual deepfakes of identifiable people. I will obtain any legally required age or consent documentation.</div>
       <div class="terms-item"><strong>No harmful or illegal use.</strong> I will not use this Studio to facilitate abuse, exploitation, coercion, trafficking, extortion, stalking, fraud, threats, harassment, privacy invasion, unlawful impersonation, or other illegal conduct.</div>
       <div class="terms-item"><strong>I am responsible for outputs and downstream use.</strong> MissingLink provides the execution/orchestration stack; it does not develop, train, or control the underlying third-party models or LoRAs. I am responsible for prompts, source materials, model/LoRA choices, reviewing results, and any use or distribution of those results.</div>
-      <div class="terms-item"><strong>Active MissingLink membership required.</strong> I will not bypass, disable, remove, alter, or interfere with membership, entitlement, access-control, responsible-use, or safety mechanisms. Violations may result in suspension/revocation and legal action where appropriate.</div>
+      <div class="terms-item"><strong>Notebook access rules apply.</strong> I understand the Studio includes 15 free Krea2 generations for eligible starter accounts, then requires Notebook Pro. I will not bypass, disable, remove, alter, or interfere with identity, quota, membership, access-control, responsible-use, or safety mechanisms.</div>
     </div>
 
     <div class="terms-foot">Third-party model and LoRA licenses still apply. These are minimum conditions; you remain responsible for any additional legal, recordkeeping, verification, notice, takedown, or distribution obligations that apply to you or your content.</div>
@@ -7022,12 +8253,77 @@ async function fetchJson(url,opts={}){
   const r=await fetch(url,opts);
   let d={};
   try{d=await r.json()}catch(_){}
+  if(d&&d.access) mlRenderAccess(d.access);
   if(!r.ok || d.ok===false){
     if(r.status===428 && d.code==='terms_acceptance_required') showTermsModal();
+    if(r.status===402 && d.code==='free_limit_reached'){
+      mlRenderAccess(d);
+      mlShowUpgradeModal('free_limit');
+    }
     throw new Error(d.error||('HTTP '+r.status));
   }
   return d;
 }
+
+// ====================================================================
+// MISSINGLINK NOTEBOOK ACCESS · 15 FREE KREA2 GENERATIONS
+// ====================================================================
+let ML_ACCESS_STATE=null;
+const ML_UPGRADE_URL='https://missinglink.build/notebook-pro/start?source=krea2-studio&model=krea2&placement=always-on-subscribe';
+function mlRenderAccess(a){
+  if(!a||!a.ok)return;
+  ML_ACCESS_STATE=a;
+  const label=$('ml_access_label'),sub=$('ml_access_sub'),up=$('ml_upgrade_link'),
+        pitch=$('ml_upgrade_pitch'),card=$('ml_access_card'),chip=$('key_chip');
+  if(a.member){
+    if(label)label.textContent='Notebook Pro · UNLIMITED KREA2';
+    if(sub)sub.textContent='Subscription active · unlimited Krea2 generations and the full MissingLink notebook library are unlocked.';
+    if(up)up.style.display='none';
+    if(pitch)pitch.style.display='none';
+    if(card){card.style.borderColor='#24472d';card.style.background='linear-gradient(135deg,#101a13,#121214)'}
+    if(chip)chip.textContent='PRO · UNLIMITED';
+  }else{
+    const rem=Math.max(0,Number(a.remaining??0));
+    if(label)label.textContent=rem>0?`Starter · ${rem} of 15 free Krea2 generations left`:'Free generation limit reached · upgrade to continue';
+    if(sub){
+      if(rem<=0)sub.textContent='Start the 7-day Notebook Pro trial to keep generating.';
+      else if(rem<=3)sub.textContent=`Only ${rem} free generation${rem===1?'':'s'} left. Notebook Pro starts with a 7-day free trial.`;
+      else sub.textContent='Use your free starter generations, or go unlimited anytime with Notebook Pro.';
+    }
+    if(up){
+      up.style.display='inline-flex';
+      up.href=a.upgrade_url||ML_UPGRADE_URL;
+      up.textContent=rem<=0?'START 7-DAY TRIAL →':'SUBSCRIBE →';
+    }
+    if(pitch)pitch.style.display='block';
+    if(card){
+      card.style.borderColor=rem<=3?'#76520d':'#4a3b12';
+      card.style.background=rem<=3?'linear-gradient(135deg,#211907,#141214)':'linear-gradient(135deg,#19170d,#121214)';
+    }
+    if(chip)chip.textContent=`${rem}/15 FREE`;
+    if(rem<=0)mlShowUpgradeModal('free_limit');
+  }
+}
+function mlShowUpgradeModal(trigger='free_limit'){
+  if(ML_ACCESS_STATE?.member)return;
+  const m=$('ml_upgrade_modal');if(!m)return;
+  m.classList.remove('hidden');m.setAttribute('aria-hidden','false');
+}
+function mlHideUpgradeModal(){
+  const m=$('ml_upgrade_modal');if(!m)return;
+  m.classList.add('hidden');m.setAttribute('aria-hidden','true');
+}
+async function mlRefreshAccess(){
+  try{
+    const r=await fetch('/api/ml/access',{cache:'no-store'});
+    const a=await r.json();
+    if(r.ok&&a.ok){mlRenderAccess(a);return a}
+  }catch(_){}
+  return null;
+}
+$('ml_upgrade_close')?.addEventListener('click',mlHideUpgradeModal);
+$('ml_upgrade_later')?.addEventListener('click',mlHideUpgradeModal);
+$('ml_upgrade_modal')?.addEventListener('click',e=>{if(e.target===$('ml_upgrade_modal'))mlHideUpgradeModal()});
 
 // ====================================================================
 // REQUIRED RESPONSIBLE-USE AGREEMENT
@@ -7127,14 +8423,90 @@ $('l_refresh').onclick=refreshLoras;
 $('l_save_stack').onclick=async()=>{
   try{const stack=activeLoraStackFromUI();const d=await fetchJson('/api/loras/active',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({loras:stack})});renderLoraLibrary(d.items||[],4);setStatus('l_status','Active LoRA stack saved for new jobs.','good')}catch(e){setStatus('l_status',e.message,'bad')}
 };
-$('l_hf_install').onclick=async()=>{
-  const btn=$('l_hf_install');btn.disabled=true;setStatus('l_status','Downloading Hugging Face LoRA…','');
-  try{const d=await fetchJson('/api/loras/install/huggingface',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({repo_id:$('l_hf_repo').value,filename:$('l_hf_file').value,revision:$('l_hf_revision').value})});renderLoraLibrary(d.items||[],4);setStatus('l_status','Installed '+d.name+'.','good')}catch(e){setStatus('l_status',e.message,'bad')}finally{btn.disabled=false}
-};
-$('l_civitai_install').onclick=async()=>{
-  const btn=$('l_civitai_install');btn.disabled=true;setStatus('l_status','Downloading Civitai LoRA…','');
-  try{const d=await fetchJson('/api/loras/install/civitai',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version_id:$('l_civitai_version').value,token:$('l_civitai_token').value})});$('l_civitai_token').value='';renderLoraLibrary(d.items||[],4);setStatus('l_status','Installed '+d.name+'.','good')}catch(e){setStatus('l_status',e.message,'bad')}finally{btn.disabled=false}
-};
+
+function openLoraInstallModal(){
+  const m=$('lora_install_modal');if(!m)return;
+  m.classList.remove('hidden');m.setAttribute('aria-hidden','false');
+  if(!$('lora_source')?.value.trim()&&$('lora_detected_name'))$('lora_detected_name').value='Paste a source URL';
+  setTimeout(()=>$('lora_source')?.focus(),0);
+}
+function closeLoraInstallModal(){
+  const m=$('lora_install_modal');if(!m)return;
+  m.classList.add('hidden');m.setAttribute('aria-hidden','true');
+}
+$('l_add').onclick=e=>{e.preventDefault();openLoraInstallModal()};
+$('lora_install_close').onclick=closeLoraInstallModal;
+$('lora_install_modal').addEventListener('click',e=>{if(e.target===$('lora_install_modal'))closeLoraInstallModal()});
+
+let loraInspectTimer=null;
+let loraLastInspected='';
+function updateDetectedLoraName(){
+  const select=$('lora_candidate');
+  const opt=select?.selectedOptions?.[0];
+  const name=opt?.dataset?.filename||'';
+  if($('lora_detected_name'))$('lora_detected_name').value=name||'No LoRA file detected';
+}
+async function inspectLoraSource({force=false}={}){
+  const source=$('lora_source').value.trim();
+  const revision=$('lora_revision').value.trim()||'main';
+  if(!source){
+    if($('lora_detected_name'))$('lora_detected_name').value='Paste a source URL';
+    setStatus('lora_download_text','Paste a Hugging Face or CivitAI source first.','bad');
+    return;
+  }
+  const signature=source+'\n'+revision;
+  if(!force&&signature===loraLastInspected)return;
+  $('lora_check_source').disabled=true;
+  $('lora_download_btn').disabled=true;
+  $('lora_candidate').disabled=true;
+  $('lora_download_progress').style.width='0%';
+  if($('lora_detected_name'))$('lora_detected_name').value='Detecting…';
+  setStatus('lora_download_text','Inspecting source and detecting LoRA name…','');
+  $('lora_source_type').value='checking…';
+  try{
+    const r=await fetchJson('/api/loras/inspect',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({source,revision})
+    });
+    loraLastInspected=signature;
+    $('lora_source_type').value=(r.source_type||'unknown').toUpperCase();
+    if(r.source_type==='hf'&&r.revision)$('lora_revision').value=r.revision;
+    const select=$('lora_candidate');select.innerHTML='';
+    (r.candidates||[]).forEach(x=>{
+      const o=document.createElement('option');
+      o.value=x.key;
+      o.dataset.filename=x.filename||'';
+      o.textContent=(x.label||x.filename)+' · '+(x.size?_fmtLoraBytes(x.size):'size unknown');
+      select.appendChild(o);
+    });
+    if(r.preferred_key&&[...select.options].some(x=>x.value===r.preferred_key))select.value=r.preferred_key;
+    const count=(r.candidates||[]).length;
+    select.disabled=!count;$('lora_download_btn').disabled=!count;
+    if(r.detected_name&&$('lora_detected_name'))$('lora_detected_name').value=r.detected_name;
+    updateDetectedLoraName();
+    const detected=$('lora_detected_name')?.value||'';
+    setStatus('lora_download_text',
+      count?`${count} SafeTensors file${count===1?'':'s'} found · ${detected} selected automatically.`:'No SafeTensors LoRA files found.',
+      count?'good':'bad');
+  }catch(err){
+    loraLastInspected='';
+    $('lora_source_type').value='error';
+    if($('lora_detected_name'))$('lora_detected_name').value='Detection failed';
+    setStatus('lora_download_text',String(err.message||err),'bad');
+  }finally{
+    $('lora_check_source').disabled=false;
+  }
+}
+function scheduleLoraInspect(delay=180){
+  clearTimeout(loraInspectTimer);
+  loraInspectTimer=setTimeout(()=>inspectLoraSource(),delay);
+}
+$('lora_check_source').onclick=async e=>{e.preventDefault();await inspectLoraSource({force:true})};
+$('lora_candidate').addEventListener('change',updateDetectedLoraName);
+$('lora_source').addEventListener('paste',()=>scheduleLoraInspect(120));
+$('lora_source').addEventListener('change',()=>scheduleLoraInspect(0));
+$('lora_source').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();inspectLoraSource({force:true})}});
 
 // ====================================================================
 // AUTO PROMPT
@@ -7913,7 +9285,8 @@ function syncBatchJob(job){
   $('b_caption').disabled=done<1;
   $('b_stop').disabled=!['queued','waiting','running'].includes(state);
   if(job.zip){$('b_zip').href=job.zip+'?download=1';$('b_zip').classList.remove('hidden')}
-  if(done!==lastBatchCount){lastBatchCount=done;refreshHistory()}
+  if(done!==lastBatchCount){lastBatchCount=done;refreshHistory();mlRefreshAccess()}
+  if(job.code==='free_limit_reached'){if(job.access)mlRenderAccess(job.access);mlShowUpgradeModal('batch_free_limit')}
 }
 
 $('b_generate').onclick=async()=>{
@@ -8274,7 +9647,11 @@ function applyFinishedJob(job){
     if(job.status==='done'&&r.image){setSharedSingleImage(r.image)}
     setStatus('in_status',message,bad?'bad':(job.status==='done'?'good':''));
   }
-  if(job.status==='done')refreshHistory();
+  if(job.code==='free_limit_reached'){
+    if(job.access)mlRenderAccess(job.access);
+    mlShowUpgradeModal('job_free_limit');
+  }
+  if(job.status==='done'){refreshHistory();mlRefreshAccess()}
 }
 
 async function pollJobs(){
@@ -8298,6 +9675,7 @@ clearSharedSingleStage();
 setStageEmpty('b_gallery');
 setStageEmpty('history_stage');
 refreshTermsStatus();
+mlRefreshAccess();
 refreshLoras();
 refreshHistory(false);pollJobs();
 setInterval(pollJobs,700);
@@ -8341,24 +9719,20 @@ def index():
 
 
 def _assert_missinglink_access_control_integrity():
-    """Tripwire against accidental removal of required entitlement enforcement.
-
-    This is intentionally explicit rather than obfuscated: automated refactors
-    should fail loudly if they delete or rename critical access-control hooks.
-    """
+    """Tripwire against accidental removal of Notebook identity/quota enforcement."""
     required_callables = {
-        "_missinglink_entitlement_active": globals().get("_missinglink_entitlement_active"),
         "_validate_missinglink_token": globals().get("_validate_missinglink_token"),
+        "_ml_reserve_generation": globals().get("_ml_reserve_generation"),
         "_require_missinglink_access": globals().get("_require_missinglink_access"),
         "_missinglink_request_gate": globals().get("_missinglink_request_gate"),
         "_missinglink_entitlement_watchdog": globals().get("_missinglink_entitlement_watchdog"),
     }
     missing = [name for name, value in required_callables.items() if not callable(value)]
-    if MISSINGLINK_ACCESS_CONTROL_SENTINEL != "ML-ENTITLEMENT-V1-FAIL-CLOSED":
+    if MISSINGLINK_ACCESS_CONTROL_SENTINEL != "ML-NOTEBOOK-FREE15-V1":
         missing.append("MISSINGLINK_ACCESS_CONTROL_SENTINEL")
     before_hooks = app.before_request_funcs.get(None, [])
     if _missinglink_request_gate not in before_hooks:
-        missing.append("Flask before_request entitlement gate registration")
+        missing.append("Flask before_request Notebook identity gate registration")
     if missing:
         raise RuntimeError(
             "MissingLink access-control integrity check failed; refusing to launch: "
@@ -8382,7 +9756,7 @@ print("CFG         :", CFG)
 print("Sampler     :", SAMPLER_NAME)
 print("Scheduler   :", SCHEDULER)
 print("Attention   : PyTorch SDPA")
-print("Access      : MissingLink API key validated")
+print("Access      : MissingLink Notebook identity + free15/Pro quota")
 print("Port        :", APP_PORT)
 print("=" * 76)
 
@@ -8451,8 +9825,8 @@ env["MISSINGLINK_UI_PORT"] = "7860"
 
 if HF_TOKEN:
     env["HF_TOKEN"] = HF_TOKEN
-if CIVITAI_TOKEN:
-    env["CIVITAI_TOKEN"] = CIVITAI_TOKEN
+if CIVITAI_API_KEY:
+    env["CIVITAI_API_KEY"] = CIVITAI_API_KEY
 
 env["PYTHONUNBUFFERED"] = "1"
 env["PYTHONFAULTHANDLER"] = "1"
@@ -8639,11 +10013,11 @@ print(
     flush=True,
 )
 
-# SECURITY / LICENSING CHECKPOINT H — FINAL UI-EXPOSURE GATE.
-# Revalidate immediately before exposing the port through Colab. A token that
-# became inactive during model/UI preload must never get a visible Studio UI.
-# DO NOT move this check after serve_kernel_port_as_iframe/window.
-if MISSINGLINK_ACCESS_CONTROL_SENTINEL != "ML-ENTITLEMENT-V1-FAIL-CLOSED":
+# ACCESS CHECKPOINT H — FINAL UI-EXPOSURE GATE.
+# Revalidate Notebook identity immediately before exposing the UI. If a starter
+# account used its final free generation during preload/session setup, require the
+# Notebook Pro 7-day trial before opening a new Studio session.
+if MISSINGLINK_ACCESS_CONTROL_SENTINEL != "ML-NOTEBOOK-FREE15-V1":
     try:
         proc.terminate()
     except Exception:
@@ -8651,19 +10025,32 @@ if MISSINGLINK_ACCESS_CONTROL_SENTINEL != "ML-ENTITLEMENT-V1-FAIL-CLOSED":
     raise RuntimeError("MissingLink access-control sentinel mismatch; refusing UI launch.")
 
 _launch_ok, _launch_error = validate_missinglink_access(MISSING_LINK_TOKEN)
-if not _launch_ok:
+_launch_state = dict(_ML_PARENT_AUTH_STATE)
+if (
+    not _launch_ok
+    or (
+        not _launch_state.get("member")
+        and int(_launch_state.get("remaining") or 0) <= 0
+    )
+):
     try:
         proc.terminate()
     except Exception:
         pass
+    if _launch_ok:
+        raise RuntimeError(
+            f"Your {KREA2_FREE_RENDER_LIMIT} free Krea2 generations are complete.\n"
+            "Start the 7-day Notebook Pro trial to continue.\n"
+            + MISSING_LINK_UPGRADE_URL
+        )
     raise RuntimeError(
-        "An active MissingLink subscription is required to launch the Studio UI.\n"
-        + (_launch_error or "Entitlement validation failed.")
-        + "\nGet access: "
-        + MISSING_LINK_TRIAL_URL
+        "MissingLink notebook sign-in is required to launch the Studio UI.\n"
+        + (_launch_error or "Identity validation failed.")
+        + "\nGet 15 free Krea2 generations: "
+        + MISSING_LINK_SIGNIN_URL
     )
 
-print("✓ Active MissingLink entitlement revalidated before UI launch", flush=True)
+print("✓ MissingLink Notebook access revalidated before UI launch", flush=True)
 
 try:
     from google.colab import output as _colab_output
