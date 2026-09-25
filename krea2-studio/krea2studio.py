@@ -1,7 +1,7 @@
 # =====================================================================
-# MISSINGLINK KREA2 STUDIO — COMPLETE ONE-CELL COLAB
+# MISSINGLINK KREA2 STUDIO — MissingLink-Extras source
 #
-# Fresh-runtime compatible
+# Run from /content/MissingLink-Extras/krea2-studio/krea2studio.py
 #
 # TABS
 #   1. Text -> Image
@@ -7616,7 +7616,9 @@ html::-webkit-scrollbar,body::-webkit-scrollbar,.app-shell::-webkit-scrollbar,.a
 /* Floating Queue + History — ported from MissingLink Studio. These are fixed
    to the viewport so they stay visible on every Krea2 tab. */
 .queue-overlay{position:fixed;top:106px;right:14px;width:300px;z-index:800;display:flex;flex-direction:column;gap:6px;pointer-events:none}
-.history-overlay{position:fixed;bottom:14px;right:14px;width:300px;z-index:790;display:flex;flex-direction:column;gap:6px;pointer-events:none}
+.history-overlay{position:fixed;bottom:14px;right:14px;width:300px;z-index:790;display:flex;flex-direction:column;gap:6px;pointer-events:none;transition:width .15s ease}
+.history-overlay.expanded{width:min(500px,calc(100vw - 20px))}
+.history-overlay.expanded .q-list{max-height:min(68vh,620px)}
 .queue-overlay>*,.history-overlay>*{pointer-events:auto}
 .queue-overlay.q-positioned,.history-overlay.q-positioned{right:auto;bottom:auto}
 .q-section{position:relative;background:rgba(17,17,19,.96);border:1px solid var(--border);border-radius:8px;overflow:hidden;box-shadow:0 8px 28px rgba(0,0,0,.45)}
@@ -7668,7 +7670,6 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
         <button class="tab" data-tab="edit">INSTRUCTION EDIT</button>
         <button class="tab" data-tab="inpaint">INPAINT</button>
         <button class="tab" data-tab="batch">ADAPTIVE BATCH</button>
-        <button class="tab" data-tab="history">HISTORY</button>
         <button class="tab" data-tab="loras">LORAS</button>
         <button class="tab" data-tab="console">CONSOLE</button>
       </nav>
@@ -8031,18 +8032,6 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
           </div>
         </section>
 
-        <section id="panel_history" class="controlpanel">
-          <div class="card">
-            <div class="cardtitle">Image History</div>
-            <div class="cardbody">
-              <div class="sectionhint">History is also always available in the movable floating panel.</div>
-              <div class="actions">
-                <button id="h_refresh" class="secondary">REFRESH</button>
-                <button id="h_zip" class="secondary">DOWNLOAD HISTORY ZIP</button>
-              </div>
-            </div>
-          </div>
-        </section>
       </div>
     </aside>
 
@@ -8064,7 +8053,6 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
         <div id="e_result" class="stageview single stagepanel"><div class="empty">Instruction edit result appears here.</div></div>
         <div id="in_result" class="stageview single stagepanel"><div class="empty">Edit / inpaint result appears here.</div></div>
         <div id="b_gallery" class="stageview gallerymode stagepanel"><div class="empty">Completed batch images stream here.</div></div>
-        <div id="history_stage" class="stageview gallerymode stagepanel"><div class="empty">History images appear here.</div></div>
         <div id="lora_stage" class="stageview lora-stage stagepanel"><h2>USER LoRA STACK</h2><p>Additional LoRAs installed from Hugging Face or Civitai are applied to new queued jobs. Keep stacks small on T4-class GPUs: every LoRA adds model patches and can increase memory pressure and generation time.</p><div id="lora_stage_active"></div></div>
         <pre id="console_stage" class="stageview console-stage stagepanel">Console output will appear here.</pre>
       </div>
@@ -8203,7 +8191,7 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
   </div>
 </div>
 
-<!-- Persistent floating history -->
+<!-- Persistent floating History — draggable, expandable, and minimizable like H3 Studio -->
 <div class="history-overlay" id="historyOverlay">
   <div class="q-section" id="qHistorySection">
     <div class="q-header q-drag-handle" data-overlay="history" title="Drag to move · double-click to reset">
@@ -8663,7 +8651,6 @@ const STAGE_EMPTY_TEXT={
   e_result:'Instruction edit result appears here.',
   in_result:'Edit / inpaint result appears here.',
   b_gallery:'Completed batch images stream here.',
-  history_stage:'History images appear here.',
   console_stage:'Console output will appear here.'
 };
 const stageState={};
@@ -8771,8 +8758,8 @@ function currentStageUrl(id){
   const img=$(id).querySelector('img');
   return img ? (img.dataset.rawUrl || img.src.split('?')[0]) : '';
 }
-const STAGE_BY_TAB={text:'t_result',image:'i_result',edit:'e_result',inpaint:'in_result',batch:'b_gallery',history:'history_stage',loras:'lora_stage',console:'console_stage'};
-const STAGE_LABELS={text:'TEXT → IMAGE',image:'IMAGE → IMAGE',edit:'INSTRUCTION EDIT',inpaint:'INPAINT',batch:'ADAPTIVE BATCH',history:'IMAGE HISTORY',loras:'LORA MANAGER',console:'CONSOLE'};
+const STAGE_BY_TAB={text:'t_result',image:'i_result',edit:'e_result',inpaint:'in_result',batch:'b_gallery',loras:'lora_stage',console:'console_stage'};
+const STAGE_LABELS={text:'TEXT → IMAGE',image:'IMAGE → IMAGE',edit:'INSTRUCTION EDIT',inpaint:'INPAINT',batch:'ADAPTIVE BATCH',loras:'LORA MANAGER',console:'CONSOLE'};
 const SINGLE_WORK_TABS=['text','image','edit','inpaint'];
 const STATUS_BY_TAB={text:'t_status',image:'i_status',edit:'e_status',inpaint:'in_status',batch:'b_status',loras:'l_status',console:'console_status'};
 let activeStageId='t_result';
@@ -8810,11 +8797,9 @@ function activateStage(tab){
 function switchStudioTab(tab){
   const previousTab=activeStudioTab;
   if(previousTab==='batch' && tab!=='batch') setStageEmpty('b_gallery');
-  if(previousTab==='history' && tab!=='history') setStageEmpty('history_stage');
   document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.tab===tab));
   document.querySelectorAll('.controlpanel').forEach(x=>x.classList.toggle('active',x.id==='panel_'+tab));
   activateStage(tab);
-  if(tab==='history') refreshHistory(true);
   if(tab==='loras') refreshLoras();
   if(tab==='console') refreshConsole(true);
 }
@@ -9360,29 +9345,15 @@ async function refreshHistory(force=false){
     lastHistoryItems=items;
     if(changed){
       lastHistorySignature=sig;
-      // Floating History is always available, but the full History stage is
-      // populated ONLY when the user explicitly opens the Image History tab.
       renderFloatingHistory(lastHistoryItems);
-      if(activeStudioTab==='history'){
-        renderStageGallery('history_stage',lastHistoryItems);
-      }
     }else{
       $('historySidebarCount').textContent=String(items.length);
     }
   }catch(e){
-    if(activeStudioTab==='history'){
-      const hs=$('history_stage');
-      if(hs) hs.innerHTML='<div class="empty">'+e.message+'</div>';
-    }
+    const root=$('qHistoryList');
+    if(root) root.innerHTML='<div class="q-empty">'+escapeHtml(e.message||'Could not load history.')+'</div>';
   }
 }
-$('h_refresh').onclick=()=>refreshHistory(true);
-$('h_zip').onclick=async()=>{
-  try{
-    const d=await fetchJson('/api/history/zip',{method:'POST'});
-    window.open(d.download+'?download=1','_blank');
-  }catch(e){setStatus('b_status',e.message,'bad')}
-};
 
 // ====================================================================
 // LIVE CONSOLE
@@ -9482,11 +9453,13 @@ function renderQueue(jobs,count,maxCount){
     tile.append(thumb,info,cancel);root.appendChild(tile);
   });
 }
+let historyFloatingExpanded=false;
 function renderFloatingHistory(items){
   $('historySidebarCount').textContent=String((items||[]).length);
   const root=$('qHistoryList');root.innerHTML='';
   if(!items||!items.length){root.innerHTML='<div class="q-empty">No generations yet.</div>';return}
-  items.slice(0,6).forEach(item=>{
+  const visible=historyFloatingExpanded ? items : items.slice(0,6);
+  visible.forEach(item=>{
     const tile=document.createElement('div');tile.className='q-hist-tile';tile.title='Load onto stage';
     const thumb=document.createElement('div');thumb.className='job-thumb';
     const img=document.createElement('img');img.src=item.url;img.loading='lazy';img.decoding='async';thumb.appendChild(img);
@@ -9502,16 +9475,21 @@ function renderFloatingHistory(items){
     root.appendChild(tile);
   });
 }
-// Only the explicit Expand button opens the History workspace. Thumbnail clicks
-// above are stage-load actions and never call this function.
-function openFullHistory(){switchStudioTab('history');}
+function toggleHistoryExpand(){
+  historyFloatingExpanded=!historyFloatingExpanded;
+  const overlay=$('historyOverlay');
+  if(overlay) overlay.classList.toggle('expanded',historyFloatingExpanded);
+  const btn=$('historyExpandBtn');
+  if(btn) btn.textContent=historyFloatingExpanded?'↙ Normal':'⛶ Expand';
+  renderFloatingHistory(lastHistoryItems);
+}
 async function cancelJob(jid){
   try{await fetchJson('/api/jobs/'+jid+'/cancel',{method:'POST'});pollJobs()}catch(e){console.error(e)}
 }
 $('queueClearAllBtn').onclick=async()=>{
   try{await fetchJson('/api/jobs/cancel_all',{method:'POST'});pollJobs()}catch(e){console.error(e)}
 };
-$('historyExpandBtn').onclick=openFullHistory;
+$('historyExpandBtn').onclick=toggleHistoryExpand;
 
 function togglePanelMin(sectionId,buttonId,key){
   const sec=$(sectionId);const minimized=!sec.classList.contains('minimized');
@@ -9673,7 +9651,6 @@ restoreMin();initOverlayDragging();
 switchStudioTab('text');
 clearSharedSingleStage();
 setStageEmpty('b_gallery');
-setStageEmpty('history_stage');
 refreshTermsStatus();
 mlRefreshAccess();
 refreshLoras();
