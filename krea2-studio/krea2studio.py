@@ -7370,6 +7370,38 @@ def api_history():
     )
 
 
+@app.get("/api/history/prompt/<path:name>")
+def api_history_prompt(name):
+    safe_name = Path(name).name
+    if safe_name != name:
+        return _json_error("Invalid history filename.", 400)
+
+    image_path = OUTPUT_DIR / safe_name
+    if image_path.suffix.lower() != ".png" or not image_path.is_file():
+        return _json_error("History image not found.", 404)
+
+    meta_path = image_path.with_suffix(".json")
+    if not meta_path.is_file():
+        return _json_error("No saved prompt metadata exists for this image.", 404)
+
+    try:
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return _json_error(f"Could not read prompt metadata: {exc}", 500)
+
+    prompt = str(metadata.get("prompt") or "")
+    if not prompt:
+        return _json_error("This history image has no saved prompt.", 404)
+
+    return jsonify(
+        ok=True,
+        filename=safe_name,
+        prompt=prompt,
+        mode=str(metadata.get("mode") or ""),
+        seed=metadata.get("seed"),
+    )
+
+
 @app.post("/api/history/zip")
 def api_history_zip():
     files = sorted(
@@ -7711,7 +7743,7 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
 .job-info{flex:1;min-width:0;font-family:var(--font-mono);font-size:9px}.job-status{color:var(--text);font-weight:700;margin-bottom:1px;display:flex;align-items:center;gap:3px;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;padding-right:24px}.job-mode{color:var(--text-muted);font-size:8px;text-transform:uppercase;letter-spacing:.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.job-meta{color:#8d8f98;font-size:8px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .job-cancel{position:absolute;top:4px;right:4px;width:20px!important;height:20px!important;background:rgba(239,68,68,.15)!important;border:1px solid var(--red)!important;color:var(--red)!important;border-radius:50%!important;cursor:pointer;font-size:12px!important;display:flex;align-items:center;justify-content:center;padding:0!important;line-height:1;font-weight:700}.job-cancel:hover{background:var(--red)!important;color:#fff!important}
 .job-progress{height:3px;background:var(--surface-3);border-radius:2px;margin-top:4px;overflow:hidden}.job-progress-fill{height:100%;background:linear-gradient(90deg,var(--gold),#ffcf4a);transition:width .4s ease-out;border-radius:2px}
-.q-hist-tile{display:flex;gap:7px;padding:4px;background:var(--surface-2);border:1px solid var(--border);border-radius:5px;align-items:center;cursor:pointer;transition:all .15s}.q-hist-tile:hover{border-color:var(--gold);background:var(--surface-3)}.q-hist-tile .job-thumb{width:38px;height:38px}.q-hist-tile .job-status{font-size:9px;padding-right:0}.q-hist-tile .job-mode{font-size:8px}
+.q-hist-tile{display:flex;gap:7px;padding:4px;background:var(--surface-2);border:1px solid var(--border);border-radius:5px;align-items:center;cursor:pointer;transition:all .15s}.q-hist-tile:hover{border-color:var(--gold);background:var(--surface-3)}.q-hist-tile .job-thumb{width:38px;height:38px}.q-hist-tile .job-status{font-size:9px;padding-right:0}.q-hist-tile .job-mode{font-size:8px}.q-hist-prompt{flex:0 0 auto;height:28px!important;padding:0 8px!important;border:1px solid #4a3b12!important;background:#1d1b13!important;color:var(--gold)!important;border-radius:5px!important;font:700 7.5px var(--font-mono)!important;letter-spacing:.55px!important;text-transform:uppercase}.q-hist-prompt:hover{background:var(--gold)!important;color:#111!important;border-color:var(--gold)!important}.q-hist-prompt:disabled{opacity:.35!important;cursor:not-allowed!important}
 /* Floating panels stay draggable at every viewport size. */
 @media(max-width:900px){
   .queue-overlay,.history-overlay{width:min(300px,calc(100vw - 16px));max-width:calc(100vw - 16px)}
@@ -9627,6 +9659,43 @@ function renderQueue(jobs,count,maxCount){
   });
 }
 let historyFloatingExpanded=false;
+async function putHistoryPromptInInput(item,button=null){
+  const filename=String(item?.filename||'').trim();
+  if(!filename)return;
+
+  const originalLabel=button?.textContent||'PROMPT';
+  if(button){button.disabled=true;button.textContent='LOADING…'}
+  try{
+    const data=await fetchJson('/api/history/prompt/'+encodeURIComponent(filename),{cache:'no-store'});
+    const prompt=String(data.prompt||'');
+    if(!prompt)throw new Error('This history image has no saved prompt.');
+
+    const promptInputByTab={
+      text:'t_prompt',
+      image:'i_prompt',
+      edit:'e_prompt',
+      inpaint:'in_prompt',
+      batch:'b_instruction'
+    };
+    let tab=activeStudioTab;
+    if(!promptInputByTab[tab]){
+      tab=lastWorkTab||'text';
+      switchStudioTab(tab);
+    }
+    const targetId=promptInputByTab[tab]||'t_prompt';
+    const target=$(targetId);
+    if(!target)throw new Error('Prompt input is unavailable.');
+    target.value=prompt;
+    target.dispatchEvent(new Event('input',{bubbles:true}));
+    target.focus();
+    try{target.setSelectionRange(prompt.length,prompt.length)}catch(_){ }
+    setStatusForTab(tab,'Prompt loaded from History.','good');
+  }catch(err){
+    setStatusForTab(activeStudioTab,String(err.message||err),'bad');
+  }finally{
+    if(button){button.disabled=false;button.textContent=originalLabel}
+  }
+}
 function renderFloatingHistory(items){
   $('historySidebarCount').textContent=String((items||[]).length);
   const root=$('qHistoryList');root.innerHTML='';
@@ -9639,7 +9708,18 @@ function renderFloatingHistory(items){
     const info=document.createElement('div');info.className='job-info';
     const st=document.createElement('div');st.className='job-status';st.textContent=item.filename||'Generation';
     const md=document.createElement('div');md.className='job-mode';md.textContent=(item.caption||'').split('\n')[0].slice(0,54)||'Krea2 output';
-    info.append(st,md);tile.append(thumb,info);
+    info.append(st,md);
+    const promptBtn=document.createElement('button');
+    promptBtn.type='button';
+    promptBtn.className='q-hist-prompt';
+    promptBtn.textContent='PROMPT';
+    promptBtn.title='Load this image prompt into the prompt input';
+    promptBtn.addEventListener('click',ev=>{
+      ev.preventDefault();
+      ev.stopPropagation();
+      putHistoryPromptInInput(item,promptBtn);
+    });
+    tile.append(thumb,info,promptBtn);
     tile.addEventListener('click',ev=>{
       ev.preventDefault();
       ev.stopPropagation();
