@@ -112,7 +112,19 @@ LIGHTNING_STEPS = 4
 LIGHTNING_SHIFT_VIDEO = 6.0
 LIGHTNING_SHIFT_AUDIO = 3.0
 
-# TaoMate-H3 3-step ComfyUI accelerator (converted from official TaoLiveAIGC adapter).
+# Official LightX2V 8-step accelerators used by the MEDIUM quality preset.
+# FL2V 768p recommendation: 8 steps, Euler/Simple, video shift 6, audio shift 3.
+# Ref2V 768p recommendation: 8 steps, Euler/Simple, video shift 12, audio shift 3.
+MEDIUM8_REPO = "lightx2v/Minimax-h3-Turbo"
+MEDIUM8_FILE = "minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors"
+MEDIUM8_REF2VA_FILE = "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors"
+MEDIUM8_STRENGTH = 1.0
+MEDIUM8_STEPS = 8
+MEDIUM8_SHIFT_VIDEO = 6.0
+MEDIUM8_REF2VA_SHIFT_VIDEO = 12.0
+MEDIUM8_SHIFT_AUDIO = 3.0
+
+# Legacy TaoMate constants remain only for old saved payload compatibility.
 TAOMATE_REPO = "Asirus/TaoMate_H3_3_Step_LoRA"
 TAOMATE_FILE = "taomate_h3_3step_MAXQUALITY_bf16.safetensors"
 TAOMATE_STRENGTH = 1.0
@@ -3102,6 +3114,40 @@ if _CU130_CHILD:
     else:
         REF2VA_LIGHTNING_AVAILABLE = _ensure_ref2va_lightning_lora()
 
+    MEDIUM8_PATH = os.path.join(ldir, MEDIUM8_FILE)
+    MEDIUM8_REF2VA_PATH = os.path.join(ldir, MEDIUM8_REF2VA_FILE)
+
+    def _ensure_medium8_lora(ref2va=False):
+        file_name = MEDIUM8_REF2VA_FILE if ref2va else MEDIUM8_FILE
+        path = MEDIUM8_REF2VA_PATH if ref2va else MEDIUM8_PATH
+        label = "Ref2VA Medium 8-Step" if ref2va else "FL2VA Medium 8-Step"
+        try:
+            if os.path.exists(path):
+                ok, err = _validate_safetensors_file(path)
+                if ok:
+                    log(f"  ✓ {label}: {file_name}")
+                    return True
+                log(f"  ⚠ {label} file is corrupt: {err}; replacing it")
+                os.remove(path)
+            log(f"  ↓ {label} LoRA: {file_name} ({MEDIUM8_REPO})")
+            src = hf_hub_download(MEDIUM8_REPO, filename=file_name)
+            _atomic_copy_weight(src, path)
+            log(f"  ✓ {label}: {file_name}")
+            return True
+        except Exception as e:
+            log(f"  ⚠ {label} unavailable: {e}")
+            return False
+
+    if LOWVRAM_T4_PROFILE:
+        MEDIUM8_AVAILABLE = False
+        log("  ✓ T4/LOW-VRAM: Medium 8-Step accelerators unavailable")
+    elif FAST_STARTUP:
+        MEDIUM8_AVAILABLE = True
+        log("  ✓ FAST STARTUP: Medium 8-Step accelerator downloads deferred until first use")
+    else:
+        # Prepare FL2VA eagerly; Ref2VA remains lazy until its tab/preset is used.
+        MEDIUM8_AVAILABLE = _ensure_medium8_lora(False)
+
     MOTION8_PATH = os.path.join(ldir, MOTION8_FILE)
     def _ensure_motion8_lora():
         try:
@@ -3253,6 +3299,8 @@ if _CU130_CHILD:
         if MOTION8_FILE: out[MOTION8_FILE] = _hf_repo_url(MOTION8_REPO)
         if LIGHTNING_FILE: out[LIGHTNING_FILE] = _hf_repo_url(LIGHTNING_REPO)
         if REF2VA_LIGHTNING_FILE: out[REF2VA_LIGHTNING_FILE] = _hf_repo_url(REF2VA_LIGHTNING_REPO)
+        if MEDIUM8_FILE: out[MEDIUM8_FILE] = _hf_repo_url(MEDIUM8_REPO)
+        if MEDIUM8_REF2VA_FILE: out[MEDIUM8_REF2VA_FILE] = _hf_repo_url(MEDIUM8_REPO)
         if TAOMATE_FILE: out[TAOMATE_FILE] = _hf_repo_url(TAOMATE_REPO)
         for fn,url in dict(LORA_SOURCE_CACHE).items():
             if fn and url: out[fn]=url
@@ -3869,6 +3917,10 @@ if _CU130_CHILD:
             if not _ensure_lightning_lora(): raise RuntimeError("FL2VA Turbo accelerator could not be downloaded.")
         elif base == REF2VA_LIGHTNING_FILE and not os.path.exists(REF2VA_LIGHTNING_PATH):
             if not _ensure_ref2va_lightning_lora(): raise RuntimeError("Ref2VA Turbo accelerator could not be downloaded.")
+        elif base == MEDIUM8_FILE and not os.path.exists(MEDIUM8_PATH):
+            if not _ensure_medium8_lora(False): raise RuntimeError("FL2VA Medium 8-Step accelerator could not be downloaded.")
+        elif base == MEDIUM8_REF2VA_FILE and not os.path.exists(MEDIUM8_REF2VA_PATH):
+            if not _ensure_medium8_lora(True): raise RuntimeError("Ref2VA Medium 8-Step accelerator could not be downloaded.")
         elif base == TAOMATE_FILE and not os.path.exists(TAOMATE_PATH):
             if not _ensure_taomate_lora(): raise RuntimeError("TaoMate-H3 3-Step accelerator could not be downloaded.")
 
@@ -3890,7 +3942,8 @@ if _CU130_CHILD:
 
     def get_models(weight_dtype, lora, lora_strength, action=False,
                    action_strength=ACTION_STRENGTH, lightning=False,
-                   lightning_strength=LIGHTNING_STRENGTH, taomate=False,
+                   lightning_strength=LIGHTNING_STRENGTH, medium8=False,
+                   medium8_strength=MEDIUM8_STRENGTH, taomate=False,
                    taomate_strength=TAOMATE_STRENGTH, unet=None, extra_loras=None):
         """Cache the base H3 weights and stack generation LoRAs on a clone per job.
 
@@ -3938,9 +3991,10 @@ if _CU130_CHILD:
 
         use_action = str(action).lower() in ("1", "true", "yes", "on")
         use_lightning = str(lightning).lower() in ("1", "true", "yes", "on")
+        use_medium8 = str(medium8).lower() in ("1", "true", "yes", "on")
         use_taomate = str(taomate).lower() in ("1", "true", "yes", "on")
-        if use_taomate and use_lightning:
-            raise RuntimeError("TaoMate 3-Step and Lightning/Turbo are alternative acceleration LoRAs; choose one.")
+        if sum(bool(x) for x in (use_lightning, use_medium8, use_taomate)) > 1:
+            raise RuntimeError("FAST, MEDIUM 8-Step, and legacy TaoMate are alternative acceleration LoRAs; choose one.")
         norm_extra_loras = []
         for item in (extra_loras or []):
             try:
@@ -3959,9 +4013,9 @@ if _CU130_CHILD:
             (str(lora or "none") == MOTION8_FILE and abs(float(lora_strength or 0.0)) > 1e-6)
             or any(name == MOTION8_FILE for name, _ in norm_extra_loras)
         )
-        if motion8_active and use_lightning:
+        if motion8_active and (use_lightning or use_medium8):
             raise RuntimeError(
-                "Motion Enhancer and Fast-Mode Accelerator are alternative LoRAs; "
+                "Motion Enhancer and the selected speed/quality accelerator are alternative LoRAs; "
                 "refusing to silently disable either one. Turn one OFF in the LoRA rack."
             )
 
@@ -4016,6 +4070,21 @@ if _CU130_CHILD:
                 model, info = _apply_lora_checked(
                     model, lightning_file, lightning_strength,
                     "Ref2VA Turbo" if is_ref2va else "Lightning")
+                if info: infos.append(info)
+
+        if use_medium8:
+            is_ref2va = os.path.basename(str(unet)).lower().startswith("minimax_h3_ref2va")
+            medium_file = MEDIUM8_REF2VA_FILE if is_ref2va else MEDIUM8_FILE
+            medium_path = MEDIUM8_REF2VA_PATH if is_ref2va else MEDIUM8_PATH
+            _ensure_optional_lora_selected(medium_file)
+            if not os.path.exists(medium_path):
+                raise RuntimeError(f"MEDIUM 8-Step is enabled but {medium_file} could not be prepared.")
+            if medium_file in already_applied:
+                log("  ↳ MEDIUM 8-Step file is already present in the LoRA rack; not applying twice")
+            else:
+                model, info = _apply_lora_checked(
+                    model, medium_file, medium8_strength,
+                    "Ref2VA Medium 8-Step" if is_ref2va else "FL2VA Medium 8-Step")
                 if info: infos.append(info)
 
         if use_taomate:
@@ -4248,6 +4317,64 @@ if _CU130_CHILD:
         if total > 15.05:
             raise ValueError(f"Combined {kind} references exceed 15 seconds ({total:.2f}s).")
         return audio_count
+
+    def _trim_reference_video_upload(path, start_sec=None, end_sec=None):
+        """Trim a Ref2VA control video before preflight/model ingestion.
+
+        The browser submits non-destructive in/out seconds. The original upload is
+        only a temporary request asset, so after a successful trim we keep the trimmed
+        MP4 and remove that temporary source copy.
+        """
+        duration = _probe_media_duration(path)
+        if duration is None or duration <= 0:
+            raise ValueError(f"Could not determine duration for {os.path.basename(path)}")
+        try:
+            start = float(start_sec) if start_sec not in (None, "") else 0.0
+        except Exception:
+            start = 0.0
+        try:
+            end = float(end_sec) if end_sec not in (None, "") else float(duration)
+        except Exception:
+            end = float(duration)
+        if not np.isfinite(start): start = 0.0
+        if not np.isfinite(end) or end <= 0: end = float(duration)
+        start = max(0.0, min(float(duration), start))
+        end = max(start, min(float(duration), end))
+        selected = end - start
+        if selected < 2.0 - 1e-3 or selected > 15.05:
+            raise ValueError(
+                f"Each trimmed video reference must be 2–15 seconds; selected {selected:.2f}s "
+                f"from {os.path.basename(path)}."
+            )
+        # No transcode when the user kept essentially the whole clip.
+        if start <= 0.015 and end >= float(duration) - 0.015:
+            return path, {"start": 0.0, "end": float(duration), "duration": float(duration)}
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError("ffmpeg is required to trim Ref2VA control videos")
+        root, _ext = os.path.splitext(path)
+        dest = root + "_trim.mp4"
+        tmp = dest + ".tmp.mp4"
+        for q in (dest, tmp):
+            try: os.remove(q)
+            except FileNotFoundError: pass
+        cmd = [
+            ffmpeg, "-y", "-ss", f"{start:.6f}", "-i", path, "-t", f"{selected:.6f}",
+            "-map", "0:v:0", "-map", "0:a?",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", tmp,
+        ]
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if r.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) <= 1024:
+            try: os.remove(tmp)
+            except Exception: pass
+            raise RuntimeError(
+                "Ref2VA control-video trim failed: " + (r.stderr[-900:] if r.stderr else "ffmpeg failed")
+            )
+        os.replace(tmp, dest)
+        try: os.remove(path)
+        except OSError: pass
+        return dest, {"start": start, "end": end, "duration": selected}
 
     def _load_reference_audio(path, required=True):
         last_err = None
@@ -5551,6 +5678,7 @@ if _CU130_CHILD:
                 action_strength=p.get("action_strength", ACTION_STRENGTH),
                 lightning=p.get("lightning", "0"),
                 lightning_strength=p.get("lightning_strength", LIGHTNING_STRENGTH),
+                medium8=p.get("medium8", "0"), medium8_strength=p.get("medium8_strength", MEDIUM8_STRENGTH),
                 taomate=p.get("taomate", "0"), taomate_strength=p.get("taomate_strength", TAOMATE_STRENGTH),
                 unet=p.get("unet") or DIT_FILE,
                 extra_loras=p.get("extra_loras"))
@@ -5656,7 +5784,8 @@ if _CU130_CHILD:
                     "video_audios": len(ref_video_audios),
                     "audios": len(ref_audios),
                 }
-                log(f"  ref2va -> {len(ref_images)} image ref(s), {len(ref_videos)} video ref(s), {len(ref_audios)} audio ref(s)")
+                trim_note = ", ".join(f"V{i+1}={float(t.get('duration') or 0):.2f}s" for i,t in enumerate(p.get("ref_video_trims") or []))
+                log(f"  ref2va -> {len(ref_images)} image ref(s), {len(ref_videos)} video ref(s), {len(ref_audios)} audio ref(s)" + (f" · trims {trim_note}" if trim_note else ""))
             else:
                 kw = dict(clip=clip, vae=vae, prompt=p["prompt"],
                           width=width, height=height, length=n_frames)
@@ -5901,6 +6030,10 @@ if _CU130_CHILD:
                         action_strength=float(p.get("action_strength") or ACTION_STRENGTH),
                         lightning=str(p.get("lightning") or "0").lower() in ("1","true","yes","on"),
                         lightning_strength=float(p.get("lightning_strength") or LIGHTNING_STRENGTH),
+                        medium8=str(p.get("medium8") or "0").lower() in ("1","true","yes","on"),
+                        medium8_strength=float(p.get("medium8_strength") or MEDIUM8_STRENGTH),
+                        taomate=str(p.get("taomate") or "0").lower() in ("1","true","yes","on"),
+                        taomate_strength=float(p.get("taomate_strength") or TAOMATE_STRENGTH),
                         unet=p.get("unet") or DIT_FILE,
                         extra_loras=p.get("extra_loras"),
                     )
@@ -6212,7 +6345,9 @@ if _CU130_CHILD:
             MOTION8_FILE:_compat_record(profiles=["stock_quality"],modes=["fl2va"],label="Motion 8-Step Enhancer · Stock H3 FL2VA only"),
             LIGHTNING_FILE:_compat_record(profiles=["stock_quality"],modes=["fl2va"],label="FL2VA Turbo accelerator · managed by FAST preset"),
             REF2VA_LIGHTNING_FILE:_compat_record(profiles=["stock_quality"],modes=["ref2va"],label="Ref2VA Turbo accelerator · managed by FAST preset"),
-            TAOMATE_FILE:_compat_record(profiles=["stock_quality"],modes=["fl2va"],label="TaoMate-H3 3-Step accelerator · managed by TAOMATE preset"),
+            MEDIUM8_FILE:_compat_record(profiles=["stock_quality"],modes=["fl2va"],label="LightX2V FL2VA 8-Step · managed by MEDIUM preset"),
+            MEDIUM8_REF2VA_FILE:_compat_record(profiles=["stock_quality"],modes=["ref2va"],label="LightX2V Ref2VA 8-Step · managed by MEDIUM preset"),
+            TAOMATE_FILE:_compat_record(profiles=["stock_quality"],modes=["fl2va"],label="Legacy TaoMate-H3 3-Step accelerator"),
         }
 
     def _known_lora_compatible(name, unet_name, mode):
@@ -6795,7 +6930,7 @@ if _CU130_CHILD:
     def meta():
         folder_paths.cache_helper.clear()
         all_loras = list(folder_paths.get_filename_list("loras"))
-        hidden_accelerators = {LIGHTNING_FILE, REF2VA_LIGHTNING_FILE, TAOMATE_FILE}
+        hidden_accelerators = {LIGHTNING_FILE, REF2VA_LIGHTNING_FILE, MEDIUM8_FILE, MEDIUM8_REF2VA_FILE, TAOMATE_FILE}
         visible_loras = [x for x in all_loras if x not in hidden_accelerators]
         try:
             gguf_unets = folder_paths.get_filename_list("unet_gguf")
@@ -6823,6 +6958,10 @@ if _CU130_CHILD:
             t4_default_unet=(T4_DIT_FILE if LOWVRAM_T4_PROFILE else ""), specialty_loras=[],
             lightning_file=LIGHTNING_FILE, lightning_available=bool(not LOWVRAM_T4_PROFILE),
             ref2va_lightning_file=REF2VA_LIGHTNING_FILE, ref2va_lightning_available=bool(not LOWVRAM_T4_PROFILE),
+            medium8_file=MEDIUM8_FILE, ref2va_medium8_file=MEDIUM8_REF2VA_FILE,
+            medium8_available=bool(MEDIUM8_AVAILABLE), medium8_strength_default=MEDIUM8_STRENGTH,
+            medium8_steps=MEDIUM8_STEPS, medium8_shift_video=MEDIUM8_SHIFT_VIDEO,
+            ref2va_medium8_shift_video=MEDIUM8_REF2VA_SHIFT_VIDEO, medium8_shift_audio=MEDIUM8_SHIFT_AUDIO,
             taomate_file=TAOMATE_FILE, taomate_available=bool(TAOMATE_AVAILABLE), taomate_strength_default=TAOMATE_STRENGTH,
             lightning_default=bool(not LOWVRAM_T4_PROFILE), lightning_strength_default=LIGHTNING_STRENGTH,
             action_label=ACTION_LABEL, action_model_id=0, action_linked_version=0, action_available=False, action_file=None,
@@ -7720,7 +7859,9 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         if mode not in {"fl2va", "ref2va"}:
             mode = "fl2va"
         preset = str(raw.get("performance_preset") or "fast").strip().lower()
-        if preset not in {"fast", "ultra", "quality", "taomate"}:
+        if preset == "taomate":
+            preset = "medium"
+        if preset not in {"fast", "ultra", "medium", "quality"}:
             preset = "fast"
         unet = os.path.basename(str(raw.get("unet") or "").strip())
 
@@ -7835,7 +7976,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
               "playback_speed","image_fit","steps","seed","denoise","story_director_token",
               "shift_video","shift_audio","sparse_percent","sampler_name","scheduler",
               "weight_dtype","lora","lora_strength","motion8","motion8_strength","action","action_strength","lightning",
-              "lightning_strength","taomate","taomate_strength","unet", "use_stage_last", "timeline_action",
+              "lightning_strength","medium8","medium8_strength","taomate","taomate_strength","unet", "use_stage_last", "timeline_action",
               "input_mode", "ref_image_size", "model_profile", "performance_preset",
               "ref_first_guide", "ref_last_guide", "ref_video_audio", "review_before_timeline")}
         input_mode = (p.get("input_mode") or "fl2va").strip().lower()
@@ -7921,8 +8062,9 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
                 _lightning_on = str(p.get("lightning") or "0").lower() in ("1", "true", "yes", "on") and abs(float(p.get("lightning_strength") or 0.0)) > 1e-6
             except Exception:
                 _lightning_on = False
+            _medium8_on = str(p.get('medium8') or '0').lower() in ('1','true','yes','on')
             _taomate_on = str(p.get('taomate') or '0').lower() in ('1','true','yes','on')
-            if _lightning_on or _taomate_on:
+            if _lightning_on or _medium8_on or _taomate_on:
                 return jsonify(error="Motion Enhancer and the selected acceleration preset are alternative LoRAs. Turn one OFF before generating; neither selection was changed."), 400
 
         _dedup = {}
@@ -7986,6 +8128,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
                 return jsonify(error=str(exc)), 400
             ref_images = []
             ref_videos = []
+            ref_video_trims = []
             ref_audios = []
             p["use_stage_last"] = "0"
             for i in range(1, 10):
@@ -8000,7 +8143,18 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
                     ext = _clean_upload_ext(f.filename, ".mp4")
                     path = os.path.join(OUT, f"{jid}_ref_video_{i}{ext}")
                     _save_binary_upload(f, path)
+                    try:
+                        path, trim_meta = _trim_reference_video_upload(
+                            path,
+                            request.form.get(f"ref_video_start_{i}"),
+                            request.form.get(f"ref_video_end_{i}"),
+                        )
+                    except Exception as exc:
+                        try: os.remove(path)
+                        except Exception: pass
+                        return jsonify(error=str(exc)), 400
                     ref_videos.append(path)
+                    ref_video_trims.append(trim_meta)
             for i in range(1, 4):
                 f = request.files.get(f"ref_audio_{i}")
                 if f and f.filename:
@@ -8012,6 +8166,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
                 return jsonify(error="Ref2VA requires at least one reference image or one reference video."), 400
             p["ref_images"] = ref_images
             p["ref_videos"] = ref_videos
+            p["ref_video_trims"] = ref_video_trims
             p["ref_audios"] = ref_audios
             p["ref_video_audio"] = str(p.get("ref_video_audio") or "1")
             try:
@@ -9145,7 +9300,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     .hiddenfile{display:none!important}
     .g2{display:grid;grid-template-columns:1fr 1fr;gap:8px}.g3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
     .hint{font-size:9.5px;color:#686a73;margin-top:5px;line-height:1.4}#meta{margin:0;padding:3px 2px 0;font-size:7.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}#meta:empty{display:none}.hint b{color:#a6a7ae}
-    .switchrow{display:flex;gap:8px;align-items:center;margin-top:8px}.switchrow input{width:auto;accent-color:var(--accent)}.switchrow label{margin:0;font-size:10.5px;color:#aaa}.sliderline{display:grid;grid-template-columns:minmax(0,1fr) 72px;gap:8px;align-items:center}.sliderline input[type=range]{padding:0;height:24px;accent-color:var(--accent);border:0;background:transparent}.slidervalue{font:10px ui-monospace,Menlo,monospace;color:#d7d8de;text-align:right}.loranumber{width:72px!important;height:29px!important;padding:4px 6px!important;border:1px solid #303139!important;border-radius:6px!important;background:#151519!important;color:#e7e8ec!important;text-align:right!important;-moz-appearance:textfield!important;appearance:textfield!important}.loranumber::-webkit-outer-spin-button,.loranumber::-webkit-inner-spin-button{-webkit-appearance:none!important;margin:0!important}.loranumber:focus{border-color:var(--accent)!important}.loranumber:disabled{opacity:.5;cursor:not-allowed}.lorarack{display:grid;gap:7px;margin-top:8px}.lorarow{border:1px solid #292a30;border-radius:8px;background:#101115;padding:8px}.lorarowhead{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}.lorarowtitle{font-size:8.5px;letter-spacing:.7px;color:#bfc1c9;font-weight:800;text-transform:uppercase}.loratitlelink{color:inherit;text-decoration:none}.loratitlelink:hover{color:#8ab4ff;text-decoration:underline}.lorarowmeta{font-size:7.5px;color:#696c76}.lorarowgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(120px,.7fr);gap:8px;align-items:center}.lorarowgrid select{height:32px;padding:5px 7px}.loraslot{display:block}.lorarow.incompatible{opacity:.48}.lorarow.incompatible input{cursor:not-allowed}.lorarow.incompatible .lorarowtitle{color:#70727a}.lorarow.incompatible .lorarowmeta{color:#555861}.loratoggle{width:38px!important;height:21px!important;padding:0!important;margin:0!important;border-radius:999px!important;background:#25262c!important;color:#8b8e97!important;border:1px solid #3a3b43!important;font-size:7px!important;line-height:19px!important}.loratoggle.on{background:var(--accent)!important;color:#111!important;border-color:var(--accent)!important}.loratoggle:disabled{opacity:.42!important}.lorarow select option:disabled{color:#595c65}.loratools{display:grid;grid-template-columns:1fr 1fr 72px 42px;gap:7px;margin-top:8px}.loratools button{margin:0;padding:8px 7px;background:#29292f;color:#ccc;font-size:8px}.motionline{display:grid;grid-template-columns:minmax(0,1fr) 54px;gap:8px;align-items:center}.motionline input[type=range]{padding:0;height:26px;accent-color:var(--accent);border:0;background:transparent}.modetabs{display:grid;grid-template-columns:1fr 1fr;gap:8px}.modetab{margin:0;background:#202126;color:#c8c9cf;border:1px solid #303139}.modetab.active{background:var(--accent);border-color:var(--accent);color:#111}.modetab:disabled{background:#17181c;color:#5a5d66;border-color:#25262b;cursor:not-allowed}.modepanel{display:none}.modepanel.active{display:block}.refimageslots{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:2px}.refslot{height:96px}.reffilelist{display:grid;gap:8px;margin-top:10px}.reffilerow{border:1px solid #2a2b31;border-radius:8px;background:#101116;padding:8px}.reffilerowhead{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}.reffilerowtitle{font-size:8px;color:#cfd0d5;font-weight:800;letter-spacing:.7px;text-transform:uppercase}.reffilename{flex:1;min-width:0;font-size:8px;color:#8b8d96;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.reffileactions{display:flex;gap:6px;align-items:center}.reffileactions button{width:auto;margin:0;padding:6px 8px;font-size:7px}.refvideopreviewwrap{display:none;position:relative;width:100%;aspect-ratio:16/9;max-height:180px;margin:0 0 8px;border:1px solid #292a30;border-radius:7px;overflow:hidden;background:#050506}.refvideopreviewwrap.show{display:block}.refvideopreview{display:block;width:100%;height:100%;object-fit:contain;background:#000}.refclear{background:#221617;color:#d99595;border:1px solid #573032}.refclear:disabled{background:#17181c;color:#53565f;border-color:#25262b}.refmodehint{margin-top:8px}.refslot .slotbadge{font-size:7px}
+    .switchrow{display:flex;gap:8px;align-items:center;margin-top:8px}.switchrow input{width:auto;accent-color:var(--accent)}.switchrow label{margin:0;font-size:10.5px;color:#aaa}.sliderline{display:grid;grid-template-columns:minmax(0,1fr) 72px;gap:8px;align-items:center}.sliderline input[type=range]{padding:0;height:24px;accent-color:var(--accent);border:0;background:transparent}.slidervalue{font:10px ui-monospace,Menlo,monospace;color:#d7d8de;text-align:right}.loranumber{width:72px!important;height:29px!important;padding:4px 6px!important;border:1px solid #303139!important;border-radius:6px!important;background:#151519!important;color:#e7e8ec!important;text-align:right!important;-moz-appearance:textfield!important;appearance:textfield!important}.loranumber::-webkit-outer-spin-button,.loranumber::-webkit-inner-spin-button{-webkit-appearance:none!important;margin:0!important}.loranumber:focus{border-color:var(--accent)!important}.loranumber:disabled{opacity:.5;cursor:not-allowed}.lorarack{display:grid;gap:7px;margin-top:8px}.lorarow{border:1px solid #292a30;border-radius:8px;background:#101115;padding:8px}.lorarowhead{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}.lorarowtitle{font-size:8.5px;letter-spacing:.7px;color:#bfc1c9;font-weight:800;text-transform:uppercase}.loratitlelink{color:inherit;text-decoration:none}.loratitlelink:hover{color:#8ab4ff;text-decoration:underline}.lorarowmeta{font-size:7.5px;color:#696c76}.lorarowgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(120px,.7fr);gap:8px;align-items:center}.lorarowgrid select{height:32px;padding:5px 7px}.loraslot{display:block}.lorarow.incompatible{opacity:.48}.lorarow.incompatible input{cursor:not-allowed}.lorarow.incompatible .lorarowtitle{color:#70727a}.lorarow.incompatible .lorarowmeta{color:#555861}.loratoggle{width:38px!important;height:21px!important;padding:0!important;margin:0!important;border-radius:999px!important;background:#25262c!important;color:#8b8e97!important;border:1px solid #3a3b43!important;font-size:7px!important;line-height:19px!important}.loratoggle.on{background:var(--accent)!important;color:#111!important;border-color:var(--accent)!important}.loratoggle:disabled{opacity:.42!important}.lorarow select option:disabled{color:#595c65}.loratools{display:grid;grid-template-columns:1fr 1fr 72px 42px;gap:7px;margin-top:8px}.loratools button{margin:0;padding:8px 7px;background:#29292f;color:#ccc;font-size:8px}.motionline{display:grid;grid-template-columns:minmax(0,1fr) 54px;gap:8px;align-items:center}.motionline input[type=range]{padding:0;height:26px;accent-color:var(--accent);border:0;background:transparent}.modetabs{display:grid;grid-template-columns:1fr 1fr;gap:8px}.modetab{margin:0;background:#202126;color:#c8c9cf;border:1px solid #303139}.modetab.active{background:var(--accent);border-color:var(--accent);color:#111}.modetab:disabled{background:#17181c;color:#5a5d66;border-color:#25262b;cursor:not-allowed}.modepanel{display:none}.modepanel.active{display:block}.refimageslots{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:2px}.refslot{height:96px}.reffilelist{display:grid;gap:8px;margin-top:10px}.reffilerow{border:1px solid #2a2b31;border-radius:8px;background:#101116;padding:8px}.reffilerowhead{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}.reffilerowtitle{font-size:8px;color:#cfd0d5;font-weight:800;letter-spacing:.7px;text-transform:uppercase}.reffilename{flex:1;min-width:0;font-size:8px;color:#8b8d96;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.reffileactions{display:flex;gap:6px;align-items:center}.reffileactions button{width:auto;margin:0;padding:6px 8px;font-size:7px}.refvideopreviewwrap{display:none;position:relative;width:132px;aspect-ratio:16/9;margin:0 0 8px;border:1px solid #34353d;border-radius:7px;overflow:hidden;background:#050506;cursor:pointer}.refvideopreviewwrap.show{display:block}.refvideopreviewwrap:hover{border-color:var(--accent)}.refvideopreview{display:block;width:100%;height:100%;object-fit:cover;background:#000;pointer-events:none}.refvideoeditbadge{position:absolute;right:5px;bottom:5px;padding:2px 5px;border-radius:4px;background:#000c;color:#e9c85f;font-size:6.5px;font-weight:900;letter-spacing:.5px}.refvideotrimlabel{font-size:7.5px;color:#a4a6ae;margin:0 0 7px}.refvideotrimlabel.edited{color:#e2c35e}.refvideoassign{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:end;margin-top:9px}.refvideoassign button{width:auto;margin:0;height:34px}.refvideomarkbuttons{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}.refvideomarkbuttons button{margin:0;background:#24252a;color:#d4d5da;border:1px solid #35363d}.refvideoeditorhint{margin-top:8px;color:#656872;font-size:8px;line-height:1.45}.refclear{background:#221617;color:#d99595;border:1px solid #573032}.refclear:disabled{background:#17181c;color:#53565f;border-color:#25262b}.refmodehint{margin-top:8px}.refslot .slotbadge{font-size:7px}
     button{border:0;border-radius:7px;background:var(--accent);color:#111;padding:10px 11px;font:inherit;font-weight:800;cursor:pointer}
     button:disabled{background:#29292f;color:#666;cursor:not-allowed}.inlinebtn{background:#29292f;color:#ccc;padding:8px 9px;width:100%;margin-top:8px;font-size:10.5px}.inlinebtn.active{background:var(--accent);color:#111}
     .installed{color:#7cc38c}.missing{color:#d6a56d}
@@ -9248,14 +9403,14 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       </div>
       <div class=g2><div><label>Ref image size</label><select id=ref_image_size><option value=match selected>match</option><option value=max>max fidelity</option></select></div><div><label>Reference budget</label><div class=hint style="margin-top:9px">Up to 9 images, 3 videos, 3 audio clips.</div></div></div>
       <div class=reffilelist>
-        <div class=reffilerow><div class=reffilerowhead><div class=reffilerowtitle>Reference Video 1</div><div class=reffilename id=ref_video_name_1>No video selected</div></div><div id=ref_video_preview_wrap_1 class=refvideopreviewwrap><video id=ref_video_preview_1 class=refvideopreview controls playsinline preload=metadata></video></div><div class=reffileactions><button id=ref_video_pick_1 class=inlinebtn type=button>CHOOSE</button><button id=ref_video_clear_1 class="inlinebtn refclear" type=button>⌫ CLEAR</button></div></div>
-        <div class=reffilerow><div class=reffilerowhead><div class=reffilerowtitle>Reference Video 2</div><div class=reffilename id=ref_video_name_2>No video selected</div></div><div id=ref_video_preview_wrap_2 class=refvideopreviewwrap><video id=ref_video_preview_2 class=refvideopreview controls playsinline preload=metadata></video></div><div class=reffileactions><button id=ref_video_pick_2 class=inlinebtn type=button>CHOOSE</button><button id=ref_video_clear_2 class="inlinebtn refclear" type=button>⌫ CLEAR</button></div></div>
-        <div class=reffilerow><div class=reffilerowhead><div class=reffilerowtitle>Reference Video 3</div><div class=reffilename id=ref_video_name_3>No video selected</div></div><div id=ref_video_preview_wrap_3 class=refvideopreviewwrap><video id=ref_video_preview_3 class=refvideopreview controls playsinline preload=metadata></video></div><div class=reffileactions><button id=ref_video_pick_3 class=inlinebtn type=button>CHOOSE</button><button id=ref_video_clear_3 class="inlinebtn refclear" type=button>⌫ CLEAR</button></div></div>
+        <div class=reffilerow><div class=reffilerowhead><div class=reffilerowtitle>Reference Video 1</div><div class=reffilename id=ref_video_name_1>No video selected</div></div><div id=ref_video_preview_wrap_1 class=refvideopreviewwrap role=button tabindex=0 aria-label="Edit reference video 1"><video id=ref_video_preview_1 class=refvideopreview muted playsinline preload=metadata></video><span class=refvideoeditbadge>EDIT</span></div><div id=ref_video_trim_label_1 class=refvideotrimlabel>No trim</div><div class=reffileactions><button id=ref_video_pick_1 class=inlinebtn type=button>CHOOSE</button><button id=ref_video_clear_1 class="inlinebtn refclear" type=button>⌫ CLEAR</button></div></div>
+        <div class=reffilerow><div class=reffilerowhead><div class=reffilerowtitle>Reference Video 2</div><div class=reffilename id=ref_video_name_2>No video selected</div></div><div id=ref_video_preview_wrap_2 class=refvideopreviewwrap role=button tabindex=0 aria-label="Edit reference video 2"><video id=ref_video_preview_2 class=refvideopreview muted playsinline preload=metadata></video><span class=refvideoeditbadge>EDIT</span></div><div id=ref_video_trim_label_2 class=refvideotrimlabel>No trim</div><div class=reffileactions><button id=ref_video_pick_2 class=inlinebtn type=button>CHOOSE</button><button id=ref_video_clear_2 class="inlinebtn refclear" type=button>⌫ CLEAR</button></div></div>
+        <div class=reffilerow><div class=reffilerowhead><div class=reffilerowtitle>Reference Video 3</div><div class=reffilename id=ref_video_name_3>No video selected</div></div><div id=ref_video_preview_wrap_3 class=refvideopreviewwrap role=button tabindex=0 aria-label="Edit reference video 3"><video id=ref_video_preview_3 class=refvideopreview muted playsinline preload=metadata></video><span class=refvideoeditbadge>EDIT</span></div><div id=ref_video_trim_label_3 class=refvideotrimlabel>No trim</div><div class=reffileactions><button id=ref_video_pick_3 class=inlinebtn type=button>CHOOSE</button><button id=ref_video_clear_3 class="inlinebtn refclear" type=button>⌫ CLEAR</button></div></div>
         <div class=reffilerow><div class=reffilerowhead><div class=reffilerowtitle>Reference Audio 1</div><div class=reffilename id=ref_audio_name_1>No audio selected</div></div><div class=reffileactions><button id=ref_audio_pick_1 class=inlinebtn type=button>CHOOSE</button><button id=ref_audio_clear_1 class="inlinebtn refclear" type=button>⌫ CLEAR</button></div></div>
         <div class=reffilerow><div class=reffilerowhead><div class=reffilerowtitle>Reference Audio 2</div><div class=reffilename id=ref_audio_name_2>No audio selected</div></div><div class=reffileactions><button id=ref_audio_pick_2 class=inlinebtn type=button>CHOOSE</button><button id=ref_audio_clear_2 class="inlinebtn refclear" type=button>⌫ CLEAR</button></div></div>
         <div class=reffilerow><div class=reffilerowhead><div class=reffilerowtitle>Reference Audio 3</div><div class=reffilename id=ref_audio_name_3>No audio selected</div></div><div class=reffileactions><button id=ref_audio_pick_3 class=inlinebtn type=button>CHOOSE</button><button id=ref_audio_clear_3 class="inlinebtn refclear" type=button>⌫ CLEAR</button></div></div>
       </div>
-      <div class="hint refmodehint" id=ref2va_hint>Fill each reference type consecutively from slot 1. Missing prompt references are rejected. Maximum 12 files combined. Video/audio: 2–15s each and at most 15s per type. Use subject_definitions, summary, retention_analysis, detailed_description, overall_soundscape and non_diegetic_music sections. Mix one shared music track across the final edit.</div>
+      <div class="hint refmodehint" id=ref2va_hint>Fill each reference type consecutively from slot 1. Missing prompt references are rejected. Maximum 12 files combined. Control-video selections must be 2–15s each and at most 15s combined; longer source clips are fine when trimmed in the video editor. Use subject_definitions, summary, retention_analysis, detailed_description, overall_soundscape and non_diegetic_music sections. Mix one shared music track across the final edit.</div>
     </div>
 
     <div class=g2><div><label>Width</label><input id=width type=number value=768 step=32 min=32 autocomplete=off></div><div><label>Height</label><input id=height type=number value=768 step=32 min=32 autocomplete=off></div></div>
@@ -9292,7 +9447,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       <button id=fastpreset class="inlinebtn active"><span class=presetname>FAST</span><span class=presetsub>Recommended</span></button>
       <button id=ultrafastpreset class=inlinebtn><span class=presetname>ULTRA</span><span class=presetsub>Max speed</span></button>
       <button id=qualitypreset class=inlinebtn><span class=presetname>QUALITY</span><span class=presetsub>Best quality</span></button>
-      <button id=taomatepreset class=inlinebtn><span class=presetname>TAOMATE</span><span class=presetsub>3-step alt</span></button>
+      <button id=mediumpreset class=inlinebtn><span class=presetname>MEDIUM</span><span class=presetsub>8-step quality</span></button>
     </div>
     <div class=hint id=preset_hint><b>FAST</b> · recommended default</div>
     </div></div>
@@ -9407,6 +9562,23 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       <div id=queue_body class=floatbody><div class=floatempty>Queue is empty.</div></div>
     </section>
     <div id=image_view_modal class=imgmodal role=dialog aria-modal=true aria-label="Image preview"><button id=image_view_close class=imgmodalclose type=button>✕</button><img id=image_view_full alt="Full size reference image"></div>
+    <div id=ref_video_modal class=uimodal role=dialog aria-modal=true aria-labelledby=ref_video_modal_title>
+      <div class="uidialog trimdialog">
+        <div class=uihead><b id=ref_video_modal_title>Reference video editor</b><button id=ref_video_modal_close class=uiclose type=button>✕</button></div>
+        <div class=uibody>
+          <video id=ref_video_editor class=trimvideo controls playsinline preload=metadata></video>
+          <div class=trimsummary><span id=ref_video_editor_range>0.00–0.00 s</span><span id=ref_video_editor_length><b>0.00 s</b> selected</span></div>
+          <div class=trimgrid>
+            <div class=trimfield><label>Start time <input id=ref_video_start_num type=number min=0 step=.01 value=0></label><input id=ref_video_start_range type=range min=0 max=1 step=.01 value=0></div>
+            <div class=trimfield><label>Stop time <input id=ref_video_end_num type=number min=0 step=.01 value=1></label><input id=ref_video_end_range type=range min=0 max=1 step=.01 value=1></div>
+          </div>
+          <div class=refvideomarkbuttons><button id=ref_video_mark_in type=button>SET START = CURRENT FRAME</button><button id=ref_video_mark_out type=button>SET STOP = CURRENT FRAME</button></div>
+          <div class=refvideoassign><div><label>Assign current frame to reference image slot</label><select id=ref_video_assign_slot><option value=1>Picture 1</option><option value=2>Picture 2</option><option value=3>Picture 3</option><option value=4>Picture 4</option><option value=5>Picture 5</option><option value=6>Picture 6</option><option value=7>Picture 7</option><option value=8>Picture 8</option><option value=9>Picture 9</option></select></div><button id=ref_video_assign_frame type=button>USE CURRENT FRAME</button></div>
+          <div class=refvideoeditorhint>Trim is applied server-side before Ref2VA conditioning, including soundtrack trim. Use the player to seek to any frame, then copy that exact frame into a Picture slot for stronger visual anchoring.</div>
+        </div>
+        <div class=uiactions><div class=trimactionsleft><button id=ref_video_full_clip type=button>FULL CLIP</button></div><button id=ref_video_modal_cancel class=uicancel type=button>Cancel</button><button id=ref_video_modal_apply class="uiconfirm neutral" type=button>Apply</button></div>
+      </div>
+    </div>
     <div id=auto_prompt_modal class=apmodal role=dialog aria-modal=true aria-labelledby=ap_title>
       <div class=apdialog>
         <div class=aphead><b id=ap_title>AUTO PROMPT SETTINGS</b><button id=ap_close class=apclose type=button>✕</button></div>
@@ -9882,8 +10054,8 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       if(target&&[...$('unet').options].some(x=>x.value===target))$('unet').value=target;
 
       let preset=String(cfg.performance_preset||'fast').toLowerCase();
-      if(!['fast','ultra','quality','taomate'].includes(preset))preset='fast';
-      if(preset==='taomate'&&mode!=='fl2va')preset='fast';
+      if(preset==='taomate')preset='medium';
+      if(!['fast','ultra','medium','quality'].includes(preset))preset='fast';
       await applyPerformancePreset(preset);
 
       // Preset application establishes coherent sampler/step defaults first; the
@@ -10000,7 +10172,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
 
     function presetRecipe(profile=ACTIVE_MODEL_PROFILE,mode=currentModelMode(),kind=ACTIVE_PERF_PRESET){
       const label=activeModelLabel();
-      if(kind==='taomate')return {short:'TAOMATE',label,steps:3,summary:'3-step alternate accelerator'};
+      if(kind==='medium')return {short:'MEDIUM',label,steps:8,summary:'higher fidelity · official LightX2V 8-step Turbo'};
       if(kind==='ultra')return {short:'ULTRA',label,steps:4,summary:'maximum speed · 4-step Lightning + 5% sparse'};
       if(kind==='fast')return {short:'FAST',label,steps:4,summary:'recommended · 4-step Lightning'};
       return {short:'QUALITY',label,steps:20,summary:'best quality · 20-step RES Multistep'};
@@ -10015,10 +10187,10 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       const m=window.H3META||{};
       const mode=currentModelMode();
       const fast=presetRecipe(ACTIVE_MODEL_PROFILE,mode,'fast');
-      const taomate=presetRecipe(ACTIVE_MODEL_PROFILE,mode,'taomate');
+      const medium=presetRecipe(ACTIVE_MODEL_PROFILE,mode,'medium');
       const ultra=presetRecipe(ACTIVE_MODEL_PROFILE,mode,'ultra');
       const quality=presetRecipe(ACTIVE_MODEL_PROFILE,mode,'quality');
-      const active=ACTIVE_PERF_PRESET==='taomate'?taomate:(ACTIVE_PERF_PRESET==='ultra'?ultra:(ACTIVE_PERF_PRESET==='quality'?quality:fast));
+      const active=ACTIVE_PERF_PRESET==='medium'?medium:(ACTIVE_PERF_PRESET==='ultra'?ultra:(ACTIVE_PERF_PRESET==='quality'?quality:fast));
 
       const setPreset=(id,on,name,sub)=>{
         const b=$(id);
@@ -10028,11 +10200,11 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       setPreset('fastpreset',ACTIVE_PERF_PRESET==='fast','FAST','Recommended');
       setPreset('ultrafastpreset',ACTIVE_PERF_PRESET==='ultra','ULTRA','Max speed');
       setPreset('qualitypreset',ACTIVE_PERF_PRESET==='quality','QUALITY','Best quality');
-      setPreset('taomatepreset',ACTIVE_PERF_PRESET==='taomate','TAOMATE','3-step alt');
+      setPreset('mediumpreset',ACTIVE_PERF_PRESET==='medium','MEDIUM','8-step quality');
 
       const lightningAvailable=mode==='ref2va'?m.ref2va_lightning_available:m.lightning_available;
       $('ultrafastpreset').disabled=(lightningAvailable===false);
-      $('taomatepreset').disabled=(mode!=='fl2va'||m.taomate_available===false);
+      $('mediumpreset').disabled=(m.medium8_available===false);
       $('preset_hint').innerHTML=`<b>${active.short}</b> · ${active.summary}`;
     }
 
@@ -11166,22 +11338,73 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     function bindRefImageSlot(index){const input=$('ref_image_'+index),img=$('ref_image_preview_'+index),slot=$('ref_image_slot_'+index),trash=$('ref_image_trash_'+index);function openOrPick(){if(slot.classList.contains('has-image')&&img.src)showImageModal(img.src);else input.click()}slot.addEventListener('click',e=>{if(e.target.closest('.slottrash'))return;openOrPick()});slot.addEventListener('keydown',e=>{if((e.key==='Enter'||e.key===' ')&&!e.target.closest('.slottrash')){e.preventDefault();openOrPick()}});trash.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();clearRefImageSlot(index);say('reference image '+index+' cleared')});input.addEventListener('change',()=>{const f=input.files[0];if(!f){clearRefImageSlot(index);return}releaseSlotObjectURL(img);const u=URL.createObjectURL(f);img.dataset.objectUrl=u;img.onload=()=>{slot.classList.add('has-image');slot.dataset.source='upload'};img.src=u})}
     function bindNamedFileInput(prefix,index,emptyLabel){const input=$(prefix+'_'+index),pick=$(prefix+'_pick_'+index),clear=$(prefix+'_clear_'+index),name=$(prefix+'_name_'+index);const sync=()=>{const f=input.files[0];name.textContent=f?f.name:emptyLabel;clear.disabled=!f};pick.onclick=e=>{e.preventDefault();input.click()};clear.onclick=e=>{e.preventDefault();input.value='';sync();say(prefix.replace('_',' ')+' '+index+' cleared')};input.addEventListener('change',sync);sync()}
     function releaseRefVideoURL(video){const u=video&&video.dataset?video.dataset.objectUrl:'';if(u){try{URL.revokeObjectURL(u)}catch(e){}delete video.dataset.objectUrl}}
+    const REF_VIDEO_EDIT_STATE={1:{start:0,end:null,duration:0},2:{start:0,end:null,duration:0},3:{start:0,end:null,duration:0}};
+    let REF_VIDEO_MODAL_INDEX=0,REF_VIDEO_MODAL_DRAFT=null;
+    function firstEmptyRefImageSlot(){for(let i=1;i<=9;i++)if(!$('ref_image_'+i).files[0])return i;return 9}
+    function syncRefVideoTrimLabel(index){
+      const st=REF_VIDEO_EDIT_STATE[index],el=$('ref_video_trim_label_'+index);if(!el)return;
+      if(!st||!st.duration){el.textContent='No trim';el.classList.remove('edited');return}
+      const end=Number.isFinite(st.end)?st.end:st.duration,sel=Math.max(0,end-st.start);
+      const edited=st.start>.015||end<st.duration-.015,valid=sel>=2&&sel<=15.05;
+      el.textContent=!valid?`Needs trim · ${sel.toFixed(2)} s selected (2–15 s required)`:(edited?`Trim ${st.start.toFixed(2)}–${end.toFixed(2)} s · ${sel.toFixed(2)} s selected`:`Full clip · ${st.duration.toFixed(2)} s`);
+      el.classList.toggle('edited',edited||!valid);
+    }
     function bindRefVideoInput(index){
       const input=$('ref_video_'+index),pick=$('ref_video_pick_'+index),clear=$('ref_video_clear_'+index),name=$('ref_video_name_'+index),preview=$('ref_video_preview_'+index),wrap=$('ref_video_preview_wrap_'+index);
       const clearPreview=()=>{try{preview.pause()}catch(e){}releaseRefVideoURL(preview);preview.removeAttribute('src');try{preview.load()}catch(e){}wrap.classList.remove('show')};
-      const sync=()=>{
-        const f=input.files[0];name.textContent=f?f.name:'No video selected';clear.disabled=!f;
-        clearPreview();
-        if(!f)return;
+      const sync=(resetState=false)=>{
+        const f=input.files[0];name.textContent=f?f.name:'No video selected';clear.disabled=!f;clearPreview();
+        if(resetState)REF_VIDEO_EDIT_STATE[index]={start:0,end:null,duration:0};
+        if(!f){syncRefVideoTrimLabel(index);return}
         const u=URL.createObjectURL(f);preview.dataset.objectUrl=u;preview.src=u;wrap.classList.add('show');
-        preview.onloadedmetadata=()=>{try{if(Number.isFinite(preview.duration)&&preview.duration>0.06)preview.currentTime=Math.min(0.08,preview.duration*0.02)}catch(e){}};
-        preview.onerror=()=>{name.textContent=f.name+' · preview unavailable';};
-        try{preview.load()}catch(e){}
+        preview.onloadedmetadata=()=>{
+          const d=Number(preview.duration||0);const st=REF_VIDEO_EDIT_STATE[index];st.duration=d;if(!Number.isFinite(st.end)||st.end<=0||st.end>d)st.end=d;
+          try{if(d>0.06)preview.currentTime=Math.min(.08,d*.02)}catch(e){}syncRefVideoTrimLabel(index);
+        };
+        preview.onerror=()=>{name.textContent=f.name+' · preview unavailable'};try{preview.load()}catch(e){}
       };
       pick.onclick=e=>{e.preventDefault();input.click()};
-      clear.onclick=e=>{e.preventDefault();input.value='';sync();say('reference video '+index+' cleared')};
-      input.addEventListener('change',sync);sync();
+      clear.onclick=e=>{e.preventDefault();input.value='';sync(true);say('reference video '+index+' cleared')};
+      wrap.onclick=e=>{e.preventDefault();if(input.files[0])openRefVideoEditor(index)};
+      wrap.onkeydown=e=>{if((e.key==='Enter'||e.key===' ')&&input.files[0]){e.preventDefault();openRefVideoEditor(index)}};
+      input.addEventListener('change',()=>sync(true));sync(false);
     }
+    function syncRefVideoEditor(changed=''){
+      const idx=REF_VIDEO_MODAL_INDEX;if(!idx||!REF_VIDEO_MODAL_DRAFT)return;const st=REF_VIDEO_MODAL_DRAFT,v=$('ref_video_editor');
+      const d=Math.max(.01,Number(st.duration||v.duration||0));
+      const sn=$('ref_video_start_num'),en=$('ref_video_end_num'),sr=$('ref_video_start_range'),er=$('ref_video_end_range');
+      let start=Number(changed==='start_range'?sr.value:sn.value);let end=Number(changed==='end_range'?er.value:en.value);
+      if(!Number.isFinite(start))start=0;if(!Number.isFinite(end))end=d;start=Math.max(0,Math.min(d,start));end=Math.max(0,Math.min(d,end));
+      if(start>end){if(changed.startsWith('start'))end=start;else start=end}
+      st.start=start;st.end=end;for(const x of [sr,er,sn,en])x.max=String(d);sn.value=sr.value=start.toFixed(2);en.value=er.value=end.toFixed(2);
+      const selected=Math.max(0,end-start);$('ref_video_editor_range').textContent=`${start.toFixed(2)}–${end.toFixed(2)} s of ${d.toFixed(2)} s`;$('ref_video_editor_length').innerHTML=`<b>${selected.toFixed(2)} s</b> selected`;
+      $('ref_video_editor_length').style.color=(selected>=2&&selected<=15.05)?'':'#ff8181';
+      if(changed.startsWith('start'))try{v.currentTime=start}catch(e){};if(changed.startsWith('end'))try{v.currentTime=end}catch(e){}
+    }
+    function openRefVideoEditor(index){
+      const input=$('ref_video_'+index),preview=$('ref_video_preview_'+index);if(!input.files[0]||!preview.src)return;REF_VIDEO_MODAL_INDEX=index;
+      const st=REF_VIDEO_EDIT_STATE[index];REF_VIDEO_MODAL_DRAFT={start:Number(st.start||0),end:Number.isFinite(st.end)?Number(st.end):null,duration:Number(st.duration||0)};$('ref_video_modal_title').textContent=`Reference Video ${index} · trim + frame assignment`;
+      const v=$('ref_video_editor');v.src=preview.src;v.onloadedmetadata=()=>{const d=REF_VIDEO_MODAL_DRAFT;d.duration=Number(v.duration||d.duration||0);if(!Number.isFinite(d.end)||d.end<=0||d.end>d.duration)d.end=d.duration;$('ref_video_start_num').value=String(d.start||0);$('ref_video_end_num').value=String(d.end||d.duration);syncRefVideoEditor();try{v.currentTime=d.start||0}catch(e){}};
+      $('ref_video_assign_slot').value=String(firstEmptyRefImageSlot());$('ref_video_modal').classList.add('show');try{v.load()}catch(e){}
+    }
+    function closeRefVideoEditor(){
+      $('ref_video_modal').classList.remove('show');const v=$('ref_video_editor');try{v.pause()}catch(e){}v.removeAttribute('src');try{v.load()}catch(e){}REF_VIDEO_MODAL_INDEX=0;REF_VIDEO_MODAL_DRAFT=null;
+    }
+    $('ref_video_modal_close').onclick=closeRefVideoEditor;$('ref_video_modal_cancel').onclick=closeRefVideoEditor;$('ref_video_modal').addEventListener('click',e=>{if(e.target===$('ref_video_modal'))closeRefVideoEditor()});
+    $('ref_video_start_range').addEventListener('input',()=>syncRefVideoEditor('start_range'));$('ref_video_end_range').addEventListener('input',()=>syncRefVideoEditor('end_range'));$('ref_video_start_num').addEventListener('input',()=>syncRefVideoEditor('start_num'));$('ref_video_end_num').addEventListener('input',()=>syncRefVideoEditor('end_num'));
+    $('ref_video_mark_in').onclick=()=>{const v=$('ref_video_editor');$('ref_video_start_num').value=Number(v.currentTime||0).toFixed(2);syncRefVideoEditor('start_num')};
+    $('ref_video_mark_out').onclick=()=>{const v=$('ref_video_editor');$('ref_video_end_num').value=Number(v.currentTime||0).toFixed(2);syncRefVideoEditor('end_num')};
+    $('ref_video_full_clip').onclick=()=>{const st=REF_VIDEO_MODAL_DRAFT;if(!st)return;$('ref_video_start_num').value='0';$('ref_video_end_num').value=String(st.duration||0);syncRefVideoEditor('end_num')};
+    $('ref_video_modal_apply').onclick=async()=>{const idx=REF_VIDEO_MODAL_INDEX;if(!idx||!REF_VIDEO_MODAL_DRAFT)return;syncRefVideoEditor();const draft=REF_VIDEO_MODAL_DRAFT,selected=(draft.end??draft.duration)-draft.start;if(selected<2||selected>15.05){await uiAlert(`Select between 2 and 15 seconds. Current selection is ${selected.toFixed(2)} s.`,'Reference video trim');return}REF_VIDEO_EDIT_STATE[idx]={start:draft.start,end:draft.end,duration:draft.duration};const committed=REF_VIDEO_EDIT_STATE[idx];syncRefVideoTrimLabel(idx);closeRefVideoEditor();say(`reference video ${idx} trim · ${committed.start.toFixed(2)}–${committed.end.toFixed(2)} s`)};
+    $('ref_video_assign_frame').onclick=async()=>{
+      const idx=REF_VIDEO_MODAL_INDEX,v=$('ref_video_editor'),slot=Math.max(1,Math.min(9,Number($('ref_video_assign_slot').value||1)));if(!idx||!v.videoWidth||!v.videoHeight)return;
+      for(let i=1;i<slot;i++){if(!$('ref_image_'+i).files[0]){await uiAlert(`Picture ${slot} would create a gap. Fill Picture ${i} first, or assign this frame to the first empty slot.`,'Reference image slots');return}}
+      if($('ref_image_'+slot).files[0]){const ok=await uiConfirm(`Picture ${slot} already has an image. Replace it with the current frame from Reference Video ${idx}?`,{title:'Replace reference image',confirmLabel:'Replace'});if(!ok)return}
+      const canvas=document.createElement('canvas');canvas.width=v.videoWidth;canvas.height=v.videoHeight;canvas.getContext('2d').drawImage(v,0,0,canvas.width,canvas.height);
+      const blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/png'));if(!blob){await uiAlert('Could not capture this video frame.','Frame capture');return}
+      const file=new File([blob],`ref_video_${idx}_${Number(v.currentTime||0).toFixed(2)}s.png`,{type:'image/png'}),dt=new DataTransfer();dt.items.add(file);$('ref_image_'+slot).files=dt.files;$('ref_image_'+slot).dispatchEvent(new Event('change',{bubbles:true}));say(`Reference Video ${idx} frame ${Number(v.currentTime||0).toFixed(2)}s → Picture ${slot}`);
+    };
+    document.addEventListener('keydown',e=>{if(e.key==='Escape'&&$('ref_video_modal').classList.contains('show')){e.preventDefault();closeRefVideoEditor()}});
     for(let i=1;i<=9;i++)bindRefImageSlot(i);
     for(let i=1;i<=3;i++){bindRefVideoInput(i);bindNamedFileInput('ref_audio',i,'No audio selected')}
     window.addEventListener('beforeunload',()=>{for(let i=1;i<=3;i++){const v=$('ref_video_preview_'+i);if(v)releaseRefVideoURL(v)}});
@@ -11646,10 +11869,10 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       const profile=ACTIVE_MODEL_PROFILE;
       const mode=currentModelMode();
       const accelerated=(kind==='fast'||kind==='ultra');
-      if(kind==='taomate' && m.motion8_file && Math.abs(_strengthForKind('motion8',m))>1e-6){ await uiAlert('TaoMate 3-Step and Motion Enhancer are alternative acceleration LoRAs. Turn Motion Enhancer OFF first.','Preset conflict'); return; }
+      const medium=(kind==='medium');
 
-      if(accelerated && m.motion8_file && Math.abs(_strengthForKind('motion8',m))>1e-6){
-        await uiAlert('FAST / ULTRA FAST use the 4-step Lightning accelerator, while Motion Enhancer is an alternative acceleration LoRA. Turn Motion Enhancer OFF first.','Preset conflict');
+      if((accelerated||medium) && m.motion8_file && Math.abs(_strengthForKind('motion8',m))>1e-6){
+        await uiAlert('FAST / ULTRA / MEDIUM use an acceleration LoRA, while Motion Enhancer is an alternative acceleration LoRA. Turn Motion Enhancer OFF first.','Preset conflict');
         return;
       }
 
@@ -11663,14 +11886,14 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         if(target&&[...$('unet').options].some(x=>x.value===target))$('unet').value=target;
       }
 
-      if(kind==='taomate'){
-        if(mode!=='fl2va'){ await uiAlert('TaoMate 3-Step preset currently targets CURRENT / KEYFRAMES (FL2VA).','TaoMate unavailable'); return; }
-        if(!m.taomate_available){ await uiAlert('TaoMate 3-Step is unavailable on this runtime.','TaoMate unavailable'); return; }
+      if(medium){
+        if(!m.medium8_available){ await uiAlert('MEDIUM 8-Step is unavailable on this runtime.','Medium unavailable'); return; }
         _setStrengthForKind('lightning',0,m);
-        $('steps').value=3;
+        $('steps').value=m.medium8_steps||8;
         if([...$('sampler_name').options].some(x=>x.value==='euler'))$('sampler_name').value='euler';
         if([...$('scheduler').options].some(x=>x.value==='simple'))$('scheduler').value='simple';
-        $('shift_video').value=10;$('shift_audio').value=3;
+        $('shift_video').value=mode==='ref2va'?(m.ref2va_medium8_shift_video??12):(m.medium8_shift_video??6);
+        $('shift_audio').value=m.medium8_shift_audio??3;
         $('sparse_percent').value=0;$('sparse_slider').value=0;updateSparseUI('number');
       }else if(accelerated){
         const accelAvailable=mode==='ref2va'?m.ref2va_lightning_available:m.lightning_available;
@@ -11705,8 +11928,8 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         if(mode==='ref2va')$('ref_image_size').value='max';
       }
 
-      // Dedicated server-side TaoMate switch; all other presets clear it.
-      window.TAOMATE_PRESET_ACTIVE=(kind==='taomate');
+      window.TAOMATE_PRESET_ACTIVE=false;
+      window.MEDIUM8_PRESET_ACTIVE=(kind==='medium');
       ACTIVE_PERF_PRESET=kind;
       updateDur();syncPresetUI();renderNamedLoraRows(window.H3META||{});
       const r=presetRecipe(profile,mode,kind);
@@ -11714,7 +11937,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     }
 
     $('fastpreset').onclick=e=>{e.preventDefault();applyPerformancePreset('fast')};
-    $('taomatepreset').onclick=e=>{e.preventDefault();applyPerformancePreset('taomate')};
+    $('mediumpreset').onclick=e=>{e.preventDefault();applyPerformancePreset('medium')};
     $('ultrafastpreset').onclick=e=>{e.preventDefault();applyPerformancePreset('ultra')};
     $('qualitypreset').onclick=e=>{e.preventDefault();applyPerformancePreset('quality')};
 
@@ -11738,7 +11961,8 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       }
 
       $('err').style.display='none';const fd=new FormData();
-      fd.append('taomate',window.TAOMATE_PRESET_ACTIVE?'1':'0'); fd.append('taomate_strength',String((window.H3META||{}).taomate_strength_default||1.0));
+      fd.append('taomate','0'); fd.append('taomate_strength','0');
+      fd.append('medium8',window.MEDIUM8_PRESET_ACTIVE?'1':'0'); fd.append('medium8_strength',String((window.H3META||{}).medium8_strength_default||1.0));
       for(const k of ['prompt','width','height','duration','frames','length_mode','playback_speed','image_fit','steps','seed','denoise','shift_video','shift_audio','sparse_percent','sampler_name','scheduler','weight_dtype','unet','use_stage_last'])fd.append(k,$(k).value);
       const motion8Submit=submittedSpecialStrength('motion8'),lightningSubmit=submittedSpecialStrength('lightning');
       fd.append('motion8_strength',String(motion8Submit));fd.append('lightning_strength',String(lightningSubmit));
@@ -11753,7 +11977,10 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         for(const k of ['ref_first_guide','ref_last_guide'])fd.append(k,$(k).value);
         fd.append('ref_video_audio',$('ref_video_audio').checked?'1':'0');
         for(let i=1;i<=9;i++) if($('ref_image_'+i).files[0]) fd.append('ref_image_'+i,$('ref_image_'+i).files[0]);
-        for(let i=1;i<=3;i++) if($('ref_video_'+i).files[0]) fd.append('ref_video_'+i,$('ref_video_'+i).files[0]);
+        for(let i=1;i<=3;i++) if($('ref_video_'+i).files[0]){
+          fd.append('ref_video_'+i,$('ref_video_'+i).files[0]);
+          const st=REF_VIDEO_EDIT_STATE[i]||{};fd.append('ref_video_start_'+i,String(Number(st.start||0)));fd.append('ref_video_end_'+i,String(Number.isFinite(st.end)?st.end:(st.duration||0)));
+        }
         for(let i=1;i<=3;i++) if($('ref_audio_'+i).files[0]) fd.append('ref_audio_'+i,$('ref_audio_'+i).files[0]);
       }else{
         for(const k of ['first_frame','last_frame'])if($(k).files[0])fd.append(k,$(k).files[0]);
