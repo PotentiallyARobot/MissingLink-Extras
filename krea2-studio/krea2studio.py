@@ -7469,8 +7469,7 @@ def _missinglink_request_gate():
         "<!doctype html><meta charset='utf-8'>"
         "<title>MissingLink access required</title>"
         "<style>body{font:15px system-ui;background:#09090b;color:#ededf0;padding:48px;max-width:760px;margin:auto}"
-        "a{color:#E8A917}code{background:#151519;padding:2px 5px;border-radius:4px}.ref-preview-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:8px}.ref-tile{position:relative;border:1px solid var(--border);border-radius:8px;overflow:hidden;background:var(--surface-2);min-height:84px}.ref-tile img{display:block;width:100%;height:84px;object-fit:cover}.ref-tile button{position:absolute;top:5px;right:5px;width:22px!important;height:22px!important;border-radius:999px!important;padding:0!important;background:rgba(10,10,10,.82)!important;border:1px solid var(--border)!important;color:#fff!important;font-size:12px!important;line-height:1}.ref-tile button:hover{border-color:var(--gold)!important;color:var(--gold)!important}.reference-hidden{display:none!important}
-</style>"
+        "a{color:#E8A917}code{background:#151519;padding:2px 5px;border-radius:4px}</style>"
         "<h1>MissingLink access required</h1>"
         f"<p>{error or 'Your MissingLink Notebook identity is not valid.'}</p>"
         "<p>Add a valid <code>MISSING_LINK_TOKEN</code> in Colab Secrets with notebook access enabled, then rerun the notebook.</p>"
@@ -8707,6 +8706,7 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
 /* Keep all scrollable surfaces functional without browser chrome cutting through the dark UI. */
 .q-list,.prompttable,.logbox,.paintbox,.sidebar-scroll,.stagepanel.gallerymode.active{scrollbar-width:none;-ms-overflow-style:none}
 .q-list::-webkit-scrollbar,.prompttable::-webkit-scrollbar,.logbox::-webkit-scrollbar,.paintbox::-webkit-scrollbar,.sidebar-scroll::-webkit-scrollbar,.stagepanel.gallerymode.active::-webkit-scrollbar{display:none;width:0;height:0}
+.ref-preview-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:8px}.ref-tile{position:relative;border:1px solid var(--border);border-radius:8px;overflow:hidden;background:var(--surface-2);min-height:84px}.ref-tile img{display:block;width:100%;height:84px;object-fit:cover}.ref-tile button{position:absolute;top:5px;right:5px;width:22px!important;height:22px!important;border-radius:999px!important;padding:0!important;background:rgba(10,10,10,.82)!important;border:1px solid var(--border)!important;color:#fff!important;font-size:12px!important;line-height:1}.ref-tile button:hover{border-color:var(--gold)!important;color:var(--gold)!important}.reference-hidden{display:none!important}
 </style>
 </head>
 <body>
