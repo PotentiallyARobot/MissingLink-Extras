@@ -567,6 +567,10 @@ subprocess.check_call([
     "Pillow",
     "numpy",
     "huggingface_hub[hf_xet]>=1.6.0,<2.0",
+    "diffusers>=0.36.0",
+    "transformers>=4.57.0",
+    "accelerate>=1.10.0",
+    "bitsandbytes>=0.48.0",
     "comfy-kitchen",
 ])
 
@@ -1114,6 +1118,16 @@ DEFAULT_INPAINT_MAX_SIDE = __DEFAULT_INPAINT_MAX_SIDE__
 DEFAULT_BATCH_WIDTH = __DEFAULT_BATCH_WIDTH__
 DEFAULT_BATCH_HEIGHT = __DEFAULT_BATCH_HEIGHT__
 
+# Dedicated re-staging engine. This is intentionally NOT a Krea checkpoint or
+# a normal LoRA slot. Camera jobs hard-swap the Krea stack out of memory, load
+# Qwen Image Edit 2511 with fal's 96-pose Multi-Angles training fused into an
+# NF4 checkpoint, and keep that engine warm until a later Krea job needs VRAM.
+QWEN_CAMERA_REPO = "mash2005/Qwen-Image-Edit-2511-MultiAngles-FullQ4"
+QWEN_CAMERA_SOURCE_LORA = "fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA"
+QWEN_CAMERA_PIPE = None
+ACTIVE_ENGINE = "krea2"
+_ENGINE_LOCK = threading.RLock()
+
 for category, filename in [
     ("diffusion_models", MODEL_NAME),
     ("text_encoders", CLIP_NAME),
@@ -1306,9 +1320,9 @@ def _apply_extra_loras(model, extra_loras=None):
 
 
 # Base-model selection mirrors H3 Studio: exactly one Krea2 diffusion
-# checkpoint is retained as the active model wrapper at a time. Switching
-# checkpoints unloads GPU residency and drops the old Python wrapper, so a T4
-# does not keep two giant model stacks alive in host/GPU memory.
+# checkpoint is retained as the active model wrapper at a time. Qwen Camera is
+# a separate runtime engine: switching to it destroys ALL Krea model wrappers,
+# and switching back destroys Qwen before recreating Krea CLIP/VAE/UNet.
 _BASE_MODEL_LOCK = threading.RLock()
 ACTIVE_BASE_MODEL_NAME = MODEL_NAME
 
@@ -1325,6 +1339,69 @@ def _normalize_base_model_name(value):
     except Exception as exc:
         raise ValueError(f"Krea2 base model is not installed: {name}") from exc
     return name
+
+
+def _hard_cuda_cleanup(label="engine swap"):
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+    try:
+        model_management.unload_all_models()
+    except Exception as exc:
+        print(f"[ENGINE] {label} Comfy unload warning: {exc!r}", flush=True)
+    try:
+        model_management.soft_empty_cache()
+    except Exception:
+        pass
+    gc.collect()
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    gpu_stats(label)
+
+
+def _release_qwen_camera_engine():
+    global QWEN_CAMERA_PIPE, ACTIVE_ENGINE
+    pipe = QWEN_CAMERA_PIPE
+    if pipe is None:
+        if ACTIVE_ENGINE == "qwen_camera":
+            ACTIVE_ENGINE = "none"
+        return
+    print("[ENGINE] releasing Qwen 2511 Camera engine...", flush=True)
+    try:
+        fn = getattr(pipe, "maybe_free_model_hooks", None)
+        if callable(fn):
+            fn()
+    except Exception as exc:
+        print("[ENGINE] Qwen hook cleanup warning:", repr(exc), flush=True)
+    QWEN_CAMERA_PIPE = None
+    pipe = None
+    ACTIVE_ENGINE = "none"
+    _hard_cuda_cleanup("Qwen released")
+
+
+def _release_krea_engine():
+    global UNET, CLIP, VAE, ACTIVE_ENGINE
+    if UNET is None and CLIP is None and VAE is None:
+        if ACTIVE_ENGINE == "krea2":
+            ACTIVE_ENGINE = "none"
+        return
+    print("[ENGINE] releasing Krea2 UNet + text encoder + VAE...", flush=True)
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+    try:
+        model_management.unload_all_models()
+    except Exception as exc:
+        print("[ENGINE] Krea unload warning:", repr(exc), flush=True)
+    UNET = None
+    CLIP = None
+    VAE = None
+    ACTIVE_ENGINE = "none"
+    _hard_cuda_cleanup("Krea2 released")
 
 
 def ensure_base_model(base_model_name=None):
@@ -1379,13 +1456,221 @@ def ensure_base_model(base_model_name=None):
             raise
 
 
+def ensure_krea_engine(base_model_name=None):
+    global CLIP, VAE, ACTIVE_ENGINE
+    with _ENGINE_LOCK:
+        if QWEN_CAMERA_PIPE is not None or ACTIVE_ENGINE == "qwen_camera":
+            _release_qwen_camera_engine()
+        if CLIP is None:
+            _emit_progress("Loading Krea2 text encoder", pct=3)
+            print("[ENGINE] recreating Krea2 Qwen text encoder...", flush=True)
+            CLIP = CLIPLoader().load_clip(clip_name=CLIP_NAME, type="krea2")[0]
+        if VAE is None:
+            _emit_progress("Loading Krea2 VAE", pct=4)
+            print("[ENGINE] recreating Krea2 VAE...", flush=True)
+            VAE = VAELoader().load_vae(vae_name=VAE_NAME)[0]
+        ACTIVE_ENGINE = "krea2"
+        return ensure_base_model(base_model_name)
+
+
+def _hf_token_for_qwen():
+    token = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN") or "").strip()
+    return token or None
+
+
+def ensure_qwen_camera_engine():
+    """Hard-swap Krea2 out, then lazily load the NF4 Qwen 2511 camera engine."""
+    global QWEN_CAMERA_PIPE, ACTIVE_ENGINE
+    with _ENGINE_LOCK:
+        if QWEN_CAMERA_PIPE is not None:
+            ACTIVE_ENGINE = "qwen_camera"
+            return QWEN_CAMERA_PIPE
+
+        _emit_progress("Releasing Krea2", pct=2)
+        _release_krea_engine()
+        _emit_progress("Loading Qwen 2511 Camera", pct=5)
+        print(f"[ENGINE] loading Qwen Camera: {QWEN_CAMERA_REPO}", flush=True)
+        try:
+            from diffusers import QwenImageEditPlusPipeline, QwenImageTransformer2DModel
+            from transformers import Qwen2_5_VLForConditionalGeneration
+        except Exception as exc:
+            raise RuntimeError(
+                "Qwen Camera dependencies are unavailable. Re-run the notebook setup so "
+                "diffusers, transformers, accelerate and bitsandbytes are installed."
+            ) from exc
+
+        token = _hf_token_for_qwen()
+        cap = torch.cuda.get_device_capability(0)
+        dtype = torch.bfloat16 if cap[0] >= 8 else torch.float16
+        common = dict(torch_dtype=dtype, token=token, low_cpu_mem_usage=True)
+        try:
+            transformer = QwenImageTransformer2DModel.from_pretrained(
+                QWEN_CAMERA_REPO,
+                subfolder="transformer",
+                device_map="cuda",
+                **common,
+            )
+            text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                QWEN_CAMERA_REPO,
+                subfolder="text_encoder",
+                device_map="cuda",
+                **common,
+            )
+            pipe = QwenImageEditPlusPipeline.from_pretrained(
+                QWEN_CAMERA_REPO,
+                transformer=transformer,
+                text_encoder=text_encoder,
+                **common,
+            )
+            # The model card uses model CPU offload after loading the pre-quantized
+            # components. Keep the same policy for activation headroom on T4/L4.
+            try:
+                pipe.enable_model_cpu_offload()
+            except Exception as exc:
+                print("[ENGINE] Qwen CPU-offload warning; keeping loaded placement:", repr(exc), flush=True)
+            try:
+                pipe.set_progress_bar_config(disable=True)
+            except Exception:
+                pass
+            QWEN_CAMERA_PIPE = pipe
+            ACTIVE_ENGINE = "qwen_camera"
+            _emit_progress("Qwen Camera ready", pct=12)
+            gpu_stats("Qwen Camera ready")
+            return QWEN_CAMERA_PIPE
+        except Exception:
+            QWEN_CAMERA_PIPE = None
+            ACTIVE_ENGINE = "none"
+            _hard_cuda_cleanup("Qwen load failed")
+            raise
+
+
+CAMERA_AZIMUTHS = {
+    "front": "front view",
+    "front-right": "front-right quarter view",
+    "right": "right side view",
+    "back-right": "back-right quarter view",
+    "back": "back view",
+    "back-left": "back-left quarter view",
+    "left": "left side view",
+    "front-left": "front-left quarter view",
+}
+CAMERA_ELEVATIONS = {
+    "low": "low-angle shot",
+    "eye": "eye-level shot",
+    "elevated": "elevated shot",
+    "high": "high-angle shot",
+}
+CAMERA_DISTANCES = {
+    "close": "close-up",
+    "medium": "medium shot",
+    "wide": "wide shot",
+}
+
+
+def qwen_camera_restage(
+    source,
+    azimuth="front",
+    elevation="eye",
+    distance="medium",
+    extra_instruction="",
+    negative_prompt=" ",
+    max_side=1024,
+    seed=-1,
+    steps=30,
+    guidance_scale=1.0,
+    true_cfg_scale=4.0,
+):
+    if source is None:
+        raise ValueError("Upload a source image for Camera / Re-stage.")
+    azimuth = str(azimuth or "front")
+    elevation = str(elevation or "eye")
+    distance = str(distance or "medium")
+    if azimuth not in CAMERA_AZIMUTHS:
+        raise ValueError("Unknown camera azimuth.")
+    if elevation not in CAMERA_ELEVATIONS:
+        raise ValueError("Unknown camera elevation.")
+    if distance not in CAMERA_DISTANCES:
+        raise ValueError("Unknown camera distance.")
+
+    source = resize_image(source, max_side=max_side)
+    seed = resolve_seed(seed)
+    control = (
+        f"<sks> {CAMERA_AZIMUTHS[azimuth]} "
+        f"{CAMERA_ELEVATIONS[elevation]} {CAMERA_DISTANCES[distance]}"
+    )
+    extra_instruction = str(extra_instruction or "").strip()
+    # History prompt recall may paste the complete fal control phrase back into the
+    # Camera instruction field. In that case, use it verbatim instead of prepending
+    # a second <sks> camera clause.
+    prompt = (
+        extra_instruction
+        if extra_instruction.lower().startswith("<sks>")
+        else (control if not extra_instruction else control + ", " + extra_instruction)
+    )
+    steps = max(1, min(80, int(steps or 30)))
+    guidance_scale = max(0.0, min(20.0, float(guidance_scale or 1.0)))
+    true_cfg_scale = max(0.0, min(20.0, float(true_cfg_scale or 4.0)))
+
+    check_stop()
+    pipe = ensure_qwen_camera_engine()
+    check_stop()
+    _emit_progress("Re-staging camera", pct=18, step=0, step_total=steps)
+    print(f"[CAMERA] {prompt} · seed={seed} · steps={steps}", flush=True)
+
+    generator = torch.Generator(device="cpu").manual_seed(int(seed))
+    started = time.time()
+    with torch.no_grad():
+        result = pipe(
+            image=[source],
+            prompt=prompt,
+            negative_prompt=str(negative_prompt or " ") or " ",
+            num_inference_steps=steps,
+            guidance_scale=guidance_scale,
+            true_cfg_scale=true_cfg_scale,
+            generator=generator,
+        )
+    check_stop()
+    images = getattr(result, "images", None) or []
+    if not images:
+        raise RuntimeError("Qwen Camera returned no image.")
+    image = images[0].convert("RGB")
+    elapsed = time.time() - started
+    _emit_progress("Saving camera result", pct=94, step=steps, step_total=steps)
+    path = save_image(
+        image,
+        "camera-restage",
+        prompt,
+        seed,
+        extra={
+            "model": QWEN_CAMERA_REPO,
+            "engine": "qwen-image-edit-2511-camera",
+            "source_lora": QWEN_CAMERA_SOURCE_LORA,
+            "camera_azimuth": azimuth,
+            "camera_elevation": elevation,
+            "camera_distance": distance,
+            "extra_instruction": extra_instruction,
+            "steps": steps,
+            "guidance_scale": guidance_scale,
+            "true_cfg_scale": true_cfg_scale,
+            "seconds": round(elapsed, 3),
+        },
+    )
+    status = (
+        f"Qwen Camera complete · {CAMERA_AZIMUTHS[azimuth]} · "
+        f"{CAMERA_ELEVATIONS[elevation]} · {CAMERA_DISTANCES[distance]} · "
+        f"seed {seed} · {elapsed:.1f}s"
+    )
+    _emit_progress("Camera complete", pct=100, step=steps, step_total=steps)
+    return path, seed, status, path
+
+
 def generation_model(
     lightning_enabled=False,
     lightning_strength=1.0,
     extra_loras=None,
     base_model_name=None,
 ):
-    model = ensure_base_model(base_model_name)
+    model = ensure_krea_engine(base_model_name)
     if lightning_enabled:
         strength = max(0.0, min(1.5, float(lightning_strength)))
         model = LIGHTNING_LOADER.load_lora_model_only(
@@ -1401,7 +1686,7 @@ def identity_edit_model(
     extra_loras=None,
     base_model_name=None,
 ):
-    model = ensure_base_model(base_model_name)
+    model = ensure_krea_engine(base_model_name)
     if lightning_enabled:
         strength = max(0.0, min(1.5, float(lightning_strength)))
         model = LIGHTNING_LOADER.load_lora_model_only(
@@ -1419,6 +1704,9 @@ SCHEDULER = "simple"
 MAX_SEED = 2**48 - 1
 
 OPENAI_MODEL = "gpt-5.6"
+MAX_REFERENCE_IMAGES = 4
+MAX_REFERENCE_ANALYSIS_SIDE = 1024
+
 
 # =====================================================================
 # COOPERATIVE + NATIVE COMFYUI INTERRUPTION
@@ -2266,6 +2554,9 @@ def text_to_image_core(
     lightning_strength=1.0,
     extra_loras=None,
     base_model_name=MODEL_NAME,
+    reference_paths=None,
+    reference_mode="style",
+    reference_strength=70,
 ):
 
     width = round16(width)
@@ -2285,8 +2576,16 @@ def text_to_image_core(
 
     total_start = time.time()
 
-    positive, negative = encode_prompt(
+    effective_prompt, reference_meta = apply_reference_guidance(
         prompt,
+        reference_paths=reference_paths,
+        reference_mode=reference_mode,
+        reference_strength=reference_strength,
+        generation_mode="text",
+    )
+
+    positive, negative = encode_prompt(
+        effective_prompt,
         negative_prompt,
     )
 
@@ -2324,6 +2623,7 @@ def text_to_image_core(
         seed,
         {
             "negative_prompt": str(negative_prompt or ""),
+            "effective_prompt": effective_prompt,
             "base_model": base_model_name,
             "width": width,
             "height": height,
@@ -2336,6 +2636,7 @@ def text_to_image_core(
             "extra_loras": _normalize_extra_loras(extra_loras),
             "sample_time": sample_time,
             "total_time": total_time,
+            **(reference_meta or {}),
         },
     )
 
@@ -2366,6 +2667,9 @@ def text_to_image(
     lightning_strength=1.0,
     extra_loras=None,
     base_model_name=MODEL_NAME,
+    reference_paths=None,
+    reference_mode="style",
+    reference_strength=70,
 ):
 
     path, seed, status = (
@@ -2384,6 +2688,9 @@ def text_to_image(
             lightning_strength=lightning_strength,
             extra_loras=extra_loras,
             base_model_name=base_model_name,
+            reference_paths=reference_paths,
+            reference_mode=reference_mode,
+            reference_strength=reference_strength,
         )
     )
 
@@ -2420,6 +2727,9 @@ def image_to_image(
     lightning_strength=1.0,
     extra_loras=None,
     base_model_name=MODEL_NAME,
+    reference_paths=None,
+    reference_mode="style",
+    reference_strength=70,
 ):
 
     source = resize_image(
@@ -2442,12 +2752,20 @@ def image_to_image(
 
     start = time.time()
 
+    effective_prompt, reference_meta = apply_reference_guidance(
+        prompt,
+        reference_paths=reference_paths,
+        reference_mode=reference_mode,
+        reference_strength=reference_strength,
+        generation_mode="image",
+    )
+
     latent = vae_encode(
         source
     )
 
     positive, negative = encode_prompt(
-        prompt,
+        effective_prompt,
         negative_prompt,
     )
 
@@ -2477,6 +2795,7 @@ def image_to_image(
         seed,
         {
             "negative_prompt": str(negative_prompt or ""),
+            "effective_prompt": effective_prompt,
             "base_model": base_model_name,
             "width": source.width,
             "height": source.height,
@@ -2490,6 +2809,7 @@ def image_to_image(
             "extra_loras": _normalize_extra_loras(extra_loras),
             "sample_time": sample_time,
             "total_time": total,
+            **(reference_meta or {}),
         },
     )
 
@@ -2533,6 +2853,9 @@ def instruction_edit(
     ground_negative=False,
     extra_loras=None,
     base_model_name=MODEL_NAME,
+    reference_paths=None,
+    reference_mode="style",
+    reference_strength=70,
 ):
 
     source = resize_image(source, max_side)
@@ -2553,12 +2876,20 @@ def instruction_edit(
     if not raw_prompt:
         raise ValueError("Enter an edit instruction.")
 
+    referenced_instruction, reference_meta = apply_reference_guidance(
+        raw_prompt,
+        reference_paths=reference_paths,
+        reference_mode=reference_mode,
+        reference_strength=reference_strength,
+        generation_mode="edit",
+    )
+
     effective_prompt = (
         "Edit the source image according to the instruction while preserving the same "
         "subject identity where applicable, scene layout, perspective, lighting, colour, "
         "materials and camera feel unless the instruction clearly asks for a broader change. "
         "Keep the result cohesive and photorealistic. Edit instruction: "
-        + raw_prompt
+        + referenced_instruction
     )
 
     positive, negative = encode_grounded_edit_prompt(
@@ -2636,6 +2967,7 @@ def instruction_edit(
             "fit_mode": fit_mode,
             "ground_negative": bool(ground_negative),
             "extra_loras": _normalize_extra_loras(extra_loras),
+            **(reference_meta or {}),
             "steps": steps,
             "cfg": cfg,
             "sampler": sampler_name,
@@ -3005,6 +3337,9 @@ def inpaint(
     ground_negative=False,
     extra_loras=None,
     base_model_name=MODEL_NAME,
+    reference_paths=None,
+    reference_mode="style",
+    reference_strength=70,
 ):
 
     steps = int(steps)
@@ -3066,13 +3401,21 @@ def inpaint(
     if not raw_prompt:
         raise ValueError("Enter an edit instruction.")
 
+    referenced_instruction, reference_meta = apply_reference_guidance(
+        raw_prompt,
+        reference_paths=reference_paths,
+        reference_mode=reference_mode,
+        reference_strength=reference_strength,
+        generation_mode="inpaint",
+    )
+
     effective_prompt = (
         "Edit the source image according to the instruction while preserving the same "
         "scene, identity where applicable, pose, perspective, scale, lighting, colour, "
         "materials and camera feel unless the instruction clearly asks for a broader change. "
         "Apply the requested change primarily within the painted region and keep nearby "
         "boundaries coherent. Edit instruction: "
-        + raw_prompt
+        + referenced_instruction
     )
 
     positive, negative = encode_grounded_edit_prompt(
@@ -3181,6 +3524,7 @@ def inpaint(
             "fit_mode": fit_mode,
             "ground_negative": bool(ground_negative),
             "extra_loras": _normalize_extra_loras(extra_loras),
+            **(reference_meta or {}),
             "mask_expand": int(expand),
             "feather": int(feather),
             "context_padding": int(context_padding),
@@ -3498,6 +3842,161 @@ def create_auto_prompt(
         raise RuntimeError("Auto Prompt returned an empty prompt.")
 
     return result
+
+
+def _pil_uploads(storages, mode="RGB", limit=MAX_REFERENCE_IMAGES):
+    out = []
+    for storage in storages or []:
+        try:
+            image = _pil_upload(storage, mode=mode)
+        except Exception:
+            image = None
+        if image is None:
+            continue
+        out.append(image)
+        if len(out) >= int(limit or MAX_REFERENCE_IMAGES):
+            break
+    return out
+
+
+def _save_job_images(images, prefix):
+    paths = []
+    for index, image in enumerate(images or [], start=1):
+        if image is None:
+            continue
+        paths.append(_save_job_image(image, f"{prefix}_{index:02d}"))
+    return paths
+
+
+def summarize_reference_images(
+    reference_images,
+    reference_mode="style",
+    reference_strength=70,
+    generation_mode="text",
+    user_prompt="",
+    agent_model=None,
+):
+    images = [img for img in (reference_images or []) if img is not None][:MAX_REFERENCE_IMAGES]
+    if not images:
+        return ""
+
+    reference_mode = str(reference_mode or "style").strip().lower()
+    if reference_mode not in {"style", "subject", "composition"}:
+        reference_mode = "style"
+    try:
+        reference_strength = int(reference_strength)
+    except Exception:
+        reference_strength = 70
+    reference_strength = max(0, min(100, reference_strength))
+    generation_mode = str(generation_mode or "text").strip().lower()
+
+    schema = {
+        "type": "object",
+        "properties": {"summary": {"type": "string"}},
+        "required": ["summary"],
+        "additionalProperties": False,
+    }
+
+    objective = {
+        "style": "the transferable visual style: palette, lighting, texture, materials, rendering language, mood, and strong recurring aesthetic choices",
+        "subject": "the reusable subject cues: character or object appearance, clothing, silhouette, key design traits, and identity-defining features that should inform a new Krea2 image",
+        "composition": "the compositional cues: framing, camera angle, perspective, staging, environment layout, and mood, plus any style signals worth carrying over",
+    }[reference_mode]
+
+    content = [{
+        "type": "input_text",
+        "text": (
+            "You are preparing visual reference guidance for MissingLink Krea2 Studio. "
+            "Analyze the attached reference images and write one concise model-facing summary that a text-to-image or edit model can use. Focus on "
+            + objective
+            + ". Keep it compact but concrete. Describe what should be borrowed, not the fact that images were provided. "
+            "Do not mention file order, filenames, or speculative details. "
+            f"Reference mode: {reference_mode}. Requested guidance strength: {reference_strength}/100. "
+            f"Krea2 tool mode: {generation_mode}. User prompt/context: {str(user_prompt or '').strip() or '[none supplied]'}."
+        ),
+    }]
+
+    for image in images:
+        content.extend([
+            {"type": "input_text", "text": "REFERENCE IMAGE: analyze this image and incorporate its relevant cues into the single summary."},
+            {"type": "input_image", "image_url": pil_to_data_url(image, max_side=MAX_REFERENCE_ANALYSIS_SIDE), "detail": "high"},
+        ])
+
+    response = responses_create_custom(
+        agent_model=agent_model or OPENAI_MODEL,
+        reasoning_effort="low",
+        reasoning_mode="standard",
+        max_output_tokens=1200,
+        input=[{"role": "user", "content": content}],
+        text={"format": {"type": "json_schema", "name": "reference_guidance", "schema": schema, "strict": True}},
+        store=False,
+    )
+
+    payload_text = getattr(response, "output_text", "") or ""
+    if not payload_text:
+        raise RuntimeError("Reference analysis returned an empty response.")
+    payload = json.loads(payload_text)
+    return str(payload.get("summary") or "").strip()
+
+
+def apply_reference_guidance(
+    prompt,
+    reference_paths=None,
+    reference_mode="style",
+    reference_strength=70,
+    generation_mode="text",
+    agent_model=None,
+):
+    paths = [str(path) for path in (reference_paths or []) if path][:MAX_REFERENCE_IMAGES]
+    if not paths:
+        return str(prompt or "").strip(), None
+
+    reference_images = []
+    reference_files = []
+    for path in paths:
+        try:
+            with Image.open(path) as image:
+                reference_images.append(image.convert("RGB").copy())
+            reference_files.append(Path(path).name)
+        except Exception as exc:
+            print("[REFERENCE] skipped", path, repr(exc), flush=True)
+
+    if not reference_images:
+        return str(prompt or "").strip(), None
+
+    summary = summarize_reference_images(
+        reference_images,
+        reference_mode=reference_mode,
+        reference_strength=reference_strength,
+        generation_mode=generation_mode,
+        user_prompt=prompt,
+        agent_model=agent_model or OPENAI_MODEL,
+    )
+
+    try:
+        reference_strength = int(reference_strength)
+    except Exception:
+        reference_strength = 70
+    reference_strength = max(0, min(100, reference_strength))
+
+    strength_phrase = "subtly" if reference_strength <= 35 else ("with balanced influence" if reference_strength <= 75 else "strongly")
+    mode_label = {
+        "style": "style and aesthetic guidance",
+        "subject": "subject / identity guidance",
+        "composition": "composition and camera guidance",
+    }.get(str(reference_mode or "style").strip().lower(), "visual guidance")
+
+    prompt = str(prompt or "").strip()
+    guidance = (f"Use the attached reference images as {mode_label} {strength_phrase}. Relevant cues to carry over: {summary}").strip()
+    effective = (prompt + "\n\n" + guidance).strip() if prompt else guidance
+    meta = {
+        "reference_count": len(reference_images),
+        "reference_mode": str(reference_mode or "style"),
+        "reference_strength": int(reference_strength),
+        "reference_summary": summary,
+        "reference_files": reference_files,
+    }
+    return effective, meta
 
 # =====================================================================
 # PROMPT TABLE HELPERS
@@ -6671,7 +7170,11 @@ def _execute_job(jid):
         job.update(
             status="running",
             stage="Starting GPU",
-            detail=("Preparing " + Path(str(params.get("base_model") or MODEL_NAME)).name + " on the local GPU."),
+            detail=(
+                "Preparing Qwen 2511 Camera on the local GPU."
+                if job.get("kind") == "camera"
+                else ("Preparing " + Path(str(params.get("base_model") or MODEL_NAME)).name + " on the local GPU.")
+            ),
             progress=max(1.0, float(job.get("progress") or 0.0)),
             started=time.time(),
             updated=time.time(),
@@ -6693,6 +7196,9 @@ def _execute_job(jid):
             lightning_strength=params.get("lightning_strength", 1.0),
             extra_loras=params.get("extra_loras", []),
             base_model_name=params.get("base_model", MODEL_NAME),
+            reference_paths=params.get("reference_paths", []),
+            reference_mode=params.get("reference_mode", "style"),
+            reference_strength=params.get("reference_strength", 70),
         )
         path, seed, status, download_path, _, _ = result
         return {"image": _output_url(path), "seed": seed, "status": status,
@@ -6712,6 +7218,9 @@ def _execute_job(jid):
             lightning_strength=params.get("lightning_strength", 1.0),
             extra_loras=params.get("extra_loras", []),
             base_model_name=params.get("base_model", MODEL_NAME),
+            reference_paths=params.get("reference_paths", []),
+            reference_mode=params.get("reference_mode", "style"),
+            reference_strength=params.get("reference_strength", 70),
         )
         path, seed, status, download_path, _, _ = result
         return {"image": _output_url(path), "seed": seed, "status": status,
@@ -6738,10 +7247,31 @@ def _execute_job(jid):
             lightning_strength=params.get("lightning_strength", 1.0),
             extra_loras=params.get("extra_loras", []),
             base_model_name=params.get("base_model", MODEL_NAME),
+            reference_paths=params.get("reference_paths", []),
+            reference_mode=params.get("reference_mode", "style"),
+            reference_strength=params.get("reference_strength", 70),
         )
         path, seed, status, download_path, _, _ = result
         return {"image": _output_url(path), "seed": seed, "status": status,
                 "download": _output_url(download_path)}
+
+    if kind == "camera":
+        source = _load_job_image(params["source_path"])
+        path, seed, status, download_path = qwen_camera_restage(
+            source=source,
+            azimuth=params.get("azimuth", "front"),
+            elevation=params.get("elevation", "eye"),
+            distance=params.get("distance", "medium"),
+            extra_instruction=params.get("extra_instruction", ""),
+            negative_prompt=params.get("negative_prompt", " "),
+            max_side=params.get("max_side", 1024),
+            seed=params.get("seed", -1),
+            steps=params.get("steps", 30),
+            guidance_scale=params.get("guidance_scale", 1.0),
+            true_cfg_scale=params.get("true_cfg_scale", 4.0),
+        )
+        return {"image": _output_url(path), "seed": seed, "status": status,
+                "download": _output_url(download_path), "engine": "qwen_camera"}
 
     if kind == "inpaint":
         source = _load_job_image(params["source_path"])
@@ -6773,6 +7303,9 @@ def _execute_job(jid):
             lightning_strength=params.get("lightning_strength", 1.0),
             extra_loras=params.get("extra_loras", []),
             base_model_name=params.get("base_model", MODEL_NAME),
+            reference_paths=params.get("reference_paths", []),
+            reference_mode=params.get("reference_mode", "style"),
+            reference_strength=params.get("reference_strength", 70),
         )
         path, seed, status, download_path, _, _ = result
         return {"image": _output_url(path), "seed": seed, "status": status,
@@ -6936,7 +7469,8 @@ def _missinglink_request_gate():
         "<!doctype html><meta charset='utf-8'>"
         "<title>MissingLink access required</title>"
         "<style>body{font:15px system-ui;background:#09090b;color:#ededf0;padding:48px;max-width:760px;margin:auto}"
-        "a{color:#E8A917}code{background:#151519;padding:2px 5px;border-radius:4px}</style>"
+        "a{color:#E8A917}code{background:#151519;padding:2px 5px;border-radius:4px}.ref-preview-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:8px}.ref-tile{position:relative;border:1px solid var(--border);border-radius:8px;overflow:hidden;background:var(--surface-2);min-height:84px}.ref-tile img{display:block;width:100%;height:84px;object-fit:cover}.ref-tile button{position:absolute;top:5px;right:5px;width:22px!important;height:22px!important;border-radius:999px!important;padding:0!important;background:rgba(10,10,10,.82)!important;border:1px solid var(--border)!important;color:#fff!important;font-size:12px!important;line-height:1}.ref-tile button:hover{border-color:var(--gold)!important;color:var(--gold)!important}.reference-hidden{display:none!important}
+</style>"
         "<h1>MissingLink access required</h1>"
         f"<p>{error or 'Your MissingLink Notebook identity is not valid.'}</p>"
         "<p>Add a valid <code>MISSING_LINK_TOKEN</code> in Colab Secrets with notebook access enabled, then rerun the notebook.</p>"
@@ -7075,7 +7609,8 @@ def api_meta():
     return jsonify(
         ok=True, product="MissingLink Krea2 Studio", gpu=GPU_NAME,
         vram_gib=round(VRAM_GB, 2), torch=torch.__version__, torch_cuda=str(torch.version.cuda),
-        model=MODEL_NAME, active_base_model=ACTIVE_BASE_MODEL_NAME,
+        model=MODEL_NAME, active_base_model=ACTIVE_BASE_MODEL_NAME, active_engine=ACTIVE_ENGINE,
+        qwen_camera_repo=QWEN_CAMERA_REPO, qwen_camera_source_lora=QWEN_CAMERA_SOURCE_LORA,
         base_models=[{
             "profile":"builtin", "label":"BUILT-IN KREA2",
             "local_name":MODEL_NAME, "repo_id":"MissingLinkBuilder/Models",
@@ -7327,22 +7862,32 @@ def api_jobs_cancel_all():
 @app.post("/api/text_to_image")
 def api_text_to_image():
     body = request.get_json(silent=True) or {}
+    form = request.form if request.form else None
+    files = request.files if request.files else None
+    source = form if form is not None and len(form) else body
     try:
+        reference_paths = _save_job_images(
+            _pil_uploads(files.getlist("references")) if files is not None else [],
+            "txt2img_reference",
+        )
         jid = _submit_job(
             "text",
             {
-                "prompt": body.get("prompt"),
-                "negative_prompt": body.get("negative_prompt", ""),
-                "base_model": _normalize_base_model_name(body.get("base_model") or MODEL_NAME),
-                "width": _int_value(body.get("width"), DEFAULT_TEXT_WIDTH, 256, 2048),
-                "height": _int_value(body.get("height"), DEFAULT_TEXT_HEIGHT, 256, 2048),
-                "seed": _int_value(body.get("seed"), -1),
-                "steps": _int_value(body.get("steps"), STEPS, 1, 80),
-                "cfg": _float_value(body.get("cfg"), CFG, 0.0, 30.0),
-                "sampler": str(body.get("sampler") or SAMPLER_NAME),
-                "scheduler": str(body.get("scheduler") or SCHEDULER),
-                "lightning_enabled": bool(body.get("lightning_enabled", False)),
-                "lightning_strength": _float_value(body.get("lightning_strength"), 1.0, 0.0, 1.5),
+                "prompt": source.get("prompt"),
+                "negative_prompt": source.get("negative_prompt", ""),
+                "base_model": _normalize_base_model_name(source.get("base_model") or MODEL_NAME),
+                "width": _int_value(source.get("width"), DEFAULT_TEXT_WIDTH, 256, 2048),
+                "height": _int_value(source.get("height"), DEFAULT_TEXT_HEIGHT, 256, 2048),
+                "seed": _int_value(source.get("seed"), -1),
+                "steps": _int_value(source.get("steps"), STEPS, 1, 80),
+                "cfg": _float_value(source.get("cfg"), CFG, 0.0, 30.0),
+                "sampler": str(source.get("sampler") or SAMPLER_NAME),
+                "scheduler": str(source.get("scheduler") or SCHEDULER),
+                "lightning_enabled": str(source.get("lightning_enabled") or "").lower() in {"1","true","yes","on"} if form is not None and len(form) else bool(source.get("lightning_enabled", False)),
+                "lightning_strength": _float_value(source.get("lightning_strength"), 1.0, 0.0, 1.5),
+                "reference_paths": reference_paths,
+                "reference_mode": str(source.get("reference_mode") or "style"),
+                "reference_strength": _int_value(source.get("reference_strength"), 70, 0, 100),
             },
             label="Text → Image", mode="txt2img",
         )
@@ -7374,6 +7919,9 @@ def api_image_to_image():
                 "scheduler": str(request.form.get("scheduler") or SCHEDULER),
                 "lightning_enabled": str(request.form.get("lightning_enabled") or "").lower() in {"1","true","yes","on"},
                 "lightning_strength": _float_value(request.form.get("lightning_strength"), 1.0, 0.0, 1.5),
+                "reference_paths": _save_job_images(_pil_uploads(request.files.getlist("references")), "img2img_reference"),
+                "reference_mode": str(request.form.get("reference_mode") or "style"),
+                "reference_strength": _int_value(request.form.get("reference_strength"), 70, 0, 100),
             },
             label="Image → Image", mode="img2img", thumb=_input_url(source_path),
         )
@@ -7409,8 +7957,49 @@ def api_instruction_edit():
                 "scheduler": str(request.form.get("scheduler") or SCHEDULER),
                 "lightning_enabled": str(request.form.get("lightning_enabled") or "").lower() in {"1","true","yes","on"},
                 "lightning_strength": _float_value(request.form.get("lightning_strength"), 1.0, 0.0, 1.5),
+                "reference_paths": _save_job_images(_pil_uploads(request.files.getlist("references")), "edit_reference"),
+                "reference_mode": str(request.form.get("reference_mode") or "style"),
+                "reference_strength": _int_value(request.form.get("reference_strength"), 70, 0, 100),
             },
             label="Instruction Edit", mode="edit", thumb=_input_url(source_path),
+        )
+        return jsonify(ok=True, id=jid, queued=True, access=_ml_public_access_state()), 202
+    except Exception as exc:
+        return _json_error(exc, 409 if "Queue is full" in str(exc) else 400)
+
+
+@app.post("/api/camera")
+def api_camera():
+    source = _pil_upload(request.files.get("source"))
+    if source is None:
+        return _json_error("Upload a source image for Camera / Re-stage.")
+    source_path = _save_job_image(source, "camera_source")
+    try:
+        azimuth = str(request.form.get("azimuth") or "front")
+        elevation = str(request.form.get("elevation") or "eye")
+        distance = str(request.form.get("distance") or "medium")
+        if azimuth not in CAMERA_AZIMUTHS:
+            raise ValueError("Unknown camera azimuth.")
+        if elevation not in CAMERA_ELEVATIONS:
+            raise ValueError("Unknown camera elevation.")
+        if distance not in CAMERA_DISTANCES:
+            raise ValueError("Unknown camera distance.")
+        jid = _submit_job(
+            "camera",
+            {
+                "source_path": source_path,
+                "azimuth": azimuth,
+                "elevation": elevation,
+                "distance": distance,
+                "extra_instruction": str(request.form.get("extra_instruction") or ""),
+                "negative_prompt": str(request.form.get("negative_prompt") or " "),
+                "max_side": _int_value(request.form.get("max_side"), DEFAULT_IMAGE_MAX_SIDE, 256, 2048),
+                "seed": _int_value(request.form.get("seed"), -1),
+                "steps": _int_value(request.form.get("steps"), 30, 1, 80),
+                "guidance_scale": _float_value(request.form.get("guidance_scale"), 1.0, 0.0, 20.0),
+                "true_cfg_scale": _float_value(request.form.get("true_cfg_scale"), 4.0, 0.0, 20.0),
+            },
+            label="Camera / Re-stage", mode="qwen-camera", thumb=_input_url(source_path),
         )
         return jsonify(ok=True, id=jid, queued=True, access=_ml_public_access_state()), 202
     except Exception as exc:
@@ -7455,6 +8044,9 @@ def api_inpaint():
                 "scheduler": str(request.form.get("scheduler") or SCHEDULER),
                 "lightning_enabled": str(request.form.get("lightning_enabled") or "").lower() in {"1","true","yes","on"},
                 "lightning_strength": _float_value(request.form.get("lightning_strength"), 1.0, 0.0, 1.5),
+                "reference_paths": _save_job_images(_pil_uploads(request.files.getlist("references")), "inpaint_reference"),
+                "reference_mode": str(request.form.get("reference_mode") or "style"),
+                "reference_strength": _int_value(request.form.get("reference_strength"), 70, 0, 100),
             },
             label="Inpaint", mode="inpaint", thumb=_input_url(source_path),
         )
@@ -7862,7 +8454,7 @@ input,textarea,select{
   padding:8px 9px;border-radius:7px;outline:none
 }
 input:focus,textarea:focus,select:focus{border-color:var(--accent)}
-textarea{resize:vertical;min-height:112px}
+textarea{resize:none;min-height:112px;scrollbar-width:none;-ms-overflow-style:none} textarea::-webkit-scrollbar{display:none}
 label{display:block;font-size:9px;color:#8d8f98;margin:8px 0 4px;text-transform:uppercase;letter-spacing:.6px}
 .nativefile{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important;opacity:0!important;pointer-events:none!important}
 .uploadrow{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:10px;width:100%;min-height:52px;padding:8px 10px;border:1px solid #2c2c33;border-radius:8px;background:var(--panel2)}
@@ -8020,9 +8612,9 @@ details .inside{padding:0 10px 10px}
 .stageview.gallerymode .tile.selected{border-color:var(--accent);box-shadow:0 0 0 1px rgba(232,169,23,.28) inset}
 .stagehint{margin-top:8px;color:#73757f;font-size:8px;line-height:1.5}
 @media(max-width:900px){.stageview{min-height:320px}.stageview.gallerymode .gallery{grid-template-columns:repeat(2,minmax(0,1fr))}}
-.console-stage{display:none!important;margin:0;padding:18px 20px;background:#050506;color:#c8cad2;font:11px/1.55 var(--font-mono);white-space:pre-wrap;word-break:break-word;overflow:auto;align-items:initial!important;justify-content:initial!important;text-align:left;scrollbar-width:thin;scrollbar-color:#34353d #09090b}
+.console-stage{display:none!important;margin:0;padding:18px 20px;background:#050506;color:#c8cad2;font:11px/1.55 var(--font-mono);white-space:pre-wrap;word-break:break-word;overflow:auto;align-items:initial!important;justify-content:initial!important;text-align:left;scrollbar-width:none;-ms-overflow-style:none}
 .console-stage.active{display:block!important}
-.console-stage::-webkit-scrollbar{width:9px;height:9px}.console-stage::-webkit-scrollbar-track{background:#09090b}.console-stage::-webkit-scrollbar-thumb{background:#34353d;border-radius:8px}
+.console-stage::-webkit-scrollbar{display:none}
 .console-toolbar-note{font-family:var(--font-mono);font-size:8px;color:#777982;line-height:1.5}
 .lora-list{display:flex;flex-direction:column;gap:6px;margin-top:8px}
 .lora-row{display:grid;grid-template-columns:24px minmax(0,1fr) 82px 54px;gap:7px;align-items:center;padding:7px;border:1px solid #2a2b31;border-radius:7px;background:#0d0d10}
@@ -8059,6 +8651,7 @@ html,body{height:100%;overflow:hidden}
 .stagepanel.gallerymode .tile:hover{border-color:var(--accent);transform:translateY(-1px)}
 .stagepanel.gallerymode .tile.selected{border-color:var(--accent);box-shadow:0 0 0 1px rgba(232,169,23,.3) inset}
 .stage-side-note{font-family:var(--font-mono);font-size:8px;color:#696b74}
+.camera-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.camera-grid .full{grid-column:1/-1}.camera-presets{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin:7px 0}.camera-presets button{padding:7px 4px;font-size:7.5px}.engine-note{border:1px solid #34301e;background:#17150d;border-radius:7px;padding:8px;color:#aaa585;font-size:8px;line-height:1.5}.engine-note b{color:var(--accent)}
 /* keep floating queue/history above the stage and independently movable */
 .queue-overlay,.history-overlay{z-index:1200!important}
 .q-header{touch-action:none}
@@ -8066,6 +8659,8 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
 /* no browser scrollbars on the application chrome */
 html,body,.app-shell,.app-body,.studio-stage{scrollbar-width:none;-ms-overflow-style:none}
 html::-webkit-scrollbar,body::-webkit-scrollbar,.app-shell::-webkit-scrollbar,.app-body::-webkit-scrollbar,.studio-stage::-webkit-scrollbar{display:none}
+*{scrollbar-width:none;-ms-overflow-style:none}
+*::-webkit-scrollbar{width:0!important;height:0!important;display:none!important}
 @media(max-width:980px){
   .app-body{grid-template-columns:340px minmax(0,1fr)}
   .mode-tabs .tab{min-width:96px;font-size:8px}
@@ -8135,8 +8730,8 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
         <button class="tab" data-tab="image">IMAGE → IMAGE</button>
         <button class="tab" data-tab="edit">INSTRUCTION EDIT</button>
         <button class="tab" data-tab="inpaint">INPAINT</button>
+        <button class="tab" data-tab="camera">CAMERA / RE-STAGE</button>
         <button class="tab" data-tab="batch">ADAPTIVE BATCH</button>
-        <button class="tab" data-tab="loras">LORAS</button>
         <button class="tab" data-tab="console">CONSOLE</button>
       </nav>
 
@@ -8171,6 +8766,54 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
               <div id="hf_model_progress_text" class="hfprogresstext">Paste whatever Hugging Face link you have. The Studio will normalize the repo, revision and direct file path when possible.</div>
             </div>
             <div id="base_model_hint" class="modelhint">Selected model: <b>Built-in Krea2</b> · <span class="installed">ready</span>.</div>
+          </div>
+        </div>
+
+        <div class="card shared-lora-card">
+          <div class="cardtitle">LoRA Stack</div>
+          <div class="cardbody">
+            <div class="sectionhint">LoRAs apply to new Krea2 jobs from every major tool. Up to four user LoRAs are snapshotted into each queued job. Qwen Camera uses its own fused fal Multi-Angles weights and does not use this Krea2 rack.</div>
+            <div class="actions">
+              <button id="l_add" type="button">+ ADD LORA</button>
+              <button id="l_refresh" class="secondary" type="button">REFRESH</button>
+            </div>
+            <div id="lora_install_inline" class="lora-inline-installer hidden">
+              <div class="lora-inline-head"><div class="lora-inline-title">ADD LORA</div><button id="lora_install_hide" class="secondary" type="button">HIDE</button></div>
+              <label>Source</label>
+              <input id="lora_source" type="text" placeholder="HF owner/repo · full HF URL · direct HF .safetensors URL · Civitai model/version URL" autocomplete="off">
+              <div class="split"><div><label>HF revision</label><input id="lora_revision" type="text" value="main" autocomplete="off"></div><div><label>Detected source</label><input id="lora_source_type" type="text" value="not checked" readonly></div></div>
+              <label>Detected LoRA name</label><input id="lora_detected_name" type="text" value="Paste a source URL" readonly>
+              <label>LoRA file</label><select id="lora_candidate" disabled><option value="">CHECK SOURCE first</option></select>
+              <div class="actions lora-install-actions"><button id="lora_check_source" class="secondary" type="button">CHECK SOURCE</button><button id="lora_download_btn" type="button" disabled>DOWNLOAD + ADD</button></div>
+              <div class="progress"><i id="lora_download_progress"></i></div>
+              <div id="lora_download_text" class="status">Paste a source URL, inspect it, then download the selected SafeTensors LoRA.</div>
+            </div>
+            <div id="l_status" class="status">Loading LoRA library…</div>
+            <details>
+              <summary>Installed LoRAs · Active Stack</summary>
+              <div class="inside">
+                <div id="lora_list" class="lora-list"><div class="empty">Loading…</div></div>
+                <div class="actions"><button id="l_save_stack" type="button">SAVE ACTIVE STACK</button></div>
+              </div>
+            </details>
+          </div>
+        </div>
+
+        <div id="reference_card" class="card shared-reference-card">
+          <div class="cardtitle">References</div>
+          <div class="cardbody">
+            <div class="sectionhint">Attach up to four visual references and Krea2 will derive reusable guidance from them at generation time. Use <b>Style</b> for look, lighting, and rendering; <b>Subject</b> for appearance cues; and <b>Composition</b> for framing, camera, or layout cues.</div>
+            <div class="split">
+              <div><label>Reference mode</label><select id="ref_mode"><option value="style">Style</option><option value="subject">Subject / identity</option><option value="composition">Composition / camera</option></select></div>
+              <div><label>Influence (0–100)</label><input id="ref_strength" type="number" min="0" max="100" step="1" value="70"></div>
+            </div>
+            <input id="ref_images" type="file" accept="image/*" multiple style="display:none">
+            <div class="actions">
+              <button id="ref_pick" type="button">+ ADD REFERENCES</button>
+              <button id="ref_clear" class="secondary" type="button">CLEAR</button>
+            </div>
+            <div id="ref_status" class="status">No reference images selected.</div>
+            <div id="ref_preview" class="ref-preview-grid"><div class="empty">No reference images selected.</div></div>
           </div>
         </div>
 
@@ -8391,6 +9034,44 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
           </div>
         </section>
 
+        <section id="panel_camera" class="controlpanel">
+          <div class="card">
+            <div class="cardtitle">Camera / Re-stage · Qwen 2511</div>
+            <div class="cardbody">
+              <div class="engine-note"><b>Dedicated camera engine.</b> A Camera job fully swaps Krea2 out of VRAM, loads Qwen Image Edit 2511 with fal's Multi-Angles camera control fused into NF4 weights, generates the new viewpoint, then keeps Qwen warm until the next Krea2 job arrives.</div>
+              <label>Source image</label>
+              <input id="c_source" class="nativefile" type="file" accept="image/*">
+              <div class="uploadrow"><button id="c_source_pick" class="filepick" type="button"><span class="filepickicon">＋</span><span>Choose image</span></button><span id="c_source_name" class="filemeta">No image selected</span></div>
+              <div id="c_preview" class="preview"><div class="empty">Choose the image you want to re-stage.</div></div>
+              <label>Horizontal camera position</label>
+              <select id="c_azimuth">
+                <option value="front">Front · 0°</option><option value="front-right">Front-right · 45°</option><option value="right">Right side · 90°</option><option value="back-right">Back-right · 135°</option><option value="back">Back · 180°</option><option value="back-left">Back-left · 225°</option><option value="left">Left side · 270°</option><option value="front-left">Front-left · 315°</option>
+              </select>
+              <div class="camera-presets">
+                <button type="button" class="secondary camera-az" data-value="front">FRONT</button><button type="button" class="secondary camera-az" data-value="right">RIGHT</button><button type="button" class="secondary camera-az" data-value="back">BACK</button><button type="button" class="secondary camera-az" data-value="left">LEFT</button>
+              </div>
+              <div class="camera-grid">
+                <div><label>Elevation</label><select id="c_elevation"><option value="low">Low · -30°</option><option value="eye" selected>Eye level · 0°</option><option value="elevated">Elevated · 30°</option><option value="high">High · 60°</option></select></div>
+                <div><label>Distance</label><select id="c_distance"><option value="close">Close-up · ×0.6</option><option value="medium" selected>Medium · ×1.0</option><option value="wide">Wide · ×1.8</option></select></div>
+                <div class="full"><label>Additional instruction · optional</label><textarea id="c_extra" placeholder="Keep the same person, outfit and environment; only change viewpoint…"></textarea></div>
+                <div class="full"><label>Negative prompt · optional</label><textarea id="c_negative" placeholder="Optional things to avoid"></textarea></div>
+                <div><label>Maximum side</label><select id="c_max"></select></div>
+                <div><label>Seed (-1 = random)</label><input id="c_seed" type="number" value="-1"></div>
+              </div>
+              <details>
+                <summary>Qwen Camera settings</summary>
+                <div class="inside">
+                  <div class="grid3"><div><label>Steps</label><input id="c_steps" type="number" min="1" max="80" value="30"></div><div><label>Guidance</label><input id="c_guidance" type="number" min="0" max="20" step=".1" value="1.0"></div><div><label>True CFG</label><input id="c_true_cfg" type="number" min="0" max="20" step=".1" value="4.0"></div></div>
+                  <div class="minihint">fal's trained control grid is 8 azimuths × 4 elevations × 3 distances = 96 camera poses. The Studio builds the exact <b>&lt;sks&gt; [azimuth] [elevation] [distance]</b> control phrase automatically.</div>
+                </div>
+              </details>
+              <div class="actions"><button id="c_generate">RE-STAGE CAMERA</button></div>
+              <div id="cam_status" class="status">Ready. First use downloads and loads the Qwen Camera engine.</div>
+              <a id="cam_download" class="hidden" target="_blank"></a>
+            </div>
+          </div>
+        </section>
+
         <section id="panel_batch" class="controlpanel">
           <div class="card">
             <div class="cardtitle">Adaptive Batch</div>
@@ -8481,53 +9162,6 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
           </div>
         </section>
 
-        <section id="panel_loras" class="controlpanel">
-          <div class="card">
-            <div class="cardtitle">LoRA Manager</div>
-            <div class="cardbody">
-              <div class="sectionhint">H3-style LoRA install: paste an HF repo, full Hugging Face URL, direct HF <b>.safetensors</b> file URL, or Civitai model/version URL. Krea2 discovers the files, shows live download progress, validates SafeTensors, then adds the installed LoRA to the active rack at strength 1.00 when space is available.</div>
-              <div class="actions">
-                <button id="l_add" type="button">+ ADD LORA</button>
-                <button id="l_refresh" class="secondary" type="button">REFRESH</button>
-              </div>
-              <div id="lora_install_inline" class="lora-inline-installer hidden">
-                <div class="lora-inline-head">
-                  <div class="lora-inline-title">ADD LORA</div>
-                  <button id="lora_install_hide" class="secondary" type="button">HIDE</button>
-                </div>
-                <label>Source</label>
-                <input id="lora_source" type="text" placeholder="HF owner/repo · full HF URL · direct HF .safetensors URL · Civitai model/version URL" autocomplete="off">
-                <div class="split">
-                  <div><label>HF revision</label><input id="lora_revision" type="text" value="main" autocomplete="off"></div>
-                  <div><label>Detected source</label><input id="lora_source_type" type="text" value="not checked" readonly></div>
-                </div>
-                <label>Detected LoRA name</label>
-                <input id="lora_detected_name" type="text" value="Paste a source URL" readonly>
-                <label>LoRA file</label>
-                <select id="lora_candidate" disabled><option value="">CHECK SOURCE first</option></select>
-                <div class="actions lora-install-actions">
-                  <button id="lora_check_source" class="secondary" type="button">CHECK SOURCE</button>
-                  <button id="lora_download_btn" type="button" disabled>DOWNLOAD + ADD</button>
-                </div>
-                <div class="progress"><i id="lora_download_progress"></i></div>
-                <div id="lora_download_text" class="status">Paste the source URL and Krea2 will inspect it automatically, detect the LoRA filename, and preselect the best SafeTensors file.</div>
-                <div class="sectionhint">This panel stays inline so you can keep watching the Stage while the download runs. CIVITAI_API_KEY is read from Colab userdata automatically; HF_TOKEN is only needed for gated/private Hugging Face files.</div>
-              </div>
-              <div id="l_status" class="status">Loading LoRA library…</div>
-            </div>
-          </div>
-          <div class="card">
-            <div class="cardtitle">Installed LoRAs · Active Stack</div>
-            <div class="cardbody">
-              <div class="sectionhint">Check a LoRA to activate it for <b>newly submitted</b> jobs and set its model strength. Up to four user LoRAs are snapshotted into each queued job. Built-in acceleration/edit LoRAs stay managed by their existing controls.</div>
-              <div id="lora_list" class="lora-list"><div class="empty">Loading…</div></div>
-              <div class="actions">
-                <button id="l_save_stack" type="button">SAVE ACTIVE STACK</button>
-              </div>
-            </div>
-          </div>
-        </section>
-
         <section id="panel_console" class="controlpanel">
           <div class="card">
             <div class="cardtitle">Console</div>
@@ -8563,8 +9197,8 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
         <div id="i_result" class="stageview single stagepanel"><div class="empty">Generated image appears here.</div></div>
         <div id="e_result" class="stageview single stagepanel"><div class="empty">Instruction edit result appears here.</div></div>
         <div id="in_result" class="stageview single stagepanel"><div class="empty">Edit / inpaint result appears here.</div></div>
+        <div id="c_result" class="stageview single stagepanel"><div class="empty">Camera / re-stage result appears here.</div></div>
         <div id="b_gallery" class="stageview gallerymode stagepanel"><div class="empty">Completed batch images stream here.</div></div>
-        <div id="lora_stage" class="stageview lora-stage stagepanel"><h2>USER LoRA STACK</h2><p>Additional LoRAs installed from Hugging Face or Civitai are applied to new queued jobs. Keep stacks small on T4-class GPUs: every LoRA adds model patches and can increase memory pressure and generation time.</p><div id="lora_stage_active"></div></div>
         <pre id="console_stage" class="stageview console-stage stagepanel">Console output will appear here.</pre>
       </div>
     </main>
@@ -8688,6 +9322,7 @@ fillSelect('t_height', dims, __DEFAULT_TEXT_HEIGHT__);
 fillSelect('i_max', dims, __DEFAULT_IMAGE_MAX_SIDE__);
 fillSelect('e_max', dims, __DEFAULT_IMAGE_MAX_SIDE__);
 fillSelect('in_max', dims, __DEFAULT_INPAINT_MAX_SIDE__);
+fillSelect('c_max', dims, __DEFAULT_IMAGE_MAX_SIDE__);
 fillSelect('b_width', dims, __DEFAULT_BATCH_WIDTH__);
 fillSelect('b_height', dims, __DEFAULT_BATCH_HEIGHT__);
 const samplerOptions=['euler','euler_ancestral','heun','dpmpp_2m','dpmpp_sde','uni_pc'];
@@ -8701,6 +9336,31 @@ function fillNamedSelect(id, values, selected){
 
 function setStatus(id,text,kind=''){
   const el=$(id); el.textContent=text||''; el.className='status'+(kind?' '+kind:'');
+}
+
+const MAX_REFERENCE_FILES=4;
+let referenceFiles=[];
+function cloneReferenceFile(file){return new File([file], file.name, {type:file.type||'image/png', lastModified:file.lastModified||Date.now()});}
+function renderReferenceFiles(){
+  const root=$('ref_preview'); if(!root)return;
+  if(!referenceFiles.length){ root.innerHTML='<div class="empty">No reference images selected.</div>'; setStatus('ref_status','No reference images selected.',''); return; }
+  root.innerHTML='';
+  referenceFiles.forEach((file,index)=>{
+    const tile=document.createElement('div'); tile.className='ref-tile';
+    const img=document.createElement('img'); img.src=URL.createObjectURL(file); img.alt=file.name;
+    const btn=document.createElement('button'); btn.type='button'; btn.textContent='×'; btn.title='Remove reference';
+    btn.onclick=()=>{referenceFiles.splice(index,1); renderReferenceFiles();};
+    tile.append(img,btn); root.appendChild(tile);
+  });
+  const modeLabel={'style':'style','subject':'subject / identity','composition':'composition'}[$('ref_mode')?.value||'style']||'style';
+  setStatus('ref_status',`${referenceFiles.length} reference image${referenceFiles.length===1?'':'s'} ready · ${modeLabel} mode.`, 'good');
+}
+function appendReferenceFilesToFormData(fd){
+  if(!fd)return fd;
+  fd.append('reference_mode',$('ref_mode')?.value||'style');
+  fd.append('reference_strength',$('ref_strength')?.value||'70');
+  referenceFiles.slice(0,MAX_REFERENCE_FILES).forEach(file=>fd.append('references', file, file.name));
+  return fd;
 }
 async function fetchJson(url,opts={}){
   const r=await fetch(url,opts);
@@ -9228,8 +9888,8 @@ const STAGE_EMPTY_TEXT={
 };
 const stageState={};
 function ensureStageState(id){ if(!stageState[id]) stageState[id]={mode:'empty',items:[],selected:0}; return stageState[id]; }
-const SINGLE_STAGE_IDS=['t_result','i_result','e_result','in_result'];
-const SINGLE_STAGE_DOWNLOADS={t_result:'t_download',i_result:'i_download',e_result:'e_download',in_result:'in_download'};
+const SINGLE_STAGE_IDS=['t_result','i_result','e_result','in_result','c_result'];
+const SINGLE_STAGE_DOWNLOADS={t_result:'t_download',i_result:'i_download',e_result:'e_download',in_result:'in_download',c_result:'cam_download'};
 function _setSingleStageImage(id,url){
   const wrap=$(id);
   wrap.classList.remove('gallerymode');
@@ -9323,6 +9983,7 @@ async function assignImageUrlToEditors(url){
   const dt1=new DataTransfer(); dt1.items.add(file); $('i_source').files=dt1.files; $('i_source').dispatchEvent(new Event('change'));
   const dtEdit=new DataTransfer(); dtEdit.items.add(file); $('e_source').files=dtEdit.files; $('e_source').dispatchEvent(new Event('change'));
   const dt2=new DataTransfer(); dt2.items.add(file); $('in_source').files=dt2.files; $('in_source').dispatchEvent(new Event('change'));
+  const dt3=new DataTransfer(); dt3.items.add(file); $('c_source').files=dt3.files; $('c_source').dispatchEvent(new Event('change'));
 }
 function currentStageUrl(id){
   const st=ensureStageState(id);
@@ -9331,10 +9992,10 @@ function currentStageUrl(id){
   const img=$(id).querySelector('img');
   return img ? (img.dataset.rawUrl || img.src.split('?')[0]) : '';
 }
-const STAGE_BY_TAB={text:'t_result',image:'i_result',edit:'e_result',inpaint:'in_result',batch:'b_gallery',loras:'lora_stage',console:'console_stage'};
-const STAGE_LABELS={text:'TEXT → IMAGE',image:'IMAGE → IMAGE',edit:'INSTRUCTION EDIT',inpaint:'INPAINT',batch:'ADAPTIVE BATCH',loras:'LORA MANAGER',console:'CONSOLE'};
-const SINGLE_WORK_TABS=['text','image','edit','inpaint'];
-const STATUS_BY_TAB={text:'t_status',image:'i_status',edit:'e_status',inpaint:'in_status',batch:'b_status',loras:'l_status',console:'console_status'};
+const STAGE_BY_TAB={text:'t_result',image:'i_result',edit:'e_result',inpaint:'in_result',camera:'c_result',batch:'b_gallery',console:'console_stage'};
+const STAGE_LABELS={text:'TEXT → IMAGE',image:'IMAGE → IMAGE',edit:'INSTRUCTION EDIT',inpaint:'INPAINT',camera:'CAMERA / RE-STAGE · QWEN 2511',batch:'ADAPTIVE BATCH',console:'CONSOLE'};
+const SINGLE_WORK_TABS=['text','image','edit','inpaint','camera'];
+const STATUS_BY_TAB={text:'t_status',image:'i_status',edit:'e_status',inpaint:'in_status',camera:'cam_status',batch:'b_status',console:'console_status'};
 let activeStageId='t_result';
 let activeStudioTab='text';
 let lastWorkTab='text';
@@ -9342,7 +10003,7 @@ function syncStageToolbar(){
   const url=currentStageUrl(activeStageId);
   $('stage_mode_label').textContent=STAGE_LABELS[activeStudioTab]||activeStudioTab.toUpperCase();
   const dl=$('stage_download');
-  const nonImage=['loras','console'].includes(activeStudioTab);
+  const nonImage=['console'].includes(activeStudioTab);
   if(url&&!nonImage){dl.href=url+'?download=1';dl.classList.remove('hidden');$('stage_assign').disabled=false;}
   else{dl.classList.add('hidden');dl.removeAttribute('href');$('stage_assign').disabled=true;}
   $('stage_clear').disabled=nonImage;
@@ -9367,7 +10028,7 @@ function activateStage(tab){
   const stage=$(activeStageId); if(stage) stage.classList.add('active');
   syncStageToolbar();
 }
-const ML_GENERATE_BY_TAB={text:'t_generate',image:'i_generate',edit:'e_generate',inpaint:'in_generate',batch:'b_generate'};
+const ML_GENERATE_BY_TAB={text:'t_generate',image:'i_generate',edit:'e_generate',inpaint:'in_generate',camera:'c_generate',batch:'b_generate'};
 function placeAccessCard(tab){
   const card=$('ml_access_card');if(!card)return;
   const genId=ML_GENERATE_BY_TAB[tab];
@@ -9384,13 +10045,13 @@ function switchStudioTab(tab){
   if(previousTab==='batch' && tab!=='batch') setStageEmpty('b_gallery');
   document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.tab===tab));
   document.querySelectorAll('.controlpanel').forEach(x=>x.classList.toggle('active',x.id==='panel_'+tab));
+  const refCard=$('reference_card'); if(refCard) refCard.classList.toggle('reference-hidden', !['text','image','edit','inpaint'].includes(tab));
   placeAccessCard(tab);
   activateStage(tab);
-  if(tab==='loras') refreshLoras();
   if(tab==='console') refreshConsole(true);
 }
 $('stage_clear').onclick=()=>{
-  if(['text','image','edit','inpaint'].includes(activeStudioTab)) clearSharedSingleStage();
+  if(['text','image','edit','inpaint','camera'].includes(activeStudioTab)) clearSharedSingleStage();
   else setStageEmpty(activeStageId);
   syncStageToolbar();
 };
@@ -9402,6 +10063,7 @@ $('stage_assign').onclick=async()=>{
     setStatus('i_status','Staged image assigned to the edit inputs.','good');
     setStatus('e_status','Staged image assigned to the edit inputs.','good');
     setStatus('in_status','Staged image assigned to the edit inputs.','good');
+    setStatus('cam_status','Staged image assigned to Camera / Re-stage.','good');
   }catch(e){
     const statusId=STATUS_BY_TAB[activeStudioTab];
     if(statusId)setStatus(statusId,e.message,'bad');
@@ -9425,11 +10087,49 @@ function bindFilePicker(inputId,buttonId,nameId,{previewId=null,emptyText='Choos
 bindFilePicker('i_source','i_source_pick','i_source_name',{previewId:'i_preview',emptyText:'Choose a source image.'});
 bindFilePicker('e_source','e_source_pick','e_source_name',{previewId:'e_preview',emptyText:'Choose a source image.'});
 bindFilePicker('in_source','in_source_pick','in_source_name');
+bindFilePicker('c_source','c_source_pick','c_source_name',{previewId:'c_preview',emptyText:'Choose the image you want to re-stage.'});
 bindFilePicker('b_reference','b_reference_pick','b_reference_name');
+$('ref_pick').onclick=()=>$('ref_images').click();
+$('ref_clear').onclick=()=>{referenceFiles=[]; if($('ref_images')) $('ref_images').value=''; renderReferenceFiles();};
+$('ref_images').addEventListener('change',()=>{
+  const picked=[...($('ref_images').files||[])].filter(f=>String(f.type||'').startsWith('image/'));
+  for(const file of picked){ if(referenceFiles.length>=MAX_REFERENCE_FILES) break; referenceFiles.push(cloneReferenceFile(file)); }
+  $('ref_images').value='';
+  renderReferenceFiles();
+});
+$('ref_mode').addEventListener('change',renderReferenceFiles);
+renderReferenceFiles();
 
 document.querySelectorAll('.tab').forEach(btn=>{
   btn.addEventListener('click',()=>switchStudioTab(btn.dataset.tab));
 });
+
+document.querySelectorAll('.camera-az').forEach(btn=>btn.addEventListener('click',()=>{
+  $('c_azimuth').value=btn.dataset.value||'front';
+}));
+
+$('c_generate').onclick=async()=>{
+  const source=$('c_source').files[0];
+  if(!source){setStatus('cam_status','Upload or assign an image first.','bad');return}
+  const fd=new FormData();
+  fd.append('source',source);
+  fd.append('azimuth',$('c_azimuth').value);
+  fd.append('elevation',$('c_elevation').value);
+  fd.append('distance',$('c_distance').value);
+  fd.append('extra_instruction',$('c_extra').value);
+  fd.append('negative_prompt',$('c_negative').value);
+  fd.append('max_side',$('c_max').value);
+  fd.append('seed',$('c_seed').value);
+  fd.append('steps',$('c_steps').value);
+  fd.append('guidance_scale',$('c_guidance').value);
+  fd.append('true_cfg_scale',$('c_true_cfg').value);
+  try{
+    setStatus('cam_status','Queued · Krea2 will be fully released when this job reaches the GPU.','');
+    const d=await fetchJson('/api/camera',{method:'POST',body:fd});
+    setStatus('cam_status','Queued · '+d.id+' · Qwen 2511 Camera will hard-swap in at execution.','');
+    pollJobs();
+  }catch(e){setStatus('cam_status',e.message,'bad')}
+};
 
 function bindLightning(toggleId,stepsId,cfgId,samplerId,schedulerId){
   const t=$(toggleId);
@@ -9504,24 +10204,21 @@ loadMeta().catch(()=>{$('key_chip').textContent='ACCESS ERROR';$('key_chip').cla
 
 $('t_generate').onclick=async()=>{
   try{
-    const d=await fetchJson('/api/text_to_image',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({
-        prompt:$('t_prompt').value,
-        negative_prompt:$('t_negative').value,
-        base_model:ACTIVE_BASE_MODEL,
-        width:+$('t_width').value,
-        height:+$('t_height').value,
-        seed:+$('t_seed').value,
-        steps:+$('t_steps').value,
-        cfg:+$('t_cfg').value,
-        sampler:$('t_sampler').value,
-        scheduler:$('t_scheduler').value,
-        lightning_enabled:$('t_lightning').checked,
-        lightning_strength:+$('t_lightning_strength').value
-      })
-    });
+    const fd=new FormData();
+    fd.append('prompt',$('t_prompt').value);
+    fd.append('negative_prompt',$('t_negative').value);
+    fd.append('base_model',ACTIVE_BASE_MODEL);
+    fd.append('width',$('t_width').value);
+    fd.append('height',$('t_height').value);
+    fd.append('seed',$('t_seed').value);
+    fd.append('steps',$('t_steps').value);
+    fd.append('cfg',$('t_cfg').value);
+    fd.append('sampler',$('t_sampler').value);
+    fd.append('scheduler',$('t_scheduler').value);
+    fd.append('lightning_enabled',$('t_lightning').checked?'1':'0');
+    fd.append('lightning_strength',$('t_lightning_strength').value);
+    appendReferenceFilesToFormData(fd);
+    const d=await fetchJson('/api/text_to_image',{method:'POST',body:fd});
     setStatus('t_status','Queued · '+d.id+' · track it in the floating Queue.','');
     pollJobs();
   }catch(e){setStatus('t_status',e.message,'bad')}
@@ -9544,6 +10241,7 @@ $('i_generate').onclick=async()=>{
   fd.append('scheduler',$('i_scheduler').value);
   fd.append('lightning_enabled',$('i_lightning').checked?'1':'0');
   fd.append('lightning_strength',$('i_lightning_strength').value);
+  appendReferenceFilesToFormData(fd);
   try{
     const d=await fetchJson('/api/image_to_image',{method:'POST',body:fd});
     setStatus('i_status','Queued · '+d.id+' · you can submit another job now.','');
@@ -9572,6 +10270,7 @@ $('e_generate').onclick=async()=>{
   fd.append('scheduler',$('e_scheduler').value);
   fd.append('lightning_enabled',$('e_lightning').checked?'1':'0');
   fd.append('lightning_strength',$('e_lightning_strength').value);
+  appendReferenceFilesToFormData(fd);
   try{
     const d=await fetchJson('/api/instruction_edit',{method:'POST',body:fd});
     setStatus('e_status','Queued · '+d.id+' · you can submit another job now.','');
@@ -9774,6 +10473,7 @@ $('in_generate').onclick=async()=>{
     fd.append('seed',$('in_seed').value);fd.append('steps',$('in_steps').value);fd.append('cfg',$('in_cfg').value);
     fd.append('sampler',$('in_sampler').value);fd.append('scheduler',$('in_scheduler').value);
     fd.append('lightning_enabled',$('in_lightning').checked?'1':'0');fd.append('lightning_strength',$('in_lightning_strength').value);
+    appendReferenceFilesToFormData(fd);
     const d=await fetchJson('/api/inpaint',{method:'POST',body:fd});
     setStatus('in_status','Queued · '+d.id+' · fresh random seed will be chosen because seed is -1.','');pollJobs();
   }catch(e){setStatus('in_status',e.message,'bad')}
@@ -9836,6 +10536,7 @@ function batchForm(){
   fd.append('base_seed',$('b_seed').value);
   fd.append('lightning_enabled',$('b_lightning').checked?'1':'0');
   fd.append('lightning_strength',$('b_lightning_strength').value);
+  appendReferenceFilesToFormData(fd);
   return fd;
 }
 
@@ -10093,6 +10794,7 @@ async function putHistoryPromptInInput(item,button=null){
       image:'i_prompt',
       edit:'e_prompt',
       inpaint:'in_prompt',
+      camera:'c_extra',
       batch:'b_instruction'
     };
     let tab=activeStudioTab;
@@ -10295,6 +10997,9 @@ function applyFinishedJob(job){
   }else if(job.kind==='inpaint'){
     if(job.status==='done'&&r.image){setSharedSingleImage(r.image)}
     setStatus('in_status',message,bad?'bad':(job.status==='done'?'good':''));
+  }else if(job.kind==='camera'){
+    if(job.status==='done'&&r.image){setSharedSingleImage(r.image)}
+    setStatus('cam_status',message,bad?'bad':(job.status==='done'?'good':''));
   }
   if(job.code==='free_limit_reached'){
     if(job.access)mlRenderAccess(job.access);
