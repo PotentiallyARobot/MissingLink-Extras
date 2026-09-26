@@ -992,12 +992,25 @@ def _bucket_download_xet(remote_path, local_path, *, label, expected_size=None, 
     )
     import time as _time
     t0 = _time.time()
-    download_bucket_files(
-        H3_RUNTIME_BUCKET,
-        files=[(info, str(part))],
-        token=token,
-        raise_on_missing_files=True,
-    )
+    _xet_script = "\n".join([
+        "import sys",
+        "from huggingface_hub import download_bucket_files, get_bucket_paths_info",
+        "bucket, remote, dest, tok = sys.argv[1:5]",
+        "infos=list(get_bucket_paths_info(bucket,[remote],token=(tok or None)))",
+        "assert infos, 'bucket object missing'",
+        "download_bucket_files(bucket,files=[(infos[0],dest)],token=(tok or None),raise_on_missing_files=True)",
+    ])
+    _watchdog = max(120, min(1800, int(_os.environ.get("H3_XET_WATCHDOG_SEC", "420") or 420)))
+    try:
+        _sp.run([_sys.executable, "-c", _xet_script, H3_RUNTIME_BUCKET, remote_path, str(part), token or ""],
+                check=True, timeout=_watchdog, env=_os.environ.copy())
+    except Exception as _xet_exc:
+        print(f"  ⚠ {label}: Xet stalled/failed ({_xet_exc}); falling back to resumable sequential download", flush=True)
+        part.unlink(missing_ok=True)
+        _bucket_download_progress(remote_path, local_path, label=label,
+                                  expected_size=expected_size or None,
+                                  strict_size=bool(strict_size), resume=True)
+        return local_path.stat().st_size
     elapsed = max(0.001, _time.time() - t0)
     actual = part.stat().st_size if part.exists() else 0
     if actual <= 0:
@@ -3952,21 +3965,20 @@ if _CU130_CHILD:
         """
         unet = unet or DIT_FILE
         if CACHE.get("key") != (unet, weight_dtype):
-            if CACHE.get("key") is not None and FULL_STACK_RESIDENCY:
+            if CACHE.get("key") is not None:
                 old_key = CACHE.get("key")
-                log(f"  ↳ full-resident profile switch: evicting old active stack {old_key[0]} before loading {unet}")
-                torch.cuda.synchronize()
-                try:
-                    mm.unload_all_models()
-                except Exception as e:
-                    log(f"  ⚠ profile-switch unload warning: {e}")
-                gc.collect()
-                try:
-                    mm.soft_empty_cache()
-                except Exception:
-                    pass
-                torch.cuda.synchronize()
-            CACHE.clear()
+                log(f"  ↳ base-model switch: unloading old active stack {old_key[0]} before loading {unet}")
+                try: torch.cuda.synchronize()
+                except Exception: pass
+                try: mm.unload_all_models()
+                except Exception as e: log(f"  ⚠ model-switch unload warning: {e}")
+                CACHE.clear(); gc.collect()
+                try: mm.soft_empty_cache()
+                except Exception: pass
+                try: torch.cuda.empty_cache(); torch.cuda.synchronize()
+                except Exception: pass
+            else:
+                CACHE.clear()
             PROG["stage"] = "loading unet"
             log(f"  loading transformer: {unet}")
             if str(unet).lower().endswith(".gguf"):
@@ -6847,6 +6859,51 @@ if _CU130_CHILD:
                 shutil.rmtree(temp_root, ignore_errors=True)
 
 
+    def _custom_model_local_path(row):
+        name=os.path.basename(str((row or {}).get("local_name") or ""))
+        if not name: return None
+        if str((row or {}).get("format") or "safetensors").lower()=="gguf":
+            try: roots=folder_paths.get_folder_paths("unet_gguf")
+            except Exception: roots=[]
+            return next((os.path.join(r,name) for r in roots if os.path.isfile(os.path.join(r,name))), os.path.join(roots[0],name) if roots else None)
+        return os.path.join(MODELS,"diffusion_models",name)
+
+    @app.post("/api/models/hf/delete")
+    def api_hf_model_delete():
+        body=request.get_json(silent=True) or {}; name=os.path.basename(str(body.get("local_name") or ""))
+        rows=_custom_model_load_registry(); row=next((r for r in rows if os.path.basename(str(r.get("local_name") or ""))==name),None)
+        if not row: return jsonify(error="Choose a downloaded custom model to delete."),404
+        if any((j or {}).get("status") in {"queued","running"} for j in JOBS.values()): return jsonify(error="Wait for the generation queue to finish first."),409
+        if not GPU_LOCK.acquire(blocking=False): return jsonify(error="GPU is busy."),409
+        try:
+            if CACHE.get("key") and os.path.basename(str(CACHE.get("key")[0]))==name:
+                try: torch.cuda.synchronize()
+                except Exception: pass
+                try: mm.unload_all_models()
+                except Exception: pass
+                CACHE.clear(); gc.collect()
+                try: mm.soft_empty_cache(); torch.cuda.empty_cache()
+                except Exception: pass
+            path=_custom_model_local_path(row); freed=0
+            if path and os.path.isfile(path): freed=os.path.getsize(path); os.remove(path)
+            _custom_model_save_registry([r for r in rows if os.path.basename(str(r.get("local_name") or ""))!=name])
+            folder_paths.cache_helper.clear()
+            return jsonify(ok=True,local_name=name,removed_bytes=freed,removed_text=_format_bytes(freed))
+        finally: GPU_LOCK.release()
+
+    @app.post("/api/models/cache/clear")
+    def api_model_cache_clear():
+        roots=[os.path.expanduser("~/.cache/huggingface/hub"),os.path.expanduser("~/.cache/huggingface/xet"),"/content/.cache/huggingface/hub","/content/.cache/huggingface/xet","/content/.missinglink_hf_model_downloads"]
+        freed=0
+        for root in dict.fromkeys(map(os.path.abspath,roots)):
+            if not os.path.exists(root): continue
+            for base,_dirs,files in os.walk(root):
+                for fn in files:
+                    try: freed+=os.path.getsize(os.path.join(base,fn))
+                    except Exception: pass
+            shutil.rmtree(root,ignore_errors=True)
+        return jsonify(ok=True,removed_bytes=freed,removed_text=_format_bytes(freed))
+
     @app.post("/api/models/hf/inspect")
     def api_hf_model_inspect():
         body = request.get_json(silent=True) or {}
@@ -9350,7 +9407,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       <label>Hugging Face source</label><input id=hf_model_repo type=text placeholder="owner/repo · repo URL · tree URL · direct model-file URL" autocomplete=off>
       <div class=hfmodelgrid><div><label>Revision</label><input id=hf_model_revision type=text value="main" autocomplete=off></div><div><label>Mode</label><select id=hf_model_mode><option value=both selected>both</option><option value=fl2va>current</option><option value=ref2va>ref2va</option></select></div></div>
       <label>Model file</label><select id=hf_model_file disabled><option value="">CHECK REPO first</option></select>
-      <div class=hfmodelactions><button id=hf_model_inspect class=inlinebtn type=button>CHECK REPO</button><button id=hf_model_install type=button disabled>DOWNLOAD + USE</button></div>
+      <div class=hfmodelactions><button id=hf_model_inspect class=inlinebtn type=button>CHECK REPO</button><button id=hf_model_install type=button disabled>DOWNLOAD + USE</button><button id=hf_model_delete class=inlinebtn type=button>DELETE SELECTED</button><button id=hf_cache_clear class=inlinebtn type=button>CLEAR DOWNLOAD CACHE</button></div>
       <div class=hfprogress><i id=hf_model_progress></i></div><div id=hf_model_progress_text class=hfprogresstext>Paste whatever Hugging Face link you have. The Studio will normalize the repo, revision and direct file path when possible.</div>
     </div>
 
@@ -10448,6 +10505,9 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       finally{$('hf_model_install').disabled=false;$('hf_model_inspect').disabled=false}
     };
 
+
+    $('hf_model_delete').onclick=async e=>{e.preventDefault();const cm=customModelForProfile(ACTIVE_MODEL_PROFILE,window.H3META||{});if(!cm){await uiAlert('Select a downloaded HF custom model first. Built-in models are protected.','Delete model');return}if(!(await uiConfirm(`Delete ${cm.local_name} from disk?`,{title:'Delete custom model',confirmLabel:'Delete model',danger:true})))return;const resp=await fetch('/api/models/hf/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({local_name:cm.local_name})});const r=await _readJsonResponse(resp,'Delete model');if(!resp.ok||r.error){await uiAlert(r.error||'Delete failed','Delete model');return}ACTIVE_MODEL_PROFILE='stock_quality';await loadMeta();await applyModelProfile('stock_quality',{install:false});$('hf_model_progress_text').textContent=`Deleted ${r.local_name} · freed ${r.removed_text}.`;};
+    $('hf_cache_clear').onclick=async e=>{e.preventDefault();if(!(await uiConfirm('Clear Hugging Face/Xet download caches? Installed model files are kept.',{title:'Clear download cache',confirmLabel:'Clear cache',danger:true})))return;const resp=await fetch('/api/models/cache/clear',{method:'POST'});const r=await _readJsonResponse(resp,'Clear cache');if(!resp.ok||r.error){await uiAlert(r.error||'Cache cleanup failed','Clear cache');return}$('hf_model_progress_text').textContent=`Download cache cleared · freed about ${r.removed_text}.`;};
 
     $('gpu_overlay_toggle').onclick=()=>{
       const p=$('gpu_overlay');
