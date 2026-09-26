@@ -1305,8 +1305,87 @@ def _apply_extra_loras(model, extra_loras=None):
     return model
 
 
-def generation_model(lightning_enabled=False, lightning_strength=1.0, extra_loras=None):
-    model = UNET
+# Base-model selection mirrors H3 Studio: exactly one Krea2 diffusion
+# checkpoint is retained as the active model wrapper at a time. Switching
+# checkpoints unloads GPU residency and drops the old Python wrapper, so a T4
+# does not keep two giant model stacks alive in host/GPU memory.
+_BASE_MODEL_LOCK = threading.RLock()
+ACTIVE_BASE_MODEL_NAME = MODEL_NAME
+
+
+def _normalize_base_model_name(value):
+    name = Path(str(value or MODEL_NAME)).name
+    if not name:
+        name = MODEL_NAME
+    if not name.lower().endswith(".safetensors"):
+        raise ValueError("Krea2 base models must be .safetensors checkpoints.")
+    folder_paths.cache_helper.clear()
+    try:
+        folder_paths.get_full_path_or_raise("diffusion_models", name)
+    except Exception as exc:
+        raise ValueError(f"Krea2 base model is not installed: {name}") from exc
+    return name
+
+
+def ensure_base_model(base_model_name=None):
+    global UNET, ACTIVE_BASE_MODEL_NAME
+    requested = _normalize_base_model_name(base_model_name or MODEL_NAME)
+    with _BASE_MODEL_LOCK:
+        if UNET is not None and ACTIVE_BASE_MODEL_NAME == requested:
+            return UNET
+
+        previous = ACTIVE_BASE_MODEL_NAME
+        print(f"[MODEL] switching base checkpoint: {previous} -> {requested}", flush=True)
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        try:
+            model_management.unload_all_models()
+        except Exception as exc:
+            print("[MODEL] unload warning:", repr(exc), flush=True)
+
+        UNET = None
+        gc.collect()
+        try:
+            model_management.soft_empty_cache()
+        except Exception:
+            pass
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+        try:
+            folder_paths.cache_helper.clear()
+            UNET = UNETLoader().load_unet(
+                unet_name=requested,
+                weight_dtype="default",
+            )[0]
+            ACTIVE_BASE_MODEL_NAME = requested
+            print(f"[MODEL] active Krea2 checkpoint: {requested}", flush=True)
+            return UNET
+        except Exception:
+            if requested != MODEL_NAME:
+                try:
+                    print("[MODEL] custom checkpoint failed; restoring built-in Krea2...", flush=True)
+                    UNET = UNETLoader().load_unet(
+                        unet_name=MODEL_NAME,
+                        weight_dtype="default",
+                    )[0]
+                    ACTIVE_BASE_MODEL_NAME = MODEL_NAME
+                except Exception as rollback_exc:
+                    print("[MODEL] built-in rollback failed:", repr(rollback_exc), flush=True)
+            raise
+
+
+def generation_model(
+    lightning_enabled=False,
+    lightning_strength=1.0,
+    extra_loras=None,
+    base_model_name=None,
+):
+    model = ensure_base_model(base_model_name)
     if lightning_enabled:
         strength = max(0.0, min(1.5, float(lightning_strength)))
         model = LIGHTNING_LOADER.load_lora_model_only(
@@ -1320,8 +1399,9 @@ def identity_edit_model(
     lightning_strength=1.0,
     edit_lora_strength=1.0,
     extra_loras=None,
+    base_model_name=None,
 ):
-    model = UNET
+    model = ensure_base_model(base_model_name)
     if lightning_enabled:
         strength = max(0.0, min(1.5, float(lightning_strength)))
         model = LIGHTNING_LOADER.load_lora_model_only(
@@ -1329,9 +1409,7 @@ def identity_edit_model(
         )[0]
     edit_strength = max(0.0, min(1.5, float(edit_lora_strength)))
     model = EDIT_LOADER.load_lora_model_only(
-        model,
-        EDIT_LORA_NAME,
-        edit_strength,
+        model, EDIT_LORA_NAME, edit_strength
     )[0]
     return _apply_extra_loras(model, extra_loras)
 
@@ -2187,6 +2265,7 @@ def text_to_image_core(
     lightning_enabled=False,
     lightning_strength=1.0,
     extra_loras=None,
+    base_model_name=MODEL_NAME,
 ):
 
     width = round16(width)
@@ -2199,7 +2278,10 @@ def text_to_image_core(
     lightning_strength = max(0.0, min(1.5, float(lightning_strength)))
     if lightning_enabled:
         steps, cfg, sampler_name, scheduler = 4, 1.0, "euler", "simple"
-    active_model = generation_model(lightning_enabled, lightning_strength, extra_loras)
+    base_model_name = _normalize_base_model_name(base_model_name)
+    active_model = generation_model(
+        lightning_enabled, lightning_strength, extra_loras, base_model_name
+    )
 
     total_start = time.time()
 
@@ -2242,6 +2324,7 @@ def text_to_image_core(
         seed,
         {
             "negative_prompt": str(negative_prompt or ""),
+            "base_model": base_model_name,
             "width": width,
             "height": height,
             "steps": steps,
@@ -2282,6 +2365,7 @@ def text_to_image(
     lightning_enabled=False,
     lightning_strength=1.0,
     extra_loras=None,
+    base_model_name=MODEL_NAME,
 ):
 
     path, seed, status = (
@@ -2299,6 +2383,7 @@ def text_to_image(
             lightning_enabled=lightning_enabled,
             lightning_strength=lightning_strength,
             extra_loras=extra_loras,
+            base_model_name=base_model_name,
         )
     )
 
@@ -2334,6 +2419,7 @@ def image_to_image(
     lightning_enabled=False,
     lightning_strength=1.0,
     extra_loras=None,
+    base_model_name=MODEL_NAME,
 ):
 
     source = resize_image(
@@ -2349,7 +2435,10 @@ def image_to_image(
     lightning_strength = max(0.0, min(1.5, float(lightning_strength)))
     if lightning_enabled:
         steps, cfg, sampler_name, scheduler = 4, 1.0, "euler", "simple"
-    active_model = generation_model(lightning_enabled, lightning_strength, extra_loras)
+    base_model_name = _normalize_base_model_name(base_model_name)
+    active_model = generation_model(
+        lightning_enabled, lightning_strength, extra_loras, base_model_name
+    )
 
     start = time.time()
 
@@ -2388,6 +2477,7 @@ def image_to_image(
         seed,
         {
             "negative_prompt": str(negative_prompt or ""),
+            "base_model": base_model_name,
             "width": source.width,
             "height": source.height,
             "denoise": float(denoise),
@@ -2442,6 +2532,7 @@ def instruction_edit(
     fit_mode="fit",
     ground_negative=False,
     extra_loras=None,
+    base_model_name=MODEL_NAME,
 ):
 
     source = resize_image(source, max_side)
@@ -2491,6 +2582,7 @@ def instruction_edit(
             lightning_strength=lightning_strength,
             edit_lora_strength=edit_lora_strength,
             extra_loras=extra_loras,
+            base_model_name=base_model_name,
         ),
         source_latent=source_latent,
         ref_boost=ref_boost,
@@ -2534,6 +2626,7 @@ def instruction_edit(
         seed,
         {
             "negative_prompt": str(negative_prompt or ""),
+            "base_model": _normalize_base_model_name(base_model_name),
             "effective_prompt": effective_prompt,
             "edit_engine": "krea2_identity_edit_v1_2",
             "edit_lora": EDIT_LORA_NAME,
@@ -2911,6 +3004,7 @@ def inpaint(
     fit_mode="fit",
     ground_negative=False,
     extra_loras=None,
+    base_model_name=MODEL_NAME,
 ):
 
     steps = int(steps)
@@ -3002,6 +3096,7 @@ def inpaint(
             lightning_strength=lightning_strength,
             edit_lora_strength=edit_lora_strength,
             extra_loras=extra_loras,
+            base_model_name=base_model_name,
         ),
         source_latent=source_latent,
         ref_boost=ref_boost,
@@ -3076,6 +3171,7 @@ def inpaint(
         seed,
         {
             "negative_prompt": str(negative_prompt or ""),
+            "base_model": _normalize_base_model_name(base_model_name),
             "effective_prompt": effective_prompt,
             "inpaint_engine": "krea2_identity_edit_v1_2",
             "edit_lora": EDIT_LORA_NAME,
@@ -4350,9 +4446,11 @@ def generate_adaptive_batch(
     lightning_enabled=False,
     lightning_strength=1.0,
     extra_loras=None,
+    base_model_name=MODEL_NAME,
 ):
 
     reset_stop()
+    base_model_name = _normalize_base_model_name(base_model_name)
 
     image_count = normalize_image_count(
         image_count
@@ -4438,6 +4536,7 @@ def generate_adaptive_batch(
         "lightning_enabled": bool(lightning_enabled),
         "lightning_strength": float(lightning_strength),
         "extra_loras": _normalize_extra_loras(extra_loras),
+        "base_model": base_model_name,
     }
 
     def correction_due(completed, used):
@@ -4621,6 +4720,7 @@ def generate_adaptive_batch(
                     lightning_enabled=lightning_enabled,
                     lightning_strength=lightning_strength,
                     extra_loras=extra_loras,
+                    base_model_name=base_model_name,
                 )
             )
 
@@ -5278,6 +5378,7 @@ TERMS_PROTECTED_PREFIXES = (
     "/api/batch/start",
     "/api/captions/start",
     "/api/loras/",
+    "/api/models/",
 )
 
 
@@ -5369,6 +5470,175 @@ def _install_huggingface_lora(repo_id, filename, revision=""):
         token=token,
     ))
     return _atomic_copy_validated_lora(downloaded, Path(filename).name)
+
+
+# =====================================================================
+# H3-STYLE BASE MODEL SLOT · HUGGING FACE CHECKPOINT INSTALLER
+# =====================================================================
+BASE_MODEL_DIR_RUNTIME = COMFY / "models" / "diffusion_models"
+BASE_MODEL_DIR_RUNTIME.mkdir(parents=True, exist_ok=True)
+CUSTOM_MODEL_REGISTRY_FILE = BASE_MODEL_DIR_RUNTIME / ".krea2_custom_base_models.json"
+CUSTOM_MODEL_DOWNLOADS = {}
+CUSTOM_MODEL_DOWNLOAD_LOCK = threading.Lock()
+
+
+def _validate_base_model_safetensors(path):
+    path = Path(path)
+    if not path.is_file():
+        return False, "file is missing"
+    if path.suffix.lower() != ".safetensors":
+        return False, "Krea2 base models must be .safetensors"
+    if path.stat().st_size < 1024 * 1024:
+        return False, "checkpoint is unexpectedly small"
+    try:
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            if not list(handle.keys()):
+                return False, "SafeTensors checkpoint contains no tensors"
+    except Exception as exc:
+        return False, f"invalid SafeTensors checkpoint: {exc}"
+    return True, "ok"
+
+
+def _custom_model_load_registry():
+    try:
+        raw = json.loads(CUSTOM_MODEL_REGISTRY_FILE.read_text(encoding="utf-8"))
+        if not isinstance(raw, list):
+            return []
+    except Exception:
+        return []
+    rows = []
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        local_name = Path(str(row.get("local_name") or "")).name
+        if not local_name:
+            continue
+        valid, _ = _validate_base_model_safetensors(BASE_MODEL_DIR_RUNTIME / local_name)
+        if valid:
+            clean = dict(row)
+            clean["local_name"] = local_name
+            rows.append(clean)
+    return rows
+
+
+def _custom_model_save_registry(rows):
+    tmp = CUSTOM_MODEL_REGISTRY_FILE.with_name(CUSTOM_MODEL_REGISTRY_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(list(rows), indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, CUSTOM_MODEL_REGISTRY_FILE)
+
+
+def _custom_model_public_rows():
+    return [{
+        "profile": "custom:" + row["local_name"],
+        "label": row.get("label") or row.get("repo_id") or row["local_name"],
+        "repo_id": row.get("repo_id") or "",
+        "revision": row.get("revision") or "main",
+        "filename": row.get("filename") or row["local_name"],
+        "local_name": row["local_name"],
+        "format": "safetensors",
+        "size": int(row.get("size") or 0),
+        "built_in": False,
+    } for row in _custom_model_load_registry()]
+
+
+def _custom_model_destination(repo_id, remote_filename):
+    base = Path(str(remote_filename or "")).name
+    if not base or not base.lower().endswith(".safetensors"):
+        raise ValueError("Choose a .safetensors Krea2 checkpoint.")
+    for row in _custom_model_load_registry():
+        if row.get("repo_id") == repo_id and row.get("filename") == remote_filename:
+            return BASE_MODEL_DIR_RUNTIME / row["local_name"], row["local_name"]
+    dest = BASE_MODEL_DIR_RUNTIME / base
+    # Never overwrite an existing checkpoint, especially the built-in Krea2 file.
+    # Match H3 Studio's collision behavior by namespacing the user download.
+    if dest.exists():
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(repo_id).replace("/", "__"))
+        base = slug + "__" + base
+        dest = BASE_MODEL_DIR_RUNTIME / base
+    return dest, base
+
+
+def _make_hf_model_progress_tqdm(download_id, expected_size=0):
+    from tqdm.auto import tqdm as _TqdmBase
+    class _StudioModelTqdm(_TqdmBase):
+        def __init__(self, *args, **kwargs):
+            kwargs["file"] = _SilentTqdmSink()
+            kwargs.setdefault("mininterval", 0.15)
+            kwargs.setdefault("miniters", 1)
+            super().__init__(*args, **kwargs)
+            self._ml_started = time.time(); self._ml_last_push = 0.0
+            self._ml_push(force=True)
+        def _ml_push(self, force=False):
+            now = time.time()
+            if not force and now - self._ml_last_push < 0.15: return
+            done = max(0, int(float(getattr(self, "n", 0) or 0)))
+            total = max(0, int(float(getattr(self, "total", 0) or 0))) or int(expected_size or 0)
+            elapsed = max(0.001, now - self._ml_started)
+            try: rate = (getattr(self, "format_dict", {}) or {}).get("rate")
+            except Exception: rate = None
+            speed = float(rate or (done / elapsed if done else 0.0))
+            with CUSTOM_MODEL_DOWNLOAD_LOCK:
+                job = CUSTOM_MODEL_DOWNLOADS.get(download_id)
+                if job is not None:
+                    job.update(downloaded_bytes=done,
+                               total_bytes=max(int(job.get("total_bytes") or 0), total),
+                               speed_bps=speed, stage="downloading")
+            self._ml_last_push = now
+        def update(self, n=1):
+            result = super().update(n); self._ml_push(); return result
+        def close(self):
+            try: self._ml_push(force=True)
+            finally: return super().close()
+    return _StudioModelTqdm
+
+
+def _custom_model_download_worker(download_id, repo_id, revision, filename, expected_size):
+    started = time.time(); temp_root = None
+    try:
+        dest, local_name = _custom_model_destination(repo_id, filename)
+        token = _hf_token() or None
+        transport = _configure_hf_xet_downloads()
+        temp_root = ROOT / ".missinglink_krea2_hf_model_downloads" / download_id
+        shutil.rmtree(temp_root, ignore_errors=True); temp_root.mkdir(parents=True, exist_ok=True)
+        with CUSTOM_MODEL_DOWNLOAD_LOCK:
+            CUSTOM_MODEL_DOWNLOADS[download_id].update(
+                status="running", stage="downloading", local_name=local_name,
+                total_bytes=int(expected_size or 0), transport=transport)
+        ProgressTqdm = _make_hf_model_progress_tqdm(download_id, expected_size)
+        print(f"[MODEL] downloading HF base checkpoint · {transport}: {repo_id}/{filename}", flush=True)
+        src_path = Path(hf_hub_download(repo_id=repo_id, filename=filename,
+            revision=revision, token=token, local_dir=str(temp_root), tqdm_class=ProgressTqdm))
+        downloaded = src_path.stat().st_size
+        with CUSTOM_MODEL_DOWNLOAD_LOCK:
+            CUSTOM_MODEL_DOWNLOADS[download_id].update(
+                downloaded_bytes=downloaded, total_bytes=downloaded, stage="validating", speed_bps=0.0)
+        valid, reason = _validate_base_model_safetensors(src_path)
+        if not valid: raise RuntimeError("Downloaded checkpoint failed validation: " + reason)
+        incoming = dest.with_name(dest.name + f".{download_id}.incoming")
+        incoming.unlink(missing_ok=True); shutil.copy2(src_path, incoming)
+        valid, reason = _validate_base_model_safetensors(incoming)
+        if not valid:
+            incoming.unlink(missing_ok=True); raise RuntimeError("Copied checkpoint failed validation: " + reason)
+        os.replace(incoming, dest)
+        rows = [r for r in _custom_model_load_registry() if r.get("local_name") != local_name]
+        rows.append({"repo_id":repo_id,"revision":revision,"filename":filename,
+                     "local_name":local_name,"label":f"{repo_id} · {Path(filename).name}",
+                     "format":"safetensors","size":downloaded,"installed_at":time.time()})
+        _custom_model_save_registry(rows); folder_paths.cache_helper.clear()
+        elapsed = max(0.001, time.time()-started)
+        with CUSTOM_MODEL_DOWNLOAD_LOCK:
+            CUSTOM_MODEL_DOWNLOADS[download_id].update(
+                status="done",stage="done",downloaded_bytes=downloaded,total_bytes=downloaded,
+                speed_bps=0.0,local_name=local_name,profile="custom:"+local_name,
+                residency_note="installed · selected for new jobs; model swaps at GPU execution")
+        print(f"[MODEL] installed {local_name} · {downloaded/elapsed/1024**2:.1f} MiB/s average", flush=True)
+    except Exception as exc:
+        with CUSTOM_MODEL_DOWNLOAD_LOCK:
+            job=CUSTOM_MODEL_DOWNLOADS.get(download_id)
+            if job is not None: job.update(status="error",stage="error",error=str(exc),speed_bps=0.0)
+        print("[MODEL] HF base-model install failed:", repr(exc), flush=True)
+    finally:
+        if temp_root: shutil.rmtree(temp_root, ignore_errors=True)
 
 
 def _civitai_headers(token=""):
@@ -6351,6 +6621,7 @@ def _run_batch_job(jid, params):
         lightning_enabled=params.get("lightning_enabled", False),
         lightning_strength=params.get("lightning_strength", 1.0),
         extra_loras=params.get("extra_loras", []),
+        base_model_name=params.get("base_model", MODEL_NAME),
     )
 
     for update in generator:
@@ -6400,7 +6671,7 @@ def _execute_job(jid):
         job.update(
             status="running",
             stage="Starting GPU",
-            detail="Preparing the local generation stack.",
+            detail=("Preparing " + Path(str(params.get("base_model") or MODEL_NAME)).name + " on the local GPU."),
             progress=max(1.0, float(job.get("progress") or 0.0)),
             started=time.time(),
             updated=time.time(),
@@ -6421,6 +6692,7 @@ def _execute_job(jid):
             lightning_enabled=params.get("lightning_enabled", False),
             lightning_strength=params.get("lightning_strength", 1.0),
             extra_loras=params.get("extra_loras", []),
+            base_model_name=params.get("base_model", MODEL_NAME),
         )
         path, seed, status, download_path, _, _ = result
         return {"image": _output_url(path), "seed": seed, "status": status,
@@ -6439,6 +6711,7 @@ def _execute_job(jid):
             lightning_enabled=params.get("lightning_enabled", False),
             lightning_strength=params.get("lightning_strength", 1.0),
             extra_loras=params.get("extra_loras", []),
+            base_model_name=params.get("base_model", MODEL_NAME),
         )
         path, seed, status, download_path, _, _ = result
         return {"image": _output_url(path), "seed": seed, "status": status,
@@ -6464,6 +6737,7 @@ def _execute_job(jid):
             lightning_enabled=params.get("lightning_enabled", False),
             lightning_strength=params.get("lightning_strength", 1.0),
             extra_loras=params.get("extra_loras", []),
+            base_model_name=params.get("base_model", MODEL_NAME),
         )
         path, seed, status, download_path, _, _ = result
         return {"image": _output_url(path), "seed": seed, "status": status,
@@ -6498,6 +6772,7 @@ def _execute_job(jid):
             lightning_enabled=params.get("lightning_enabled", False),
             lightning_strength=params.get("lightning_strength", 1.0),
             extra_loras=params.get("extra_loras", []),
+            base_model_name=params.get("base_model", MODEL_NAME),
         )
         path, seed, status, download_path, _, _ = result
         return {"image": _output_url(path), "seed": seed, "status": status,
@@ -6739,12 +7014,75 @@ def api_console_clear():
     return jsonify(ok=True)
 
 
+@app.post("/api/models/hf/inspect")
+def api_hf_model_inspect():
+    body=request.get_json(silent=True) or {}
+    source=str(body.get("source") or body.get("repo_id") or "").strip()
+    revision_hint=str(body.get("revision") or "main").strip() or "main"
+    try:
+        parsed=_parse_hf_source(source,revision_hint); repo_id=parsed["repo_id"]; revision=parsed["revision"]
+        rows=[r for r in _hf_repo_candidates(repo_id,revision)
+              if str(r.get("filename") or "").lower().endswith(".safetensors")]
+        if not rows: return _json_error("No .safetensors checkpoint files were found in that repo/revision.",404)
+        preferred=parsed.get("filename") or ""
+        if preferred and preferred not in {r["filename"] for r in rows}: preferred=""
+        return jsonify(ok=True,repo_id=repo_id,revision=revision,preferred_filename=preferred,candidates=rows)
+    except Exception as exc:
+        return _json_error(exc,400)
+
+
+@app.post("/api/models/hf/install")
+def api_hf_model_install():
+    body=request.get_json(silent=True) or {}
+    source=str(body.get("source") or body.get("repo_id") or "").strip()
+    revision_hint=str(body.get("revision") or "main").strip() or "main"
+    filename=str(body.get("filename") or "").strip().lstrip("/")
+    try:
+        parsed=_parse_hf_source(source,revision_hint); repo_id=parsed["repo_id"]; revision=parsed["revision"]
+        if not filename and parsed.get("filename"): filename=parsed["filename"]
+        by_name={r["filename"]:r for r in _hf_repo_candidates(repo_id,revision)}
+        if filename not in by_name or not filename.lower().endswith(".safetensors"):
+            return _json_error("Choose a .safetensors model file returned by CHECK REPO.",400)
+        selected=by_name[filename]; free_bytes=shutil.disk_usage("/content").free
+        required=int(selected.get("size") or 0)+2*1024**3
+        if selected.get("size") and free_bytes<required:
+            return _json_error(f"Not enough disk space. Need about {_format_bytes(required)}, have {_format_bytes(free_bytes)}.",400)
+        did=uuid.uuid4().hex[:12]
+        with CUSTOM_MODEL_DOWNLOAD_LOCK:
+            CUSTOM_MODEL_DOWNLOADS[did]={"id":did,"status":"queued","stage":"queued","error":"",
+                "repo_id":repo_id,"revision":revision,"filename":filename,"downloaded_bytes":0,
+                "total_bytes":int(selected.get("size") or 0),"speed_bps":0.0,"started":time.time(),"local_name":""}
+        threading.Thread(target=_custom_model_download_worker,
+            args=(did,repo_id,revision,filename,int(selected.get("size") or 0)),
+            daemon=True,name=f"krea2-hf-model-{did}").start()
+        return jsonify(ok=True,id=did,repo_id=repo_id,revision=revision,filename=filename),202
+    except Exception as exc:
+        return _json_error(exc,400)
+
+
+@app.get("/api/models/hf/progress/<download_id>")
+def api_hf_model_progress(download_id):
+    with CUSTOM_MODEL_DOWNLOAD_LOCK: job=dict(CUSTOM_MODEL_DOWNLOADS.get(download_id) or {})
+    if not job: return _json_error("Unknown model download.",404)
+    total=int(job.get("total_bytes") or 0); done=int(job.get("downloaded_bytes") or 0); speed=float(job.get("speed_bps") or 0.0)
+    job.update(pct=(done/total*100.0) if total>0 else None,downloaded_text=_format_bytes(done),
+               total_text=_format_bytes(total) if total else "unknown",speed_text=(_format_bytes(speed)+"/s") if speed>0 else "")
+    return jsonify(ok=True,**job)
+
+
 @app.get("/api/meta")
 def api_meta():
     return jsonify(
         ok=True, product="MissingLink Krea2 Studio", gpu=GPU_NAME,
         vram_gib=round(VRAM_GB, 2), torch=torch.__version__, torch_cuda=str(torch.version.cuda),
-        model=MODEL_NAME, steps=STEPS, cfg=CFG, sampler=SAMPLER_NAME,
+        model=MODEL_NAME, active_base_model=ACTIVE_BASE_MODEL_NAME,
+        base_models=[{
+            "profile":"builtin", "label":"BUILT-IN KREA2",
+            "local_name":MODEL_NAME, "repo_id":"MissingLinkBuilder/Models",
+            "filename":MODEL_NAME, "built_in":True,
+        }] + _custom_model_public_rows(),
+        custom_models=_custom_model_public_rows(),
+        steps=STEPS, cfg=CFG, sampler=SAMPLER_NAME,
         scheduler=SCHEDULER, attention="PyTorch SDPA", max_batch=MAX_BATCH_IMAGES,
         key_valid=True, queue_max=JOB_MAX_ACTIVE, low_vram_mode=LOW_VRAM_MODE,
         missinglink_required=True, entitlement_mode="free15_then_notebook_pro",
@@ -6995,6 +7333,7 @@ def api_text_to_image():
             {
                 "prompt": body.get("prompt"),
                 "negative_prompt": body.get("negative_prompt", ""),
+                "base_model": _normalize_base_model_name(body.get("base_model") or MODEL_NAME),
                 "width": _int_value(body.get("width"), DEFAULT_TEXT_WIDTH, 256, 2048),
                 "height": _int_value(body.get("height"), DEFAULT_TEXT_HEIGHT, 256, 2048),
                 "seed": _int_value(body.get("seed"), -1),
@@ -7025,6 +7364,7 @@ def api_image_to_image():
                 "source_path": source_path,
                 "prompt": request.form.get("prompt"),
                 "negative_prompt": request.form.get("negative_prompt", ""),
+                "base_model": _normalize_base_model_name(request.form.get("base_model") or MODEL_NAME),
                 "denoise": _float_value(request.form.get("denoise"), 0.65, 0.05, 1.0),
                 "max_side": _int_value(request.form.get("max_side"), DEFAULT_IMAGE_MAX_SIDE, 256, 2048),
                 "seed": _int_value(request.form.get("seed"), -1),
@@ -7055,6 +7395,7 @@ def api_instruction_edit():
                 "source_path": source_path,
                 "prompt": request.form.get("prompt"),
                 "negative_prompt": request.form.get("negative_prompt", ""),
+                "base_model": _normalize_base_model_name(request.form.get("base_model") or MODEL_NAME),
                 "edit_lora_strength": _float_value(request.form.get("edit_lora_strength"), 1.0, 0.0, 1.5),
                 "ref_boost": _float_value(request.form.get("ref_boost"), 4.5, 0.0, 1000.0),
                 "grounding_px": _int_value(request.form.get("grounding_px"), 768, 0, 4096),
@@ -7093,6 +7434,7 @@ def api_inpaint():
                 "source_path": source_path, "mask_path": mask_path,
                 "prompt": request.form.get("prompt"),
                 "negative_prompt": request.form.get("negative_prompt", ""),
+                "base_model": _normalize_base_model_name(request.form.get("base_model") or MODEL_NAME),
                 "denoise": _float_value(request.form.get("denoise"), 1.0, 0.0, 1.0),
                 "edit_lora_strength": _float_value(request.form.get("edit_lora_strength"), _float_value(request.form.get("denoise"), 1.0, 0.0, 1.5), 0.0, 1.5),
                 "ref_boost": _float_value(request.form.get("ref_boost"), 4.0, 0.0, 1000.0),
@@ -7157,6 +7499,7 @@ def api_batch_start():
         "instruction": request.form.get("instruction"),
         "reference_path": reference_path,
         "rows": rows,
+        "base_model": _normalize_base_model_name(request.form.get("base_model") or MODEL_NAME),
         "width": _int_value(request.form.get("width"), DEFAULT_BATCH_WIDTH, 256, 2048),
         "height": _int_value(request.form.get("height"), DEFAULT_BATCH_HEIGHT, 256, 2048),
         "base_seed": _int_value(request.form.get("base_seed"), -1),
@@ -7573,6 +7916,22 @@ a{color:inherit}
 /* H3-style primary generation actions span the full left sidebar width. */
 #t_generate,#i_generate,#e_generate,#in_generate,#b_generate{display:block;width:100%;padding:12px 12px;font-size:11px;letter-spacing:.4px}
 #b_stop{width:100%}
+.base-model-card{margin-bottom:10px!important}
+.base-model-card .cardtitle{background:#0f0f12}
+.inlinebtn{background:#29292f!important;color:#ccc!important;padding:8px 9px!important;width:100%;margin-top:8px;font-size:9px;border:1px solid #34353d!important}
+.inlinebtn:hover{border-color:var(--accent)!important;color:var(--accent)!important;background:#211d10!important}
+.hfmodelbox{margin-top:9px;padding:9px;border:1px solid #2b2c32;border-radius:8px;background:#0d0e11;display:none}
+.hfmodelbox.show{display:block}
+.hfmodelgrid{display:grid;grid-template-columns:minmax(0,1fr) 92px;gap:7px}
+.hfmodelactions{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:7px}
+.hfmodelactions button{margin:0}
+.hfprogress{height:6px;background:#24252a;border-radius:999px;overflow:hidden;margin-top:9px}
+.hfprogress i{display:block;height:100%;width:0;background:var(--accent);transition:width .18s}
+.hfprogresstext{font-size:8px;color:#8e9099;margin-top:5px;min-height:12px;line-height:1.4}
+.hfmodelbox select,.hfmodelbox input{font-size:10px}
+.modelhint{font-size:8px;color:#696b74;margin-top:6px;line-height:1.45}
+.modelhint b{color:#c7c9d0}
+.installed{color:var(--good)}
 .lora-inline-installer{margin-top:10px;padding:10px;border:1px solid #2d2e34;border-radius:8px;background:#0b0b0d;display:flex;flex-direction:column;gap:0}
 .lora-inline-installer.hidden{display:none!important}
 .lora-inline-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px}
@@ -7793,6 +8152,28 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
       </div>
 
       <div class="sidebar-scroll">
+        <div class="card base-model-card">
+          <div class="cardtitle">Base Model</div>
+          <div class="cardbody">
+            <label>Base model</label>
+            <select id="base_model_select"><option value="krea2-def.safetensors">BUILT-IN KREA2</option></select>
+            <button id="hf_model_toggle" class="inlinebtn" type="button">+ HF BASE MODEL</button>
+            <div id="hf_model_box" class="hfmodelbox">
+              <label>Hugging Face source</label>
+              <input id="hf_model_repo" type="text" placeholder="owner/repo · repo URL · tree URL · direct model-file URL" autocomplete="off">
+              <div class="hfmodelgrid">
+                <div><label>Revision</label><input id="hf_model_revision" type="text" value="main" autocomplete="off"></div>
+                <div><label>Type</label><input type="text" value="Krea2" readonly></div>
+              </div>
+              <label>Model file</label><select id="hf_model_file" disabled><option value="">CHECK REPO first</option></select>
+              <div class="hfmodelactions"><button id="hf_model_inspect" class="inlinebtn" type="button">CHECK REPO</button><button id="hf_model_install" type="button" disabled>DOWNLOAD + USE</button></div>
+              <div class="hfprogress"><i id="hf_model_progress"></i></div>
+              <div id="hf_model_progress_text" class="hfprogresstext">Paste whatever Hugging Face link you have. The Studio will normalize the repo, revision and direct file path when possible.</div>
+            </div>
+            <div id="base_model_hint" class="modelhint">Selected model: <b>Built-in Krea2</b> · <span class="installed">ready</span>.</div>
+          </div>
+        </div>
+
         <section id="panel_text" class="controlpanel active">
           <div class="card">
             <div class="cardtitle">Text → Image</div>
@@ -9067,26 +9448,59 @@ bindLightning('i_lightning','i_steps','i_cfg','i_sampler','i_scheduler');
 bindLightning('e_lightning','e_steps','e_cfg','e_sampler','e_scheduler');
 bindLightning('in_lightning','in_steps','in_cfg','in_sampler','in_scheduler');
 
-fetchJson('/api/meta').then(d=>{
-  const profile=(d.gpu_profile||'auto').toUpperCase();
-  $('gpu_chip').textContent=d.gpu+' · '+d.vram_gib.toFixed(1)+' GiB · '+profile;
-  const api=$('ap_api_status');
-  if(api){
-    api.textContent=d.openai_available?'✓ OPENAI_API_KEY available to Auto Prompt.':'✗ OPENAI_API_KEY unavailable — Auto Prompt is disabled.';
-    api.className=d.openai_available?'auto-api-ok':'auto-api-bad';
-  }
+let KREA_META={};
+let ACTIVE_BASE_MODEL='';
+
+function _humanBytes(n){n=Number(n||0);const u=['B','KiB','MiB','GiB','TiB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return `${n.toFixed(i<2?1:2)} ${u[i]}`}
+function syncBaseModelOptions(meta=KREA_META){
+  const sel=$('base_model_select');if(!sel)return;
+  const rows=(meta.base_models||[]).length?meta.base_models:[{local_name:meta.model||'krea2-def.safetensors',built_in:true}];
+  sel.innerHTML=rows.map(x=>{const label=x.built_in?'BUILT-IN KREA2':('HF · '+(x.repo_id||x.local_name)+' · '+(x.filename||x.local_name));return `<option value="${escapeHtml(x.local_name)}">${escapeHtml(label)}</option>`}).join('');
+  if(rows.some(x=>x.local_name===ACTIVE_BASE_MODEL))sel.value=ACTIVE_BASE_MODEL;
+  else{ACTIVE_BASE_MODEL=meta.active_base_model||meta.model||rows[0]?.local_name||'krea2-def.safetensors';sel.value=ACTIVE_BASE_MODEL}
+}
+function activeBaseModelRow(){return (KREA_META.base_models||[]).find(x=>x.local_name===ACTIVE_BASE_MODEL)||null}
+function syncBaseModelUI(){
+  syncBaseModelOptions(KREA_META);
+  const row=activeBaseModelRow();const label=row?(row.built_in?'Built-in Krea2':(row.repo_id||row.local_name)):ACTIVE_BASE_MODEL;
+  if($('base_model_hint'))$('base_model_hint').innerHTML=`Selected model: <b>${escapeHtml(label||ACTIVE_BASE_MODEL)}</b> · <span class="installed">ready</span> · queued jobs keep the selected checkpoint.`;
+}
+async function loadMeta(){
+  const d=await fetchJson('/api/meta',{cache:'no-store'});KREA_META=d||{};if(!ACTIVE_BASE_MODEL)ACTIVE_BASE_MODEL=d.active_base_model||d.model||'krea2-def.safetensors';
+  const profile=(d.gpu_profile||'auto').toUpperCase();$('gpu_chip').textContent=d.gpu+' · '+d.vram_gib.toFixed(1)+' GiB · '+profile;
+  const api=$('ap_api_status');if(api){api.textContent=d.openai_available?'✓ OPENAI_API_KEY available to Auto Prompt.':'✗ OPENAI_API_KEY unavailable — Auto Prompt is disabled.';api.className=d.openai_available?'auto-api-ok':'auto-api-bad'}
   const defs=d.defaults||{};
-  if($("t_width") && defs.text_width) $("t_width").value=String(defs.text_width);
-  if($("t_height") && defs.text_height) $("t_height").value=String(defs.text_height);
-  if($("i_max") && defs.image_max_side) $("i_max").value=String(defs.image_max_side);
-  if($("e_max") && defs.image_max_side) $("e_max").value=String(defs.image_max_side);
-  if($("in_max") && defs.inpaint_max_side) $("in_max").value=String(defs.inpaint_max_side);
-  if($("b_width") && defs.batch_width) $("b_width").value=String(defs.batch_width);
-  if($("b_height") && defs.batch_height) $("b_height").value=String(defs.batch_height);
-}).catch(e=>{
-  $('key_chip').textContent='ACCESS ERROR';
-  $('key_chip').classList.remove('good');
-});
+  if($('t_width')&&defs.text_width)$('t_width').value=String(defs.text_width);if($('t_height')&&defs.text_height)$('t_height').value=String(defs.text_height);
+  if($('i_max')&&defs.image_max_side)$('i_max').value=String(defs.image_max_side);if($('e_max')&&defs.image_max_side)$('e_max').value=String(defs.image_max_side);if($('in_max')&&defs.inpaint_max_side)$('in_max').value=String(defs.inpaint_max_side);
+  if($('b_width')&&defs.batch_width)$('b_width').value=String(defs.batch_width);if($('b_height')&&defs.batch_height)$('b_height').value=String(defs.batch_height);
+  syncBaseModelUI();return d;
+}
+$('base_model_select').addEventListener('change',()=>{ACTIVE_BASE_MODEL=$('base_model_select').value||KREA_META.model||'krea2-def.safetensors';syncBaseModelUI();const row=activeBaseModelRow();const name=row?(row.built_in?'Built-in Krea2':(row.filename||row.local_name)):ACTIVE_BASE_MODEL;setStatusForTab(activeStudioTab,'Base model selected for new jobs: '+name+'.','good')});
+
+async function _readJsonResponse(resp,label='request'){
+  const text=await resp.text();const status=`HTTP ${resp.status}${resp.statusText?' '+resp.statusText:''}`;
+  if(!String(text||'').trim())throw new Error(`${label} returned ${status} with an empty response.`);
+  try{return JSON.parse(text)}catch(_){throw new Error(`${label} returned ${status} instead of JSON · ${String(text).replace(/\s+/g,' ').slice(0,500)}`)}
+}
+$('hf_model_toggle').onclick=e=>{e.preventDefault();$('hf_model_box').classList.toggle('show')};
+$('hf_model_inspect').onclick=async e=>{
+  e.preventDefault();const source=$('hf_model_repo').value.trim(),revision=$('hf_model_revision').value.trim()||'main';
+  if(!source){$('hf_model_progress_text').textContent='Paste a Hugging Face repo or URL first.';return}
+  $('hf_model_inspect').disabled=true;$('hf_model_install').disabled=true;$('hf_model_progress').style.width='0%';$('hf_model_progress_text').textContent='Inspecting Hugging Face source…';
+  try{const resp=await fetch('/api/models/hf/inspect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source,revision})});const r=await _readJsonResponse(resp,'HF source inspection');if(!resp.ok||r.ok===false)throw new Error(r.error||'Could not inspect Hugging Face source.');$('hf_model_repo').value=r.repo_id||source;$('hf_model_revision').value=r.revision||revision;$('hf_model_file').innerHTML=(r.candidates||[]).map(x=>`<option value="${escapeHtml(x.filename)}">${escapeHtml(x.filename)} · ${x.size?_humanBytes(x.size):'size unknown'}</option>`).join('');if(r.preferred_filename&&[...$('hf_model_file').options].some(x=>x.value===r.preferred_filename))$('hf_model_file').value=r.preferred_filename;$('hf_model_file').disabled=!(r.candidates||[]).length;$('hf_model_install').disabled=!(r.candidates||[]).length;$('hf_model_progress_text').textContent=`${(r.candidates||[]).length} checkpoint file(s) found in ${r.repo_id}@${r.revision}.${r.preferred_filename?' Direct file selected from your link.':' Choose one and download.'}`}
+  catch(err){$('hf_model_progress_text').textContent=String(err.message||err)}finally{$('hf_model_inspect').disabled=false}
+};
+async function pollHFModelDownload(id){
+  let transientFailures=0;while(true){let resp,r;try{resp=await fetch('/api/models/hf/progress/'+encodeURIComponent(id),{cache:'no-store'});r=await _readJsonResponse(resp,'HF model progress');if(!resp.ok||(r.ok===false&&r.status!=='error'))throw new Error(r.error||`Download status failed (HTTP ${resp.status}).`);transientFailures=0}catch(err){transientFailures++;if(transientFailures>=12)throw err;$('hf_model_progress_text').textContent=`Download is still running · reconnecting status (${transientFailures}/12)…`;await new Promise(resolve=>setTimeout(resolve,1000));continue}const pct=r.pct==null?0:Math.max(0,Math.min(100,Number(r.pct)));$('hf_model_progress').style.width=pct+'%';$('hf_model_progress_text').textContent=`${r.stage||r.status} · ${r.downloaded_text||'0 B'} / ${r.total_text||'unknown'}${r.speed_text?' · '+r.speed_text:''}${r.pct==null?'':` · ${pct.toFixed(1)}%`}`;if(r.status==='done')return r;if(r.status==='error')throw new Error(r.error||'Model download failed.');await new Promise(resolve=>setTimeout(resolve,750))}
+}
+$('hf_model_install').onclick=async e=>{
+  e.preventDefault();const source=$('hf_model_repo').value.trim(),revision=$('hf_model_revision').value.trim()||'main',filename=$('hf_model_file').value;
+  if(!source||!filename){$('hf_model_progress_text').textContent='Check the source and choose a model file first.';return}
+  $('hf_model_install').disabled=true;$('hf_model_inspect').disabled=true;
+  try{const resp=await fetch('/api/models/hf/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source,revision,filename})});const r=await _readJsonResponse(resp,'HF model install');if(!resp.ok||r.ok===false)throw new Error(r.error||'Could not start model download.');$('hf_model_repo').value=r.repo_id||source;$('hf_model_revision').value=r.revision||revision;const done=await pollHFModelDownload(r.id);await loadMeta();ACTIVE_BASE_MODEL=done.local_name;syncBaseModelUI();$('base_model_select').value=ACTIVE_BASE_MODEL;$('hf_model_progress').style.width='100%';$('hf_model_progress_text').textContent=`Installed ${done.local_name}. Selected as the active base model.${done.residency_note?' · '+done.residency_note:''}`;setStatusForTab(activeStudioTab,'HF base model installed and selected: '+done.local_name+'.','good')}
+  catch(err){$('hf_model_progress_text').textContent=String(err.message||err)}finally{$('hf_model_install').disabled=false;$('hf_model_inspect').disabled=false}
+};
+loadMeta().catch(()=>{$('key_chip').textContent='ACCESS ERROR';$('key_chip').classList.remove('good')});
 
 $('t_generate').onclick=async()=>{
   try{
@@ -9096,6 +9510,7 @@ $('t_generate').onclick=async()=>{
       body:JSON.stringify({
         prompt:$('t_prompt').value,
         negative_prompt:$('t_negative').value,
+        base_model:ACTIVE_BASE_MODEL,
         width:+$('t_width').value,
         height:+$('t_height').value,
         seed:+$('t_seed').value,
@@ -9119,6 +9534,7 @@ $('i_generate').onclick=async()=>{
   fd.append('source',file);
   fd.append('prompt',$('i_prompt').value);
   fd.append('negative_prompt',$('i_negative').value);
+  fd.append('base_model',ACTIVE_BASE_MODEL);
   fd.append('denoise',$('i_denoise').value);
   fd.append('max_side',$('i_max').value);
   fd.append('seed',$('i_seed').value);
@@ -9142,6 +9558,7 @@ $('e_generate').onclick=async()=>{
   fd.append('source',file);
   fd.append('prompt',$('e_prompt').value);
   fd.append('negative_prompt',$('e_negative').value);
+  fd.append('base_model',ACTIVE_BASE_MODEL);
   fd.append('edit_lora_strength',$('e_edit_lora_strength').value);
   fd.append('ref_boost',$('e_ref_boost').value);
   fd.append('grounding_px',$('e_grounding_px').value);
@@ -9347,7 +9764,7 @@ $('in_generate').onclick=async()=>{
     const maskBlob=await exportMaskBlob();
     const fd=new FormData();
     fd.append('source',source);fd.append('mask',maskBlob,'mask.png');
-    fd.append('prompt',$('in_prompt').value);fd.append('negative_prompt',$('in_negative').value);
+    fd.append('prompt',$('in_prompt').value);fd.append('negative_prompt',$('in_negative').value);fd.append('base_model',ACTIVE_BASE_MODEL);
     fd.append('edit_lora_strength',$('in_edit_lora_strength').value);fd.append('denoise',$('in_edit_lora_strength').value);
     fd.append('ref_boost',$('in_ref_boost').value);fd.append('grounding_px',$('in_grounding_px').value);fd.append('fit_mode',$('in_fit_mode').value);
     fd.append('ground_negative',$('in_ground_negative').checked?'1':'0');fd.append('max_side',$('in_max').value);
@@ -9399,6 +9816,7 @@ $('b_caption_instructions').value=DEFAULT_CAPTION;
 function batchForm(){
   const fd=new FormData();
   fd.append('instruction',$('b_instruction').value);
+  fd.append('base_model',ACTIVE_BASE_MODEL);
   const ref=$('b_reference').files[0]; if(ref)fd.append('reference',ref);
   fd.append('prompt_table',JSON.stringify(promptTableData()));
   fd.append('image_count',$('b_count').value);
