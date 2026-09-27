@@ -8804,6 +8804,15 @@ html,body{height:100%;overflow:hidden}
 .stagepanel.gallerymode .tile.selected{border-color:var(--accent);box-shadow:0 0 0 1px rgba(232,169,23,.3) inset}
 .stage-side-note{font-family:var(--font-mono);font-size:8px;color:#696b74}
 .camera-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.camera-grid .full{grid-column:1/-1}.camera-presets{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin:7px 0}.camera-presets button{padding:7px 4px;font-size:7.5px}.engine-note{border:1px solid #34301e;background:#17150d;border-radius:7px;padding:8px;color:#aaa585;font-size:8px;line-height:1.5}.engine-note b{color:var(--accent)}
+/* Camera pose controls mirror MissingLink Studio: draggable 3D orbit widget + exact dropdowns. */
+.camera-pose-block{margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
+.camera-pose-title{display:flex;align-items:center;gap:6px;margin:0 0 8px;font:800 8.5px var(--font-mono);letter-spacing:1px;text-transform:uppercase;color:#8f9199}
+.camera-pose-title .cam-icon{color:var(--accent)}
+.viewport-widget{border:1px solid var(--line);border-radius:7px;overflow:hidden;margin-bottom:10px;background:#0d0d0f}
+#camera_viewport{width:100%;height:200px;display:block;cursor:grab;background:#0d0d0f;touch-action:none}
+#camera_viewport:active{cursor:grabbing}
+.camera-pose-block label{margin-top:7px}
+.camera-pose-block select{width:100%}
 /* keep floating queue/history above the stage and independently movable */
 .queue-overlay,.history-overlay{z-index:1200!important}
 .q-header{touch-action:none}
@@ -9253,16 +9262,27 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
               <input id="c_source" class="nativefile" type="file" accept="image/*">
               <div class="uploadrow"><button id="c_source_pick" class="filepick" type="button"><span class="filepickicon">＋</span><span>Choose image</span></button><span id="c_source_name" class="filemeta">No image selected</span></div>
               <div id="c_preview" class="preview"><div class="empty">Choose the image you want to re-stage.</div></div>
-              <label>Horizontal camera position</label>
-              <select id="c_azimuth">
-                <option value="front">Front · 0°</option><option value="front-right">Front-right · 45°</option><option value="right">Right side · 90°</option><option value="back-right">Back-right · 135°</option><option value="back">Back · 180°</option><option value="back-left">Back-left · 225°</option><option value="left">Left side · 270°</option><option value="front-left">Front-left · 315°</option>
-              </select>
-              <div class="camera-presets">
-                <button type="button" class="secondary camera-az" data-value="front">FRONT</button><button type="button" class="secondary camera-az" data-value="right">RIGHT</button><button type="button" class="secondary camera-az" data-value="back">BACK</button><button type="button" class="secondary camera-az" data-value="left">LEFT</button>
+              <div class="camera-pose-block">
+                <div class="camera-pose-title"><span class="cam-icon">🎥</span> CAMERA POSE</div>
+                <div class="viewport-widget"><canvas id="camera_viewport"></canvas></div>
+                <label>Azimuth</label>
+                <select id="c_azimuth" onchange="syncCameraPoseFromDropdowns()">
+                  <option value="front">Front (0°)</option><option value="front-right">Front-Right (45°)</option>
+                  <option value="right">Right (90°)</option><option value="back-right">Back-Right (135°)</option>
+                  <option value="back">Back (180°)</option><option value="back-left">Back-Left (225°)</option>
+                  <option value="left">Left (270°)</option><option value="front-left">Front-Left (315°)</option>
+                </select>
+                <label>Elevation</label>
+                <select id="c_elevation" onchange="syncCameraPoseFromDropdowns()">
+                  <option value="low">Low Angle (-30°)</option><option value="eye">Eye Level (0°)</option>
+                  <option value="elevated" selected>Elevated (20°)</option><option value="high">High Angle (45°)</option>
+                </select>
+                <label>Distance</label>
+                <select id="c_distance" onchange="syncCameraPoseFromDropdowns()">
+                  <option value="close">Close-up</option><option value="medium" selected>Medium Shot</option><option value="wide">Wide Shot</option>
+                </select>
               </div>
               <div class="camera-grid">
-                <div><label>Elevation</label><select id="c_elevation"><option value="low">Low · -30°</option><option value="eye" selected>Eye level · 0°</option><option value="elevated">Elevated · 30°</option><option value="high">High · 60°</option></select></div>
-                <div><label>Distance</label><select id="c_distance"><option value="close">Close-up · ×0.6</option><option value="medium" selected>Medium · ×1.0</option><option value="wide">Wide · ×1.8</option></select></div>
                 <div class="full"><label>Additional instruction · optional</label><textarea id="c_extra" placeholder="Keep the same person, outfit and environment; only change viewpoint…"></textarea></div>
                 <div class="full"><label>Negative prompt · optional</label><textarea id="c_negative" placeholder="Optional things to avoid"></textarea></div>
                 <div><label>Maximum side</label><select id="c_max"></select></div>
@@ -9549,6 +9569,7 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
   </div>
 </div>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 const dims = [768,832,896,1024,1152,1280,1344,1536];
@@ -10361,6 +10382,12 @@ function switchStudioTab(tab){
   const refCard=$('reference_card'); if(refCard) refCard.classList.toggle('reference-hidden', !['text','image','edit','inpaint'].includes(tab));
   placeAccessCard(tab);
   activateStage(tab);
+  if(tab==='camera' && cameraCanvas && cameraRenderer && cameraViewCam){
+    requestAnimationFrame(()=>{
+      const W=cameraCanvas.clientWidth||300,H=cameraCanvas.clientHeight||200;
+      cameraViewCam.aspect=W/H;cameraViewCam.updateProjectionMatrix();cameraRenderer.setSize(W,H);
+    });
+  }
   if(tab==='console') refreshConsole(true);
 }
 $('stage_clear').onclick=()=>{
@@ -10420,6 +10447,7 @@ $('ref_images').addEventListener('change',()=>{
 });
 $('ref_mode').addEventListener('change',renderReferenceFiles);
 renderReferenceFiles();
+initCameraViewport();
 
 document.querySelectorAll('.tab').forEach(btn=>{
   btn.addEventListener('click',()=>switchStudioTab(btn.dataset.tab));
@@ -10446,9 +10474,41 @@ $('qe_generate').onclick=async()=>{
   }catch(e){setStatus('qe_status',e.message,'bad')}
 };
 
-document.querySelectorAll('.camera-az').forEach(btn=>btn.addEventListener('click',()=>{
-  $('c_azimuth').value=btn.dataset.value||'front';
-}));
+// Camera pose widget — same interaction model as MissingLink Studio.
+const CAMERA_AZ=[{v:'front',d:0},{v:'front-right',d:45},{v:'right',d:90},{v:'back-right',d:135},{v:'back',d:180},{v:'back-left',d:225},{v:'left',d:270},{v:'front-left',d:315}];
+const CAMERA_EL=[{v:'low',a:-30},{v:'eye',a:0},{v:'elevated',a:20},{v:'high',a:45}];
+const CAMERA_DI=[{v:'close',r:2.2},{v:'medium',r:3.8},{v:'wide',r:5.5}];
+const CAMERA_RING_R=4,CAMERA_CENTER_Y=.6;
+let cameraAzDeg=0,cameraElDeg=20,cameraDistR=3.8;
+let cameraScene,cameraViewCam,cameraRenderer,cameraCanvas,cameraAzHandle,cameraElHandle,cameraDistHandle,cameraModel,cameraImagePlane,cameraRay,cameraElArc,cameraRaycaster,cameraMouse;
+let cameraDrag=null,cameraDragStart={x:0,y:0},cameraDragElStart=0;
+const cameraGroundPlane=window.THREE?new THREE.Plane(new THREE.Vector3(0,1,0),0):null;
+function initCameraViewport(){
+  if(!window.THREE)return;cameraCanvas=$('camera_viewport');if(!cameraCanvas)return;
+  const W=cameraCanvas.clientWidth||300,H=cameraCanvas.clientHeight||200;cameraScene=new THREE.Scene();cameraScene.background=new THREE.Color(0x0d0d0f);
+  cameraViewCam=new THREE.PerspectiveCamera(38,W/H,.1,100);cameraViewCam.position.set(7,5.5,7);cameraViewCam.lookAt(0,CAMERA_CENTER_Y,0);
+  cameraRenderer=new THREE.WebGLRenderer({canvas:cameraCanvas,antialias:true});cameraRenderer.setSize(W,H);cameraRenderer.setPixelRatio(Math.min(devicePixelRatio,2));cameraScene.add(new THREE.GridHelper(12,24,0x222226,0x18181c));
+  const ring=new THREE.Mesh(new THREE.TorusGeometry(CAMERA_RING_R,.04,8,80),new THREE.MeshBasicMaterial({color:0xE8A917,transparent:true,opacity:.5}));ring.rotation.x=Math.PI/2;cameraScene.add(ring);
+  cameraElArc=new THREE.Line(new THREE.BufferGeometry(),new THREE.LineBasicMaterial({color:0xE8A917,transparent:true,opacity:.3}));cameraScene.add(cameraElArc);const hg=new THREE.SphereGeometry(.3,16,16);
+  cameraAzHandle=new THREE.Mesh(hg,new THREE.MeshBasicMaterial({color:0x22C55E}));cameraAzHandle.userData.h='az';cameraScene.add(cameraAzHandle);cameraElHandle=new THREE.Mesh(hg,new THREE.MeshBasicMaterial({color:0xE8A917}));cameraElHandle.userData.h='el';cameraScene.add(cameraElHandle);cameraDistHandle=new THREE.Mesh(hg,new THREE.MeshBasicMaterial({color:0xEF4444}));cameraDistHandle.userData.h='dist';cameraScene.add(cameraDistHandle);
+  const cg=new THREE.Group();cg.add(new THREE.Mesh(new THREE.BoxGeometry(.45,.3,.3),new THREE.MeshBasicMaterial({color:0x3a3a50})));const lens=new THREE.Mesh(new THREE.CylinderGeometry(.06,.12,.2,8),new THREE.MeshBasicMaterial({color:0x222233}));lens.rotation.x=Math.PI/2;lens.position.z=-.25;cg.add(lens);cameraModel=cg;cameraScene.add(cameraModel);
+  cameraRay=new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(),new THREE.Vector3()]),new THREE.LineBasicMaterial({color:0xE8A917,transparent:true,opacity:.35}));cameraScene.add(cameraRay);cameraImagePlane=new THREE.Mesh(new THREE.PlaneGeometry(1.6,1.6),new THREE.MeshBasicMaterial({color:0x333340,side:THREE.DoubleSide,transparent:true,opacity:.85}));cameraImagePlane.position.set(0,CAMERA_CENTER_Y,0);cameraScene.add(cameraImagePlane);cameraRaycaster=new THREE.Raycaster();cameraMouse=new THREE.Vector2();
+  cameraCanvas.addEventListener('pointerdown',cameraPointerDown);cameraCanvas.addEventListener('pointermove',cameraPointerMove);cameraCanvas.addEventListener('pointerup',cameraPointerUp);cameraCanvas.addEventListener('pointerleave',cameraPointerUp);updateCameraScene();requestAnimationFrame(cameraViewportLoop);
+}
+function setCameraViewportImage(url){if(!window.THREE||!cameraImagePlane||!url)return;new THREE.TextureLoader().load(url,tex=>{const ar=tex.image.width/tex.image.height,h=1.6,w=Math.min(h*ar,2.4);cameraImagePlane.geometry.dispose();cameraImagePlane.geometry=new THREE.PlaneGeometry(w,h);cameraImagePlane.material.map=tex;cameraImagePlane.material.color.set(0xffffff);cameraImagePlane.material.opacity=1;cameraImagePlane.material.needsUpdate=true;});}
+function nearestCameraValue(list,value,key){let best=list[0],delta=Infinity;for(const item of list){let d=Math.abs(item[key]-value);if(key==='d'&&d>180)d=360-d;if(d<delta){delta=d;best=item}}return best.v}
+function syncCameraDropdownsFromPose(){const az=((cameraAzDeg%360)+360)%360;$('c_azimuth').value=nearestCameraValue(CAMERA_AZ,az,'d');$('c_elevation').value=nearestCameraValue(CAMERA_EL,cameraElDeg,'a');$('c_distance').value=nearestCameraValue(CAMERA_DI,cameraDistR,'r');}
+function updateCameraScene(){if(!window.THREE||!cameraModel)return;const azR=THREE.MathUtils.degToRad(cameraAzDeg),elR=THREE.MathUtils.degToRad(cameraElDeg);const cx=cameraDistR*Math.cos(elR)*Math.sin(azR),cy=cameraDistR*Math.sin(elR)+CAMERA_CENTER_Y,cz=cameraDistR*Math.cos(elR)*Math.cos(azR);cameraModel.position.set(cx,cy,cz);cameraModel.lookAt(0,CAMERA_CENTER_Y,0);cameraAzHandle.position.set(CAMERA_RING_R*Math.sin(azR),0,CAMERA_RING_R*Math.cos(azR));const pts=[];for(let a=-40;a<=55;a+=3){const r=THREE.MathUtils.degToRad(a);pts.push(new THREE.Vector3(CAMERA_RING_R*Math.cos(r)*Math.sin(azR),CAMERA_RING_R*Math.sin(r)+CAMERA_CENTER_Y,CAMERA_RING_R*Math.cos(r)*Math.cos(azR)));}cameraElArc.geometry.dispose();cameraElArc.geometry=new THREE.BufferGeometry().setFromPoints(pts);cameraElHandle.position.set(CAMERA_RING_R*Math.cos(elR)*Math.sin(azR),CAMERA_RING_R*Math.sin(elR)+CAMERA_CENTER_Y,CAMERA_RING_R*Math.cos(elR)*Math.cos(azR));cameraDistHandle.position.set(cx*.55,cy*.55+CAMERA_CENTER_Y*.45,cz*.55);const p=cameraRay.geometry.attributes.position.array;p[0]=cx;p[1]=cy;p[2]=cz;p[3]=0;p[4]=CAMERA_CENTER_Y;p[5]=0;cameraRay.geometry.attributes.position.needsUpdate=true;syncCameraDropdownsFromPose();}
+function syncCameraPoseFromDropdowns(){const az=CAMERA_AZ.find(x=>x.v===$('c_azimuth').value);if(az)cameraAzDeg=az.d;const el=CAMERA_EL.find(x=>x.v===$('c_elevation').value);if(el)cameraElDeg=el.a;const di=CAMERA_DI.find(x=>x.v===$('c_distance').value);if(di)cameraDistR=di.r;updateCameraScene();}
+function snapCameraPose(){const az=nearestCameraValue(CAMERA_AZ,((cameraAzDeg%360)+360)%360,'d');cameraAzDeg=CAMERA_AZ.find(x=>x.v===az).d;const el=nearestCameraValue(CAMERA_EL,cameraElDeg,'a');cameraElDeg=CAMERA_EL.find(x=>x.v===el).a;const di=nearestCameraValue(CAMERA_DI,cameraDistR,'r');cameraDistR=CAMERA_DI.find(x=>x.v===di).r;updateCameraScene();}
+function cameraNdc(e){const r=cameraCanvas.getBoundingClientRect();return new THREE.Vector2(((e.clientX-r.left)/r.width)*2-1,-((e.clientY-r.top)/r.height)*2+1)}
+function cameraGroundHit(n){cameraRaycaster.setFromCamera(n,cameraViewCam);const v=new THREE.Vector3();return cameraRaycaster.ray.intersectPlane(cameraGroundPlane,v)?v:null}
+function cameraPointerDown(e){const n=cameraNdc(e);cameraRaycaster.setFromCamera(n,cameraViewCam);const hits=cameraRaycaster.intersectObjects([cameraAzHandle,cameraElHandle,cameraDistHandle]);if(hits.length){cameraDrag=hits[0].object.userData.h;cameraDragStart={x:e.clientX,y:e.clientY};cameraDragElStart=cameraElDeg;cameraCanvas.setPointerCapture(e.pointerId);cameraCanvas.style.cursor='grabbing';e.preventDefault()}}
+function cameraPointerMove(e){if(!cameraDrag){const n=cameraNdc(e);cameraRaycaster.setFromCamera(n,cameraViewCam);cameraCanvas.style.cursor=cameraRaycaster.intersectObjects([cameraAzHandle,cameraElHandle,cameraDistHandle]).length?'pointer':'grab';return}const n=cameraNdc(e);if(cameraDrag==='az'){const g=cameraGroundHit(n);if(g)cameraAzDeg=THREE.MathUtils.radToDeg(Math.atan2(g.x,g.z))}else if(cameraDrag==='el'){cameraElDeg=THREE.MathUtils.clamp(cameraDragElStart-(e.clientY-cameraDragStart.y)*.3,-35,50)}else if(cameraDrag==='dist'){const g=cameraGroundHit(n);if(g)cameraDistR=THREE.MathUtils.clamp(Math.sqrt(g.x*g.x+g.z*g.z)*.9,1.5,7)}updateCameraScene()}
+function cameraPointerUp(e){if(cameraDrag){try{cameraCanvas.releasePointerCapture(e.pointerId)}catch(_){}cameraDrag=null;cameraCanvas.style.cursor='grab';snapCameraPose()}}
+function cameraViewportLoop(){if(cameraRenderer&&cameraScene&&cameraViewCam)cameraRenderer.render(cameraScene,cameraViewCam);requestAnimationFrame(cameraViewportLoop)}
+window.addEventListener('resize',()=>{if(!cameraCanvas||!cameraRenderer||!cameraViewCam)return;const W=cameraCanvas.clientWidth||300,H=cameraCanvas.clientHeight||200;cameraViewCam.aspect=W/H;cameraViewCam.updateProjectionMatrix();cameraRenderer.setSize(W,H)});
+$('c_source').addEventListener('change',()=>{const f=$('c_source').files&&$('c_source').files[0];if(!f)return;const u=URL.createObjectURL(f);setCameraViewportImage(u);setTimeout(()=>URL.revokeObjectURL(u),15000)});
 
 $('c_generate').onclick=async()=>{
   const source=$('c_source').files[0];
