@@ -8754,6 +8754,7 @@ details .inside{padding:0 10px 10px}
 .stageactions{display:flex;gap:6px;flex-wrap:wrap}
 .stagebtn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:30px;padding:0 10px;border-radius:7px;border:1px solid #34353d;background:#17181c;color:#d3d4d8;font-family:var(--font-mono);font-size:8.5px;text-transform:uppercase;letter-spacing:.6px;cursor:pointer}
 .stagebtn:hover{border-color:var(--accent);color:var(--accent);background:#1d1b13}
+.stagebtn.active{border-color:var(--accent);color:#111;background:var(--accent)}
 .stagebtn.danger:hover{border-color:#e5484d;color:#e5484d;background:#1b1214}
 .stageview{min-height:540px;display:flex;align-items:center;justify-content:center;background:#050506;border:1px solid #24252a;border-radius:10px;overflow:hidden;position:relative}
 .stageview.single img{display:block;max-width:100%;max-height:74vh;object-fit:contain}
@@ -8764,9 +8765,10 @@ details .inside{padding:0 10px 10px}
 .stageview.gallerymode .tile.selected{border-color:var(--accent);box-shadow:0 0 0 1px rgba(232,169,23,.28) inset}
 .stagehint{margin-top:8px;color:#73757f;font-size:8px;line-height:1.5}
 @media(max-width:900px){.stageview{min-height:320px}.stageview.gallerymode .gallery{grid-template-columns:repeat(2,minmax(0,1fr))}}
-.console-stage{display:none!important;margin:0;padding:18px 20px;background:#050506;color:#c8cad2;font:11px/1.55 var(--font-mono);white-space:pre-wrap;word-break:break-word;overflow:auto;align-items:initial!important;justify-content:initial!important;text-align:left;scrollbar-width:none;-ms-overflow-style:none}
+.console-stage{display:none!important;margin:0;padding:0;background:#050506;color:#c8cad2;overflow:hidden;align-items:initial!important;justify-content:initial!important;text-align:left}
 .console-stage.active{display:block!important}
-.console-stage::-webkit-scrollbar{display:none}
+.console-stage #console_output{margin:0;width:100%;height:100%;padding:18px 20px;background:#050506;color:#c8cad2;font:11px/1.55 var(--font-mono);white-space:pre-wrap;word-break:break-word;overflow:auto;scrollbar-width:none;-ms-overflow-style:none}
+.console-stage #console_output::-webkit-scrollbar{display:none}
 .console-toolbar-note{font-family:var(--font-mono);font-size:8px;color:#777982;line-height:1.5}
 .lora-list{display:flex;flex-direction:column;gap:6px;margin-top:8px}
 .lora-row{display:grid;grid-template-columns:24px minmax(0,1fr) 82px 54px;gap:7px;align-items:center;padding:7px;border:1px solid #2a2b31;border-radius:7px;background:#0d0d10}
@@ -8896,7 +8898,6 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
         <button class="tab" data-tab="inpaint">INPAINT</button>
         <button class="tab" data-tab="camera">QWEN CAMERA</button>
         <button class="tab" data-tab="batch">ADAPTIVE BATCH</button>
-        <button class="tab" data-tab="console">CONSOLE</button>
       </nav>
 
       <div id="ml_access_card" style="margin:8px 10px 0;border:1px solid #4a3b12;background:linear-gradient(135deg,#19170d,#121214);border-radius:9px;padding:9px 10px;box-shadow:0 8px 26px rgba(0,0,0,.18)">
@@ -9403,20 +9404,6 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
           </div>
         </section>
 
-        <section id="panel_console" class="controlpanel">
-          <div class="card">
-            <div class="cardtitle">Console</div>
-            <div class="cardbody">
-              <div class="sectionhint">Live stdout/stderr from the Studio process, including ComfyUI/Krea2Edit logs and Python tracebacks.</div>
-              <div class="actions">
-                <button id="console_refresh" class="secondary" type="button">REFRESH</button>
-                <button id="console_clear" class="secondary" type="button">CLEAR</button>
-              </div>
-              <label><input id="console_follow" type="checkbox" style="width:auto" checked> Auto-follow latest output</label>
-              <div id="console_status" class="status">Console is live.</div>
-            </div>
-          </div>
-        </section>
 
       </div>
     </aside>
@@ -9428,6 +9415,7 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
           <span class="stage-mode" id="stage_mode_label">TEXT → IMAGE</span>
         </div>
         <div class="stage-toolbar-actions">
+          <button id="console_toggle" class="stagebtn" type="button">LOG</button>
           <button id="stage_assign" class="stagebtn" type="button">Assign as input</button>
           <a id="stage_download" class="stagebtn hidden" target="_blank">Download</a>
           <button id="stage_clear" class="stagebtn danger" type="button">Clear stage</button>
@@ -9441,13 +9429,14 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
         <div id="qe_result" class="stageview single stagepanel"><div class="empty">Qwen edit result appears here.</div></div>
         <div id="c_result" class="stageview single stagepanel"><div class="empty">Qwen camera result appears here.</div></div>
         <div id="b_gallery" class="stageview gallerymode stagepanel"><div class="empty">Completed batch images stream here.</div></div>
-        <pre id="console_stage" class="stageview console-stage stagepanel">Console output will appear here.</pre>
+        <div id="console_stage" class="stageview console-stage stagepanel"><pre id="console_output">Console output will appear here.</pre></div>
       </div>
     </main>
   </div>
 </div>
 
-<div id="terms_modal" class="terms-modal hidden" aria-hidden="true">
+<!-- Visible by default: JS hides this only after /api/terms/status confirms acceptance. -->
+<div id="terms_modal" class="terms-modal" aria-hidden="false">
   <div class="terms-shell" role="dialog" aria-modal="true" aria-labelledby="terms_title">
     <div id="terms_title" class="terms-title">18+ · RESPONSIBLE USE AGREEMENT</div>
     <div class="terms-subtitle">By clicking <strong>AGREE TO ALL &amp; CONTINUE</strong>, you certify and agree to every condition below.</div>
@@ -9715,11 +9704,61 @@ function hideTermsModal(){
   const m=$('terms_modal'); if(!m)return;
   m.classList.add('hidden');m.setAttribute('aria-hidden','true');
 }
+let STUDIO_RUNTIME_STARTED=false;
+let STUDIO_RUNTIME_TIMERS=[];
+
+function _studioSafeStart(label, fn){
+  // Never let one optional startup service prevent the rest of the Studio from
+  // becoming interactive. Errors are surfaced in the browser console/status UI.
+  try{
+    const value=fn();
+    if(value && typeof value.catch==='function'){
+      value.catch(err=>console.error('[startup] '+label, err));
+    }
+  }catch(err){
+    console.error('[startup] '+label, err);
+  }
+}
+
+function startStudioRuntime(){
+  if(STUDIO_RUNTIME_STARTED)return;
+  STUDIO_RUNTIME_STARTED=true;
+
+  // Yield one paint after dismissing the legal gate. This keeps the UI responsive
+  // even on slower Colab/browser sessions while background panels initialize.
+  setTimeout(()=>{
+    _studioSafeStart('metadata',()=>loadMeta().catch(err=>{
+      $('key_chip').textContent='ACCESS ERROR';
+      $('key_chip').classList.remove('good');
+      throw err;
+    }));
+    _studioSafeStart('access',()=>mlRefreshAccess());
+    _studioSafeStart('LoRAs',()=>refreshLoras());
+    _studioSafeStart('history',()=>refreshHistory(false));
+    _studioSafeStart('jobs',()=>pollJobs());
+
+    STUDIO_RUNTIME_TIMERS.push(setInterval(()=>_studioSafeStart('jobs poll',()=>pollJobs()),700));
+    STUDIO_RUNTIME_TIMERS.push(setInterval(()=>_studioSafeStart('history poll',()=>refreshHistory(false)),2500));
+    STUDIO_RUNTIME_TIMERS.push(setInterval(()=>{
+      if(consoleOverlayOpen)_studioSafeStart('console poll',()=>refreshConsole(false));
+    },700));
+  },0);
+}
+
 async function refreshTermsStatus(){
+  // The modal is intentionally visible in the HTML before any JavaScript runs.
+  // Only a confirmed server-side acceptance is allowed to hide it.
+  showTermsModal();
   try{
     const d=await fetchJson('/api/terms/status');
-    if(d.accepted) hideTermsModal(); else showTermsModal();
-  }catch(_){showTermsModal()}
+    if(d.accepted){
+      hideTermsModal();
+      startStudioRuntime();
+    }
+  }catch(err){
+    console.error('[startup] terms status',err);
+    showTermsModal();
+  }
 }
 $('terms_accept').onclick=async()=>{
   const button=$('terms_accept');
@@ -9741,6 +9780,7 @@ $('terms_accept').onclick=async()=>{
     });
     setStatus('terms_status','Agreement accepted.','good');
     hideTermsModal();
+    startStudioRuntime();
   }catch(e){
     setStatus('terms_status',e.message,'bad');
     button.disabled=false;
@@ -10326,21 +10366,24 @@ function currentStageUrl(id){
   const img=$(id).querySelector('img');
   return img ? (img.dataset.rawUrl || img.src.split('?')[0]) : '';
 }
-const STAGE_BY_TAB={text:'t_result',image:'i_result',edit:'e_result',inpaint:'in_result',qedit:'qe_result',camera:'c_result',batch:'b_gallery',console:'console_stage'};
-const STAGE_LABELS={text:'TEXT → IMAGE',image:'IMAGE → IMAGE',edit:'KREA EDIT',inpaint:'INPAINT',qedit:'QWEN EDIT · 2511',camera:'QWEN CAMERA · 2511 + MULTI-ANGLES',batch:'ADAPTIVE BATCH',console:'CONSOLE'};
+const STAGE_BY_TAB={text:'t_result',image:'i_result',edit:'e_result',inpaint:'in_result',qedit:'qe_result',camera:'c_result',batch:'b_gallery'};
+const STAGE_LABELS={text:'TEXT → IMAGE',image:'IMAGE → IMAGE',edit:'KREA EDIT',inpaint:'INPAINT',qedit:'QWEN EDIT · 2511',camera:'QWEN CAMERA · 2511 + MULTI-ANGLES',batch:'ADAPTIVE BATCH'};
 const SINGLE_WORK_TABS=['text','image','edit','inpaint','qedit','camera'];
-const STATUS_BY_TAB={text:'t_status',image:'i_status',edit:'e_status',inpaint:'in_status',qedit:'qe_status',camera:'cam_status',batch:'b_status',console:'console_status'};
+const STATUS_BY_TAB={text:'t_status',image:'i_status',edit:'e_status',inpaint:'in_status',qedit:'qe_status',camera:'cam_status',batch:'b_status'};
 let activeStageId='t_result';
 let activeStudioTab='text';
 let lastWorkTab='text';
+let consoleOverlayOpen=false;
 function syncStageToolbar(){
   const url=currentStageUrl(activeStageId);
-  $('stage_mode_label').textContent=STAGE_LABELS[activeStudioTab]||activeStudioTab.toUpperCase();
+  $('stage_mode_label').textContent=consoleOverlayOpen?'CONSOLE':(STAGE_LABELS[activeStudioTab]||activeStudioTab.toUpperCase());
   const dl=$('stage_download');
-  const nonImage=['console'].includes(activeStudioTab);
+  const nonImage=consoleOverlayOpen;
   if(url&&!nonImage){dl.href=url+'?download=1';dl.classList.remove('hidden');$('stage_assign').disabled=false;}
   else{dl.classList.add('hidden');dl.removeAttribute('href');$('stage_assign').disabled=true;}
   $('stage_clear').disabled=nonImage;
+  const logBtn=$('console_toggle');
+  if(logBtn){logBtn.classList.toggle('active',consoleOverlayOpen);logBtn.textContent=consoleOverlayOpen?'BACK':'LOG';}
 }
 function setStatusForTab(tab,message,kind='good'){
   const id=STATUS_BY_TAB[tab];
@@ -10375,6 +10418,7 @@ function placeAccessCard(tab){
   row.parentNode.insertBefore(card,row);
 }
 function switchStudioTab(tab){
+  consoleOverlayOpen=false;
   const previousTab=activeStudioTab;
   if(previousTab==='batch' && tab!=='batch') setStageEmpty('b_gallery');
   document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.tab===tab));
@@ -10388,8 +10432,15 @@ function switchStudioTab(tab){
       cameraViewCam.aspect=W/H;cameraViewCam.updateProjectionMatrix();cameraRenderer.setSize(W,H);
     });
   }
-  if(tab==='console') refreshConsole(true);
 }
+if($('console_toggle')) $('console_toggle').onclick=async()=>{
+  consoleOverlayOpen=!consoleOverlayOpen;
+  document.querySelectorAll('.stagepanel').forEach(el=>el.classList.remove('active'));
+  const stage=$(consoleOverlayOpen?'console_stage':activeStageId);
+  if(stage) stage.classList.add('active');
+  syncStageToolbar();
+  if(consoleOverlayOpen) await refreshConsole(true);
+};
 $('stage_clear').onclick=()=>{
   if(['text','image','edit','inpaint','qedit','camera'].includes(activeStudioTab)) clearSharedSingleStage();
   else setStageEmpty(activeStageId);
@@ -10602,7 +10653,8 @@ $('hf_model_install').onclick=async e=>{
   try{const resp=await fetch('/api/models/hf/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source,revision,filename})});const r=await _readJsonResponse(resp,'HF model install');if(!resp.ok||r.ok===false)throw new Error(r.error||'Could not start model download.');$('hf_model_repo').value=r.repo_id||source;$('hf_model_revision').value=r.revision||revision;const done=await pollHFModelDownload(r.id);await loadMeta();ACTIVE_BASE_MODEL=done.local_name;syncBaseModelUI();$('base_model_select').value=ACTIVE_BASE_MODEL;$('hf_model_progress').style.width='100%';$('hf_model_progress_text').textContent=`Installed ${done.local_name}. Selected as the active base model.${done.residency_note?' · '+done.residency_note:''}`;setStatusForTab(activeStudioTab,'HF base model installed and selected: '+done.local_name+'.','good')}
   catch(err){$('hf_model_progress_text').textContent=String(err.message||err)}finally{$('hf_model_install').disabled=false;$('hf_model_inspect').disabled=false}
 };
-loadMeta().catch(()=>{$('key_chip').textContent='ACCESS ERROR';$('key_chip').classList.remove('good')});
+// Metadata loading is intentionally deferred until the responsible-use gate
+// has been accepted. startStudioRuntime() owns all startup network activity.
 
 $('t_generate').onclick=async()=>{
   try{
@@ -11096,7 +11148,7 @@ async function refreshConsole(force=false){
     const text=String(d.text||'');
     if(force || text!==lastConsoleText){
       lastConsoleText=text;
-      const pre=$('console_stage');
+      const pre=$('console_output');
       if(pre){
         const follow=$('console_follow') ? $('console_follow').checked : true;
         const wasNearBottom=(pre.scrollHeight-pre.scrollTop-pre.clientHeight)<80;
@@ -11431,19 +11483,21 @@ async function pollJobs(){
   }
 }
 
-restoreMin();initOverlayDragging();
-// Always boot into the Text → Image workspace. History remains available in
-// the floating panel but never takes over the Stage until explicitly opened.
-switchStudioTab('text');
-clearSharedSingleStage();
-setStageEmpty('b_gallery');
+// Minimal synchronous boot only. Do not start background API traffic until the
+// agreement gate has been resolved; doing so made startup look frozen when any
+// optional service was slow or failed.
+try{restoreMin()}catch(err){console.error('[startup] restore overlays',err)}
+try{initOverlayDragging()}catch(err){console.error('[startup] overlay dragging',err)}
+try{
+  // Always boot into Text → Image. The stage is usable immediately after consent.
+  switchStudioTab('text');
+  clearSharedSingleStage();
+  setStageEmpty('b_gallery');
+}catch(err){console.error('[startup] initial workspace',err)}
+
+// The HTML renders the agreement visible by default. This status check can only
+// hide it when the current Studio process has already recorded acceptance.
 refreshTermsStatus();
-mlRefreshAccess();
-refreshLoras();
-refreshHistory(false);pollJobs();
-setInterval(pollJobs,700);
-setInterval(()=>refreshHistory(false),2500);
-setInterval(()=>{if(activeStudioTab==='console')refreshConsole(false)},700);
 </script>
 </body>
 </html>
