@@ -10672,7 +10672,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       // Fast-mode accelerator, but place them in this same stack.
       if(m.motion8_file){
         cards.push({kind:'motion8',file:m.motion8_file,label:'Motion Enhancer LoRA',available:!!m.motion8_available,
-          detail:'rzgar H3 FL2V 8-step',source_url:sourceMap[m.motion8_file]||''});seen.add(m.motion8_file);
+          detail:'rzgar H3 FL2V 8-step · alternative to FAST / ULTRA / MEDIUM; select QUALITY and disable Fast-Mode Accelerator before enabling.',source_url:sourceMap[m.motion8_file]||''});seen.add(m.motion8_file);
       }
       const accelFile=currentModelMode()==='ref2va'?m.ref2va_lightning_file:m.lightning_file;
       const accelAvailable=currentModelMode()==='ref2va'?m.ref2va_lightning_available:m.lightning_available;
@@ -10758,6 +10758,13 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         const sliderValueFor=n=>Math.max(sliderMin,Math.min(sliderMax,Number(n)));
         const syncState=(n,{normalizeNumber=true}={})=>{
           if(!Number.isFinite(n))return;
+          const conflict=(card.kind==='motion8'||card.kind==='lightning')?accelerationConflict(card.kind,n):'';
+          if(conflict){
+            slider.value=String(sliderValueFor(st.strength||0));
+            out.value=String(st.strength||0);
+            meta.textContent=conflict;
+            return;
+          }
           // The numeric field is authoritative and intentionally unbounded. The
           // slider is only a 0–5 convenience control, so out-of-range numbers pin
           // the thumb to the nearest endpoint without changing the stored strength.
@@ -10817,6 +10824,15 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       const m=window.H3META||{},card=_namedLoraCards(m).find(x=>x.kind===kind);
       if(!card||!_cardCompatible(card,m))return 0;
       return Number(_stateForCard(card).strength||0);
+    }
+    function accelerationConflict(kind=null,strength=0){
+      const value=k=>kind===k?Number(strength):submittedSpecialStrength(k);
+      const motion=Math.abs(value('motion8'))>1e-6;
+      const lightning=Math.abs(value('lightning'))>1e-6;
+      if(motion&&(lightning||window.MEDIUM8_PRESET_ACTIVE||window.TAOMATE_PRESET_ACTIVE)){
+        return 'Motion Enhancer cannot run with FAST / ULTRA / MEDIUM acceleration. To use Motion Enhancer, select QUALITY and turn Fast-Mode Accelerator OFF, then enable Motion Enhancer. To keep acceleration, turn Motion Enhancer OFF. Your selections have not been changed.';
+      }
+      return '';
     }
     function resetNamedLoras(){
       LORA_CARD_STATE.clear();renderNamedLoraRows(window.H3META||{});
@@ -12009,6 +12025,13 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       $('err').textContent=m;$('go').disabled=false;$('pb').style.width='0';refreshTimeline(true)}
 
     async function submitGeneration(){
+      const conflict=accelerationConflict();
+      if(conflict){
+        mlTrack('notebook_h3_generate_validation_blocked',{action:'acceleration_conflict',target:'#go',meta:{code:'acceleration_conflict'},immediate:true});
+        fail(conflict);
+        await uiAlert(conflict,'Choose one acceleration option');
+        return;
+      }
       const mode=currentModelMode();
       const segs=((window.H3TIMELINE||{}).segments)||[];
       const usePrevious=mode==='fl2va' && $('continuity_enabled').checked && segs.length>0;

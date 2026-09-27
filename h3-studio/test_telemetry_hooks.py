@@ -3,6 +3,7 @@ import ast
 import pathlib
 import types
 import unittest
+import uuid
 
 
 class TelemetryIsolationTests(unittest.TestCase):
@@ -21,7 +22,7 @@ class TelemetryIsolationTests(unittest.TestCase):
                     attempts.append(event)
                     raise RuntimeError("cannot start new thread")
 
-                scope = dict(_ml_telemetry_async=failing_telemetry,
+                scope = dict(_ml_telemetry_async=failing_telemetry, _ml_uuid=uuid,
                              time=types.SimpleNamespace(time=lambda: 123),
                              PROG={"stage": "queued"}, JOBS={"job": {}}, log=lambda message: None,
                              request=types.SimpleNamespace(path="/api/generate", method="POST"))
@@ -29,17 +30,17 @@ class TelemetryIsolationTests(unittest.TestCase):
                 scope["_set_job_stage"]("job", "loading")
                 self.assertEqual(scope["PROG"]["stage"], "loading")
                 self.assertEqual(scope["JOBS"]["job"]["stage_started"], 123)
-                response = types.SimpleNamespace(status_code=402)
+                response = types.SimpleNamespace(status_code=402, get_json=lambda **kwargs: {})
                 self.assertIs(scope["_ml_report_api_failure"](response), response)
                 scope["_ml_observe"]("notebook_h3_setup_completed")
-                self.assertEqual(len(attempts), 3)
+                self.assertEqual(len(attempts), 4 if filename == "h3_studio_3.py" else 3)
                 response.status_code = 200
                 self.assertIs(scope["_ml_report_api_failure"](response), response)
-                self.assertEqual(len(attempts), 3)
+                self.assertEqual(len(attempts), 4 if filename == "h3_studio_3.py" else 3)
                 response.status_code = 500
                 scope["request"].path = "/api/ml/activity"
                 scope["_ml_report_api_failure"](response)
-                self.assertEqual(len(attempts), 3)  # No telemetry-error reporting loop.
+                self.assertEqual(len(attempts), 4 if filename == "h3_studio_3.py" else 3)  # No telemetry-error reporting loop.
 
 
 if __name__ == "__main__":
