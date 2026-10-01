@@ -9710,6 +9710,15 @@ let STUDIO_RUNTIME_TIMERS=[];
 let lastHistoryItems=[];
 let lastHistorySignature='';
 
+// Core UI state must be initialized before any startup callback or immediate
+// widget initialization can reference it. Keeping these declarations here avoids
+// JavaScript temporal-dead-zone failures if a later initializer throws.
+let KREA_META={};
+let ACTIVE_BASE_MODEL='';
+let cameraAzDeg=0,cameraElDeg=20,cameraDistR=3.8;
+let cameraScene,cameraViewCam,cameraRenderer,cameraCanvas,cameraAzHandle,cameraElHandle,cameraDistHandle,cameraModel,cameraImagePlane,cameraRay,cameraElArc,cameraRaycaster,cameraMouse;
+let cameraDrag=null,cameraDragStart={x:0,y:0},cameraDragElStart=0;
+
 function _studioSafeStart(label, fn){
   // Never let one optional startup service prevent the rest of the Studio from
   // becoming interactive. Errors are surfaced in the browser console/status UI.
@@ -10501,7 +10510,6 @@ $('ref_images').addEventListener('change',()=>{
 });
 $('ref_mode').addEventListener('change',renderReferenceFiles);
 renderReferenceFiles();
-initCameraViewport();
 
 document.querySelectorAll('.tab').forEach(btn=>{
   btn.addEventListener('click',()=>switchStudioTab(btn.dataset.tab));
@@ -10533,9 +10541,6 @@ const CAMERA_AZ=[{v:'front',d:0},{v:'front-right',d:45},{v:'right',d:90},{v:'bac
 const CAMERA_EL=[{v:'low',a:-30},{v:'eye',a:0},{v:'elevated',a:20},{v:'high',a:45}];
 const CAMERA_DI=[{v:'close',r:2.2},{v:'medium',r:3.8},{v:'wide',r:5.5}];
 const CAMERA_RING_R=4,CAMERA_CENTER_Y=.6;
-let cameraAzDeg=0,cameraElDeg=20,cameraDistR=3.8;
-let cameraScene,cameraViewCam,cameraRenderer,cameraCanvas,cameraAzHandle,cameraElHandle,cameraDistHandle,cameraModel,cameraImagePlane,cameraRay,cameraElArc,cameraRaycaster,cameraMouse;
-let cameraDrag=null,cameraDragStart={x:0,y:0},cameraDragElStart=0;
 const cameraGroundPlane=window.THREE?new THREE.Plane(new THREE.Vector3(0,1,0),0):null;
 function initCameraViewport(){
   if(!window.THREE)return;cameraCanvas=$('camera_viewport');if(!cameraCanvas)return;
@@ -10563,6 +10568,9 @@ function cameraPointerUp(e){if(cameraDrag){try{cameraCanvas.releasePointerCaptur
 function cameraViewportLoop(){if(cameraRenderer&&cameraScene&&cameraViewCam)cameraRenderer.render(cameraScene,cameraViewCam);requestAnimationFrame(cameraViewportLoop)}
 window.addEventListener('resize',()=>{if(!cameraCanvas||!cameraRenderer||!cameraViewCam)return;const W=cameraCanvas.clientWidth||300,H=cameraCanvas.clientHeight||200;cameraViewCam.aspect=W/H;cameraViewCam.updateProjectionMatrix();cameraRenderer.setSize(W,H)});
 $('c_source').addEventListener('change',()=>{const f=$('c_source').files&&$('c_source').files[0];if(!f)return;const u=URL.createObjectURL(f);setCameraViewportImage(u);setTimeout(()=>URL.revokeObjectURL(u),15000)});
+
+// Initialize only after all camera state/constants/helpers above have been evaluated.
+initCameraViewport();
 
 $('c_generate').onclick=async()=>{
   const source=$('c_source').files[0];
@@ -10604,8 +10612,6 @@ bindLightning('i_lightning','i_steps','i_cfg','i_sampler','i_scheduler');
 bindLightning('e_lightning','e_steps','e_cfg','e_sampler','e_scheduler');
 bindLightning('in_lightning','in_steps','in_cfg','in_sampler','in_scheduler');
 
-let KREA_META={};
-let ACTIVE_BASE_MODEL='';
 
 function _humanBytes(n){n=Number(n||0);const u=['B','KiB','MiB','GiB','TiB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return `${n.toFixed(i<2?1:2)} ${u[i]}`}
 function syncBaseModelOptions(meta=KREA_META){
