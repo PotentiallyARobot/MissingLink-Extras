@@ -9706,6 +9706,9 @@ function hideTermsModal(){
 }
 let STUDIO_RUNTIME_STARTED=false;
 let STUDIO_RUNTIME_TIMERS=[];
+// History state must exist before any startup/event path can call refreshHistory().
+let lastHistoryItems=[];
+let lastHistorySignature='';
 
 function _studioSafeStart(label, fn){
   // Never let one optional startup service prevent the rest of the Studio from
@@ -11110,8 +11113,6 @@ $('b_caption').onclick=async()=>{
   }catch(e){setStatus('c_status',e.message,'bad');$('b_caption').disabled=false}
 };
 
-let lastHistoryItems=[];
-let lastHistorySignature='';
 function historySignature(items){
   return JSON.stringify((items||[]).map(item=>[
     item.filename||'',
