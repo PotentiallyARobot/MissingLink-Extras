@@ -3504,6 +3504,207 @@ if _CU130_CHILD:
         cls = N[name]
         return getattr(cls(), cls.FUNCTION)(**kw)
 
+    # H3_CONTINUITY_V2_BEGIN — standalone cell; no sibling-module dependency.
+    # Optional upstream packages are pinned and imported only when selected.
+    H3_CONTINUITY_PACKS = {
+        "suite": ("HerrgottMargott/Herrgotts-H3-Infinite-Continuation-Suite", "4b1edd678de7356beebf3761b2532a35e07d0389"),
+        "motion": ("NikoDemon80/ComfyUI-H3-Motion-Context", "5335715abe54c1a9bfbe3494da29aae3e8635ce3"),
+    }
+    H3_CONTINUITY_HASHES = {
+        "suite": "7e27c1b87152676cc82dfa57f4caa95c5afb3203a0a692311c3ceb1849265c7b",
+        "motion": "1fede541bc2c140fe0575aa6439768cd177017c893b4e26907a609cc80762b8e",
+    }
+    _CONTINUITY_MODULES = {}
+
+    def _continuity_options(p):
+        mode = str(p.get("continuation_mode") or "frame")
+        if mode not in {"frame", "motion", "masked"}:
+            raise ValueError("Unknown continuation method.")
+        result = {"continuation_mode": mode}
+        for key, default, low, high in (("continuation_context", 22, 5, 56),
+                                        ("continuation_audio_context", 24, 3, 240),
+                                        ("seam_video_frames", 4, 0, 16),
+                                        ("seam_audio_ms", 15, 0, 100)):
+            raw = p.get(key)
+            try:
+                value = float(default if raw in (None, "") else raw)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid {key}.")
+            if not np.isfinite(value) or value != int(value) or not low <= value <= high:
+                raise ValueError(f"{key} must be an integer from {low} to {high}.")
+            result[key] = int(value)
+        if result["continuation_context"] not in {5, 22, 39, 56}:
+            raise ValueError("Motion context must be 5, 22, 39 or 56 frames.")
+        if result["continuation_audio_context"] % 3:
+            raise ValueError("Audio context must be a multiple of 3 frames.")
+        result["seam_luminance"] = str(p.get("seam_luminance") or "0").lower() in {"1", "true", "on"}
+        return result
+
+    def _continuity_pack(name):
+        if name in _CONTINUITY_MODULES:
+            return _CONTINUITY_MODULES[name]
+        import importlib, importlib.util, tarfile, tempfile, types
+        repo, revision = H3_CONTINUITY_PACKS[name]
+        root = os.path.join(COMFY_DIR, "h3_studio_optional", name + "-" + revision)
+        marker = os.path.join(root, ".complete")
+        if not os.path.isfile(marker):
+            log(f"  ↓ optional H3 {name} continuation package ({revision[:12]})")
+            parent = os.path.dirname(root)
+            os.makedirs(parent, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=parent) as temp:
+                archive = os.path.join(temp, "source.tar.gz")
+                with urllib.request.urlopen(f"https://codeload.github.com/{repo}/tar.gz/{revision}", timeout=90) as response, open(archive, "wb") as dest:
+                    shutil.copyfileobj(response, dest)
+                import hashlib
+                with open(archive, "rb") as downloaded:
+                    if hashlib.file_digest(downloaded, "sha256").hexdigest() != H3_CONTINUITY_HASHES[name]:
+                        raise RuntimeError("Continuation download checksum mismatch; package was not loaded.")
+                extracted = os.path.join(temp, "extracted")
+                os.makedirs(extracted)
+                with tarfile.open(archive, "r:gz") as bundle:
+                    # Extract regular files/directories only. Never follow archive links.
+                    for member in bundle.getmembers():
+                        parts = member.name.split("/")[1:]
+                        if not parts or not parts[-1]:
+                            continue
+                        if member.issym() or member.islnk() or not (member.isfile() or member.isdir()):
+                            raise RuntimeError("Unsupported entry in continuation archive.")
+                        if any(part in {"..", ""} for part in parts) or member.name.startswith("/"):
+                            raise RuntimeError("Unsafe path in continuation archive.")
+                        target = os.path.join(extracted, *parts)
+                        if member.isdir():
+                            os.makedirs(target, exist_ok=True)
+                        else:
+                            os.makedirs(os.path.dirname(target), exist_ok=True)
+                            with bundle.extractfile(member) as src, open(target, "wb") as dst:
+                                shutil.copyfileobj(src, dst)
+                if not os.path.isfile(os.path.join(extracted, "nodes.py")):
+                    raise RuntimeError("Incomplete continuation package download.")
+                with open(os.path.join(extracted, ".complete"), "w") as f:
+                    f.write(revision)
+                if os.path.isdir(root):
+                    shutil.rmtree(root)
+                os.replace(extracted, root)
+        # Import nodes directly: avoid registering a second web UI or server routes.
+        package_name = "_h3_studio_" + name + "_" + revision[:12]
+        package = types.ModuleType(package_name)
+        package.__path__ = [root]
+        sys.modules[package_name] = package
+        module = importlib.import_module(package_name + ".nodes")
+        _CONTINUITY_MODULES[name] = module
+        return module
+
+    def _continuity_path(filename):
+        # Checkpoints are app-generated basenames, never client-supplied paths.
+        if not filename or os.path.basename(str(filename)) != str(filename):
+            raise ValueError("Invalid continuation checkpoint name.")
+        path = os.path.join(OUT, str(filename))
+        if not os.path.isfile(path):
+            raise ValueError("The previous latent checkpoint is missing. Restore its output files or start a new chain.")
+        return path
+
+    def _continuity_previous(p, segments):
+        retry = p.get("timeline_action") == "retry"
+        index = -2 if retry else -1
+        if len(segments) < abs(index):
+            raise ValueError("No preceding clip is available for latent continuation.")
+        prev = segments[index]
+        if _segment_is_trimmed(dict(prev)):
+            raise ValueError("Latent continuation needs the original clip timing. Undo its manual trim or use last-frame continuation.")
+        mode = p["continuation_mode"]
+        if prev.get("continuation_mode") != mode:
+            raise ValueError("Start a new sequence with this continuation method enabled; the preceding clip uses a different method or has no latent checkpoint.")
+        _continuity_path(prev.get("latent_file"))
+        if mode == "masked" and int((prev.get("handover") or {}).get("handover_end_frame", -1)) <= int(prev.get("context_head_frames") or 0):
+            raise ValueError("The previous clip has no usable motion before its frozen ending. Retry it with more motion or a longer duration.")
+        prior_params = prev.get("params") or {}
+        if (p.get("unet") or DIT_FILE) != (prior_params.get("unet") or DIT_FILE):
+            raise ValueError("Keep the same base checkpoint within a latent chain.")
+        # Freeze the actual parent identity for retry, history acceptance and export.
+        p["_continuity_parent"] = {k: prev.get(k) for k in (
+            "job", "latent_file", "continuation_mode", "handover", "context_head_frames", "native_frames", "width", "height")}
+        p["stage_source_job"] = prev.get("job")
+        p["width"], p["height"] = str(prev["width"]), str(prev["height"])
+        p.pop("first_frame", None)
+        p["use_stage_last"] = "0"
+
+    def _continuity_effective_segments(segments):
+        """Only shorten a masked landing when its actual continuation follows it."""
+        result = [dict(s) for s in segments]
+        for index, following in enumerate(result[1:]):
+            previous = result[index]
+            if (following.get("continuation_mode") == "masked"
+                    and following.get("continued_from_job") == previous.get("job")
+                    and not _segment_is_trimmed(previous)):
+                end = int((previous.get("handover") or {}).get("handover_end_frame", -1))
+                head = int(previous.get("context_head_frames") or 0)
+                if end >= head:
+                    previous["trim_end_frame"] = end - head
+                    _segment_source_shape(previous)
+        return result
+
+    def _continuity_validate_export(segments):
+        if not segments:
+            raise ValueError("The active sequence is empty.")
+        method = segments[0].get("continuation_mode")
+        if method not in {"motion", "masked"} or int(segments[0].get("context_head_frames") or 0):
+            raise ValueError("Seamless export needs a complete chain starting with a latent-enabled starter clip.")
+        for i, seg in enumerate(segments):
+            if seg.get("continuation_mode") != method or _segment_is_trimmed(dict(seg)):
+                raise ValueError("Seamless export needs one untrimmed latent chain. Use COMPILE for a manually edited sequence.")
+            _continuity_path(seg.get("latent_file"))
+            if i and seg.get("continued_from_job") != segments[i - 1].get("job"):
+                raise ValueError("The clips are not in their original continuation order. Restore their order or use COMPILE.")
+        return method
+
+    def _continuity_export(jid, p):
+        """Runs on the normal worker; bounded-memory upstream export decodes one clip at a time."""
+        import tempfile
+        j = JOBS[jid]
+        segments = p["_continuity_export"]
+        with GPU_LOCK, torch.no_grad():
+            _check_job_cancel(jid)
+            _continuity_validate_export(segments)
+            j.update(status="running")
+            _set_job_stage(jid, "exporting seamless chain")
+            suite = _continuity_pack("suite")
+            vae, = call("VAELoader", vae_name="minimax_h3_video_vae_fp16.safetensors")
+            avae, = call("VAELoader", vae_name="minimax_h3_audio_vae_fp32.safetensors")
+            with tempfile.TemporaryDirectory(prefix="h3_export_", dir=OUT) as temp:
+                prefix = os.path.join(temp, "clip")
+                for i, seg in enumerate(segments, 1):
+                    src = _continuity_path(seg["latent_file"])
+                    dest = f"{prefix}_{i:05d}.safetensors"
+                    try:
+                        os.link(src, dest)
+                    except OSError:
+                        shutil.copy2(src, dest)
+                # Cancellation between decoded clips, without patching shared node globals.
+                class ExportVAE:
+                    def __init__(self, inner): self.inner = inner
+                    def __getattr__(self, key): return getattr(self.inner, key)
+                    def decode(self, *args, **kwargs):
+                        _check_job_cancel(jid)
+                        return self.inner.decode(*args, **kwargs)
+                path, note = suite.H3ContinuousStitchSavedChainV14().stitch(
+                    video_vae=ExportVAE(vae), audio_vae=ExportVAE(avae),
+                    latent_prefix=prefix, first_clip=1, last_clip=len(segments),
+                    filename_prefix=os.path.join(temp, "master"),
+                    video_crossfade_frames=p["seam_video_frames"],
+                    audio_crossfade_ms=p["seam_audio_ms"],
+                    luminance_match=p["seam_luminance"], max_safe_tail_bridge_frames=0)
+                _check_job_cancel(jid)
+                filename = f"seamless_{jid}.mp4"
+                os.replace(path, os.path.join(OUT, filename))
+            with TIMELINE_LOCK:
+                seq = _find_sequence_unlocked(p["_target_sequence_id"])
+                # Never replace a master after an intervening edit or project switch.
+                if seq and json.dumps(seq.get("segments"), sort_keys=True) == p["_export_snapshot"]:
+                    seq["master_file"] = filename
+                    _autosave_timeline_unlocked("seamless_export")
+            j.update(status="done", file=filename, msg=note, export=True)
+    # H3_CONTINUITY_V2_END
+
     def opts(node, field):
         spec = N[node].INPUT_TYPES()["required"][field]
         o = spec[1].get("options") if len(spec)>1 and isinstance(spec[1],dict) else None
@@ -5058,7 +5259,7 @@ if _CU130_CHILD:
 
     def _sequence_duration(seq):
         total = 0.0
-        for seg in (seq.get("segments") or []):
+        for seg in _continuity_effective_segments(seq.get("segments") or []):
             _segment_source_shape(seg)
             total += float(seg.get("duration") or 0)
         return round(total, 3)
@@ -5088,6 +5289,8 @@ if _CU130_CHILD:
             "prompt": seg.get("prompt", ""),
             "last_frame_file": (os.path.basename(last_path) if last_path else seg.get("last_frame_file")),
             "first_frame_file": (os.path.basename(first_path) if first_path else seg.get("first_frame_file")),
+            "continuation_mode": seg.get("continuation_mode", "frame"),
+            "latent_available": bool(seg.get("latent_file") and os.path.isfile(os.path.join(OUT, seg["latent_file"]))),
             "continued": bool(seg.get("continued")),
             "continued_from_job": seg.get("continued_from_job"),
         }
@@ -5304,7 +5507,7 @@ if _CU130_CHILD:
                     "active": bool(active and seq.get("id") == active.get("id")),
                 })
             active_segs = list((active or {}).get("segments") or [])
-            active_public = [_public_segment(seg, i, (active or {}).get("id")) for i, seg in enumerate(active_segs)]
+            active_public = [_public_segment(seg, i, (active or {}).get("id")) for i, seg in enumerate(_continuity_effective_segments(active_segs))]
             active_duration = _sequence_duration(active or {"segments": []})
             return {
                 "project_id": TIMELINE_STATE.get("project_id"),
@@ -5392,7 +5595,7 @@ if _CU130_CHILD:
                 return False, None, "sequence not found"
             segs = list(seq.get("segments") or [])
         try:
-            paths = [_timeline_segment_media_path(seg) for seg in segs]
+            paths = [_timeline_segment_media_path(seg) for seg in _continuity_effective_segments(segs)]
         except Exception as exc:
             return False, None, str(exc)
         if not segs:
@@ -5515,6 +5718,16 @@ if _CU130_CHILD:
 
     def _resolve_queued_inputs(p):
         action = (p.get("timeline_action") or "new").lower()
+        if p.get("continuation_mode") in {"motion", "masked"}:
+            needs_parent = action == "continue" or (action == "retry" and p.get("_retry_continued") == "1")
+            if needs_parent:
+                with TIMELINE_LOCK:
+                    seq = _find_sequence_unlocked(p.get("_target_sequence_id"))
+                    segments = list((seq or {}).get("segments") or [])
+                _continuity_previous(p, segments)
+            else:
+                p.pop("_continuity_parent", None)
+            return p
         target_id = p.get("_target_sequence_id")
         if action == "continue":
             with TIMELINE_LOCK:
@@ -5562,8 +5775,14 @@ if _CU130_CHILD:
                 continue
             try:
                 p = dict(j.pop("_params", {}) or {})
-                _resolve_queued_inputs(p)
-                generate(jid, p)
+                if p.get("_continuity_export"):
+                    _continuity_export(jid, p)
+                else:
+                    _resolve_queued_inputs(p)
+                    generate(jid, p)
+            except JobCancelled as exc:
+                if jid in JOBS:
+                    JOBS[jid].update(status="cancelled", msg=str(exc))
             except Exception:
                 traceback.print_exc()
                 if jid in JOBS:
@@ -5682,6 +5901,17 @@ if _CU130_CHILD:
             log(f"  job {jid} start: {f0:.1f} GB free")
             j["memlog"] = f"VRAM at job start: {f0:.1f} GB free\n"
 
+            continuation = p.get("continuation_mode") in {"motion", "masked"}
+            continuity_head = 0
+            continuity_meta = {}
+            continuity_parent = p.get("_continuity_parent")
+            suite = None
+            if continuation:
+                suite = _continuity_pack("suite")
+                if p["continuation_mode"] == "masked":
+                    suite._require_masked_av_support()
+                else:
+                    _continuity_pack("motion")._ensure_layout_ok()
             _set_job_stage(jid, "loading model")
             _check_job_cancel(jid)
             model, clip, vae, avae, lora_info = get_models(
@@ -5734,6 +5964,11 @@ if _CU130_CHILD:
 
             _set_job_stage(jid, "conditioning")
             n_frames, actual_sec, requested_sec = resolve_length(p)
+            if continuation:
+                context = (39 if p["continuation_mode"] == "masked" else int(p["continuation_context"])) if continuity_parent else 0
+                n_frames = _snap_frames(float(p["duration"]) * MODEL_FPS + context)
+                actual_sec = n_frames / MODEL_FPS
+                requested_sec = float(p["duration"])
             j["resolved_frames"] = int(n_frames)
             j["requested_final_sec"] = round(requested_sec, 3)
             log(f"  length -> {n_frames} legal frames ({actual_sec:.2f}s model time; requested final {requested_sec:.2f}s)")
@@ -5748,7 +5983,20 @@ if _CU130_CHILD:
                 raise ValueError("width and height must be at least 32")
             mode = (p.get("input_mode") or "fl2va").lower()
             t_cond0 = time.perf_counter()
-            if mode == "ref2va":
+            if continuation and continuity_parent and p["continuation_mode"] == "masked":
+                previous, _, _, handover = suite.H3ContinuousLoadLatent().load(
+                    _continuity_path(continuity_parent["latent_file"]), clip_index=1)
+                last = _prepare_frame(p["last_frame"], width, height, p.get("image_fit") or "cover") if p.get("last_frame") else None
+                positive, latent, continuity_head, _, note, _ = suite.H3ContinuousContinueV14().build(
+                    clip=clip, vae=vae, previous_latent=previous, prompt=p["prompt"],
+                    width=width, height=height, duration=actual_sec,
+                    duration_mode="Total Generation", masked_context_frames="39",
+                    audio_tail_carryover="Full Previous Tail", audio_feather_ticks=0,
+                    handover=handover, last_frame=last)
+                j["conditioning_mode"] = "masked_av"
+                log("  " + note)
+                previous = None
+            elif mode == "ref2va":
                 if not REF2VA_NODE_NAME:
                     raise RuntimeError("This ComfyUI build does not expose MiniMaxH3ReferenceToVideo, so the Ref2VA tab cannot run.")
                 kw = dict(clip=clip, vae=vae, audio_vae=avae, prompt=p["prompt"],
@@ -5808,6 +6056,15 @@ if _CU130_CHILD:
                     kw["last_frame"] = _prepare_frame(p["last_frame"], width, height, fit_mode)
                 positive, latent = call("MiniMaxH3ImageToVideo", **kw)
                 j["conditioning_mode"] = "fl2va"
+            if continuation and continuity_parent and p["continuation_mode"] == "motion":
+                previous, _, _, _ = suite.H3ContinuousLoadLatent().load(
+                    _continuity_path(continuity_parent["latent_file"]), clip_index=1)
+                positive, continuity_head = _continuity_pack("motion").MiniMaxH3MotionContext().apply(
+                    conditioning=positive, vae=vae, latent=latent,
+                    context_length=str(p["continuation_context"]),
+                    audio_context_length=p["continuation_audio_context"], context_latent=previous)
+                previous = None
+                j["conditioning_mode"] = "motion_context"
             # Conditioning kernels are asynchronous. Synchronize here before any
             # model-manager unload/move so no kernel can still reference TE storage.
             torch.cuda.synchronize()
@@ -6032,6 +6289,40 @@ if _CU130_CHILD:
             torch.cuda.synchronize()
             j["audio_decode_sec"] = round(time.perf_counter() - t_adec0, 3)
 
+            if continuation:
+                from safetensors.torch import save_file as _save_av_checkpoint
+                _check_job_cancel(jid)
+                _set_job_stage(jid, "saving continuation checkpoint")
+                if p["continuation_mode"] == "masked":
+                    handover = suite.H3ContinuousAnalyzeHandoverV14().analyze(images, preset="Balanced")[0]
+                else:
+                    handover = {"available": True, "frame_count": n_frames,
+                                "handover_end_frame": n_frames - 1, "landing_tail_frames": 0}
+                latent_name = f"{jid}.av.safetensors"
+                latent_path = os.path.join(OUT, latent_name)
+                video_z, audio_z = samples["samples"].tensors
+                metadata = {"format": "h3_continuous_av_v8", "fps": str(MODEL_FPS),
+                            "frame_count": str(n_frames), "head_context_frames": str(continuity_head),
+                            "handover_json": json.dumps(handover), "studio_continuation": p["continuation_mode"]}
+                try:
+                    _save_av_checkpoint({"video": video_z.detach().cpu().contiguous(),
+                                         "audio": audio_z.detach().cpu().contiguous()}, latent_path + ".tmp", metadata=metadata)
+                    os.replace(latent_path + ".tmp", latent_path)
+                finally:
+                    if os.path.exists(latent_path + ".tmp"): os.remove(latent_path + ".tmp")
+                continuity_meta = {"continuation_mode": p["continuation_mode"], "latent_file": latent_name,
+                                   "handover": handover, "native_frames": n_frames,
+                                   "context_head_frames": int(continuity_head)}
+                # Preview keeps the final landing; it is shortened only when its child is accepted.
+                # Trim audio on the exact same 24 fps time axis as the duplicated picture head.
+                images, audio, _, _, _ = suite.H3ContinuousStitchOutputV14().prepare(
+                    images=images, audio=audio, output_mode="Final Clip",
+                    head_context_frames=int(continuity_head), handover=handover)
+                stage_first_png, stage_last_png = _save_stage_frame_pair(jid, images)
+                n_frames = int(images.shape[0])
+                actual_sec = n_frames / MODEL_FPS
+                j["continuation"] = dict(continuity_meta)
+
             if FULL_STACK_RESIDENCY:
                 # If the model manager moved anything during VAE decode, restore it
                 # immediately so idle VRAM remains warm for the next queued job.
@@ -6080,7 +6371,7 @@ if _CU130_CHILD:
             requested_final = max(0.01, float(requested_sec))
             # This is the real playback factor after H3 legal-frame snapping. For
             # 7.00 sec at normal speed: 175/24 / 7.00 = 1.0416667x.
-            effective_speed = actual_sec / requested_final
+            effective_speed = 1.0 if continuation else actual_sec / requested_final
             raw_dest = dest if abs(effective_speed - 1.0) < 1e-6 else os.path.join(OUT, f"{jid}.native.mp4")
             video.save_to(raw_dest)
             if not os.path.exists(raw_dest):
@@ -6155,6 +6446,7 @@ if _CU130_CHILD:
                 "continued_from_job": p.get("stage_source_job"),
                 "params": dict(p),
             }
+            entry.update(continuity_meta)
             review_only = str(p.get("review_before_timeline") or "0") == "1"
             entry["review_required"] = review_only
             if review_only:
@@ -6190,7 +6482,7 @@ if _CU130_CHILD:
                 else:
                     _set_job_stage(jid, "stitching timeline")
                     try:
-                        segment_paths = [_timeline_segment_media_path(s) for s in segs]
+                        segment_paths = [_timeline_segment_media_path(s) for s in _continuity_effective_segments(segs)]
                         master_name = f"timeline_{uuid.uuid4().hex[:10]}.mp4"
                         master_path = os.path.join(OUT, master_name)
                         stitch_ok, stitch_note = _concat_mp4_timeline(segment_paths, master_path)
@@ -7937,7 +8229,12 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
                     continue
                 lora_state[key] = strength
 
+        try:
+            continuity_config = _continuity_options(raw.get("continuity") or {})
+        except ValueError:
+            continuity_config = _continuity_options({})
         return {
+            "continuity": continuity_config,
             "schema": STUDIO_CONFIG_SCHEMA,
             "model_profile": profile,
             "unet": unet,
@@ -8035,11 +8332,28 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
               "weight_dtype","lora","lora_strength","motion8","motion8_strength","action","action_strength","lightning",
               "lightning_strength","medium8","medium8_strength","taomate","taomate_strength","unet", "use_stage_last", "timeline_action",
               "input_mode", "ref_image_size", "model_profile", "performance_preset",
-              "ref_first_guide", "ref_last_guide", "ref_video_audio", "review_before_timeline")}
+              "ref_first_guide", "ref_last_guide", "ref_video_audio", "review_before_timeline",
+              "continuation_mode", "continuation_context", "continuation_audio_context",
+              "seam_video_frames", "seam_audio_ms", "seam_luminance")}
         input_mode = (p.get("input_mode") or "fl2va").strip().lower()
         if input_mode not in {"fl2va", "ref2va"}:
             input_mode = "fl2va"
         p["input_mode"] = input_mode
+        try:
+            p.update(_continuity_options(p))
+            if p["continuation_mode"] in {"motion", "masked"}:
+                if input_mode == "ref2va" and p["continuation_mode"] == "masked":
+                    raise ValueError("Masked A/V currently uses FL2VA. Choose Motion context for Ref2VA.")
+                if float(p.get("playback_speed") or 1) != 1 or float(p.get("denoise") or 1) != 1:
+                    raise ValueError("Latent continuation requires motion pace 1.00× and denoise 1.0.")
+                minimum = 4 if p["continuation_mode"] == "masked" else 2
+                duration = float(p.get("duration") or 0)
+                if not np.isfinite(duration) or not minimum <= duration <= 15:
+                    raise ValueError(f"Use {minimum}–15 seconds of new footage per latent-continuation clip.")
+                if p.get("length_mode") not in (None, "", "seconds"):
+                    raise ValueError("Latent continuation uses seconds of new footage.")
+        except (ValueError, TypeError) as exc:
+            return jsonify(error=str(exc)), 400
         _allowed_unets = {FALLBACK_DIT_FILE, REF2VA_DIT_FILE, T4_DIT_FILE} | {x["local_name"] for x in _custom_model_public_rows()}
         requested_unet = os.path.basename(str(p.get("unet") or DIT_FILE))
         if requested_unet not in _allowed_unets:
@@ -8244,7 +8558,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         timeline_action = (p.get("timeline_action") or "new").lower()
         if timeline_action != "continue":
             p["use_stage_last"] = "0"
-        if input_mode != "fl2va" and timeline_action == "continue":
+        if input_mode != "fl2va" and timeline_action == "continue" and p["continuation_mode"] != "motion":
             return jsonify(error="Continue uses the FL2VA first/last-frame path. Switch back to the Current Model tab for continuation renders."), 400
         with TIMELINE_LOCK:
             target_seq = _active_sequence_unlocked(create=True)
@@ -8274,6 +8588,11 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
                     has_pending_same = True
             if not has_pending_same:
                 return jsonify(error="The active sequence is empty. Generate or queue its first clip before continuing."), 400
+        if timeline_action == "continue" and target_has_clips and p["continuation_mode"] in {"motion", "masked"}:
+            try:
+                _continuity_previous(p, list(target_seq.get("segments") or []))
+            except ValueError as exc:
+                return jsonify(error=str(exc)), 400
         # Explicit uploaded first frames are already stored above. Stage/continue
         # references are resolved by the worker when this job reaches the GPU.
         thumb_src = p.get("first_frame") or ((p.get("ref_images") or [None])[0])
@@ -8406,6 +8725,26 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
             note=note,
             timeline=_timeline_public_state(),
         )
+
+    @app.post("/api/timeline/seamless_export")
+    def api_timeline_seamless_export():
+        if not ML_OK:
+            return jsonify(error="MissingLink token not validated."), 402
+        try:
+            settings = _continuity_options(request.get_json(silent=True) or {})
+            with TIMELINE_LOCK:
+                seq = _active_sequence_unlocked(create=True)
+                snapshot = json.dumps(seq.get("segments") or [], sort_keys=True)
+                segments = json.loads(snapshot)
+                _continuity_validate_export(segments)
+                settings.update(_continuity_export=segments, _target_sequence_id=seq["id"], _export_snapshot=snapshot)
+        except (ValueError, TypeError) as exc:
+            return jsonify(error=str(exc)), 400
+        jid = uuid.uuid4().hex[:8]
+        JOBS[jid] = {"status": "queued", "t0": time.time(), "stage": "queued", "export": True,
+                     "prompt": "Seamless chain export", "target_sequence_id": seq["id"]}
+        _enqueue_generation(jid, settings)
+        return jsonify(id=jid, queued=True)
 
     @app.post("/api/timeline/retry_last")
     def api_timeline_retry_last():
@@ -9174,8 +9513,9 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
                 return jsonify(error="That history clip has a different canvas size. Use a matching sequence or start a new sequence."), 400
             src.pop("history_id", None); src.pop("created", None); src.pop("status", None)
             src["segment_id"] = uuid.uuid4().hex[:12]
-            src["continued"] = False
-            src["continued_from_job"] = None
+            if src.get("continuation_mode") not in {"motion", "masked"}:
+                src["continued"] = False
+                src["continued_from_job"] = None
             src["params"] = dict(src.get("params") or {})
             src["source_frames"] = int(src.get("source_frames") or src.get("frames") or 1)
             src["source_duration"] = float(src.get("source_duration") or src.get("duration") or (src["source_frames"] / MODEL_FPS))
@@ -9361,6 +9701,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     button{border:0;border-radius:7px;background:var(--accent);color:#111;padding:10px 11px;font:inherit;font-weight:800;cursor:pointer}
     button:disabled{background:#29292f;color:#666;cursor:not-allowed}.inlinebtn{background:#29292f;color:#ccc;padding:8px 9px;width:100%;margin-top:8px;font-size:10.5px}.inlinebtn.active{background:var(--accent);color:#111}
     .installed{color:#7cc38c}.missing{color:#d6a56d}
+    #continuity_options[hidden],#continuity_motion_options[hidden],#continuity_latent_options[hidden]{display:none!important}
     .preset3{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
     .preset3 .inlinebtn{margin:0;min-height:58px;padding:9px 10px;display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:3px;text-align:left;border:1px solid #35363d;border-radius:10px}
     .preset3 .inlinebtn:hover{border-color:#555761}
@@ -9483,7 +9824,28 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     <div style="margin-top:11px;padding-top:9px;border-top:1px solid #24252a">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
         <div style="font-size:8px;font-weight:800;letter-spacing:.8px;color:#a7a9b0;text-transform:uppercase">Clip continuity · optional</div>
-        <label class=switchrow style="margin:0"><input id=continuity_enabled type=checkbox autocomplete=off><span style="font-size:9px;color:#aaa">USE PREVIOUS LAST FRAME</span></label>
+        <label class=switchrow style="margin:0"><input id=continuity_enabled type=checkbox autocomplete=off><span style="font-size:9px;color:#aaa">ENABLE CONTINUATION</span></label>
+      </div>
+      <div id=continuity_options hidden>
+        <label for=continuation_mode>Continuation method</label>
+        <select id=continuation_mode>
+          <option value=frame>Last frame · existing behavior</option>
+          <option value=motion>Motion context · video + audio</option>
+          <option value=masked>Masked A/V · freeze-aware FL2VA</option>
+        </select>
+        <div id=continuity_motion_options class=g2 hidden>
+          <div><label for=continuation_context>Video context</label><select id=continuation_context><option value=5>5 frames</option><option value=22 selected>22 frames · recommended</option><option value=39>39 frames</option><option value=56>56 frames</option></select></div>
+          <div><label for=continuation_audio_context>Audio context</label><select id=continuation_audio_context><option value=24>1 second</option><option value=48>2 seconds</option><option value=72>3 seconds</option></select></div>
+        </div>
+        <div id=continuity_latent_options hidden>
+          <div class=hint>Enable before generating the first clip in a new sequence. Saves video/audio checkpoints for later continuation. Use native motion pace 1.00× and denoise 1.0. Duration is new footage, rounded to H3's frame grid.</div>
+          <details><summary>Seamless export settings</summary>
+            <div class=g2><div><label for=seam_video_frames>Video blend · frames</label><input id=seam_video_frames type=number value=4 min=0 max=16 step=1></div><div><label for=seam_audio_ms>Audio de-click · ms</label><input id=seam_audio_ms type=number value=15 min=0 max=100 step=1></div></div>
+            <label><input id=seam_luminance type=checkbox> Match brightness at joins</label>
+            <div class=hint>Brightness matching is optional; start with it off. These controls apply to SEAMLESS EXPORT, which rebuilds the chain from its saved checkpoints. COMPILE remains a fast preview. Zero disables either blend.</div>
+          </details>
+          <div class=hint>First use downloads the selected continuation tools. Old clips without checkpoints need a new latent-enabled starter. Same model and resolution throughout a chain.</div>
+        </div>
       </div>
       <div class=switchrow><input id=continuity_keep_seed type=checkbox autocomplete=off><label for=continuity_keep_seed>reuse previous clip seed</label></div>
       <div class=hint id=continuity_hint><b>OFF:</b> GENERATE makes a fully independent clip. When enabled, the next GENERATE uses the previous timeline clip's lossless final frame as its first-frame anchor. No latent data is carried between clips.</div>
@@ -9593,6 +9955,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
           <button id=timeline_new_sequence>+ SEQUENCE</button>
           <button id=project_menu_btn>PROJECT ▾</button>
           <button id=timeline_compile class=compile type=button disabled>⧉ COMPILE</button>
+          <button id=timeline_seamless class=compile type=button disabled>SEAMLESS EXPORT</button>
           <button id=timeline_clear class=danger type=button disabled>⌫ CLEAR</button>
         </div>
       </div>
@@ -10053,6 +10416,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         input_mode:currentModelMode(),
         performance_preset:ACTIVE_PERF_PRESET||'fast',
         lora_state:studioLoraStateSnapshot(),
+        continuity:{...continuitySettings(),continuation_mode:$('continuation_mode').value},
       };
     }
     async function loadDriveStudioConfig(){
@@ -10118,24 +10482,47 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       // Preset application establishes coherent sampler/step defaults first; the
       // persisted LoRA card map is authoritative afterwards, including OFF states.
       restoreLoraStateFromConfig(cfg.lora_state||{});
+      if(cfg.continuity){
+        for(const key of ['continuation_mode','continuation_context','continuation_audio_context','seam_video_frames','seam_audio_ms']){
+          if(cfg.continuity[key]!==undefined)$(key).value=String(cfg.continuity[key]);
+        }
+        $('seam_luminance').checked=['1','true'].includes(String(cfg.continuity.seam_luminance));
+        updateContinuityAvailability();
+      }
       syncModelProfileUI();
       syncUnifiedLoraCompatibility();
       say(`restored Drive config · ${activeModelLabel()} · ${mode==='ref2va'?'Ref2VA':'Current'} · ${preset.toUpperCase()}`);
       return true;
     }
+    function continuitySettings(){
+      return {
+        continuation_mode:$('continuity_enabled').checked?$('continuation_mode').value:'frame',
+        continuation_context:$('continuation_context').value,
+        continuation_audio_context:$('continuation_audio_context').value,
+        seam_video_frames:$('seam_video_frames').value,
+        seam_audio_ms:$('seam_audio_ms').value,
+        seam_luminance:$('seam_luminance').checked?'1':'0',
+      };
+    }
     function updateContinuityAvailability(){
-      const fl=currentModelMode()==='fl2va';
-      const toggle=$('continuity_enabled');
+      const mode=currentModelMode(),toggle=$('continuity_enabled');
       if(!toggle)return;
-      toggle.disabled=!fl;
-      if(!fl)toggle.checked=false;
+      $('continuation_mode').querySelector('[value="masked"]').disabled=mode!=='fl2va';
+      if(mode!=='fl2va'&&$('continuation_mode').value!=='motion')$('continuation_mode').value='motion';
+      const method=$('continuation_mode').value,advanced=method!=='frame';
       const segs=((window.H3TIMELINE||{}).segments)||[];
+      $('continuity_options').hidden=!toggle.checked;
+      $('continuity_motion_options').hidden=method!=='motion';
+      $('continuity_latent_options').hidden=!advanced;
       if(!toggle.checked){
-        $('continuity_hint').innerHTML='<b>OFF:</b> GENERATE makes a fully independent clip. When enabled, the next GENERATE uses the previous timeline clip\'s lossless final frame as its first-frame anchor. No latent data is carried between clips.';
-      }else if(!segs.length){
-        $('continuity_hint').innerHTML='<b>ARMED:</b> there is no previous timeline clip yet, so this GENERATE will be independent. The following GENERATE can continue from its final frame.';
+        $('continuity_hint').textContent='OFF: Generate makes an independent clip.';
+      }else if(!advanced){
+        $('continuity_hint').textContent=segs.length?'Uses the previous clip’s last image. Motion and audio context are not carried.':'Armed: the first clip is independent; later clips use its last image.';
       }else{
-        $('continuity_hint').innerHTML='<b>LAST-FRAME CONTINUITY:</b> the next GENERATE will use the previous timeline clip\'s lossless final frame as its first-frame anchor. No latent state, overlap, or latent checkpoint is used.';
+        const prev=segs[segs.length-1];
+        const ready=!prev||(prev.latent_available&&prev.continuation_mode===method);
+        const detail=method==='masked'?'39 protected frames; automatic freeze-safe handover; full audio-tail carryover. Use 4–15 seconds.':'Carries the original motion and audio latents. Use 2–15 seconds.';
+        $('continuity_hint').textContent=(ready?(prev?'Ready to continue. ':'Ready to create a checkpointed starter. '):'Start a new sequence: the previous clip has no matching checkpoint. ')+detail;
       }
     }
     function customModelForProfile(profile=ACTIVE_MODEL_PROFILE,m=window.H3META||{}){
@@ -10223,6 +10610,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     $('continuity_enabled').checked=false;
     $('continuity_keep_seed').checked=false;
     $('continuity_enabled').addEventListener('change',updateContinuityAvailability);
+    $('continuation_mode').addEventListener('change',updateContinuityAvailability);
 
     let ACTIVE_MODEL_PROFILE='stock_quality';
     let ACTIVE_PERF_PRESET='fast';
@@ -11803,6 +12191,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       if(document.activeElement!==$('project_name')) $('project_name').value=t.project_name||'Current Project';
       updateContinuityAvailability(); $('timeline_retry').disabled=!segs.length;
       $('timeline_compile').disabled=!segs.length;
+      $('timeline_seamless').disabled=!segs.length||!segs.every(s=>s.latent_available);
       $('timeline_clear').disabled=!segs.length;
       const dl=$('project_download');if(t.project_file){dl.classList.remove('disabled');dl.dataset.href='/out/timeline_projects/'+encodeURIComponent(t.project_file)}else{dl.classList.add('disabled');delete dl.dataset.href}
       const ps=$('project_select'),saved=t.saved_projects||[];ps.innerHTML=saved.length?saved.map(p=>`<option value="${esc(p.project_file)}" ${p.project_file===t.project_file?'selected':''}>${esc(p.project_name||p.project_file)} · ${p.clip_count||0} clip(s) · ${(Number(p.total_duration)||0).toFixed(2)}s</option>`).join(''):'<option value="">No saved timelines yet</option>';
@@ -12034,7 +12423,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       }
       const mode=currentModelMode();
       const segs=((window.H3TIMELINE||{}).segments)||[];
-      const usePrevious=mode==='fl2va' && $('continuity_enabled').checked && segs.length>0;
+      const usePrevious=$('continuity_enabled').checked && segs.length>0 && (mode==='fl2va'||$('continuation_mode').value==='motion');
       const timelineAction=usePrevious?'continue':'new';
       if(!usePrevious)stageButtonActive(false);
 
@@ -12054,6 +12443,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       fd.append('model_profile',String(ACTIVE_MODEL_PROFILE||'stock_quality'));
       fd.append('performance_preset',String(ACTIVE_PERF_PRESET||''));
       if(NEXT_SCENE_PENDING_TOKEN)fd.append('story_director_token',NEXT_SCENE_PENDING_TOKEN);
+      for(const [key,value] of Object.entries(continuitySettings()))fd.append(key,value);
       fd.append('review_before_timeline',$('review_before_timeline').checked?'1':'0');
       fd.append('timeline_action',timelineAction);fd.append('input_mode',mode);fd.append('ref_image_size',$('ref_image_size').value);fd.append('action','0');fd.append('action_strength','0');fd.append('lightning',Math.abs(lightningSubmit)>1e-6?'1':'0');
       if(mode==='ref2va'){
@@ -12069,7 +12459,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         for(const k of ['first_frame','last_frame'])if($(k).files[0])fd.append(k,$(k).files[0]);
       }
       mlTrack('notebook_h3_generate_pressed',{action:'submit',target:'#go',meta:{...mlGenerationUiMeta(),timeline_action:timelineAction},immediate:true});
-      dot('live');say(timelineAction==='continue'?'adding generation with previous last-frame continuity':(mode==='ref2va'?'adding Ref2VA generation to queue':'adding generation to queue'));
+      dot('live');say(timelineAction==='continue'?'adding continuation to queue':(mode==='ref2va'?'adding Ref2VA generation to queue':'adding generation to queue'));
       const resp=await fetch('/api/generate',{method:'POST',body:fd});
       const r=await resp.json();
       if(r.adult_ack_required){
@@ -12096,6 +12486,25 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       job=r.id;poll(job);refreshQueue();
     }
     $('go').onclick=()=>submitGeneration();
+    $('timeline_seamless').onclick=async()=>{
+      try{
+        const response=await fetch('/api/timeline/seamless_export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(continuitySettings())});
+        const result=await response.json();
+        if(!response.ok||result.error)throw new Error(result.error||'Could not queue export.');
+        say('Seamless export queued · cancellable from Queue');
+        const watch=async()=>{
+          try{
+            const status=await(await fetch('/api/job/'+result.id)).json();
+            if(status.status==='done'){
+              await refreshTimeline(true);previewTimelineFile(status.file);say('Seamless export ready');return;
+            }
+            if(status.status==='error'||status.status==='cancelled'){await uiAlert(status.msg||status.status,'Seamless export');return;}
+            setTimeout(watch,1500);
+          }catch(error){await uiAlert(error.message,'Export status unavailable');}
+        };
+        setTimeout(watch,1500);
+      }catch(error){await uiAlert(error.message,'Seamless export');}
+    };
     $('timeline_compile').onclick=async()=>{
       $('err').style.display='none';
       const b=$('timeline_compile');
