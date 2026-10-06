@@ -151,6 +151,15 @@ VR180SBS_FILE = "h3-vr180-sbs-lora-v2.safetensors"
 VR180SBS_DEFAULT_STRENGTH = 0.0
 VR180SBS_ON_STRENGTH = 1.0
 
+# Projection LoRAs render at H3's native 768P 21:9 bucket, then optionally ship
+# 2K/4K delivery files through a post-export packaging step.
+PROJECTION_DELIVERY_DEFAULT = "4k"
+PROJECTION_DELIVERY_MODES = {"native", "2k", "4k"}
+PROJECTION_DELIVERY_TARGETS = {
+    "2k": (2048, 1024),
+    "4k": (4096, 2048),
+}
+
 # No built-in specialty catalog is configured.
 SPECIALTY_LORA_PRESETS = []
 SPECIALTY_LORA_STATES = []
@@ -4096,7 +4105,9 @@ if _CU130_CHILD:
         "muxing": 95.0,
         "saving": 97.0,
         "retiming exact duration": 98.0,
-        "stitching timeline": 99.0,
+        "upscaling delivery": 98.6,
+        "packaging projection output": 99.2,
+        "stitching timeline": 99.5,
         "done": 100.0,
     }
 
@@ -4211,6 +4222,10 @@ if _CU130_CHILD:
         if not name or name == "none" or float(strength) == 0:
             return model, None
         _ensure_optional_lora_selected(name)
+        try:
+            folder_paths.cache_helper.clear()
+        except Exception:
+            pass
         before = _patch_count(model)
         model, = call("LoraLoaderModelOnly", model=model, lora_name=name,
                       strength_model=float(strength))
@@ -4834,6 +4849,53 @@ if _CU130_CHILD:
         except Exception:
             pass
         return None
+
+    def _normalize_projection_delivery_mode(value):
+        mode = str(value or PROJECTION_DELIVERY_DEFAULT).strip().lower()
+        return mode if mode in PROJECTION_DELIVERY_MODES else PROJECTION_DELIVERY_DEFAULT
+
+    def _projection_delivery_target(mode):
+        mode = _normalize_projection_delivery_mode(mode)
+        return PROJECTION_DELIVERY_TARGETS.get(mode)
+
+    def _package_projection_delivery_video(src, dest, *, projection_kind="", delivery_mode="4k"):
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError("ffmpeg is required for 2K/4K projection delivery packaging")
+        target = _projection_delivery_target(delivery_mode)
+        if not target:
+            if os.path.abspath(src) != os.path.abspath(dest):
+                os.replace(src, dest)
+            return
+        tw, th = target
+        # Preserve the rendered view, upscale with Lanczos, then pad to an exact
+        # 2:1 headset-friendly container instead of cropping away panorama width.
+        vf = (
+            f"scale={tw}:{th}:force_original_aspect_ratio=decrease:flags=lanczos,"
+            f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
+        )
+        tmp = dest + ".tmp.mp4"
+        for pth in (tmp, dest):
+            try:
+                if pth != src:
+                    os.remove(pth)
+            except FileNotFoundError:
+                pass
+        cmd = [
+            ffmpeg, "-y", "-i", src,
+            "-vf", vf,
+            "-map", "0:v:0", "-map", "0:a?",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart", tmp,
+        ]
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if r.returncode != 0 or not os.path.exists(tmp):
+            raise RuntimeError(
+                f"{projection_kind or 'projection'} {delivery_mode.upper()} packaging failed: " +
+                (r.stderr[-900:] if r.stderr else "ffmpeg failed")
+            )
+        os.replace(tmp, dest)
 
     def _retime_video(src, dest, speed):
         speed = float(speed)
@@ -6456,6 +6518,29 @@ if _CU130_CHILD:
                     pass
             final_speed = effective_speed if speed_ok else 1.0
             final_duration = actual_sec / final_speed
+            output_width, output_height = int(width), int(height)
+            delivery_mode = _normalize_projection_delivery_mode(p.get("delivery_resolution"))
+            projection_output = str(p.get("projection_output") or "").strip().lower()
+            if projection_output in {"vr180sbs", "equirect360"} and delivery_mode in {"2k", "4k"}:
+                _set_job_stage(jid, "upscaling delivery")
+                _check_job_cancel(jid)
+                delivery0 = time.perf_counter()
+                packaged = dest + ".delivery.mp4"
+                _package_projection_delivery_video(dest, packaged, projection_kind=projection_output, delivery_mode=delivery_mode)
+                _set_job_stage(jid, "packaging projection output")
+                _check_job_cancel(jid)
+                os.replace(packaged, dest)
+                output_width, output_height = _projection_delivery_target(delivery_mode)
+                j["delivery_post_sec"] = round(time.perf_counter() - delivery0, 3)
+                j["delivery_resolution"] = delivery_mode
+                j["projection_output"] = projection_output
+                j["delivery_dimensions"] = [int(output_width), int(output_height)]
+                log(f"  ✓ projection delivery -> {projection_output} {delivery_mode.upper()} {output_width}x{output_height}")
+            else:
+                j["delivery_resolution"] = "native"
+                j["requested_delivery_resolution"] = delivery_mode
+                if delivery_mode != "native" and not projection_output:
+                    log(f"  ↳ delivery {delivery_mode.upper()} requested without a managed projection LoRA; native output kept")
             measured_file_duration = _probe_media_duration(dest)
             if measured_file_duration is not None:
                 j["file_duration_sec"] = round(measured_file_duration, 4)
@@ -6503,8 +6588,12 @@ if _CU130_CHILD:
                 "source_frames": int(n_frames),
                 "trim_start_frame": 0,
                 "trim_end_frame": max(0, int(n_frames) - 1),
-                "width": int(width),
-                "height": int(height),
+                "width": int(output_width),
+                "height": int(output_height),
+                "render_width": int(width),
+                "render_height": int(height),
+                "delivery_resolution": j.get("delivery_resolution") or _normalize_projection_delivery_mode(p.get("delivery_resolution")),
+                "projection_output": projection_output,
                 "seed": int(p.get("seed") or 0),
                 "prompt": p.get("prompt") or "",
                 "first_frame_file": (os.path.basename(stage_first_png) if stage_first_png else None),
@@ -6612,6 +6701,9 @@ if _CU130_CHILD:
                      model_duration=round(actual_sec, 2), duration=round(final_duration, 2),
                      requested_final_sec=round(requested_sec, 2),
                      playback_speed=round(final_speed, 3), note=speed_note,
+                     width=int(output_width), height=int(output_height),
+                     render_width=int(width), render_height=int(height),
+                     delivery_resolution=j.get("delivery_resolution") or _normalize_projection_delivery_mode(p.get("delivery_resolution")),
                      continued_from_stage=(str(p.get("use_stage_last") or "0") == "1"),
                      stage_last_frame_file=(os.path.basename(stage_last_png) if stage_last_png else None))
         except GenerationRestart:
@@ -7396,6 +7488,7 @@ if _CU130_CHILD:
             ref2va_unet=REF2VA_DIT_FILE, stock_ref2va_unet=REF2VA_DIT_FILE,
             base_fl2va_unet=(T4_DIT_FILE if LOWVRAM_T4_PROFILE else FALLBACK_DIT_FILE),
             output_storage=OUTPUT_STORAGE, output_persistent=bool(OUTPUT_PERSISTENT), output_label=OUTPUT_LABEL,
+            delivery_resolution_default=PROJECTION_DELIVERY_DEFAULT,
             eros_max_unet="", redmix_unet="", eros_max_sha256="", eros_integrated_turbo=False,
             motion8_file=MOTION8_FILE, motion8_available=bool(not LOWVRAM_T4_PROFILE), model_profiles=profile_state,
             equirect360_repo=EQUIRECT360_REPO, equirect360_file=EQUIRECT360_FILE,
@@ -8312,6 +8405,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
             continuity_config = _continuity_options(raw.get("continuity") or {})
         except ValueError:
             continuity_config = _continuity_options({})
+        output_resolution = _normalize_projection_delivery_mode(raw.get("output_resolution"))
         return {
             "continuity": continuity_config,
             "schema": STUDIO_CONFIG_SCHEMA,
@@ -8319,6 +8413,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
             "unet": unet,
             "input_mode": mode,
             "performance_preset": preset,
+            "output_resolution": output_resolution,
             "lora_state": lora_state,
         }
 
@@ -8410,7 +8505,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
               "shift_video","shift_audio","sparse_percent","sampler_name","scheduler",
               "weight_dtype","lora","lora_strength","motion8","motion8_strength","action","action_strength","lightning",
               "lightning_strength","medium8","medium8_strength","taomate","taomate_strength","unet", "use_stage_last", "timeline_action",
-              "input_mode", "ref_image_size", "model_profile", "performance_preset",
+              "input_mode", "ref_image_size", "model_profile", "performance_preset", "delivery_resolution",
               "ref_first_guide", "ref_last_guide", "ref_video_audio", "review_before_timeline",
               "continuation_mode", "continuation_context", "continuation_audio_context",
               "seam_video_frames", "seam_audio_ms", "seam_luminance")}
@@ -8418,6 +8513,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         if input_mode not in {"fl2va", "ref2va"}:
             input_mode = "fl2va"
         p["input_mode"] = input_mode
+        p["delivery_resolution"] = _normalize_projection_delivery_mode(p.get("delivery_resolution"))
         try:
             p.update(_continuity_options(p))
             if p["continuation_mode"] in {"motion", "masked"}:
@@ -8456,7 +8552,12 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
                 name = os.path.basename(str(item.get("file") or ""))
                 if not name or name == "none":
                     continue
-                if name not in installed_loras:
+                # Managed built-ins are intentionally allowed through while absent:
+                # get_models() will lazily install them as a backend safety net. The
+                # browser normally pre-downloads them through /api/loras/install so
+                # users see live byte/progress updates before this request is sent.
+                managed_lazy_loras = {EQUIRECT360_FILE, VR180SBS_FILE}
+                if name not in installed_loras and name not in managed_lazy_loras:
                     return jsonify(error=f"LoRA is not installed: {name}"), 400
                 try:
                     strength = float(item.get("strength") or 0.0)
@@ -8464,6 +8565,31 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
                     strength = 0.0
                 if abs(strength) > 1e-6:
                     extra_loras.append((name, strength))
+
+        # Managed projection LoRAs have a fixed native H3 render bucket. Enforce it
+        # server-side too so saved configs, direct API calls, or stale browser state
+        # cannot submit an invalid 21:9 approximation such as 5120x2160.
+        _active_managed_names = {name for name, strength in extra_loras if abs(float(strength)) > 1e-6}
+        if EQUIRECT360_FILE in _active_managed_names or VR180SBS_FILE in _active_managed_names:
+            p["width"] = "1536"
+            p["height"] = "672"
+        p["projection_output"] = (
+            "vr180sbs" if VR180SBS_FILE in _active_managed_names else
+            ("equirect360" if EQUIRECT360_FILE in _active_managed_names else "")
+        )
+        if VR180SBS_FILE in _active_managed_names:
+            # Keep VR180 on the native stock H3 recipe. Its model card warns that
+            # the 8-step accelerated route degrades stereo consistency.
+            p["medium8"] = "0"
+            p["lightning"] = "0"
+            p["taomate"] = "0"
+            p["steps"] = "20"
+            p["sampler_name"] = "res_multistep"
+            p["scheduler"] = "simple"
+            p["shift_video"] = "12"
+            p["shift_audio"] = "3"
+            p["sparse_percent"] = "0"
+            p["performance_preset"] = "quality"
 
         for i in range(1, 5):
             name = (request.form.get(f"extra_lora_{i}") or "none").strip()
@@ -9891,7 +10017,9 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     </div>
 
     <div class=g2><div><label>Width</label><input id=width type=number value=768 step=32 min=32 autocomplete=off></div><div><label>Height</label><input id=height type=number value=768 step=32 min=32 autocomplete=off></div></div>
-    <div class=g2><div><label>Duration</label><input id=duration type=number value=7 step=0.1 min=0.21 max=149.7 autocomplete=off></div><div><label>Motion pace</label><div class=motionline><input id=playback_speed type=range value=1 min=0.75 max=2 step=0.05><span id=motion_pace_value class=slidervalue>1.00×</span></div></div></div>
+    <div class=g2><div><label>Delivery resolution</label><select id=delivery_resolution><option value="native">Native render only</option><option value="2k">2K packaged output</option><option value="4k" selected>4K packaged output</option></select></div><div><label>Duration</label><input id=duration type=number value=7 step=0.1 min=0.21 max=149.7 autocomplete=off></div></div>
+    <div class=hint id=delivery_hint>Projection LoRAs render at 1536×672, then optional 2K/4K delivery packaging exports a headset-friendly file. Non-projection renders keep their native size.</div>
+    <div class=g2><div><label>Motion pace</label><div class=motionline><input id=playback_speed type=range value=1 min=0.75 max=2 step=0.05><span id=motion_pace_value class=slidervalue>1.00×</span></div></div><div></div></div>
     <input id=length_mode type=hidden value=seconds><input id=frames type=hidden value=481>
     <div class=hint id=durhint></div>
     <div class=hint><b>Motion pace:</b> 1.00× keeps native H3 timing. Higher values generate more model-time and retime it back to the requested duration, reducing the “slow-motion” feel without changing the final clip length.</div>
@@ -10494,6 +10622,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         unet:$('unet')?$('unet').value:'',
         input_mode:currentModelMode(),
         performance_preset:ACTIVE_PERF_PRESET||'fast',
+        output_resolution:$('delivery_resolution')?$('delivery_resolution').value:(window.H3META?.delivery_resolution_default||'4k'),
         lora_state:studioLoraStateSnapshot(),
         continuity:{...continuitySettings(),continuation_mode:$('continuation_mode').value},
       };
@@ -10568,8 +10697,13 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         $('seam_luminance').checked=['1','true'].includes(String(cfg.continuity.seam_luminance));
         updateContinuityAvailability();
       }
+      if($('delivery_resolution')){
+        const dr=String(cfg.output_resolution||window.H3META?.delivery_resolution_default||'4k').toLowerCase();
+        $('delivery_resolution').value=['native','2k','4k'].includes(dr)?dr:(window.H3META?.delivery_resolution_default||'4k');
+      }
       syncModelProfileUI();
       syncUnifiedLoraCompatibility();
+      updateDeliveryResolutionHint();
       say(`restored Drive config · ${activeModelLabel()} · ${mode==='ref2va'?'Ref2VA':'Current'} · ${preset.toUpperCase()}`);
       return true;
     }
@@ -11153,7 +11287,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       if(m.equirect360_file){
         cards.push({kind:'managed360',file:m.equirect360_file,label:'360° Equirectangular LoRA',
           available:true,installed:!!m.equirect360_installed,onStrength:Number(m.equirect360_on_strength||0.75),
-          detail:m.equirect360_installed?'MiniMax H3 360° panorama · installed':'MiniMax H3 360° panorama · download on enable',
+          detail:m.equirect360_installed?'MiniMax H3 360° panorama · native 1536×672 (21:9) · installed':'MiniMax H3 360° panorama · native 1536×672 (21:9) · download on enable',
           source_url:sourceMap[m.equirect360_file]||('https://huggingface.co/'+String(m.equirect360_repo||''))});
         seen.add(m.equirect360_file);
       }
@@ -11163,7 +11297,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       if(m.vr180sbs_file){
         cards.push({kind:'managedvr180',file:m.vr180sbs_file,label:'VR180 SBS LoRA',
           available:true,installed:!!m.vr180sbs_installed,onStrength:Number(m.vr180sbs_on_strength||1.0),
-          detail:m.vr180sbs_installed?'VR180 stereo SBS · 21:9 · trigger: vr180sbs · installed':'VR180 stereo SBS · 21:9 · trigger: vr180sbs · download on enable',
+          detail:m.vr180sbs_installed?'VR180 stereo SBS · native 1536×672 (21:9) · trigger: vr180sbs · installed':'VR180 stereo SBS · native 1536×672 (21:9) · trigger: vr180sbs · download on enable',
           source_url:sourceMap[m.vr180sbs_file]||('https://huggingface.co/'+String(m.vr180sbs_repo||''))});
         seen.add(m.vr180sbs_file);
       }
@@ -11208,6 +11342,53 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       const card=_namedLoraCards(m).find(x=>x.kind===kind);
       if(!card)return;
       _stateForCard(card).strength=Number(strength||0);
+    }
+    function _managedOutputState(m=window.H3META||{}){
+      const active={vr180:false,equirect360:false};
+      for(const card of _namedLoraCards(m)){
+        if(card.kind!=='managed360'&&card.kind!=='managedvr180')continue;
+        const strength=Number(_stateForCard(card).strength||0);
+        if(Math.abs(strength)<=1e-6||!_cardCompatible(card,m))continue;
+        if(card.kind==='managedvr180')active.vr180=true;
+        if(card.kind==='managed360')active.equirect360=true;
+      }
+      return active;
+    }
+    function updateDeliveryResolutionHint(){
+      const el=$('delivery_hint'); if(!el) return;
+      const mode=String(($('delivery_resolution')&&$('delivery_resolution').value)||((window.H3META||{}).delivery_resolution_default||'4k')).toLowerCase();
+      const active=_managedOutputState(window.H3META||{});
+      const modeLabel=mode==='2k'?'2K':(mode==='4k'?'4K':'native');
+      if(active.vr180){
+        el.textContent=mode==='native'
+          ? 'VR180 renders at native 1536×672. Choose 2K or 4K to package a headset-ready 2:1 SBS delivery file after generation.'
+          : `VR180 will render at 1536×672, then export a ${modeLabel} 2:1 SBS delivery file (${mode==='4k'?'4096×2048':'2048×1024'}).`;
+      }else if(active.equirect360){
+        el.textContent=mode==='native'
+          ? '360 renders at native 1536×672. Choose 2K or 4K to package an exact 2:1 delivery file after generation.'
+          : `360 will render at 1536×672, then export a ${modeLabel} 2:1 delivery file (${mode==='4k'?'4096×2048':'2048×1024'}).`;
+      }else{
+        el.textContent='Projection LoRAs render at 1536×672, then optional 2K/4K delivery packaging exports a headset-friendly file. Non-projection renders keep their native size.';
+      }
+    }
+    async function applyManagedLoraOutputPreset({announce=true}={}){
+      const active=_managedOutputState(window.H3META||{});
+      if(!active.vr180&&!active.equirect360)return active;
+      // Both trained adapters expect H3's native 768P 21:9 bucket. 1536x672 is
+      // exactly 21:9 and both dimensions satisfy H3's multiple-of-32 constraint.
+      $('width').value='1536';
+      $('height').value='672';
+      $('short_edge').value='672';
+      if(active.vr180 && (window.MEDIUM8_PRESET_ACTIVE || ACTIVE_PERF_PRESET==='fast' || ACTIVE_PERF_PRESET==='ultra')){
+        // VR180's author specifically recommends the native H3 path rather than an
+        // accelerated LoRA route for stereo consistency. Move to the stock QUALITY
+        // recipe automatically instead of silently generating a weaker stereo pair.
+        await applyPerformancePreset('quality');
+      }
+      updateDeliveryResolutionHint();
+      const deliveryMode=String(($('delivery_resolution')&&$('delivery_resolution').value)||((window.H3META||{}).delivery_resolution_default||'4k')).toUpperCase();
+      if(announce) say(active.vr180?`VR180 preset → 1536×672 native 21:9 · QUALITY · ${deliveryMode} delivery`:`360 preset → 1536×672 native 21:9 · ${deliveryMode} delivery`);
+      return active;
     }
     async function _installCatalogCard(card){
       const resp=await fetch('/api/loras/catalog_install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:card.catalogKey})});
@@ -11271,6 +11452,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         const selected=Math.abs(Number(st.strength||0))>1e-6;
         const active=compatible&&selected;
         const row=document.createElement('div');row.className='lorarow'+(compatible?'':' incompatible');
+        row.dataset.loraKey=_cardKey(card);
         const safeId='lc_'+Math.random().toString(36).slice(2);
         const status=!compatible?`incompatible with current model / mode${selected?` · saved ${Number(st.strength).toFixed(2)}`:''}`:(active?`active · ${Number(st.strength).toFixed(2)}`:(((card.kind==='catalog'||card.kind==='managed360'||card.kind==='managedvr180')&&!card.installed)?'download on enable':'off'));
         row.innerHTML=`<div class=lorarowhead><div><div class=lorarowtitle>${_cardTitleHTML(card)}</div><div class=lorarowmeta>${esc(status)}</div></div>`+
@@ -11327,6 +11509,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
               state.strength=Number(card.onStrength||(card.kind==='managedvr180'?1.0:0.75));
               LORA_CARD_STATE.delete(oldKey);
               LORA_CARD_STATE.set('file:'+file,state);
+              await applyManagedLoraOutputPreset();
               renderNamedLoraRows(window.H3META||{});
             }catch(err){
               st.strength=0;
@@ -11349,11 +11532,13 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
             return;
           }
           syncState(enabling?((card.kind==='managed360'||card.kind==='managedvr180')?Number(card.onStrength||(card.kind==='managedvr180'?1.0:0.75)):1):0);
+          if(enabling&&(card.kind==='managed360'||card.kind==='managedvr180'))await applyManagedLoraOutputPreset();
         };
       }
     }
-    function syncUnifiedLoraCompatibility(){renderNamedLoraRows(window.H3META||{})}
+    function syncUnifiedLoraCompatibility(){renderNamedLoraRows(window.H3META||{});updateDeliveryResolutionHint()}
     $('unet').addEventListener('change',syncUnifiedLoraCompatibility);
+    if($('delivery_resolution'))$('delivery_resolution').addEventListener('change',()=>updateDeliveryResolutionHint());
 
     function activeCreativeLoraStack(){
       const m=window.H3META||{},out=[];
@@ -11364,6 +11549,35 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       }
       return out;
     }
+    async function ensureActiveManagedLorasInstalled(){
+      // A saved Studio config can restore a managed LoRA at a nonzero strength
+      // even on a fresh runtime where the weight has not been downloaded yet.
+      // Treat that restored ON state exactly like clicking the switch: download it
+      // first through the progress-tracked installer, then submit generation.
+      let m=window.H3META||{};
+      for(const card of _namedLoraCards(m)){
+        if(!['managed360','managedvr180'].includes(card.kind))continue;
+        const st=_stateForCard(card),strength=Number(st.strength||0);
+        if(Math.abs(strength)<=1e-6||!_cardCompatible(card,m)||card.installed)continue;
+        const key=_cardKey(card);
+        const row=[...document.querySelectorAll('#unified_lora_rows .lorarow')].find(x=>x.dataset.loraKey===key);
+        const meta=row&&row.querySelector('.lorarowmeta');
+        if(!row||!meta)throw new Error('Could not locate the managed LoRA progress row. Refresh the Studio and try again.');
+        const toggle=row.querySelector('.loratoggle'),slider=row.querySelector('input[type=range]'),num=row.querySelector('.loranumber');
+        if(toggle)toggle.disabled=true;if(slider)slider.disabled=true;if(num)num.disabled=true;
+        meta.textContent='starting download…';
+        const file=await _installManagedLoraCard(card,meta,row);
+        const state=LORA_CARD_STATE.get(key)||st;
+        // Preserve the exact saved/user-entered strength instead of replacing it
+        // with the recommended switch-on default during automatic restoration.
+        state.strength=strength;
+        LORA_CARD_STATE.delete(key);
+        LORA_CARD_STATE.set('file:'+file,state);
+        m=window.H3META||{};
+        renderNamedLoraRows(m);
+      }
+    }
+
     function submittedSpecialStrength(kind){
       const m=window.H3META||{},card=_namedLoraCards(m).find(x=>x.kind===kind);
       if(!card||!_cardCompatible(card,m))return 0;
@@ -12570,11 +12784,20 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       $('err').textContent=m;$('go').disabled=false;$('pb').style.width='0';refreshTimeline(true)}
 
     async function submitGeneration(){
+      await applyManagedLoraOutputPreset({announce:false});
       const conflict=accelerationConflict();
       if(conflict){
         mlTrack('notebook_h3_generate_validation_blocked',{action:'acceleration_conflict',target:'#go',meta:{code:'acceleration_conflict'},immediate:true});
         fail(conflict);
         await uiAlert(conflict,'Choose one acceleration option');
+        return;
+      }
+      try{
+        await ensureActiveManagedLorasInstalled();
+      }catch(err){
+        const msg=String(err&&err.message||err||'Managed LoRA download failed.');
+        fail(msg);
+        await uiAlert(msg,'LoRA download failed');
         return;
       }
       const mode=currentModelMode();
@@ -12591,7 +12814,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       $('err').style.display='none';const fd=new FormData();
       fd.append('taomate','0'); fd.append('taomate_strength','0');
       fd.append('medium8',window.MEDIUM8_PRESET_ACTIVE?'1':'0'); fd.append('medium8_strength',String((window.H3META||{}).medium8_strength_default||1.0));
-      for(const k of ['prompt','width','height','duration','frames','length_mode','playback_speed','image_fit','steps','seed','denoise','shift_video','shift_audio','sparse_percent','sampler_name','scheduler','weight_dtype','unet','use_stage_last'])fd.append(k,$(k).value);
+      for(const k of ['prompt','width','height','duration','frames','length_mode','playback_speed','image_fit','steps','seed','denoise','shift_video','shift_audio','sparse_percent','sampler_name','scheduler','weight_dtype','unet','use_stage_last','delivery_resolution'])fd.append(k,$(k).value);
       const motion8Submit=submittedSpecialStrength('motion8'),lightningSubmit=submittedSpecialStrength('lightning');
       fd.append('motion8_strength',String(motion8Submit));fd.append('lightning_strength',String(lightningSubmit));
       fd.append('lora','none');fd.append('lora_strength','0');fd.append('lora_stack_json',JSON.stringify(activeCreativeLoraStack()));
