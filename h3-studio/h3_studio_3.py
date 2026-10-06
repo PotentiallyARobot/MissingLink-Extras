@@ -137,6 +137,20 @@ MOTION8_REPO = "rzgar/minimax-h3_fl2v_8Step_motion_enhancer"
 MOTION8_FILE = "minimax-h3_fl2v_8Step_motion_enhancer.safetensors"
 MOTION8_STRENGTH = 1.0
 
+# rehan-fal MiniMax H3 360° equirectangular creative LoRA.
+# It is intentionally OFF at startup and downloaded lazily only when enabled.
+EQUIRECT360_REPO = "rehan-fal/minimax-h3-360-equirect-lora"
+EQUIRECT360_FILE = "h3-360-equirect-lora-v1.safetensors"
+EQUIRECT360_DEFAULT_STRENGTH = 0.0
+EQUIRECT360_ON_STRENGTH = 0.75
+
+# rehan-fal MiniMax H3 VR180 stereoscopic side-by-side creative LoRA.
+# Like the 360 LoRA, it is OFF at startup and downloaded only on first enable.
+VR180SBS_REPO = "rehan-fal/minimax-h3-vr180-sbs-lora"
+VR180SBS_FILE = "h3-vr180-sbs-lora-v2.safetensors"
+VR180SBS_DEFAULT_STRENGTH = 0.0
+VR180SBS_ON_STRENGTH = 1.0
+
 # No built-in specialty catalog is configured.
 SPECIALTY_LORA_PRESETS = []
 SPECIALTY_LORA_STATES = []
@@ -3189,6 +3203,55 @@ if _CU130_CHILD:
     else:
         MOTION8_AVAILABLE = _ensure_motion8_lora()
 
+    EQUIRECT360_PATH = os.path.join(ldir, EQUIRECT360_FILE)
+    def _ensure_equirect360_lora():
+        try:
+            if os.path.exists(EQUIRECT360_PATH):
+                ok, err = _validate_safetensors_file(EQUIRECT360_PATH)
+                if ok:
+                    log(f"  ✓ 360 Equirect LoRA: {EQUIRECT360_FILE}")
+                    return True
+                log(f"  ⚠ 360 Equirect LoRA is corrupt: {err}; replacing it")
+                os.remove(EQUIRECT360_PATH)
+            log(f"  ↓ 360 Equirect LoRA: {EQUIRECT360_FILE} ({EQUIRECT360_REPO})")
+            src = hf_hub_download(EQUIRECT360_REPO, filename=EQUIRECT360_FILE, token=_hf_token() or None)
+            _atomic_copy_weight(src, EQUIRECT360_PATH)
+            _remember_lora_source(EQUIRECT360_FILE, _hf_repo_url(EQUIRECT360_REPO))
+            log(f"  ✓ 360 Equirect LoRA: {EQUIRECT360_FILE}")
+            return True
+        except Exception as e:
+            log(f"  ⚠ 360 Equirect LoRA unavailable: {e}")
+            return False
+
+    # Deliberately never download this at startup. The browser switch installs it
+    # with visible byte progress; this backend ensure is only a defensive fallback.
+    EQUIRECT360_AVAILABLE = True
+    log("  ✓ 360 Equirect LoRA available · download deferred until enabled")
+
+    VR180SBS_PATH = os.path.join(ldir, VR180SBS_FILE)
+    def _ensure_vr180sbs_lora():
+        try:
+            if os.path.exists(VR180SBS_PATH):
+                ok, err = _validate_safetensors_file(VR180SBS_PATH)
+                if ok:
+                    log(f"  ✓ VR180 SBS LoRA: {VR180SBS_FILE}")
+                    return True
+                log(f"  ⚠ VR180 SBS LoRA is corrupt: {err}; replacing it")
+                os.remove(VR180SBS_PATH)
+            log(f"  ↓ VR180 SBS LoRA: {VR180SBS_FILE} ({VR180SBS_REPO})")
+            src = hf_hub_download(VR180SBS_REPO, filename=VR180SBS_FILE, token=_hf_token() or None)
+            _atomic_copy_weight(src, VR180SBS_PATH)
+            _remember_lora_source(VR180SBS_FILE, _hf_repo_url(VR180SBS_REPO))
+            log(f"  ✓ VR180 SBS LoRA: {VR180SBS_FILE}")
+            return True
+        except Exception as e:
+            log(f"  ⚠ VR180 SBS LoRA unavailable: {e}")
+            return False
+
+    # Deliberately lazy: the browser installs with visible byte progress.
+    VR180SBS_AVAILABLE = True
+    log("  ✓ VR180 SBS LoRA available · download deferred until enabled")
+
     # ── Optional TaoMate-H3 3-step accelerator ───────────────────────────────
     TAOMATE_PATH = os.path.join(ldir, TAOMATE_FILE)
     def _ensure_taomate_lora():
@@ -3315,6 +3378,8 @@ if _CU130_CHILD:
         if MEDIUM8_FILE: out[MEDIUM8_FILE] = _hf_repo_url(MEDIUM8_REPO)
         if MEDIUM8_REF2VA_FILE: out[MEDIUM8_REF2VA_FILE] = _hf_repo_url(MEDIUM8_REPO)
         if TAOMATE_FILE: out[TAOMATE_FILE] = _hf_repo_url(TAOMATE_REPO)
+        if EQUIRECT360_FILE: out[EQUIRECT360_FILE] = _hf_repo_url(EQUIRECT360_REPO)
+        if VR180SBS_FILE: out[VR180SBS_FILE] = _hf_repo_url(VR180SBS_REPO)
         for fn,url in dict(LORA_SOURCE_CACHE).items():
             if fn and url: out[fn]=url
         return out
@@ -4137,6 +4202,10 @@ if _CU130_CHILD:
             if not _ensure_medium8_lora(True): raise RuntimeError("Ref2VA Medium 8-Step accelerator could not be downloaded.")
         elif base == TAOMATE_FILE and not os.path.exists(TAOMATE_PATH):
             if not _ensure_taomate_lora(): raise RuntimeError("TaoMate-H3 3-Step accelerator could not be downloaded.")
+        elif base == EQUIRECT360_FILE and not os.path.exists(EQUIRECT360_PATH):
+            if not _ensure_equirect360_lora(): raise RuntimeError("360 Equirect LoRA could not be downloaded.")
+        elif base == VR180SBS_FILE and not os.path.exists(VR180SBS_PATH):
+            if not _ensure_vr180sbs_lora(): raise RuntimeError("VR180 SBS LoRA could not be downloaded.")
 
     def _apply_lora_checked(model, name, strength, label):
         if not name or name == "none" or float(strength) == 0:
@@ -6652,6 +6721,8 @@ if _CU130_CHILD:
             MEDIUM8_FILE:_compat_record(profiles=["stock_quality"],modes=["fl2va"],label="LightX2V FL2VA 8-Step · managed by MEDIUM preset"),
             MEDIUM8_REF2VA_FILE:_compat_record(profiles=["stock_quality"],modes=["ref2va"],label="LightX2V Ref2VA 8-Step · managed by MEDIUM preset"),
             TAOMATE_FILE:_compat_record(profiles=["stock_quality"],modes=["fl2va"],label="Legacy TaoMate-H3 3-Step accelerator"),
+            EQUIRECT360_FILE:_compat_record(profiles=["stock_quality"],modes=["fl2va","ref2va"],label="360° Equirectangular panorama LoRA"),
+            VR180SBS_FILE:_compat_record(profiles=["stock_quality"],modes=["fl2va","ref2va"],label="VR180 stereoscopic side-by-side LoRA · use 21:9 + vr180sbs trigger"),
         }
 
     def _known_lora_compatible(name, unet_name, mode):
@@ -7327,6 +7398,14 @@ if _CU130_CHILD:
             output_storage=OUTPUT_STORAGE, output_persistent=bool(OUTPUT_PERSISTENT), output_label=OUTPUT_LABEL,
             eros_max_unet="", redmix_unet="", eros_max_sha256="", eros_integrated_turbo=False,
             motion8_file=MOTION8_FILE, motion8_available=bool(not LOWVRAM_T4_PROFILE), model_profiles=profile_state,
+            equirect360_repo=EQUIRECT360_REPO, equirect360_file=EQUIRECT360_FILE,
+            equirect360_installed=bool(os.path.exists(EQUIRECT360_PATH)),
+            equirect360_strength_default=EQUIRECT360_DEFAULT_STRENGTH,
+            equirect360_on_strength=EQUIRECT360_ON_STRENGTH,
+            vr180sbs_repo=VR180SBS_REPO, vr180sbs_file=VR180SBS_FILE,
+            vr180sbs_installed=bool(os.path.exists(VR180SBS_PATH)),
+            vr180sbs_strength_default=VR180SBS_DEFAULT_STRENGTH,
+            vr180sbs_on_strength=VR180SBS_ON_STRENGTH,
             naughty_file="", naughty_strength=0.0,
             stock_quality_sampler="res_multistep", stock_quality_scheduler="simple", stock_quality_steps=20,
             stock_quality_shift_video=12.0, stock_quality_shift_audio=3.0,
@@ -11069,6 +11148,26 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
           detail:currentModelMode()==='ref2va'?'Ref2VA 4-step Turbo':'FL2VA 4-step Turbo',source_url:sourceMap[accelFile]||''});seen.add(accelFile);
       }
 
+      // Built-in 360 equirectangular creative LoRA. It remains visible while
+      // uninstalled, defaults OFF/0.00, and downloads only when its switch is enabled.
+      if(m.equirect360_file){
+        cards.push({kind:'managed360',file:m.equirect360_file,label:'360° Equirectangular LoRA',
+          available:true,installed:!!m.equirect360_installed,onStrength:Number(m.equirect360_on_strength||0.75),
+          detail:m.equirect360_installed?'MiniMax H3 360° panorama · installed':'MiniMax H3 360° panorama · download on enable',
+          source_url:sourceMap[m.equirect360_file]||('https://huggingface.co/'+String(m.equirect360_repo||''))});
+        seen.add(m.equirect360_file);
+      }
+
+      // Built-in VR180 SBS creative LoRA. OFF/0.00 until enabled; first enable
+      // downloads with visible progress, then applies the model-card scale of 1.0.
+      if(m.vr180sbs_file){
+        cards.push({kind:'managedvr180',file:m.vr180sbs_file,label:'VR180 SBS LoRA',
+          available:true,installed:!!m.vr180sbs_installed,onStrength:Number(m.vr180sbs_on_strength||1.0),
+          detail:m.vr180sbs_installed?'VR180 stereo SBS · 21:9 · trigger: vr180sbs · installed':'VR180 stereo SBS · 21:9 · trigger: vr180sbs · download on enable',
+          source_url:sourceMap[m.vr180sbs_file]||('https://huggingface.co/'+String(m.vr180sbs_repo||''))});
+        seen.add(m.vr180sbs_file);
+      }
+
       // Installed creative LoRAs become named cards. /api/meta has already stripped
       // adult filenames when Adult Mode is off, so they cannot leak into this list.
       for(const file of (m.loras||[])){
@@ -11097,6 +11196,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         const cat=_catalogEntryForKey(card.catalogKey,m);
         return !!cat&&(cat.profiles||['stock_quality']).includes(_compatProfileForUI(m))&&(cat.modes||['fl2va']).includes(currentModelMode());
       }
+      if(card.kind==='managed360'||card.kind==='managedvr180')return !!card.available&&_loraFileCompatible(card.file,m);
       return !!card.available&&_loraFileCompatible(card.file,m);
     }
     function _strengthForKind(kind,m=window.H3META||{}){
@@ -11119,6 +11219,43 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
       await loadMeta();
       return r.file;
     }
+    async function _installManagedLoraCard(card,metaEl,row){
+      const m=window.H3META||{};
+      const isVr180=card.kind==='managedvr180';
+      const source=isVr180?(m.vr180sbs_repo||'rehan-fal/minimax-h3-vr180-sbs-lora'):(m.equirect360_repo||'rehan-fal/minimax-h3-360-equirect-lora');
+      const candidate_key='hf::'+String((isVr180?m.vr180sbs_file:m.equirect360_file)||card.file||'');
+      const label=isVr180?'VR180 SBS LoRA':'360 LoRA';
+      const resp=await fetch('/api/loras/install',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({source,revision:'main',candidate_key})
+      });
+      const r=await _readJsonResponse(resp,label+' download start');
+      if(!resp.ok||r.error)throw new Error(r.error||('Could not start '+label+' download.'));
+      let bar=row.querySelector('.managedloraprogress');
+      if(!bar){
+        const wrap=document.createElement('div');
+        wrap.className='hfprogress managedloraprogresswrap';
+        wrap.innerHTML='<i class="managedloraprogress" style="width:0%"></i>';
+        row.appendChild(wrap);
+        bar=wrap.firstElementChild;
+      }
+      while(true){
+        const pr=await fetch('/api/loras/progress/'+encodeURIComponent(r.id),{cache:'no-store'});
+        const st=await _readJsonResponse(pr,label+' download status');
+        if(!pr.ok)throw new Error(st.error||(label+' download status failed.'));
+        const pct=st.pct==null?0:Math.max(0,Math.min(100,Number(st.pct)));
+        bar.style.width=pct+'%';
+        metaEl.textContent=`downloading · ${st.downloaded_text||'0 B'} / ${st.total_text||'unknown'}${st.speed_text?' · '+st.speed_text:''}${st.pct==null?'':` · ${pct.toFixed(1)}%`}`;
+        if(st.status==='done'){
+          bar.style.width='100%';
+          await loadMeta();
+          return st.file||card.file;
+        }
+        if(st.status==='error')throw new Error(st.error||(label+' download failed.'));
+        await new Promise(resolve=>setTimeout(resolve,350));
+      }
+    }
+
     function renderNamedLoraRows(m=window.H3META||{}){
       const box=$('unified_lora_rows');if(!box)return;box.innerHTML='';
       const cards=_namedLoraCards(m);
@@ -11135,7 +11272,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         const active=compatible&&selected;
         const row=document.createElement('div');row.className='lorarow'+(compatible?'':' incompatible');
         const safeId='lc_'+Math.random().toString(36).slice(2);
-        const status=!compatible?`incompatible with current model / mode${selected?` · saved ${Number(st.strength).toFixed(2)}`:''}`:(active?`active · ${Number(st.strength).toFixed(2)}`:(card.kind==='catalog'&&!card.installed?'download on enable':'off'));
+        const status=!compatible?`incompatible with current model / mode${selected?` · saved ${Number(st.strength).toFixed(2)}`:''}`:(active?`active · ${Number(st.strength).toFixed(2)}`:(((card.kind==='catalog'||card.kind==='managed360'||card.kind==='managedvr180')&&!card.installed)?'download on enable':'off'));
         row.innerHTML=`<div class=lorarowhead><div><div class=lorarowtitle>${_cardTitleHTML(card)}</div><div class=lorarowmeta>${esc(status)}</div></div>`+
           `<button class="loratoggle${selected?' on':''}" type=button aria-pressed="${selected?'true':'false'}" ${compatible?'':'disabled'}>${selected?'ON':'OFF'}</button></div>`+
           `<div class=sliderline><input id="${safeId}" type=range min="0" max="5" step=".05" value="${Math.max(0,Math.min(5,Number(st.strength||0)))}" ${compatible?'':'disabled'}><input class="slidervalue loranumber" type=number step="any" value="${Number(st.strength||0).toFixed(2)}" aria-label="${esc(card.label)} strength" ${compatible?'':'disabled'}></div>`+
@@ -11180,6 +11317,25 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
           // The switch is authoritative: OFF always means strength 0.00 and ON
           // always means strength 1.00. syncState updates the stored strength,
           // numeric field, slider thumb, switch label, and status text together.
+          if((card.kind==='managed360'||card.kind==='managedvr180')&&!card.installed){
+            if(!enabling){syncState(0);return}
+            toggle.disabled=true;slider.disabled=true;out.disabled=true;
+            meta.textContent='starting download…';
+            try{
+              const file=await _installManagedLoraCard(card,meta,row);
+              const oldKey=_cardKey(card),state=LORA_CARD_STATE.get(oldKey)||st;
+              state.strength=Number(card.onStrength||(card.kind==='managedvr180'?1.0:0.75));
+              LORA_CARD_STATE.delete(oldKey);
+              LORA_CARD_STATE.set('file:'+file,state);
+              renderNamedLoraRows(window.H3META||{});
+            }catch(err){
+              st.strength=0;
+              meta.textContent='download failed';
+              await uiAlert(String(err.message||err),(card.kind==='managedvr180'?'VR180 SBS':'360')+' LoRA download failed');
+              renderNamedLoraRows(window.H3META||{});
+            }
+            return;
+          }
           if(card.kind==='catalog'&&!card.installed){
             if(!enabling){syncState(0);return}
             toggle.disabled=true;
@@ -11192,7 +11348,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
             renderNamedLoraRows(window.H3META||{});
             return;
           }
-          syncState(enabling?1:0);
+          syncState(enabling?((card.kind==='managed360'||card.kind==='managedvr180')?Number(card.onStrength||(card.kind==='managedvr180'?1.0:0.75)):1):0);
         };
       }
     }
@@ -11202,7 +11358,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     function activeCreativeLoraStack(){
       const m=window.H3META||{},out=[];
       for(const card of _namedLoraCards(m)){
-        if(card.kind!=='creative')continue;
+        if(!['creative','managed360','managedvr180'].includes(card.kind))continue;
         const st=_stateForCard(card),strength=Number(st.strength||0);
         if(card.file&&Math.abs(strength)>1e-6&&_cardCompatible(card,m))out.push({file:card.file,strength});
       }
