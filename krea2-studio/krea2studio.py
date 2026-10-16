@@ -571,6 +571,7 @@ subprocess.check_call([
     "transformers>=4.57.0",
     "accelerate>=1.10.0",
     "bitsandbytes>=0.48.0",
+    "peft>=0.17.0",
     "comfy-kitchen",
 ])
 
@@ -973,9 +974,15 @@ sys.stdout = _ConsoleTee(sys.stdout, "stdout")
 sys.stderr = _ConsoleTee(sys.stderr, "stderr")
 
 
+_POLL_LOG_PATTERN = re.compile(
+    r'"GET /api/(?:jobs|history|console|ml/access|terms/status)(?:[? ][^"\r\n]*)? HTTP/[^" ]+" (?:200|304)'
+)
+
+
 def _console_text(limit_chars=300000):
     with _CONSOLE_LOCK:
         value = "".join(_CONSOLE_CHUNKS)
+    value = "".join(line for line in value.splitlines(keepends=True) if not _POLL_LOG_PATTERN.search(line))
     if len(value) > int(limit_chars):
         value = value[-int(limit_chars):]
     return value
@@ -1124,6 +1131,7 @@ DEFAULT_BATCH_HEIGHT = __DEFAULT_BATCH_HEIGHT__
 # NF4 checkpoint, and keep that engine warm until a later Krea job needs VRAM.
 QWEN_CAMERA_REPO = "mash2005/Qwen-Image-Edit-2511-MultiAngles-FullQ4"
 QWEN_CAMERA_SOURCE_LORA = "fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA"
+QWEN_EDIT_REPO = "Qwen/Qwen-Image-Edit-2511"
 QWEN_CAMERA_PIPE = None
 ACTIVE_ENGINE = "krea2"
 _ENGINE_LOCK = threading.RLock()
@@ -1500,10 +1508,13 @@ def _qwen_pipeline_classes():
     return QwenImageEditPlusPipeline, QwenImageTransformer2DModel, Qwen2_5_VLForConditionalGeneration
 
 
-def ensure_qwen_camera_engine():
+def ensure_qwen_camera_engine(edit=False):
     """Hard-swap Krea2 out, then lazily load the NF4 Qwen 2511 camera engine."""
     global QWEN_CAMERA_PIPE, ACTIVE_ENGINE
+    repo = QWEN_EDIT_REPO if edit else QWEN_CAMERA_REPO
     with _ENGINE_LOCK:
+        if QWEN_CAMERA_PIPE is not None and getattr(QWEN_CAMERA_PIPE, "_studio_repo", None) != repo:
+            _release_qwen_camera_engine()
         if QWEN_CAMERA_PIPE is not None:
             ACTIVE_ENGINE = "qwen_camera"
             return QWEN_CAMERA_PIPE
@@ -1520,32 +1531,48 @@ def ensure_qwen_camera_engine():
 
         _emit_progress("Releasing Krea2", pct=2)
         _release_krea_engine()
-        _emit_progress("Loading Qwen 2511 Camera", pct=5)
-        print(f"[ENGINE] loading Qwen Camera: {QWEN_CAMERA_REPO}", flush=True)
+        _emit_progress("Loading Qwen Image Edit 2511" if edit else "Loading Qwen 2511 Camera", pct=5)
+        print(f"[ENGINE] loading Qwen Camera: {repo}", flush=True)
 
         token = _hf_token_for_qwen()
         cap = torch.cuda.get_device_capability(0)
         dtype = torch.bfloat16 if cap[0] >= 8 else torch.float16
         common = dict(torch_dtype=dtype, token=token, low_cpu_mem_usage=True)
+        transformer_options = {}
+        if edit:
+            from diffusers import BitsAndBytesConfig
+            transformer_options["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=True,
+            )
         try:
+            _emit_progress("Loading Qwen image transformer", pct=5,
+                           detail="Downloading missing weights and loading the image model. First use can take several minutes.")
             transformer = QwenImageTransformer2DModel.from_pretrained(
-                QWEN_CAMERA_REPO,
+                repo,
                 subfolder="transformer",
+                **transformer_options,
                 device_map="cuda",
                 **common,
             )
+            _emit_progress("Loading Qwen text encoder", pct=8,
+                           detail="Downloading missing weights and loading the prompt and image encoder.")
             text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                QWEN_CAMERA_REPO,
+                repo,
                 subfolder="text_encoder",
-                device_map="cuda",
+                device_map="cpu" if edit else "cuda",
                 **common,
             )
+            _emit_progress("Loading Qwen pipeline components", pct=10,
+                           detail="Loading the VAE, tokenizer, scheduler and image processor.")
             pipe = QwenImageEditPlusPipeline.from_pretrained(
-                QWEN_CAMERA_REPO,
+                repo,
                 transformer=transformer,
                 text_encoder=text_encoder,
                 **common,
             )
+            _emit_progress("Configuring Qwen memory", pct=11,
+                           detail="Preparing CPU/GPU offload for the available VRAM.")
             # The model card uses model CPU offload after loading the pre-quantized
             # components. Keep the same policy for activation headroom on T4/L4.
             try:
@@ -1556,10 +1583,12 @@ def ensure_qwen_camera_engine():
                 pipe.set_progress_bar_config(disable=True)
             except Exception:
                 pass
+            pipe._studio_repo = repo
+            pipe._studio_scheduler_config = dict(pipe.scheduler.config)
             QWEN_CAMERA_PIPE = pipe
             ACTIVE_ENGINE = "qwen_camera"
-            _emit_progress("Qwen Camera ready", pct=12)
-            gpu_stats("Qwen Camera ready")
+            _emit_progress("Qwen Edit ready" if edit else "Qwen Camera ready", pct=12)
+            gpu_stats("Qwen Edit ready" if edit else "Qwen Camera ready")
             return QWEN_CAMERA_PIPE
         except Exception:
             QWEN_CAMERA_PIPE = None
@@ -1589,6 +1618,21 @@ CAMERA_DISTANCES = {
     "medium": "medium shot",
     "wide": "wide shot",
 }
+
+
+def _qwen_step_callback(steps):
+    def on_step_end(pipe, step_index, timestep, callback_kwargs):
+        check_stop()
+        done = min(int(steps), int(step_index) + 1)
+        if done == int(steps):
+            _emit_progress("Decoding Qwen image", pct=90, step=done, step_total=steps,
+                           detail="All sampling steps finished. Decoding the final image.")
+        else:
+            _emit_progress("Sampling Qwen image", pct=20 + 68 * done / steps,
+                           step=done, step_total=steps,
+                           detail=f"Completed sampling step {done} of {steps}.")
+        return callback_kwargs
+    return on_step_end
 
 
 def qwen_camera_restage(
@@ -1638,7 +1682,8 @@ def qwen_camera_restage(
     check_stop()
     pipe = ensure_qwen_camera_engine()
     check_stop()
-    _emit_progress("Re-staging camera", pct=18, step=0, step_total=steps)
+    _emit_progress("Encoding camera inputs", pct=18, step=0, step_total=steps,
+                   detail="Encoding the source image and prompt; the first sampling step follows.")
     print(f"[CAMERA] {prompt} · seed={seed} · steps={steps}", flush=True)
 
     generator = torch.Generator(device="cpu").manual_seed(int(seed))
@@ -1652,6 +1697,8 @@ def qwen_camera_restage(
             guidance_scale=guidance_scale,
             true_cfg_scale=true_cfg_scale,
             generator=generator,
+            callback_on_step_end=_qwen_step_callback(steps),
+            callback_on_step_end_tensor_inputs=[],
         )
     check_stop()
     images = getattr(result, "images", None) or []
@@ -1688,6 +1735,79 @@ def qwen_camera_restage(
     return path, seed, status, path
 
 
+QWEN_EDIT_ADAPTERS = {
+    "lightning": ("lightx2v/Qwen-Image-Edit-2511-Lightning", "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors"),
+    "angles": ("fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA", "qwen-image-edit-2511-multiple-angles-lora.safetensors"),
+}
+
+
+def _normalize_qwen_loras(value):
+    import math
+    if value is None:
+        value = [{"name": "lightning", "strength": 1.0}]
+    if isinstance(value, str):
+        value = json.loads(value)
+    if not isinstance(value, list) or len(value) > 6:
+        raise ValueError("Choose up to four custom Qwen LoRAs plus Lightning and Angles.")
+    result, seen = [], set()
+    for item in value:
+        name = str(item.get("name", ""))
+        strength = float(item.get("strength", 1))
+        if not math.isfinite(strength) or not -2 <= strength <= 2:
+            raise ValueError("LoRA strength must be between -2 and 2.")
+        if name in seen:
+            raise ValueError("Duplicate Qwen LoRA: " + name)
+        seen.add(name)
+        if name not in QWEN_EDIT_ADAPTERS:
+            if name != Path(name).name or not name.endswith(".safetensors"):
+                raise ValueError("Invalid Qwen LoRA filename.")
+            valid, reason = _validate_user_lora_file(LORA_DIR_RUNTIME / name)
+            if not valid:
+                raise ValueError("Invalid Qwen LoRA: " + str(reason))
+        result.append({"name": name, "strength": strength})
+    if sum(x["name"] not in QWEN_EDIT_ADAPTERS for x in result) > 4:
+        raise ValueError("Choose up to four custom Qwen LoRAs.")
+    return result
+
+
+def _configure_qwen_edit_loras(pipe, adapters):
+    import math
+    from diffusers import FlowMatchEulerDiscreteScheduler
+    active = [x for x in adapters if x["strength"] != 0]
+    signature = tuple((x["name"], x["strength"]) for x in active)
+    if getattr(pipe, "_studio_lora_signature", None) == signature:
+        return
+    _emit_progress("Loading Qwen edit LoRAs", pct=14,
+                   detail="Downloading missing adapters and applying the selected strengths.")
+    # Clear the previous job's adapters; never fuse them into the base weights.
+    pipe.unload_lora_weights()
+    pipe._studio_lora_signature = None
+    names, weights = [], []
+    try:
+        for i, item in enumerate(active):
+            name = item["name"]
+            source, filename = QWEN_EDIT_ADAPTERS.get(name, (str(LORA_DIR_RUNTIME), name))
+            adapter = "qwen_edit_" + str(i)
+            pipe.load_lora_weights(source, weight_name=filename, adapter_name=adapter)
+            names.append(adapter)
+            weights.append(item["strength"])
+        if names:
+            pipe.set_adapters(names, adapter_weights=weights)
+        config = dict(pipe._studio_scheduler_config)
+        if any(x["name"] == "lightning" for x in active):
+            config.update(base_image_seq_len=256, max_image_seq_len=8192,
+                          base_shift=math.log(3), max_shift=math.log(3),
+                          shift=1.0, shift_terminal=None, use_dynamic_shifting=True,
+                          time_shift_type="exponential", stochastic_sampling=False,
+                          invert_sigmas=False, use_beta_sigmas=False,
+                          use_exponential_sigmas=False, use_karras_sigmas=False)
+        pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(config)
+        pipe._studio_lora_signature = signature
+    except Exception:
+        pipe.unload_lora_weights()
+        raise
+
+
 def qwen_instruction_edit(
     source,
     prompt,
@@ -1695,9 +1815,10 @@ def qwen_instruction_edit(
     negative_prompt=" ",
     max_side=1024,
     seed=-1,
-    steps=30,
+    steps=4,
     guidance_scale=1.0,
-    true_cfg_scale=4.0,
+    true_cfg_scale=1.0,
+    qwen_loras=None,
 ):
     if source is None:
         raise ValueError("Upload a source image for Qwen Edit.")
@@ -1718,9 +1839,14 @@ def qwen_instruction_edit(
     true_cfg_scale = max(0.0, min(20.0, float(true_cfg_scale or 4.0)))
 
     check_stop()
-    pipe = ensure_qwen_camera_engine()
+    pipe = ensure_qwen_camera_engine(edit=True)
+    adapters = _normalize_qwen_loras(qwen_loras)
+    _configure_qwen_edit_loras(pipe, adapters)
+    if any(x["name"] == "lightning" and x["strength"] != 0 for x in adapters):
+        steps, true_cfg_scale = 4, 1.0
     check_stop()
-    _emit_progress("Qwen instruction edit", pct=18, step=0, step_total=steps)
+    _emit_progress("Encoding Qwen edit inputs", pct=18, step=0, step_total=steps,
+                   detail="Encoding source images and instructions before sampling.")
     print(
         f"[QWEN EDIT] refs={len(refs)} · seed={seed} · steps={steps} · {prompt[:240]}",
         flush=True,
@@ -1738,6 +1864,8 @@ def qwen_instruction_edit(
             guidance_scale=guidance_scale,
             true_cfg_scale=true_cfg_scale,
             generator=generator,
+            callback_on_step_end=_qwen_step_callback(steps),
+            callback_on_step_end_tensor_inputs=[],
         )
     check_stop()
     outputs = getattr(result, "images", None) or []
@@ -1752,9 +1880,9 @@ def qwen_instruction_edit(
         prompt,
         seed,
         extra={
-            "model": QWEN_CAMERA_REPO,
+            "model": QWEN_EDIT_REPO,
             "engine": "qwen-image-edit-2511",
-            "source_lora": QWEN_CAMERA_SOURCE_LORA,
+            "loras": adapters,
             "reference_count": len(refs),
             "steps": steps,
             "guidance_scale": guidance_scale,
@@ -1894,6 +2022,10 @@ def _emit_progress(stage=None, pct=None, step=None, step_total=None, detail=None
             return
 
         if stage is not None:
+            if job.get("stage") != str(stage):
+                job["stage_started"] = time.time()
+                if detail is None:
+                    job["detail"] = ""
             job["stage"] = str(stage)
             if step is None and not str(stage).lower().startswith("sampling"):
                 job["step"] = 0
@@ -5956,6 +6088,17 @@ def _require_missinglink_access(context="Studio operation", force=True):
     return True
 
 
+# Suppress successful UI polling at the logger, preserving failures and POSTs.
+import logging
+
+
+class _QuietPollingFilter(logging.Filter):
+    def filter(self, record):
+        return not _POLL_LOG_PATTERN.search(record.getMessage())
+
+
+logging.getLogger("werkzeug").addFilter(_QuietPollingFilter())
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 128 * 1024 * 1024
 
@@ -7022,7 +7165,8 @@ def _lora_download_worker(download_id, source, revision_hint, candidate_key):
             os.replace(part, destination)
             part = None
 
-        _activate_installed_lora(installed_name)
+        if LORA_DOWNLOADS.get(download_id, {}).get("target_tab") != "qedit":
+            _activate_installed_lora(installed_name)
         elapsed = max(0.001, time.time() - started)
         with LORA_DOWNLOAD_LOCK:
             LORA_DOWNLOADS[download_id].update(
@@ -7160,7 +7304,7 @@ def _job_public(job):
         "finished", "cancel_requested", "thumb", "error", "result",
         "status_text", "planning_notes", "review_text", "prompt_table",
         "gallery", "zip", "paths", "batch_current", "batch_total",
-        "code", "access",
+        "code", "access", "stage_started",
     )
     return {key: job.get(key) for key in keys}
 
@@ -7430,9 +7574,10 @@ def _execute_job(jid):
             negative_prompt=params.get("negative_prompt", " "),
             max_side=params.get("max_side", 1024),
             seed=params.get("seed", -1),
-            steps=params.get("steps", 30),
+            steps=params.get("steps", 4),
             guidance_scale=params.get("guidance_scale", 1.0),
-            true_cfg_scale=params.get("true_cfg_scale", 4.0),
+            true_cfg_scale=params.get("true_cfg_scale", 1.0),
+            qwen_loras=params.get("qwen_loras"),
         )
         return {"image": _output_url(path), "seed": seed, "status": status,
                 "download": _output_url(download_path), "engine": "qwen_edit"}
@@ -7898,6 +8043,7 @@ def api_loras_install():
             "stage": "resolving source",
             "error": "",
             "source": source,
+            "target_tab": str(body.get("target_tab") or "text"),
             "revision": revision,
             "candidate_key": candidate_key,
             "filename": filename_hint,
@@ -8167,14 +8313,15 @@ def api_qwen_edit():
             "qedit",
             {
                 "source_path": source_path,
+                "qwen_loras": _normalize_qwen_loras(request.form.get("qwen_loras")),
                 "reference_paths": reference_paths,
                 "prompt": str(request.form.get("prompt") or ""),
                 "negative_prompt": str(request.form.get("negative_prompt") or " "),
                 "max_side": _int_value(request.form.get("max_side"), DEFAULT_IMAGE_MAX_SIDE, 256, 2048),
                 "seed": _int_value(request.form.get("seed"), -1),
-                "steps": _int_value(request.form.get("steps"), 30, 1, 80),
+                "steps": _int_value(request.form.get("steps"), 4, 1, 80),
                 "guidance_scale": _float_value(request.form.get("guidance_scale"), 1.0, 0.0, 20.0),
-                "true_cfg_scale": _float_value(request.form.get("true_cfg_scale"), 4.0, 0.0, 20.0),
+                "true_cfg_scale": _float_value(request.form.get("true_cfg_scale"), 1.0, 0.0, 20.0),
             },
             label="Qwen Edit", mode="qwen_edit", thumb=_input_url(source_path),
         )
@@ -8860,14 +9007,14 @@ html,body{height:100%;overflow:hidden}
 .controlpanel{display:none}.controlpanel.active{display:block}
 .controlpanel .card{margin-bottom:10px;border-radius:8px}
 .controlpanel .cardtitle{background:#0f0f12}
-.studio-stage{min-width:0;min-height:0;display:grid;grid-template-rows:44px minmax(0,1fr);background:#070708;position:relative;overflow:hidden}
+.studio-stage{min-width:0;min-height:0;display:grid;grid-template-rows:44px auto minmax(0,1fr);background:#070708;position:relative;overflow:hidden}
 .stage-toolbar{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 12px;border-bottom:1px solid var(--line);background:#0d0d10;z-index:4}
 .stage-toolbar-left{display:flex;align-items:center;gap:10px;min-width:0}
 .stage-title{font-family:var(--font-mono);font-size:10px;font-weight:800;letter-spacing:1.2px;color:#a6a8b1;text-transform:uppercase}
 .stage-mode{font-family:var(--font-mono);font-size:9px;color:var(--accent);letter-spacing:.8px;text-transform:uppercase;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .stage-toolbar-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
 .stage-toolbar-actions .stagebtn{height:30px}
-.stage-canvas{position:relative;min-width:0;min-height:0;overflow:hidden;background:#050506}
+.stage-canvas{grid-row:3;position:relative;min-width:0;min-height:0;overflow:hidden;background:#050506}
 .stagepanel{position:absolute;inset:0;display:none;min-height:0;border:0;border-radius:0;background:#050506}
 .stagepanel.active{display:flex}
 .stagepanel.gallerymode.active{display:block;overflow:auto;padding:18px;scrollbar-width:none;-ms-overflow-style:none}
@@ -8946,6 +9093,17 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
 .q-list::-webkit-scrollbar,.prompttable::-webkit-scrollbar,.logbox::-webkit-scrollbar,.paintbox::-webkit-scrollbar,.sidebar-scroll::-webkit-scrollbar,.stagepanel.gallerymode.active::-webkit-scrollbar{display:none;width:0;height:0}
 .ref-preview-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:8px}.ref-tile{position:relative;border:1px solid var(--border);border-radius:8px;overflow:hidden;background:var(--surface-2);min-height:84px}.ref-tile img{display:block;width:100%;height:84px;object-fit:cover}.ref-tile button{position:absolute;top:5px;right:5px;width:22px!important;height:22px!important;border-radius:999px!important;padding:0!important;background:rgba(10,10,10,.82)!important;border:1px solid var(--border)!important;color:#fff!important;font-size:12px!important;line-height:1}.ref-tile button:hover{border-color:var(--gold)!important;color:var(--gold)!important}.reference-hidden{display:none!important}
 .tab-lora-stack{margin-top:12px;padding:10px;border:1px solid #2a2b31;border-radius:8px;background:#0b0b0d}.tab-lora-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font:700 9px var(--font-mono);letter-spacing:.8px;color:#c8cad1}.tab-lora-count{color:var(--gold);font-size:8px}.tab-lora-actions{margin-top:7px!important}.tab-lora-list{max-height:250px;overflow:auto;scrollbar-width:none;-ms-overflow-style:none}.tab-lora-list::-webkit-scrollbar{display:none;width:0;height:0}.tab-lora-stack .lora-row{grid-template-columns:24px minmax(0,1fr) 70px 0}.tab-lora-stack .lora-delete{display:none!important}.tab-lora-stack .lora-meta{font-size:7px}.tab-lora-stack .lora-strength{height:30px!important}.tab-lora-stack .status{margin-top:7px}.lora-inline-installer{margin-top:0!important}.shared-lora-card{display:none!important}
+.qe-rack{margin-top:18px;border-top:1px solid #343436;padding-top:10px}
+.qe-slider{display:grid;grid-template-columns:minmax(95px, .8fr) minmax(60px,1.3fr) 48px 20px;align-items:center;gap:10px;padding:13px 0;border-bottom:1px solid #2d2d30}
+.qe-slider label{margin:0;font-size:10px;letter-spacing:1px;overflow-wrap:anywhere;color:#bbb}
+.qe-slider input[type=range]{padding:0;accent-color:#d5b969;height:4px;min-width:0;width:100%}
+.qe-slider input[type=number]{padding:4px 0;text-align:right;background:transparent;border:0;font-size:12px;width:48px}
+.qe-info{margin-left:6px;color:#777;letter-spacing:0}
+.qe-slider input[type=range]{appearance:none;background:#303034;border:0;border-radius:4px}
+.qe-slider input[type=range]::-webkit-slider-thumb{appearance:none;width:17px;height:17px;border-radius:50%;background:#e8ad12;cursor:pointer}
+.qe-slider input[type=range]::-moz-range-thumb{width:17px;height:17px;border:0;border-radius:50%;background:#e8ad12;cursor:pointer}
+.qe-slider button{padding:0;background:transparent;border:0;color:#aaa}
+#qe_generate{width:100%;flex:1}
 </style>
 </head>
 <body>
@@ -9291,7 +9449,7 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
           <div class="card">
             <div class="cardtitle">Qwen Edit · 2511 NF4</div>
             <div class="cardbody">
-              <div class="engine-note"><b>Dedicated Qwen edit engine.</b> This uses the same Qwen Image Edit 2511 NF4 runtime as Qwen Camera. Krea2 is fully released before the first Qwen job; Qwen stays warm when moving between Qwen Edit and Qwen Camera.</div>
+              <div class="engine-note"><b>Dedicated Qwen edit engine.</b> Clean Qwen Image Edit 2511 with adjustable LoRAs. Lightning starts enabled for 4-step edits. The active model is released when switching engines.</div>
               <label>Source image</label>
               <input id="qe_source" class="nativefile" type="file" accept="image/*">
               <div class="uploadrow"><button id="qe_source_pick" class="filepick" type="button"><span class="filepickicon">＋</span><span>Choose image</span></button><span id="qe_source_name" class="filemeta">No image selected</span></div>
@@ -9310,19 +9468,16 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
                 <div><label>Maximum side</label><select id="qe_max"></select></div>
                 <div><label>Seed (-1 = random)</label><input id="qe_seed" type="number" value="-1"></div>
               </div>
-              <details>
-                <summary>Qwen Edit settings</summary>
-                <div class="inside">
-                  <div class="grid3">
-                    <div><label>Steps</label><input id="qe_steps" type="number" min="1" max="80" value="30"></div>
-                    <div><label>Guidance</label><input id="qe_guidance" type="number" min="0" max="20" step=".1" value="1.0"></div>
-                    <div><label>True CFG</label><input id="qe_true_cfg" type="number" min="0" max="20" step=".1" value="4.0"></div>
-                  </div>
-                  <div class="minihint">Use the source as Image 1. Optional references are passed directly to Qwen as additional images for subject, product, scene or visual-context editing.</div>
-                </div>
-              </details>
-              <div class="actions"><button id="qe_generate">QWEN EDIT</button></div>
-              <div id="qe_status" class="status">Ready. First Qwen job swaps Krea2 out and loads the NF4 Qwen 2511 engine.</div>
+              <div class="qe-rack">
+                <div id="qe-settings"></div>
+                <input id="qe_guidance" type="hidden" value="1">
+                <div id="qe-loras"></div>
+                <div class="actions"><button type="button" class="lora-add-tab" data-lora-tab="qedit">＋ ADD LORA</button></div>
+                <div class="split"><select id="qe-installed" aria-label="Installed Qwen LoRA"></select><button id="qe-add-installed" type="button">ADD INSTALLED</button></div>
+                <div class="minihint">Use Qwen Image Edit 2511 compatible LoRAs. Set strength to 0 to disable. Lightning uses 4 steps and CFG 1.</div>
+              </div>
+              <div class="actions"><button id="qe_generate">GENERATE</button></div>
+              <div id="qe_status" class="status">Ready · Qwen Edit · 4-step Lightning enabled. First use downloads the clean model and adapter.</div>
               <a id="qe_download" class="hidden" target="_blank"></a>
             </div>
           </div>
@@ -9496,6 +9651,7 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
           <button id="stage_clear" class="stagebtn danger" type="button">Clear stage</button>
         </div>
       </div>
+      <div id="stage_progress" class="hidden" role="status" aria-live="polite" style="padding:10px 16px;border-bottom:1px solid var(--line);font:11px/1.5 var(--font-mono);color:var(--text)"></div>
       <div class="stage-canvas">
         <div id="t_result" class="stageview single stagepanel active"><div class="empty">Generated image appears here.</div></div>
         <div id="i_result" class="stageview single stagepanel"><div class="empty">Generated image appears here.</div></div>
@@ -9906,6 +10062,43 @@ let loraLibrary=[];
 let loraStacks={text:[],image:[],edit:[],inpaint:[],batch:[]};
 let loraStacksInitialized=false;
 let loraInstallerTargetTab='text';
+let qwenLoras=[{name:'lightning',strength:1},{name:'angles',strength:0}];
+function qwenSlider(root,label,id,value,min,max,step,onchange,remove){
+  const row=document.createElement('div');row.className='qe-slider';
+  const title=document.createElement('label');title.textContent=label;title.htmlFor=id;
+  title.title=label+' · drag the slider or enter a value';
+  const help=document.createElement('span');help.className='qe-info';help.textContent='ⓘ';help.title=title.title;title.append(help);
+  const range=document.createElement('input');range.type='range';range.min=min;range.max=max;range.step=step;range.value=value;range.setAttribute('aria-label',label);
+  const number=document.createElement('input');number.type='number';number.id=id;number.min=min;number.max=max;number.step=step;number.value=value;number.setAttribute('aria-label',label+' value');
+  const sync=(v)=>{v=Number(v);if(!Number.isFinite(v))return;v=Math.max(min,Math.min(max,v));number.value=v;range.value=v;onchange?.(v)};
+  range.oninput=()=>sync(range.value);number.onchange=()=>sync(number.value);
+  const end=document.createElement(remove?'button':'span');end.textContent=remove?'×':'';end.title=remove?'Remove LoRA':title.title;if(remove){end.type='button';end.onclick=remove;end.setAttribute('aria-label','Remove '+label)}
+  row.append(title,range,number,end);root.append(row);return {range,number};
+}
+let qeStepsControl,qeCfgControl;
+function syncQwenLightning(){
+ const on=qwenLoras.some(x=>x.name==='lightning'&&x.strength!==0);
+ for(const [control,value] of [[qeStepsControl,on?4:40],[qeCfgControl,on?1:4]]){
+   control.range.value=value;control.number.value=value;control.range.disabled=on;control.number.disabled=on;
+ }
+}
+function renderQwenLoras(){
+ const root=$('qe-loras');root.replaceChildren();
+ qwenLoras.forEach((item,i)=>qwenSlider(root,item.name==='lightning'?'LIGHTNING LORA':item.name==='angles'?'ANGLES LORA':item.name,'qe-lora-'+i,item.strength,0,2,.05,v=>{const was=item.strength!==0;item.strength=v;if(item.name==='lightning'&&was!==(v!==0))syncQwenLightning()},['lightning','angles'].includes(item.name)?null:()=>{qwenLoras.splice(i,1);renderQwenLoras()}));
+ const select=$('qe-installed');select.replaceChildren(new Option('Choose installed LoRA…',''));
+ loraLibrary.filter(x=>x.valid&&!x.reserved&&!qwenLoras.some(y=>y.name===x.name)).forEach(x=>select.add(new Option(x.name,x.name)));
+}
+function addQwenLora(name){
+ if(qwenLoras.some(x=>x.name===name))return;
+ if(qwenLoras.length>=6){setStatus('qe_status','Remove a custom LoRA before adding another.','bad');return;}
+ qwenLoras.push({name,strength:1});renderQwenLoras();
+}
+qeCfgControl=qwenSlider($('qe-settings'),'CFG','qe_true_cfg',1,0,20,.1);
+qeStepsControl=qwenSlider($('qe-settings'),'STEPS','qe_steps',4,1,80,1);
+$('qe-add-installed').onclick=()=>{const name=$('qe-installed').value;if(name)addQwenLora(name)};
+syncQwenLightning();
+renderQwenLoras();
+
 
 function _fmtLoraBytes(bytes){
   bytes=Math.max(0,+bytes||0);
@@ -9988,6 +10181,7 @@ function renderLoraLibrary(items,maxActive=4){
     KREA_LORA_TABS.forEach(tab=>{loraStacks[tab]=_normalizedClientStack(loraStacks[tab])});
   }
   KREA_LORA_TABS.forEach(tab=>renderLoraTab(tab,maxActive));
+  renderQwenLoras();
 }
 async function refreshLoras(){
   try{
@@ -10056,7 +10250,8 @@ async function pollLoraDownload(downloadId){
         loraProgressWidth(100);
         if(d.items)renderLoraLibrary(d.items||[],4);
         const installed=String(d.file||d.filename||'');
-        if(installed){
+        if(installed && d.target_tab==='qedit'){addQwenLora(installed);}
+        else if(installed){
           const tab=KREA_LORA_TABS.includes(loraInstallerTargetTab)?loraInstallerTargetTab:'text';
           const next=activeLoraStackForTab(tab).filter(x=>x.name!==installed);
           if(next.length<4)next.push({name:installed,strength:1});
@@ -10123,7 +10318,7 @@ async function startLoraDownload(){
     const r=await fetchJson('/api/loras/install',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({source,revision,candidate_key,filename})
+      body:JSON.stringify({source,revision,candidate_key,filename,target_tab:loraInstallerTargetTab})
     });
     if(r.filename&&$('lora_detected_name'))$('lora_detected_name').value=r.filename;
     pollLoraDownload(r.id);
@@ -10537,6 +10732,7 @@ function activateStage(tab){
   document.querySelectorAll('.stagepanel').forEach(el=>el.classList.remove('active'));
   const stage=$(activeStageId); if(stage) stage.classList.add('active');
   syncStageToolbar();
+  syncLiveJobStatus(queueSnapshot);
 }
 const ML_GENERATE_BY_TAB={text:'t_generate',image:'i_generate',edit:'e_generate',inpaint:'in_generate',qedit:'qe_generate',camera:'c_generate',batch:'b_generate'};
 function placeAccessCard(tab){
@@ -10649,6 +10845,7 @@ $('qe_generate').onclick=async()=>{
   fd.append('negative_prompt',$('qe_negative').value);
   fd.append('max_side',$('qe_max').value);
   fd.append('seed',$('qe_seed').value);
+  fd.append('qwen_loras',JSON.stringify(qwenLoras.map(x=>({...x}))));
   fd.append('steps',$('qe_steps').value);
   fd.append('guidance_scale',$('qe_guidance').value);
   fd.append('true_cfg_scale',$('qe_true_cfg').value);
@@ -11402,7 +11599,8 @@ function renderQueue(jobs,count,maxCount){
     const meta=document.createElement('div');meta.className='job-meta';meta.textContent=fmtElapsed(job)+step+etaText(job);
     const bar=document.createElement('div');bar.className='job-progress';
     const fill=document.createElement('div');fill.className='job-progress-fill';fill.style.width=Math.max(0,Math.min(100,+job.progress||0))+'%';bar.appendChild(fill);
-    info.append(status,mode,meta,bar);
+    const detail=document.createElement('div');detail.className='job-meta';detail.textContent=job.detail||'';
+    info.append(status,mode,detail,meta,bar);
     const cancel=document.createElement('button');cancel.className='job-cancel';cancel.type='button';cancel.title='Cancel this job';cancel.textContent='×';cancel.onclick=(ev)=>{ev.stopPropagation();cancelJob(job.id)};
     tile.append(thumb,info,cancel);root.appendChild(tile);
   });
@@ -11642,10 +11840,29 @@ function applyFinishedJob(job){
   if(job.status==='done'){refreshHistory();mlRefreshAccess()}
 }
 
+function syncLiveJobStatus(jobs){
+  const live=(jobs||[]).filter(job=>['queued','waiting','running'].includes(job.status));
+  const current=live.find(job=>job.kind===activeStudioTab && job.status==='running')
+    ||live.find(job=>job.kind===activeStudioTab);
+  const banner=$('stage_progress');
+  if(banner){
+    banner.classList.toggle('hidden',!current);
+    if(current){
+      const steps=current.step?` · step ${current.step}/${current.step_total}`:'';
+      const elapsed=current.stage_started?` · ${fmtSeconds(Date.now()/1000-current.stage_started)} in this phase`:'';
+      banner.textContent=`${stageText(current)}${steps}${elapsed}${current.detail?' — '+current.detail:''}`;
+    }
+  }
+  for(const tab of SINGLE_WORK_TABS){
+    const job=live.find(item=>item.kind===tab&&item.status==='running')||live.find(item=>item.kind===tab);
+    if(job)setStatusForTab(tab,stageText(job)+(job.step?` · ${job.step}/${job.step_total} steps`:'')+(job.detail?' · '+job.detail:''),'');
+  }
+}
 async function pollJobs(){
   try{
     const d=await fetchJson('/api/jobs');
     renderQueue(d.jobs||[],d.count,d.max);
+    syncLiveJobStatus(d.jobs||[]);
     (d.jobs||[]).forEach(job=>{
       if(job.kind==='batch'&&job.id===activeBatchId)syncBatchJob(job);
       applyFinishedJob(job);
