@@ -1493,7 +1493,7 @@ def _qwen_pipeline_classes():
     """Load the bitsandbytes Qwen runtime without optional TorchAO integration.
 
     ComfyUI can install a TorchAO version lacking Diffusers' FqnToConfig API.
-    Qwen's FullQ4 checkpoint uses bitsandbytes, so TorchAO is unnecessary here.
+    Qwen uses GGUF and bitsandbytes, so TorchAO is unnecessary here.
     Keep the installed package available to ComfyUI; change only Diffusers'
     backend detection before its lazy quantizer imports run.
     """
@@ -1770,6 +1770,29 @@ def _normalize_qwen_loras(value):
     return result
 
 
+def _qwen_load_lora_weights(pipe, source, **kwargs):
+    """Skip PEFT's unrelated TorchAO probe for the GGUF Qwen transformer.
+
+    PEFT checks TorchAO even on non-TorchAO layers and can reject the older
+    package installed by ComfyUI. Patch both the original probe and the
+    dispatch module's imported binding only while attaching a Qwen adapter.
+    Restore them even if loading fails; leave ComfyUI's installation intact.
+    """
+    import peft.import_utils as peft_imports
+    import peft.tuners.lora.torchao as peft_torchao
+    original_probe = peft_imports.is_torchao_available
+    original_dispatch_probe = peft_torchao.is_torchao_available
+    def no_torchao(*args, **kwargs):
+        return False
+    try:
+        peft_imports.is_torchao_available = no_torchao
+        peft_torchao.is_torchao_available = no_torchao
+        return pipe.load_lora_weights(source, **kwargs)
+    finally:
+        peft_imports.is_torchao_available = original_probe
+        peft_torchao.is_torchao_available = original_dispatch_probe
+
+
 def _configure_qwen_edit_loras(pipe, adapters):
     import math
     from diffusers import FlowMatchEulerDiscreteScheduler
@@ -1788,7 +1811,7 @@ def _configure_qwen_edit_loras(pipe, adapters):
             name = item["name"]
             source, filename = QWEN_EDIT_ADAPTERS.get(name, (str(LORA_DIR_RUNTIME), name))
             adapter = "qwen_edit_" + str(i)
-            pipe.load_lora_weights(source, weight_name=filename, adapter_name=adapter)
+            _qwen_load_lora_weights(pipe, source, weight_name=filename, adapter_name=adapter)
             names.append(adapter)
             weights.append(item["strength"])
         if names:
@@ -9014,14 +9037,14 @@ html,body{height:100%;overflow:hidden}
 .controlpanel{display:none}.controlpanel.active{display:block}
 .controlpanel .card{margin-bottom:10px;border-radius:8px}
 .controlpanel .cardtitle{background:#0f0f12}
-.studio-stage{min-width:0;min-height:0;display:grid;grid-template-rows:44px auto minmax(0,1fr);background:#070708;position:relative;overflow:hidden}
+.studio-stage{min-width:0;min-height:0;display:grid;grid-template-rows:44px minmax(0,1fr);background:#070708;position:relative;overflow:hidden}
 .stage-toolbar{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 12px;border-bottom:1px solid var(--line);background:#0d0d10;z-index:4}
 .stage-toolbar-left{display:flex;align-items:center;gap:10px;min-width:0}
 .stage-title{font-family:var(--font-mono);font-size:10px;font-weight:800;letter-spacing:1.2px;color:#a6a8b1;text-transform:uppercase}
 .stage-mode{font-family:var(--font-mono);font-size:9px;color:var(--accent);letter-spacing:.8px;text-transform:uppercase;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .stage-toolbar-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
 .stage-toolbar-actions .stagebtn{height:30px}
-.stage-canvas{grid-row:3;position:relative;min-width:0;min-height:0;overflow:hidden;background:#050506}
+.stage-canvas{grid-row:2;position:relative;min-width:0;min-height:0;overflow:hidden;background:#050506}
 .stagepanel{position:absolute;inset:0;display:none;min-height:0;border:0;border-radius:0;background:#050506}
 .stagepanel.active{display:flex}
 .stagepanel.gallerymode.active{display:block;overflow:auto;padding:18px;scrollbar-width:none;-ms-overflow-style:none}
@@ -9111,6 +9134,13 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
 .qe-slider input[type=range]::-moz-range-thumb{width:17px;height:17px;border:0;border-radius:50%;background:#e8ad12;cursor:pointer}
 .qe-slider button{padding:0;background:transparent;border:0;color:#aaa}
 #qe_generate{width:100%;flex:1}
+.model-progress{flex:none;margin:10px 12px;padding:12px;border:1px solid var(--line);border-radius:9px;background:#151517}
+.model-progress-heading{display:flex;justify-content:space-between;gap:12px;font:11px/1.4 var(--font-mono);margin-bottom:9px}
+.model-progress-track{height:6px;overflow:hidden;border-radius:6px;background:#303034}
+.model-progress-track i{display:block;height:100%;background:var(--gold);border-radius:6px;transition:width .25s}
+.model-progress-track.indeterminate i{width:35%!important;animation:model-load-progress 1.4s ease-in-out infinite}
+@keyframes model-load-progress{from{transform:translateX(-110%)}to{transform:translateX(390%)}}
+@media(prefers-reduced-motion:reduce){.model-progress-track.indeterminate i{animation:none;width:100%!important;opacity:.6}}
 </style>
 </head>
 <body>
@@ -9150,6 +9180,10 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
         <div id="ml_upgrade_pitch" style="display:none;margin-top:7px;padding-top:7px;border-top:1px solid #292718;font-size:7.6px;line-height:1.45;color:#8f9198"><b style="color:#ddd">Notebook Pro goes unlimited.</b> Start with a <span style="color:#f1d56d">7-day free trial</span> and unlock the full MissingLink notebook library.</div>
       </div>
 
+      <div id="model_progress" class="model-progress hidden" aria-live="polite">
+        <div class="model-progress-heading"><span id="model_progress_label"></span><span id="model_progress_value"></span></div>
+        <div id="model_progress_track" class="model-progress-track" role="progressbar" aria-label="Generation progress" aria-valuemin="0" aria-valuemax="100"><i id="model_progress_fill"></i></div>
+      </div>
       <div class="sidebar-scroll">
         <div class="card base-model-card">
           <div class="cardtitle">Base Model</div>
@@ -9659,7 +9693,6 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
           <button id="stage_clear" class="stagebtn danger" type="button">Clear stage</button>
         </div>
       </div>
-      <div id="stage_progress" class="hidden" role="status" aria-live="polite" style="padding:10px 16px;border-bottom:1px solid var(--line);font:11px/1.5 var(--font-mono);color:var(--text)"></div>
       <div class="stage-canvas">
         <div id="t_result" class="stageview single stagepanel active"><div class="empty">Generated image appears here.</div></div>
         <div id="i_result" class="stageview single stagepanel"><div class="empty">Generated image appears here.</div></div>
@@ -11879,13 +11912,22 @@ function syncLiveJobStatus(jobs){
   const live=(jobs||[]).filter(job=>['queued','waiting','running'].includes(job.status));
   const current=live.find(job=>job.kind===activeStudioTab && job.status==='running')
     ||live.find(job=>job.kind===activeStudioTab);
-  const banner=$('stage_progress');
-  if(banner){
-    banner.classList.toggle('hidden',!current);
-    if(current){
-      const steps=current.step?` · step ${current.step}/${current.step_total}`:'';
-      const elapsed=current.stage_started?` · ${fmtSeconds(Date.now()/1000-current.stage_started)} in this phase`:'';
-      banner.textContent=`${stageText(current)}${steps}${elapsed}${current.detail?' — '+current.detail:''}`;
+  const card=$('model_progress');
+  if(card){
+    const shown=current||live.find(job=>job.status==='running');
+    card.classList.toggle('hidden',!shown);
+    if(shown){
+      const preparing=!shown.step && Number(shown.progress||0)<18;
+      const percent=Math.max(0,Math.min(100,Number(shown.progress)||0));
+      const track=$('model_progress_track');
+      $('model_progress_label').textContent=stageText(shown);
+      $('model_progress_label').title=shown.detail||'';
+      $('model_progress_value').textContent=preparing?'':Math.round(percent)+'%';
+      track.classList.toggle('indeterminate',preparing);
+      track.setAttribute('aria-label',stageText(shown));
+      if(preparing)track.removeAttribute('aria-valuenow');
+      else track.setAttribute('aria-valuenow',String(percent));
+      $('model_progress_fill').style.width=percent+'%';
     }
   }
   for(const tab of SINGLE_WORK_TABS){
