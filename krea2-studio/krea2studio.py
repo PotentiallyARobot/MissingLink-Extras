@@ -3158,6 +3158,9 @@ def instruction_edit(
         + referenced_instruction
     )
 
+    # Qwen releases CLIP/VAE. Restore the selected Krea engine before encoding.
+    ensure_krea_engine(base_model_name)
+
     positive, negative = encode_grounded_edit_prompt(
         effective_prompt,
         source,
@@ -3683,6 +3686,9 @@ def inpaint(
         "boundaries coherent. Edit instruction: "
         + referenced_instruction
     )
+
+    # Qwen releases CLIP/VAE. Restore the selected Krea engine before encoding.
+    ensure_krea_engine(base_model_name)
 
     positive, negative = encode_grounded_edit_prompt(
         effective_prompt,
@@ -10651,7 +10657,7 @@ function _setSingleStageImage(id,url){
 function setSharedSingleImage(url){
   if(!url) return;
   SINGLE_STAGE_IDS.forEach(id=>_setSingleStageImage(id,url));
-  if(['text','image','edit','inpaint'].includes(activeStudioTab)) syncStageToolbar();
+  if(SINGLE_WORK_TABS.includes(activeStudioTab)) syncStageToolbar();
 }
 function clearSharedSingleStage(){
   SINGLE_STAGE_IDS.forEach(id=>setStageEmpty(id, SINGLE_STAGE_DOWNLOADS[id]));
@@ -10719,17 +10725,17 @@ function renderStageGallery(id,items){
   wrap.appendChild(grid);
   if(id===activeStageId)syncStageToolbar();
 }
-async function assignImageUrlToEditors(url){
-  if(!url) throw new Error('Nothing is currently staged.');
+async function assignImageUrlToEditors(url,tab){
+  if(!url)throw new Error('Nothing is currently staged.');
+  const sourceId={image:'i_source',edit:'e_source',inpaint:'in_source',qedit:'qe_source',camera:'c_source'}[tab];
+  if(!sourceId)throw new Error('This view has no source image slot.');
   const resp=await fetch(url);
-  if(!resp.ok) throw new Error('Could not fetch the staged image.');
+  if(!resp.ok)throw new Error('Could not fetch the staged image.');
   const blob=await resp.blob();
-  const file=new File([blob], 'missinglink-staged.png', {type: blob.type || 'image/png'});
-  const dt1=new DataTransfer(); dt1.items.add(file); $('i_source').files=dt1.files; $('i_source').dispatchEvent(new Event('change'));
-  const dtEdit=new DataTransfer(); dtEdit.items.add(file); $('e_source').files=dtEdit.files; $('e_source').dispatchEvent(new Event('change'));
-  const dt2=new DataTransfer(); dt2.items.add(file); $('in_source').files=dt2.files; $('in_source').dispatchEvent(new Event('change'));
-  const dtQ=new DataTransfer(); dtQ.items.add(file); $('qe_source').files=dtQ.files; $('qe_source').dispatchEvent(new Event('change'));
-  const dt3=new DataTransfer(); dt3.items.add(file); $('c_source').files=dt3.files; $('c_source').dispatchEvent(new Event('change'));
+  const file=new File([blob],'missinglink-staged.png',{type:blob.type||'image/png'});
+  const transfer=new DataTransfer();transfer.items.add(file);
+  $(sourceId).files=transfer.files;
+  $(sourceId).dispatchEvent(new Event('change',{bubbles:true}));
 }
 function currentStageUrl(id){
   const st=ensureStageState(id);
@@ -10773,25 +10779,18 @@ async function loadHistoryImageToStage(item){
     setStatusForTab('batch','Loaded batch from History.','good');
     return;
   }
-  setSharedSingleImage(item.url);
-  if(!SINGLE_WORK_TABS.includes(activeStudioTab)){
-    switchStudioTab(lastWorkTab||'image');
+  consoleOverlayOpen=false;
+  if(activeStudioTab==='batch'){
+    // Keep a history selection from being replaced by batch polling.
+    batchStageCleared=true;
+    showImage('b_gallery',item.url);
+  }else{
+    setSharedSingleImage(item.url);
   }
-  const targetTab=activeStudioTab;
-  try{
-    const sourceId={image:'i_source',edit:'e_source',inpaint:'in_source',qedit:'qe_source',camera:'c_source'}[targetTab];
-    if(sourceId){
-      const response=await fetch(item.url);
-      if(!response.ok)throw new Error('Could not load history image.');
-      const blob=await response.blob();
-      const dt=new DataTransfer();
-      dt.items.add(new File([blob],item.filename||'history.png',{type:blob.type||'image/png'}));
-      $(sourceId).files=dt.files;
-      $(sourceId).dispatchEvent(new Event('change'));
-    }
-    setStatusForTab(targetTab,'Loaded image from History.','good');
-  }catch(error){setStatusForTab(targetTab,error.message,'bad');}
+  activateStage(activeStudioTab);
+  setStatusForTab(activeStudioTab,'History image staged. Use Assign as input to replace the source image.','good');
 }
+
 function activateStage(tab){
   activeStudioTab=tab;
   if(SINGLE_WORK_TABS.includes(tab)) lastWorkTab=tab;
@@ -10846,19 +10845,13 @@ $('stage_clear').onclick=()=>{
   syncStageToolbar();
 };
 $('stage_assign').onclick=async()=>{
+  const targetTab=['image','edit','inpaint','qedit','camera'].includes(activeStudioTab)?activeStudioTab:'image';
   try{
     const url=currentStageUrl(activeStageId);
-    await assignImageUrlToEditors(url);
-    switchStudioTab(['edit','inpaint','qedit','camera'].includes(activeStudioTab)?activeStudioTab:'image');
-    setStatus('i_status','Staged image assigned to the edit inputs.','good');
-    setStatus('e_status','Staged image assigned to the edit inputs.','good');
-    setStatus('in_status','Staged image assigned to the edit inputs.','good');
-    setStatus('qe_status','Staged image assigned to Qwen Edit.','good');
-    setStatus('cam_status','Staged image assigned to Qwen Camera.','good');
-  }catch(e){
-    const statusId=STATUS_BY_TAB[activeStudioTab];
-    if(statusId)setStatus(statusId,e.message,'bad');
-  }
+    await assignImageUrlToEditors(url,targetTab);
+    if(activeStudioTab!==targetTab)switchStudioTab(targetTab);
+    setStatusForTab(targetTab,'Staged image assigned as input.','good');
+  }catch(e){setStatusForTab(activeStudioTab,e.message,'bad');}
 };
 
 function bindFilePicker(inputId,buttonId,nameId,{previewId=null,emptyText='Choose an image.'}={}){
@@ -11678,7 +11671,8 @@ async function putHistoryPromptInInput(item,button=null){
   const filename=String(item?.filename||'').trim();
   if(!filename)return;
 
-  const originalLabel=button?.textContent||'PROMPT';
+  const requestedTab=activeStudioTab;
+  const originalLabel=button?.textContent||'USE PROMPT';
   if(button){button.disabled=true;button.textContent='LOADING…'}
   try{
     const data=await fetchJson('/api/history/prompt/'+encodeURIComponent(filename),{cache:'no-store'});
@@ -11691,9 +11685,10 @@ async function putHistoryPromptInInput(item,button=null){
       edit:'e_prompt',
       inpaint:'in_prompt',
       camera:'c_extra',
+      qedit:'qe_prompt',
       batch:'b_instruction'
     };
-    let tab=activeStudioTab;
+    let tab=requestedTab;
     if(!promptInputByTab[tab]){
       tab=lastWorkTab||'text';
       switchStudioTab(tab);
@@ -11728,8 +11723,8 @@ function renderFloatingHistory(items){
     const promptBtn=document.createElement('button');
     promptBtn.type='button';
     promptBtn.className='q-hist-prompt';
-    promptBtn.textContent='PROMPT';
-    promptBtn.title='Load this image prompt into the prompt input';
+    promptBtn.textContent='USE PROMPT';
+    promptBtn.title='Replace the current prompt with this image’s saved prompt';
     promptBtn.addEventListener('click',ev=>{
       ev.preventDefault();
       ev.stopPropagation();
