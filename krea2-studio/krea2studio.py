@@ -1478,6 +1478,28 @@ def _hf_token_for_qwen():
     return token or None
 
 
+def _qwen_pipeline_classes():
+    """Load the bitsandbytes Qwen runtime without optional TorchAO integration.
+
+    ComfyUI can install a TorchAO version lacking Diffusers' FqnToConfig API.
+    Qwen's FullQ4 checkpoint uses bitsandbytes, so TorchAO is unnecessary here.
+    Keep the installed package available to ComfyUI; change only Diffusers'
+    backend detection before its lazy quantizer imports run.
+    """
+    import diffusers.utils as diffusion_utils
+    from diffusers.utils import import_utils as diffusion_imports
+
+    def no_torchao(*args, **kwargs):
+        return False
+
+    diffusion_imports._torchao_available = False
+    diffusion_imports.is_torchao_available = no_torchao
+    diffusion_utils.is_torchao_available = no_torchao
+    from diffusers import QwenImageEditPlusPipeline, QwenImageTransformer2DModel
+    from transformers import Qwen2_5_VLForConditionalGeneration
+    return QwenImageEditPlusPipeline, QwenImageTransformer2DModel, Qwen2_5_VLForConditionalGeneration
+
+
 def ensure_qwen_camera_engine():
     """Hard-swap Krea2 out, then lazily load the NF4 Qwen 2511 camera engine."""
     global QWEN_CAMERA_PIPE, ACTIVE_ENGINE
@@ -1486,18 +1508,20 @@ def ensure_qwen_camera_engine():
             ACTIVE_ENGINE = "qwen_camera"
             return QWEN_CAMERA_PIPE
 
+        _emit_progress("Checking Qwen dependencies", pct=1)
+        try:
+            (QwenImageEditPlusPipeline, QwenImageTransformer2DModel,
+             Qwen2_5_VLForConditionalGeneration) = _qwen_pipeline_classes()
+        except Exception as exc:
+            raise RuntimeError(
+                "Qwen dependency import failed: " + str(exc)
+                + " Re-run setup with the updated notebook and retry."
+            ) from exc
+
         _emit_progress("Releasing Krea2", pct=2)
         _release_krea_engine()
         _emit_progress("Loading Qwen 2511 Camera", pct=5)
         print(f"[ENGINE] loading Qwen Camera: {QWEN_CAMERA_REPO}", flush=True)
-        try:
-            from diffusers import QwenImageEditPlusPipeline, QwenImageTransformer2DModel
-            from transformers import Qwen2_5_VLForConditionalGeneration
-        except Exception as exc:
-            raise RuntimeError(
-                "Qwen Camera dependencies are unavailable. Re-run the notebook setup so "
-                "diffusers, transformers, accelerate and bitsandbytes are installed."
-            ) from exc
 
         token = _hf_token_for_qwen()
         cap = torch.cuda.get_device_capability(0)
@@ -4962,6 +4986,10 @@ def create_batch_zip(
         ],
     }
 
+    (OUTPUT_DIR / f"{stem}.batch.json").write_text(
+        json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+    )
+
     with zipfile.ZipFile(
         zip_path,
         "w",
@@ -5029,6 +5057,7 @@ def generate_adaptive_batch(
     lightning_strength=1.0,
     extra_loras=None,
     base_model_name=MODEL_NAME,
+    reference_guidance="",
 ):
 
     reset_stop()
@@ -5259,6 +5288,8 @@ def generate_adaptive_batch(
             check_stop()
 
             prompt = prompts[index]
+            if reference_guidance:
+                prompt = prompt + "\n\nReference image guidance: " + reference_guidance
 
             allowed, access = _ml_reserve_generation(
                 {
@@ -7081,8 +7112,33 @@ def _public_gallery(gallery):
 
 def _history_payload():
     gallery, downloadable = history_snapshot()
+    items = _public_gallery(gallery)
+    # Saved manifests keep batch groups available across server restarts.
+    manifests = list(OUTPUT_DIR.glob("*.batch.json"))
+    manifests += [p for p in OUTPUT_DIR.glob("*_adaptive_batch*.zip")
+                  if not p.with_suffix(".batch.json").exists()]
+    for manifest_path in sorted(manifests, key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            if manifest_path.suffix == ".zip":
+                with zipfile.ZipFile(manifest_path) as archive:
+                    manifest = json.loads(archive.read("batch_manifest.json"))
+            else:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            images = [
+                {"filename": row["filename"], "url": _output_url(row["filename"]),
+                 "caption": row.get("prompt", "")}
+                for row in manifest.get("images", [])
+                if Path(row["filename"]).name == row["filename"]
+                and (OUTPUT_DIR / row["filename"]).is_file()
+            ]
+            if images:
+                items.insert(0, {"kind": "batch", "filename": manifest_path.name,
+                                "url": images[0]["url"], "images": images,
+                                "caption": f"BATCH · {len(images)} images"})
+        except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile):
+            continue
     return {
-        "items": _public_gallery(gallery),
+        "items": items,
         "files": [
             {"filename": Path(path).name, "url": _output_url(path)}
             for path in downloadable
@@ -7117,9 +7173,11 @@ def _active_job_count():
 
 
 def _submit_job(kind, params, *, label, mode, thumb=None, batch_total=0):
-    # Identity is required for every queued operation. Single-image jobs reserve one
-    # Krea2 generation here; adaptive batches reserve one generation per image.
-    _require_missinglink_access("job submission", force=True)
+    # Identity and generation quota remain enforced before GPU execution.
+    # Enqueue locally; the worker performs fresh identity and quota checks
+    # before any GPU work. Avoid blocking the HTTP response on remote services.
+    if not _ML_AUTH_STATE.get("ok"):
+        raise RuntimeError("MissingLink notebook access is required for job submission.")
     params = dict(params or {})
     if "extra_loras" in params:
         params["extra_loras"] = _normalize_extra_loras(params.get("extra_loras") or [])
@@ -7133,17 +7191,6 @@ def _submit_job(kind, params, *, label, mode, thumb=None, batch_total=0):
                 "Cancel a job or wait for one to finish."
             )
 
-    if kind != "batch":
-        reserve_params = dict(params)
-        reserve_params["kind"] = kind
-        allowed, access = _ml_reserve_generation(
-            reserve_params,
-            origin=f"{kind}_submit",
-        )
-        if not allowed:
-            raise FreeGenerationLimitError(access)
-
-    with JOB_LOCK:
         jid = uuid.uuid4().hex[:12]
         now = time.time()
         JOBS[jid] = {
@@ -7191,12 +7238,18 @@ def _load_job_image(path, mode="RGB"):
 
 
 def _run_batch_job(jid, params):
+    reference_guidance, reference_meta = apply_reference_guidance(
+        "", params.get("reference_paths"),
+        params.get("reference_mode", "style"), params.get("reference_strength", 70),
+        generation_mode="text", agent_model=params.get("agent_model"),
+    )
     reference = None
     if params.get("reference_path"):
         reference = _load_job_image(params["reference_path"])
 
     generator = generate_adaptive_batch(
         instruction=params["instruction"],
+        reference_guidance=reference_guidance,
         reference_image=reference,
         rows=params["rows"],
         width=params["width"],
@@ -7264,6 +7317,18 @@ def _execute_job(jid):
     with JOB_LOCK:
         job = JOBS[jid]
         params = JOB_PARAMS[jid]
+    if _job_cancelled(jid):
+        check_stop()
+        raise RuntimeError("Job cancelled before generation.")
+    if job["kind"] != "batch":
+        reserve_params = dict(params)
+        reserve_params["kind"] = job["kind"]
+        allowed, access = _ml_reserve_generation(
+            reserve_params, origin=f"{job['kind']}_execute",
+        )
+        if not allowed:
+            raise FreeGenerationLimitError(access)
+    with JOB_LOCK:
         job.update(
             status="running",
             stage="Starting GPU",
@@ -8214,8 +8279,15 @@ def api_batch_analyze():
         rows = []
     reference = _pil_upload(request.files.get("reference"))
     try:
+        instruction, _ = apply_reference_guidance(
+            request.form.get("instruction"),
+            _save_job_images(_pil_uploads(request.files.getlist("references")), "batch_style"),
+            request.form.get("reference_mode") or "style",
+            _int_value(request.form.get("reference_strength"), 70, 0, 100),
+            agent_model=request.form.get("agent_model") or OPENAI_MODEL,
+        )
         table, status, notes = plan_prompts(
-            request.form.get("instruction"), rows, reference,
+            instruction, rows, reference,
             _int_value(request.form.get("image_count"), 8, 1, MAX_BATCH_IMAGES),
             request.form.get("planner_instructions") or DEFAULT_AGENT_INSTRUCTIONS,
             request.form.get("agent_model") or OPENAI_MODEL,
@@ -8241,6 +8313,9 @@ def api_batch_start():
     params = {
         "instruction": request.form.get("instruction"),
         "reference_path": reference_path,
+        "reference_paths": _save_job_images(_pil_uploads(request.files.getlist("references")), "batch_style"),
+        "reference_mode": request.form.get("reference_mode") or "style",
+        "reference_strength": _int_value(request.form.get("reference_strength"), 70, 0, 100),
         "rows": rows,
         "base_model": _normalize_base_model_name(request.form.get("base_model") or MODEL_NAME),
         "width": _int_value(request.form.get("width"), DEFAULT_BATCH_WIDTH, 256, 2048),
@@ -8263,7 +8338,6 @@ def api_batch_start():
         "lightning_strength": _float_value(request.form.get("lightning_strength"), 1.0, 0.0, 1.5),
     }
     try:
-        _validate_missinglink_token(force=True)
         access = _ml_public_access_state()
         if not access.get("member"):
             remaining = max(0, int(access.get("remaining") or 0))
@@ -8652,13 +8726,13 @@ a{color:inherit}
 .actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}
 .actions a{display:inline-flex;align-items:center;text-decoration:none;border-radius:7px;background:#25262c;color:#d3d4d8;border:1px solid #34353d;padding:8px 10px;font-weight:800;font-size:9px}
 /* H3-style generation footer: membership card directly above a full-width primary generate button. */
-#t_generate,#i_generate,#e_generate,#in_generate,#b_generate{width:100%;min-height:48px;font-size:13px;letter-spacing:.2px}
+#t_generate,#i_generate,#e_generate,#in_generate,#c_generate,#b_generate{width:100%;min-height:48px;font-size:13px;letter-spacing:.2px}
 #ml_access_card.ml-action-card{margin:10px 0 8px!important;width:100%;box-sizing:border-box}
 .progress.indeterminate{position:relative;overflow:hidden}
 .progress.indeterminate i{width:28%!important;position:absolute;left:-28%;animation:mlLoraIndeterminate 1.05s linear infinite}
 @keyframes mlLoraIndeterminate{from{left:-28%}to{left:100%}}
 /* H3-style primary generation actions span the full left sidebar width. */
-#t_generate,#i_generate,#e_generate,#in_generate,#b_generate{display:block;width:100%;padding:12px 12px;font-size:11px;letter-spacing:.4px}
+#t_generate,#i_generate,#e_generate,#in_generate,#c_generate,#b_generate{display:block;width:100%;padding:12px 12px;font-size:11px;letter-spacing:.4px}
 #b_stop{width:100%}
 .base-model-card{margin-bottom:10px!important}
 .base-model-card .cardtitle{background:#0f0f12}
@@ -8767,7 +8841,7 @@ details .inside{padding:0 10px 10px}
 @media(max-width:900px){.stageview{min-height:320px}.stageview.gallerymode .gallery{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .console-stage{display:none!important;margin:0;padding:0;background:#050506;color:#c8cad2;overflow:hidden;align-items:initial!important;justify-content:initial!important;text-align:left}
 .console-stage.active{display:block!important}
-.console-stage #console_output{margin:0;width:100%;height:100%;padding:18px 20px;background:#050506;color:#c8cad2;font:11px/1.55 var(--font-mono);white-space:pre-wrap;word-break:break-word;overflow:auto;scrollbar-width:none;-ms-overflow-style:none}
+.console-stage #console_output{margin:0;width:100%;height:100%;padding:18px 20px;background:#050506;color:#c8cad2;font:11px/1.55 var(--font-mono);white-space:pre-wrap;word-break:break-word;user-select:text;-webkit-user-select:text;overflow:auto;scrollbar-width:none;-ms-overflow-style:none}
 .console-stage #console_output::-webkit-scrollbar{display:none}
 .console-toolbar-note{font-family:var(--font-mono);font-size:8px;color:#777982;line-height:1.5}
 .lora-list{display:flex;flex-direction:column;gap:6px;margin-top:8px}
@@ -9296,7 +9370,7 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
                   <div class="minihint">fal's trained control grid is 8 azimuths × 4 elevations × 3 distances = 96 camera poses. The Studio builds the exact <b>&lt;sks&gt; [azimuth] [elevation] [distance]</b> control phrase automatically.</div>
                 </div>
               </details>
-              <div class="actions"><button id="c_generate">RE-STAGE CAMERA</button></div>
+              <div class="actions"><button id="c_generate">GENERATE</button></div>
               <div id="cam_status" class="status">Ready. First use downloads and loads the Qwen Camera engine.</div>
               <a id="cam_download" class="hidden" target="_blank"></a>
             </div>
@@ -9416,6 +9490,7 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
         </div>
         <div class="stage-toolbar-actions">
           <button id="console_toggle" class="stagebtn" type="button">LOG</button>
+          <button id="console_copy" class="stagebtn" type="button" title="Copy all console output" aria-live="polite">Copy console</button>
           <button id="stage_assign" class="stagebtn" type="button">Assign as input</button>
           <a id="stage_download" class="stagebtn hidden" target="_blank">Download</a>
           <button id="stage_clear" class="stagebtn danger" type="button">Clear stage</button>
@@ -9617,7 +9692,30 @@ function appendReferenceFilesToFormData(fd){
   referenceFiles.slice(0,MAX_REFERENCE_FILES).forEach(file=>fd.append('references', file, file.name));
   return fd;
 }
+const QUEUE_SUBMISSIONS={
+  '/api/text_to_image':{kind:'text',label:'Text → Image'},
+  '/api/image_to_image':{kind:'image',label:'Image → Image'},
+  '/api/instruction_edit':{kind:'edit',label:'Krea Edit'},
+  '/api/inpaint':{kind:'inpaint',label:'Inpaint'},
+  '/api/qwen_edit':{kind:'qedit',label:'Qwen Edit'},
+  '/api/camera':{kind:'camera',label:'Qwen Camera'},
+  '/api/batch/start':{kind:'batch',label:'Adaptive Batch'}
+};
+let queueSnapshot=[];
 async function fetchJson(url,opts={}){
+  const response=await _fetchJson(url,opts);
+  const spec=opts.method?.toUpperCase()==='POST'?QUEUE_SUBMISSIONS[url]:null;
+  if(spec && response.id){
+    // The server has accepted a real job. Render it without another round trip.
+    if(!queueSnapshot.some(item=>item.id===response.id)){
+      queueSnapshot=[...queueSnapshot,{...spec,id:response.id,status:'queued',
+        created:Date.now()/1000,batch_total:Number(opts.body?.get?.('image_count')||0)}];
+    }
+    renderQueue(queueSnapshot);
+  }
+  return response;
+}
+async function _fetchJson(url,opts={}){
   const r=await fetch(url,opts);
   let d={};
   try{d=await r.json()}catch(_){}
@@ -10332,7 +10430,7 @@ function renderStageGallery(id,items){
   wrap.classList.remove('single');
   const st=ensureStageState(id);
   st.mode='gallery';
-  st.items=(items||[]).map(item=>({url:item.url, caption:item.caption||item.filename||'', filename:item.filename||''}));
+  st.items=(items||[]).map(item=>({...item, caption:item.caption||item.filename||''}));
   st.selected=Math.max(0, st.items.length-1);
   if(!st.items.length){
     wrap.innerHTML='<div class="empty">'+(STAGE_EMPTY_TEXT[id]||'Nothing staged yet.')+'</div>';
@@ -10401,13 +10499,36 @@ function setStatusForTab(tab,message,kind='good'){
   const id=STATUS_BY_TAB[tab];
   if(id && $(id)) setStatus(id,message,kind);
 }
-function loadHistoryImageToStage(item){
+async function loadHistoryImageToStage(item){
   if(!item || !item.url) return;
+  if(item.kind==='batch'){
+    activeBatchId=null;
+    $('b_stop').disabled=true;
+    $('b_caption').disabled=true;
+    $('b_zip').classList.add('hidden');
+    switchStudioTab('batch');
+    renderStageGallery('b_gallery',item.images||[]);
+    setStatusForTab('batch','Loaded batch from History.','good');
+    return;
+  }
   setSharedSingleImage(item.url);
   if(!SINGLE_WORK_TABS.includes(activeStudioTab)){
     switchStudioTab(lastWorkTab||'image');
   }
-  setStatusForTab(activeStudioTab,'Loaded image from History onto the stage.','good');
+  const targetTab=activeStudioTab;
+  try{
+    const sourceId={image:'i_source',edit:'e_source',inpaint:'in_source',qedit:'qe_source',camera:'c_source'}[targetTab];
+    if(sourceId){
+      const response=await fetch(item.url);
+      if(!response.ok)throw new Error('Could not load history image.');
+      const blob=await response.blob();
+      const dt=new DataTransfer();
+      dt.items.add(new File([blob],item.filename||'history.png',{type:blob.type||'image/png'}));
+      $(sourceId).files=dt.files;
+      $(sourceId).dispatchEvent(new Event('change'));
+    }
+    setStatusForTab(targetTab,'Loaded image from History.','good');
+  }catch(error){setStatusForTab(targetTab,error.message,'bad');}
 }
 function activateStage(tab){
   activeStudioTab=tab;
@@ -10435,7 +10556,7 @@ function switchStudioTab(tab){
   if(previousTab==='batch' && tab!=='batch') setStageEmpty('b_gallery');
   document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.tab===tab));
   document.querySelectorAll('.controlpanel').forEach(x=>x.classList.toggle('active',x.id==='panel_'+tab));
-  const refCard=$('reference_card'); if(refCard) refCard.classList.toggle('reference-hidden', !['text','image','edit','inpaint'].includes(tab));
+  const refCard=$('reference_card'); if(refCard) refCard.classList.toggle('reference-hidden', !['text','image','edit','inpaint','batch'].includes(tab));
   placeAccessCard(tab);
   activateStage(tab);
   if(tab==='camera' && cameraCanvas && cameraRenderer && cameraViewCam){
@@ -10455,14 +10576,17 @@ if($('console_toggle')) $('console_toggle').onclick=async()=>{
 };
 $('stage_clear').onclick=()=>{
   if(['text','image','edit','inpaint','qedit','camera'].includes(activeStudioTab)) clearSharedSingleStage();
-  else setStageEmpty(activeStageId);
+  else {
+    if(activeStudioTab==='batch') batchStageCleared=true;
+    setStageEmpty(activeStageId);
+  }
   syncStageToolbar();
 };
 $('stage_assign').onclick=async()=>{
   try{
     const url=currentStageUrl(activeStageId);
     await assignImageUrlToEditors(url);
-    switchStudioTab('image');
+    switchStudioTab(['edit','inpaint','qedit','camera'].includes(activeStudioTab)?activeStudioTab:'image');
     setStatus('i_status','Staged image assigned to the edit inputs.','good');
     setStatus('e_status','Staged image assigned to the edit inputs.','good');
     setStatus('in_status','Staged image assigned to the edit inputs.','good');
@@ -11024,6 +11148,7 @@ $('b_analyze').onclick=async()=>{
 };
 
 let activeBatchId=null,lastBatchCount=0;
+let batchStageCleared=false;
 function renderGallery(id,items){
   const root=$(id);root.innerHTML='';
   if(!items||!items.length){root.innerHTML='<div class="empty">No completed images yet.</div>';return}
@@ -11056,7 +11181,7 @@ function syncBatchJob(job){
   $('b_planning_notes').textContent=job.planning_notes||'';
   $('b_review').textContent=job.review_text||'No agentic correction has run yet.';
   if(job.prompt_table)setPromptTable(job.prompt_table);
-  renderStageGallery('b_gallery',job.gallery||[]);
+  if(!batchStageCleared)renderStageGallery('b_gallery',job.gallery||[]);
   $('b_progress').style.width=Math.max(0,Math.min(100,+job.progress||0))+'%';
   const done=(job.gallery||[]).length;
   $('b_caption').disabled=done<1;
@@ -11067,6 +11192,7 @@ function syncBatchJob(job){
 }
 
 $('b_generate').onclick=async()=>{
+  batchStageCleared=false;
   $('b_zip').classList.add('hidden');
   setStageEmpty('b_gallery'); $('b_gallery').innerHTML='<div class="empty">Batch queued — progress is also visible in the floating Queue.</div>'; ensureStageState('b_gallery').mode='empty';
   $('b_progress').style.width='0%';lastBatchCount=0;
@@ -11123,7 +11249,8 @@ function historySignature(items){
   return JSON.stringify((items||[]).map(item=>[
     item.filename||'',
     item.url||'',
-    (item.caption||'').slice(0,160)
+    (item.caption||'').slice(0,160),
+    (item.images||[]).map(image=>image.filename)
   ]));
 }
 async function refreshHistory(force=false){
@@ -11149,6 +11276,42 @@ async function refreshHistory(force=false){
 // LIVE CONSOLE
 // ====================================================================
 let lastConsoleText='';
+async function copyConsoleOutput(){
+  const button=$('console_copy');
+  const text=lastConsoleText;
+  if(!text){button.textContent='Console is empty';setTimeout(()=>button.textContent='Copy console',2000);return;}
+  let copied=false;
+  try{
+    if(navigator.clipboard && window.isSecureContext){
+      await navigator.clipboard.writeText(text);
+      copied=true;
+    }
+  }catch(_){}
+  if(!copied){
+    const input=document.createElement('textarea');
+    input.value=text;
+    input.setAttribute('readonly','');
+    input.style.cssText='position:fixed;left:0;top:0;opacity:0;pointer-events:none';
+    const previousFocus=document.activeElement;
+    document.body.appendChild(input);
+    try{input.focus();input.select();copied=document.execCommand('copy');}
+    catch(_){}
+    finally{input.remove();if(previousFocus)previousFocus.focus();}
+  }
+  if(copied){
+    button.textContent='Copied!';
+  }else{
+    if(!consoleOverlayOpen)$('console_toggle').click();
+    const pre=$('console_output');
+    pre.textContent=text;
+    const range=document.createRange();range.selectNodeContents(pre);
+    const selection=window.getSelection();selection.removeAllRanges();selection.addRange(range);
+    button.textContent='Press Ctrl+C / ⌘C';
+  }
+  setTimeout(()=>button.textContent='Copy console',3000);
+}
+$('console_copy').onclick=copyConsoleOutput;
+
 async function refreshConsole(force=false){
   try{
     const d=await fetchJson('/api/console');
@@ -11220,8 +11383,9 @@ function stageText(job){
 }
 function renderQueue(jobs,count,maxCount){
   queueMax=maxCount||queueMax;
-  const active=(jobs||[]).filter(j=>['queued','waiting','running'].includes(j.status));
-  $('queueCount').textContent=(count??active.length)+'/'+queueMax;
+  queueSnapshot=jobs||[];
+  const active=queueSnapshot.filter(j=>['queued','waiting','running'].includes(j.status));
+  $('queueCount').textContent=active.length+'/'+queueMax;
   $('queueClearAllBtn').style.display=active.length?'inline-flex':'none';
   const root=$('qActiveList');root.innerHTML='';
   if(!active.length){root.innerHTML='<div class="q-empty">No queued jobs. Submit from any Krea2 tool.</div>';return}
@@ -11292,7 +11456,7 @@ function renderFloatingHistory(items){
     const thumb=document.createElement('div');thumb.className='job-thumb';
     const img=document.createElement('img');img.src=item.url;img.loading='lazy';img.decoding='async';thumb.appendChild(img);
     const info=document.createElement('div');info.className='job-info';
-    const st=document.createElement('div');st.className='job-status';st.textContent=item.filename||'Generation';
+    const st=document.createElement('div');st.className='job-status';st.textContent=item.kind==='batch'?'BATCH · '+item.images.length+' images':(item.filename||'Generation');
     const md=document.createElement('div');md.className='job-mode';md.textContent=(item.caption||'').split('\n')[0].slice(0,54)||'Krea2 output';
     info.append(st,md);
     const promptBtn=document.createElement('button');
@@ -11305,7 +11469,8 @@ function renderFloatingHistory(items){
       ev.stopPropagation();
       putHistoryPromptInInput(item,promptBtn);
     });
-    tile.append(thumb,info,promptBtn);
+    tile.append(thumb,info);
+    if(item.kind!=='batch')tile.appendChild(promptBtn);
     tile.addEventListener('click',ev=>{
       ev.preventDefault();
       ev.stopPropagation();
