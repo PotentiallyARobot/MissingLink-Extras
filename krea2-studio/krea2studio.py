@@ -567,7 +567,8 @@ subprocess.check_call([
     "Pillow",
     "numpy",
     "huggingface_hub[hf_xet]>=1.6.0,<2.0",
-    "diffusers>=0.36.0",
+    "git+https://github.com/huggingface/diffusers.git",
+    "gguf",
     "transformers>=4.57.0",
     "accelerate>=1.10.0",
     "bitsandbytes>=0.48.0",
@@ -1132,6 +1133,8 @@ DEFAULT_BATCH_HEIGHT = __DEFAULT_BATCH_HEIGHT__
 QWEN_CAMERA_REPO = "mash2005/Qwen-Image-Edit-2511-MultiAngles-FullQ4"
 QWEN_CAMERA_SOURCE_LORA = "fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA"
 QWEN_EDIT_REPO = "Qwen/Qwen-Image-Edit-2511"
+QWEN_GGUF_REPO = "unsloth/Qwen-Image-Edit-2511-GGUF"
+QWEN_GGUF_FILE = "qwen-image-edit-2511-Q4_K_M.gguf"
 QWEN_CAMERA_PIPE = None
 ACTIVE_ENGINE = "krea2"
 _ENGINE_LOCK = threading.RLock()
@@ -1509,87 +1512,56 @@ def _qwen_pipeline_classes():
 
 
 def ensure_qwen_camera_engine(edit=False):
-    """Hard-swap Krea2 out, then lazily load the NF4 Qwen 2511 camera engine."""
+    """Use the working Modal reference's GGUF Qwen setup for both Qwen tabs."""
     global QWEN_CAMERA_PIPE, ACTIVE_ENGINE
-    repo = QWEN_EDIT_REPO if edit else QWEN_CAMERA_REPO
     with _ENGINE_LOCK:
-        if QWEN_CAMERA_PIPE is not None and getattr(QWEN_CAMERA_PIPE, "_studio_repo", None) != repo:
-            _release_qwen_camera_engine()
         if QWEN_CAMERA_PIPE is not None:
             ACTIVE_ENGINE = "qwen_camera"
             return QWEN_CAMERA_PIPE
-
         _emit_progress("Checking Qwen dependencies", pct=1)
-        try:
-            (QwenImageEditPlusPipeline, QwenImageTransformer2DModel,
-             Qwen2_5_VLForConditionalGeneration) = _qwen_pipeline_classes()
-        except Exception as exc:
-            raise RuntimeError(
-                "Qwen dependency import failed: " + str(exc)
-                + " Re-run setup with the updated notebook and retry."
-            ) from exc
-
+        (QwenImageEditPlusPipeline, QwenImageTransformer2DModel,
+         Qwen2_5_VLForConditionalGeneration) = _qwen_pipeline_classes()
+        from diffusers import GGUFQuantizationConfig
+        from transformers import BitsAndBytesConfig
+        from huggingface_hub import hf_hub_download
         _emit_progress("Releasing Krea2", pct=2)
         _release_krea_engine()
-        _emit_progress("Loading Qwen Image Edit 2511" if edit else "Loading Qwen 2511 Camera", pct=5)
-        print(f"[ENGINE] loading Qwen Camera: {repo}", flush=True)
-
         token = _hf_token_for_qwen()
-        cap = torch.cuda.get_device_capability(0)
-        dtype = torch.bfloat16 if cap[0] >= 8 else torch.float16
-        common = dict(torch_dtype=dtype, token=token, low_cpu_mem_usage=True)
-        transformer_options = {}
-        if edit:
-            from diffusers import BitsAndBytesConfig
-            transformer_options["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=True,
-            )
+        dtype = torch.bfloat16 if torch.cuda.get_device_capability(0)[0] >= 8 else torch.float16
         try:
-            _emit_progress("Loading Qwen image transformer", pct=5,
-                           detail="Downloading missing weights and loading the image model. First use can take several minutes.")
-            transformer = QwenImageTransformer2DModel.from_pretrained(
-                repo,
-                subfolder="transformer",
-                **transformer_options,
-                device_map="cuda",
-                **common,
-            )
+            _emit_progress("Loading Qwen GGUF transformer", pct=5,
+                           detail="Loading the Q4_K_M transformer used by the working Modal setup.")
+            model_path = hf_hub_download(repo_id=QWEN_GGUF_REPO,
+                                         filename=QWEN_GGUF_FILE, token=token)
+            transformer = QwenImageTransformer2DModel.from_single_file(
+                model_path, quantization_config=GGUFQuantizationConfig(compute_dtype=dtype),
+                torch_dtype=dtype, config=QWEN_EDIT_REPO, subfolder="transformer", token=token)
             _emit_progress("Loading Qwen text encoder", pct=8,
-                           detail="Downloading missing weights and loading the prompt and image encoder.")
+                           detail="Loading the reference setup's NF4 text encoder.")
             text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                repo,
-                subfolder="text_encoder",
-                device_map="cpu" if edit else "cuda",
-                **common,
-            )
-            _emit_progress("Loading Qwen pipeline components", pct=10,
-                           detail="Loading the VAE, tokenizer, scheduler and image processor.")
+                QWEN_EDIT_REPO, subfolder="text_encoder", token=token,
+                quantization_config=BitsAndBytesConfig(load_in_4bit=True,
+                    bnb_4bit_compute_dtype=dtype, bnb_4bit_quant_type="nf4"),
+                torch_dtype=dtype)
+            _emit_progress("Loading Qwen pipeline", pct=10)
             pipe = QwenImageEditPlusPipeline.from_pretrained(
-                repo,
-                transformer=transformer,
-                text_encoder=text_encoder,
-                **common,
-            )
-            _emit_progress("Configuring Qwen memory", pct=11,
-                           detail="Preparing CPU/GPU offload for the available VRAM.")
-            # The model card uses model CPU offload after loading the pre-quantized
-            # components. Keep the same policy for activation headroom on T4/L4.
-            try:
-                pipe.enable_model_cpu_offload()
-            except Exception as exc:
-                print("[ENGINE] Qwen CPU-offload warning; keeping loaded placement:", repr(exc), flush=True)
-            try:
-                pipe.set_progress_bar_config(disable=True)
-            except Exception:
-                pass
-            pipe._studio_repo = repo
+                QWEN_EDIT_REPO, transformer=transformer, text_encoder=text_encoder,
+                torch_dtype=dtype, token=token)
             pipe._studio_scheduler_config = dict(pipe.scheduler.config)
+            _emit_progress("Moving Qwen to GPU", pct=11)
+            pipe.to("cuda")
+            pipe.vae.enable_tiling()
+            pipe.vae.enable_slicing()
+            pipe.set_progress_bar_config(disable=True)
+            pipe._studio_repo = QWEN_EDIT_REPO
             QWEN_CAMERA_PIPE = pipe
             ACTIVE_ENGINE = "qwen_camera"
-            _emit_progress("Qwen Edit ready" if edit else "Qwen Camera ready", pct=12)
-            gpu_stats("Qwen Edit ready" if edit else "Qwen Camera ready")
-            return QWEN_CAMERA_PIPE
+            import diffusers, transformers, peft
+            print(f"[QWEN] transformer={QWEN_GGUF_REPO}/{QWEN_GGUF_FILE} "
+                  f"text_encoder=NF4 dtype={dtype} diffusers={diffusers.__version__} "
+                  f"transformers={transformers.__version__} peft={peft.__version__}", flush=True)
+            _emit_progress("Qwen ready", pct=12)
+            return pipe
         except Exception:
             QWEN_CAMERA_PIPE = None
             ACTIVE_ENGINE = "none"
@@ -1635,6 +1607,24 @@ def _qwen_step_callback(steps):
     return on_step_end
 
 
+def _qwen_output_size(source, max_side):
+    import math
+    iw, ih = source.size
+    scale = min(math.sqrt((1024 * 1024) / (iw * ih)), float(max_side) / max(iw, ih))
+    width = max(32, int(iw * scale) // 32 * 32)
+    height = max(32, int(ih * scale) // 32 * 32)
+    return width, height
+
+
+def _qwen_prepare_sampling(source, max_side, steps, cfg, adapters):
+    import diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus as qem
+    width, height = _qwen_output_size(source, max_side)
+    qem.VAE_IMAGE_SIZE = width * height
+    print(f"[QWEN] generation={width}x{height} steps={steps} true_cfg={cfg} "
+          f"loras={adapters} VAE_IMAGE_SIZE={qem.VAE_IMAGE_SIZE}", flush=True)
+    return width, height
+
+
 def qwen_camera_restage(
     source,
     azimuth="front",
@@ -1644,9 +1634,10 @@ def qwen_camera_restage(
     negative_prompt=" ",
     max_side=1024,
     seed=-1,
-    steps=30,
+    steps=4,
     guidance_scale=1.0,
-    true_cfg_scale=4.0,
+    true_cfg_scale=1.0,
+    qwen_loras=None,
 ):
     if source is None:
         raise ValueError("Upload a source image for Camera / Re-stage.")
@@ -1680,19 +1671,26 @@ def qwen_camera_restage(
     true_cfg_scale = max(0.0, min(20.0, float(true_cfg_scale or 4.0)))
 
     check_stop()
-    pipe = ensure_qwen_camera_engine()
+    pipe = ensure_qwen_camera_engine(edit=True)
+    adapters = _normalize_qwen_loras(qwen_loras if qwen_loras is not None else [
+        {"name": "lightning", "strength": 1.0}, {"name": "angles", "strength": 0.9}])
+    _configure_qwen_edit_loras(pipe, adapters)
+    if any(x["name"] == "lightning" and x["strength"] != 0 for x in adapters):
+        steps, true_cfg_scale = 4, 1.0
     check_stop()
     _emit_progress("Encoding camera inputs", pct=18, step=0, step_total=steps,
                    detail="Encoding the source image and prompt; the first sampling step follows.")
     print(f"[CAMERA] {prompt} · seed={seed} · steps={steps}", flush=True)
 
-    generator = torch.Generator(device="cpu").manual_seed(int(seed))
+    generator = torch.Generator(device="cuda").manual_seed(int(seed))
+    width, height = _qwen_prepare_sampling(source, max_side, steps, true_cfg_scale, adapters)
     started = time.time()
-    with torch.no_grad():
+    with torch.inference_mode():
         result = pipe(
             image=[source],
             prompt=prompt,
             negative_prompt=str(negative_prompt or " ") or " ",
+            height=height, width=width,
             num_inference_steps=steps,
             guidance_scale=guidance_scale,
             true_cfg_scale=true_cfg_scale,
@@ -1713,9 +1711,11 @@ def qwen_camera_restage(
         prompt,
         seed,
         extra={
-            "model": QWEN_CAMERA_REPO,
+            "model": QWEN_EDIT_REPO,
+            "transformer": QWEN_GGUF_REPO + "/" + QWEN_GGUF_FILE,
+            "width": width, "height": height,
             "engine": "qwen-image-edit-2511-camera",
-            "source_lora": QWEN_CAMERA_SOURCE_LORA,
+            "loras": adapters,
             "camera_azimuth": azimuth,
             "camera_elevation": elevation,
             "camera_distance": distance,
@@ -1853,13 +1853,15 @@ def qwen_instruction_edit(
     )
 
     images = [source] + refs
-    generator = torch.Generator(device="cpu").manual_seed(int(seed))
+    generator = torch.Generator(device="cuda").manual_seed(int(seed))
+    width, height = _qwen_prepare_sampling(source, max_side, steps, true_cfg_scale, adapters)
     started = time.time()
-    with torch.no_grad():
+    with torch.inference_mode():
         result = pipe(
             image=images,
             prompt=prompt,
             negative_prompt=str(negative_prompt or " ") or " ",
+            height=height, width=width,
             num_inference_steps=steps,
             guidance_scale=guidance_scale,
             true_cfg_scale=true_cfg_scale,
@@ -1881,6 +1883,8 @@ def qwen_instruction_edit(
         seed,
         extra={
             "model": QWEN_EDIT_REPO,
+            "transformer": QWEN_GGUF_REPO + "/" + QWEN_GGUF_FILE,
+            "width": width, "height": height,
             "engine": "qwen-image-edit-2511",
             "loras": adapters,
             "reference_count": len(refs),
@@ -7165,7 +7169,7 @@ def _lora_download_worker(download_id, source, revision_hint, candidate_key):
             os.replace(part, destination)
             part = None
 
-        if LORA_DOWNLOADS.get(download_id, {}).get("target_tab") != "qedit":
+        if LORA_DOWNLOADS.get(download_id, {}).get("target_tab") not in ("qedit", "camera"):
             _activate_installed_lora(installed_name)
         elapsed = max(0.001, time.time() - started)
         with LORA_DOWNLOAD_LOCK:
@@ -7593,9 +7597,10 @@ def _execute_job(jid):
             negative_prompt=params.get("negative_prompt", " "),
             max_side=params.get("max_side", 1024),
             seed=params.get("seed", -1),
-            steps=params.get("steps", 30),
+            steps=params.get("steps", 4),
             guidance_scale=params.get("guidance_scale", 1.0),
-            true_cfg_scale=params.get("true_cfg_scale", 4.0),
+            true_cfg_scale=params.get("true_cfg_scale", 1.0),
+            qwen_loras=params.get("qwen_loras"),
         )
         return {"image": _output_url(path), "seed": seed, "status": status,
                 "download": _output_url(download_path), "engine": "qwen_camera"}
@@ -8350,6 +8355,8 @@ def api_camera():
             "camera",
             {
                 "source_path": source_path,
+                "qwen_loras": _normalize_qwen_loras(request.form.get("qwen_loras") or [
+                    {"name": "lightning", "strength": 1.0}, {"name": "angles", "strength": 0.9}]),
                 "azimuth": azimuth,
                 "elevation": elevation,
                 "distance": distance,
@@ -8357,9 +8364,9 @@ def api_camera():
                 "negative_prompt": str(request.form.get("negative_prompt") or " "),
                 "max_side": _int_value(request.form.get("max_side"), DEFAULT_IMAGE_MAX_SIDE, 256, 2048),
                 "seed": _int_value(request.form.get("seed"), -1),
-                "steps": _int_value(request.form.get("steps"), 30, 1, 80),
+                "steps": _int_value(request.form.get("steps"), 4, 1, 80),
                 "guidance_scale": _float_value(request.form.get("guidance_scale"), 1.0, 0.0, 20.0),
-                "true_cfg_scale": _float_value(request.form.get("true_cfg_scale"), 4.0, 0.0, 20.0),
+                "true_cfg_scale": _float_value(request.form.get("true_cfg_scale"), 1.0, 0.0, 20.0),
             },
             label="Camera / Re-stage", mode="qwen-camera", thumb=_input_url(source_path),
         )
@@ -9447,9 +9454,9 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
 
         <section id="panel_qedit" class="controlpanel">
           <div class="card">
-            <div class="cardtitle">Qwen Edit · 2511 NF4</div>
+            <div class="cardtitle">Qwen Edit · 2511 GGUF</div>
             <div class="cardbody">
-              <div class="engine-note"><b>Dedicated Qwen edit engine.</b> Clean Qwen Image Edit 2511 with adjustable LoRAs. Lightning starts enabled for 4-step edits. The active model is released when switching engines.</div>
+              <div class="engine-note"><b>Dedicated Qwen edit engine.</b> Qwen Image Edit 2511 Q4_K_M with adjustable LoRAs. Lightning starts enabled for 4-step edits. The active model is released when switching engines.</div>
               <label>Source image</label>
               <input id="qe_source" class="nativefile" type="file" accept="image/*">
               <div class="uploadrow"><button id="qe_source_pick" class="filepick" type="button"><span class="filepickicon">＋</span><span>Choose image</span></button><span id="qe_source_name" class="filemeta">No image selected</span></div>
@@ -9487,7 +9494,7 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
           <div class="card">
             <div class="cardtitle">Qwen Camera · 2511 + Multi-Angles</div>
             <div class="cardbody">
-              <div class="engine-note"><b>Dedicated camera engine.</b> A Camera job fully swaps Krea2 out of VRAM, loads Qwen Image Edit 2511 with fal's Multi-Angles camera control fused into NF4 weights, generates the new viewpoint, then keeps Qwen warm until the next Krea2 job arrives.</div>
+              <div class="engine-note"><b>Dedicated camera engine.</b> Qwen Image Edit 2511 with separate Lightning and Multi-Angles adapters. Adjust their strengths below; Camera and Qwen Edit keep separate LoRA selections.</div>
               <label>Source image</label>
               <input id="c_source" class="nativefile" type="file" accept="image/*">
               <div class="uploadrow"><button id="c_source_pick" class="filepick" type="button"><span class="filepickicon">＋</span><span>Choose image</span></button><span id="c_source_name" class="filemeta">No image selected</span></div>
@@ -9518,15 +9525,16 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
                 <div><label>Maximum side</label><select id="c_max"></select></div>
                 <div><label>Seed (-1 = random)</label><input id="c_seed" type="number" value="-1"></div>
               </div>
-              <details>
-                <summary>Qwen Camera settings</summary>
-                <div class="inside">
-                  <div class="grid3"><div><label>Steps</label><input id="c_steps" type="number" min="1" max="80" value="30"></div><div><label>Guidance</label><input id="c_guidance" type="number" min="0" max="20" step=".1" value="1.0"></div><div><label>True CFG</label><input id="c_true_cfg" type="number" min="0" max="20" step=".1" value="4.0"></div></div>
-                  <div class="minihint">fal's trained control grid is 8 azimuths × 4 elevations × 3 distances = 96 camera poses. The Studio builds the exact <b>&lt;sks&gt; [azimuth] [elevation] [distance]</b> control phrase automatically.</div>
-                </div>
-              </details>
+              <div class="qe-rack">
+                <div id="qc-settings"></div>
+                <input id="c_guidance" type="hidden" value="1">
+                <div id="qc-loras"></div>
+                <div class="actions"><button type="button" class="lora-add-tab" data-lora-tab="camera">＋ ADD LORA</button></div>
+                <div class="split"><select id="qc-installed" aria-label="Installed Qwen LoRA"></select><button id="qc-add-installed" type="button">ADD INSTALLED</button></div>
+                <div class="minihint">Use Qwen Image Edit 2511 compatible LoRAs. Set strength to 0 to disable. Lightning uses 4 steps and CFG 1.</div>
+              </div>
               <div class="actions"><button id="c_generate">GENERATE</button></div>
-              <div id="cam_status" class="status">Ready. First use downloads and loads the Qwen Camera engine.</div>
+              <div id="cam_status" class="status">Ready · Lightning 1.0 · Angles 0.9 · 4 steps. First use downloads the clean Qwen model and adapters.</div>
               <a id="cam_download" class="hidden" target="_blank"></a>
             </div>
           </div>
@@ -10098,6 +10106,30 @@ qeStepsControl=qwenSlider($('qe-settings'),'STEPS','qe_steps',4,1,80,1);
 $('qe-add-installed').onclick=()=>{const name=$('qe-installed').value;if(name)addQwenLora(name)};
 syncQwenLightning();
 renderQwenLoras();
+let cameraLoras=[{name:'lightning',strength:1},{name:'angles',strength:.9}];
+let qcStepsControl,qcCfgControl;
+function syncCameraLightning(){
+ const on=cameraLoras.some(x=>x.name==='lightning'&&x.strength!==0);
+ for(const [control,value] of [[qcStepsControl,on?4:40],[qcCfgControl,on?1:4]]){
+   control.range.value=value;control.number.value=value;control.range.disabled=on;control.number.disabled=on;
+ }
+}
+function renderCameraLoras(){
+ const root=$('qc-loras');root.replaceChildren();
+ cameraLoras.forEach((item,i)=>qwenSlider(root,item.name==='lightning'?'LIGHTNING LORA':item.name==='angles'?'ANGLES LORA':item.name,'qc-lora-'+i,item.strength,0,2,.05,v=>{const was=item.strength!==0;item.strength=v;if(item.name==='lightning'&&was!==(v!==0))syncCameraLightning()},['lightning','angles'].includes(item.name)?null:()=>{cameraLoras.splice(i,1);renderCameraLoras()}));
+ const select=$('qc-installed');select.replaceChildren(new Option('Choose installed LoRA…',''));
+ loraLibrary.filter(x=>x.valid&&!x.reserved&&!cameraLoras.some(y=>y.name===x.name)).forEach(x=>select.add(new Option(x.name,x.name)));
+}
+function addCameraLora(name){
+ if(cameraLoras.some(x=>x.name===name))return;
+ if(cameraLoras.length>=6){setStatus('cam_status','Remove a custom LoRA before adding another.','bad');return;}
+ cameraLoras.push({name,strength:1});renderCameraLoras();
+}
+qcCfgControl=qwenSlider($('qc-settings'),'CFG','c_true_cfg',1,0,20,.1);
+qcStepsControl=qwenSlider($('qc-settings'),'STEPS','c_steps',4,1,80,1);
+$('qc-add-installed').onclick=()=>{const name=$('qc-installed').value;if(name)addCameraLora(name)};
+syncCameraLightning();
+renderCameraLoras();
 
 
 function _fmtLoraBytes(bytes){
@@ -10182,6 +10214,7 @@ function renderLoraLibrary(items,maxActive=4){
   }
   KREA_LORA_TABS.forEach(tab=>renderLoraTab(tab,maxActive));
   renderQwenLoras();
+  renderCameraLoras();
 }
 async function refreshLoras(){
   try{
@@ -10251,6 +10284,7 @@ async function pollLoraDownload(downloadId){
         if(d.items)renderLoraLibrary(d.items||[],4);
         const installed=String(d.file||d.filename||'');
         if(installed && d.target_tab==='qedit'){addQwenLora(installed);}
+        else if(installed && d.target_tab==='camera'){addCameraLora(installed);}
         else if(installed){
           const tab=KREA_LORA_TABS.includes(loraInstallerTargetTab)?loraInstallerTargetTab:'text';
           const next=activeLoraStackForTab(tab).filter(x=>x.name!==installed);
@@ -10905,6 +10939,7 @@ $('c_generate').onclick=async()=>{
   fd.append('negative_prompt',$('c_negative').value);
   fd.append('max_side',$('c_max').value);
   fd.append('seed',$('c_seed').value);
+  fd.append('qwen_loras',JSON.stringify(cameraLoras.map(x=>({...x}))));
   fd.append('steps',$('c_steps').value);
   fd.append('guidance_scale',$('c_guidance').value);
   fd.append('true_cfg_scale',$('c_true_cfg').value);
