@@ -2132,17 +2132,18 @@ def unload_models():
 
 
 
-def cleanup_generation_memory(label="post-generation"):
-    """Release transient Comfy/Krea2 edit state between queued jobs."""
+def cleanup_generation_memory(label="post-generation", force_unload=False):
+    """Collect transient tensors while keeping healthy model weights cached."""
     try:
         torch.cuda.synchronize()
     except Exception:
         pass
 
-    try:
-        model_management.unload_all_models()
-    except Exception as e:
-        print("[memory] cleanup unload warning:", repr(e), flush=True)
+    if force_unload:
+        try:
+            model_management.unload_all_models()
+        except Exception as e:
+            print("[memory] cleanup unload warning:", repr(e), flush=True)
 
     try:
         model_management.soft_empty_cache()
@@ -2632,7 +2633,6 @@ def vae_encode(image):
 
     check_stop()
     _emit_progress("Encoding source image", pct=7)
-    unload_models()
     gpu_stats("VAE encode")
 
     start = time.time()
@@ -2666,7 +2666,6 @@ def vae_encode_inpaint(image, core_mask, noise_mask=None):
     """
     check_stop()
     _emit_progress("Encoding contextual edit crop", pct=7)
-    unload_models()
     gpu_stats("VAE contextual inpaint encode")
 
     start = time.time()
@@ -2706,7 +2705,6 @@ def vae_decode(latent):
 
     check_stop()
     _emit_progress("Decoding image", pct=86)
-    unload_models()
     gpu_stats("VAE decode")
 
     start = time.time()
@@ -2725,7 +2723,6 @@ def vae_decode(latent):
         flush=True,
     )
 
-    unload_models()
     check_stop()
     _emit_progress("Image decoded", pct=94)
 
@@ -2758,7 +2755,6 @@ def sample_latent(
 
     check_stop()
     _emit_progress("Preparing sampler", pct=20, step=0, step_total=steps)
-    unload_models()
     gpu_stats("sample")
 
     print(
@@ -7508,7 +7504,7 @@ def _execute_job(jid):
     with JOB_LOCK:
         job.update(
             status="running",
-            stage="Starting GPU",
+            stage="Preparing job",
             detail=(
                 "Preparing Qwen 2511 on the local GPU."
                 if job.get("kind") in {"camera", "qedit"}
@@ -7701,7 +7697,7 @@ def _job_worker():
                     continue
                 ACTIVE_JOB_ID = jid
                 job["status"] = "waiting"
-                job["stage"] = "Starting GPU"
+                job["stage"] = "Preparing job"
                 job["updated"] = time.time()
 
             try:
@@ -7742,10 +7738,11 @@ def _job_worker():
                     job["updated"] = time.time()
 
             finally:
-                # Always recover VRAM after success, cancellation, or OOM so a
-                # failed edit cannot poison the next queued generation.
+                # Keep healthy weights cached. Release model residency only
+                # after errors/cancellation; engine switches handle their own unloads.
                 try:
-                    cleanup_generation_memory("job boundary cleanup")
+                    cleanup_generation_memory("job boundary cleanup",
+                                              force_unload=JOBS.get(jid, {}).get("status") in {"error", "cancelled"})
                 except Exception as cleanup_error:
                     print("[memory] post-job cleanup warning:", repr(cleanup_error), flush=True)
                 reset_stop()
@@ -9140,13 +9137,16 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
 .qe-slider input[type=range]::-moz-range-thumb{width:17px;height:17px;border:0;border-radius:50%;background:#e8ad12;cursor:pointer}
 .qe-slider button{padding:0;background:transparent;border:0;color:#aaa}
 #qe_generate{width:100%;flex:1}
-.model-progress{flex:none;margin:10px 12px;padding:12px;border:1px solid var(--line);border-radius:9px;background:#151517}
-.model-progress-heading{display:flex;justify-content:space-between;gap:12px;font:11px/1.4 var(--font-mono);margin-bottom:9px}
-.model-progress-track{height:6px;overflow:hidden;border-radius:6px;background:#303034}
-.model-progress-track i{display:block;height:100%;background:var(--gold);border-radius:6px;transition:width .25s}
-.model-progress-track.indeterminate i{width:35%!important;animation:model-load-progress 1.4s ease-in-out infinite}
-@keyframes model-load-progress{from{transform:translateX(-110%)}to{transform:translateX(390%)}}
-@media(prefers-reduced-motion:reduce){.model-progress-track.indeterminate i{animation:none;width:100%!important;opacity:.6}}
+.job-progress.loading .job-progress-fill{width:35%!important;animation:queue-loading 1.4s ease-in-out infinite}
+@keyframes queue-loading{from{transform:translateX(-110%)}to{transform:translateX(390%)}}
+@media(prefers-reduced-motion:reduce){.job-progress.loading .job-progress-fill{animation:none;width:100%!important;opacity:.6}}
+#input_image_viewer{position:fixed;inset:0;width:100vw;height:100dvh;max-width:none;max-height:none;margin:0;padding:48px 16px 16px;border:0;background:rgba(5,5,7,.97);overflow:hidden;box-sizing:border-box}
+#input_image_viewer[open]{display:flex;align-items:center;justify-content:center}
+#input_image_viewer::backdrop{background:#050507}
+#input_image_viewer_image{display:block;max-width:100%;max-height:100%;object-fit:contain}
+#input_image_viewer_close{position:absolute;right:16px;top:12px;z-index:1;padding:8px 14px;cursor:pointer}
+.preview img,.ref-tile img{cursor:zoom-in}
+.preview img:focus-visible,.ref-tile img:focus-visible{outline:2px solid var(--gold);outline-offset:-2px}
 </style>
 </head>
 <body>
@@ -9186,10 +9186,6 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
         <div id="ml_upgrade_pitch" style="display:none;margin-top:7px;padding-top:7px;border-top:1px solid #292718;font-size:7.6px;line-height:1.45;color:#8f9198"><b style="color:#ddd">Notebook Pro goes unlimited.</b> Start with a <span style="color:#f1d56d">7-day free trial</span> and unlock the full MissingLink notebook library.</div>
       </div>
 
-      <div id="model_progress" class="model-progress hidden" aria-live="polite">
-        <div class="model-progress-heading"><span id="model_progress_label"></span><span id="model_progress_value"></span></div>
-        <div id="model_progress_track" class="model-progress-track" role="progressbar" aria-label="Generation progress" aria-valuemin="0" aria-valuemax="100"><i id="model_progress_fill"></i></div>
-      </div>
       <div class="sidebar-scroll">
         <div class="card base-model-card">
           <div class="cardtitle">Base Model</div>
@@ -9837,6 +9833,10 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<dialog id="input_image_viewer" aria-label="Full-screen input image">
+  <button id="input_image_viewer_close" type="button" aria-label="Close image viewer" autofocus>✕ Close</button>
+  <img id="input_image_viewer_image" alt="Input image">
+</dialog>
 <script>
 const $ = id => document.getElementById(id);
 const dims = [768,832,896,1024,1152,1280,1344,1536];
@@ -9881,6 +9881,7 @@ function renderReferenceFiles(){
   referenceFiles.forEach((file,index)=>{
     const tile=document.createElement('div'); tile.className='ref-tile';
     const img=document.createElement('img'); img.src=URL.createObjectURL(file); img.alt=file.name;
+    img.tabIndex=0;img.setAttribute('role','button');img.setAttribute('aria-label','View '+file.name+' full screen');img.title='View full screen';
     const btn=document.createElement('button'); btn.type='button'; btn.textContent='×'; btn.title='Remove reference';
     btn.onclick=()=>{referenceFiles.splice(index,1); renderReferenceFiles();};
     tile.append(img,btn); root.appendChild(tile);
@@ -10854,6 +10855,28 @@ $('stage_assign').onclick=async()=>{
   }catch(e){setStatusForTab(activeStudioTab,e.message,'bad');}
 };
 
+function openInputImageViewer(img){
+  if(!img?.src)return;
+  const viewer=$('input_image_viewer');
+  const full=$('input_image_viewer_image');
+  full.src=img.currentSrc||img.src;full.alt=img.alt||'Input image';
+  if(!viewer.open)viewer.showModal();
+}
+$('input_image_viewer_close').onclick=()=>$('input_image_viewer').close();
+$('input_image_viewer').addEventListener('click',ev=>{
+  if(ev.target===$('input_image_viewer'))$('input_image_viewer').close();
+});
+$('input_image_viewer').addEventListener('close',()=>$('input_image_viewer_image').removeAttribute('src'));
+$('input_image_viewer').addEventListener('keydown',ev=>ev.stopPropagation());
+document.addEventListener('click',ev=>{
+  const img=ev.target.closest('.preview img,.ref-tile img');
+  if(img){ev.preventDefault();ev.stopPropagation();openInputImageViewer(img)}
+});
+document.addEventListener('keydown',ev=>{
+  if((ev.key==='Enter'||ev.key===' ')&&ev.target.matches('.preview img,.ref-tile img')){
+    ev.preventDefault();openInputImageViewer(ev.target);
+  }
+});
 function bindFilePicker(inputId,buttonId,nameId,{previewId=null,emptyText='Choose an image.'}={}){
   const input=$(inputId), button=$(buttonId), name=$(nameId), preview=previewId?$(previewId):null;
   button.addEventListener('click',()=>input.click());
@@ -10864,7 +10887,10 @@ function bindFilePicker(inputId,buttonId,nameId,{previewId=null,emptyText='Choos
     if(preview){
       if(!f){preview.innerHTML='<div class="empty">'+emptyText+'</div>';return}
       const u=URL.createObjectURL(f);
-      preview.innerHTML='<img src="'+u+'">';
+      preview.replaceChildren();
+      const img=document.createElement('img');img.src=u;img.alt=f.name;
+      img.tabIndex=0;img.setAttribute('role','button');img.setAttribute('aria-label','View '+f.name+' full screen');
+      img.title='View full screen';preview.appendChild(img);
     }
   });
 }
@@ -11633,7 +11659,7 @@ function modeText(job){
 }
 function stageText(job){
   if(job.status==='queued')return 'Queued';
-  if(job.status==='waiting')return 'Starting GPU';
+  if(job.status==='waiting')return 'Preparing job';
   if(job.status==='cancelled')return 'Cancelled';
   if(job.status==='error')return 'Error';
   if(job.status==='done')return 'Complete';
@@ -11659,6 +11685,10 @@ function renderQueue(jobs,count,maxCount){
     const step=(job.step_total&&job.step)?' · step '+job.step+'/'+job.step_total:'';
     const meta=document.createElement('div');meta.className='job-meta';meta.textContent=fmtElapsed(job)+step+etaText(job);
     const bar=document.createElement('div');bar.className='job-progress';
+    const loading=job.status==='running'&&!job.step&&Number(job.progress||0)<18;
+    bar.classList.toggle('loading',loading);
+    bar.setAttribute('role','progressbar');bar.setAttribute('aria-label',stageText(job));
+    if(!loading)bar.setAttribute('aria-valuenow',String(Math.max(0,Math.min(100,+job.progress||0))));
     const fill=document.createElement('div');fill.className='job-progress-fill';fill.style.width=Math.max(0,Math.min(100,+job.progress||0))+'%';bar.appendChild(fill);
     const detail=document.createElement('div');detail.className='job-meta';detail.textContent=job.detail||'';
     info.append(status,mode,detail,meta,bar);
@@ -11905,26 +11935,6 @@ function applyFinishedJob(job){
 
 function syncLiveJobStatus(jobs){
   const live=(jobs||[]).filter(job=>['queued','waiting','running'].includes(job.status));
-  const current=live.find(job=>job.kind===activeStudioTab && job.status==='running')
-    ||live.find(job=>job.kind===activeStudioTab);
-  const card=$('model_progress');
-  if(card){
-    const shown=current||live.find(job=>job.status==='running');
-    card.classList.toggle('hidden',!shown);
-    if(shown){
-      const preparing=!shown.step && Number(shown.progress||0)<18;
-      const percent=Math.max(0,Math.min(100,Number(shown.progress)||0));
-      const track=$('model_progress_track');
-      $('model_progress_label').textContent=stageText(shown);
-      $('model_progress_label').title=shown.detail||'';
-      $('model_progress_value').textContent=preparing?'':Math.round(percent)+'%';
-      track.classList.toggle('indeterminate',preparing);
-      track.setAttribute('aria-label',stageText(shown));
-      if(preparing)track.removeAttribute('aria-valuenow');
-      else track.setAttribute('aria-valuenow',String(percent));
-      $('model_progress_fill').style.width=percent+'%';
-    }
-  }
   for(const tab of SINGLE_WORK_TABS){
     const job=live.find(item=>item.kind===tab&&item.status==='running')||live.find(item=>item.kind===tab);
     if(job)setStatusForTab(tab,stageText(job)+(job.step?` · ${job.step}/${job.step_total} steps`:'')+(job.detail?' · '+job.detail:''),'');
