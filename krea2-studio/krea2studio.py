@@ -9095,8 +9095,6 @@ html::-webkit-scrollbar,body::-webkit-scrollbar,.app-shell::-webkit-scrollbar,.a
    to the viewport so they stay visible on every Krea2 tab. */
 .queue-overlay{position:fixed;top:106px;right:14px;width:300px;z-index:800;display:flex;flex-direction:column;gap:6px;pointer-events:none}
 .history-overlay{position:fixed;bottom:14px;right:14px;width:300px;z-index:790;display:flex;flex-direction:column;gap:6px;pointer-events:none;transition:width .15s ease}
-.history-overlay.expanded{width:min(500px,calc(100vw - 20px))}
-.history-overlay.expanded .q-list{max-height:min(68vh,620px)}
 .queue-overlay>*,.history-overlay>*{pointer-events:auto}
 .queue-overlay.q-positioned,.history-overlay.q-positioned{right:auto;bottom:auto}
 .q-section{position:relative;background:rgba(17,17,19,.96);border:1px solid var(--border);border-radius:8px;overflow:hidden;box-shadow:0 8px 28px rgba(0,0,0,.45)}
@@ -9147,6 +9145,18 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
 #input_image_viewer_close{position:absolute;right:16px;top:12px;z-index:1;padding:8px 14px;cursor:pointer}
 .preview img,.ref-tile img{cursor:zoom-in}
 .preview img:focus-visible,.ref-tile img:focus-visible{outline:2px solid var(--gold);outline-offset:-2px}
+#history_modal{border:0;padding:0;background:transparent;color:var(--text);width:min(1200px,95vw);max-width:95vw;max-height:90dvh;overflow:visible}
+#history_modal::backdrop{background:rgba(0,0,0,.8)}
+.history-modal-panel{display:flex;flex-direction:column;height:min(85dvh,800px);background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.history-modal-head{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);font:700 13px var(--font-mono);letter-spacing:1px;flex:none}
+.history-modal-head button{padding:6px 10px}
+.history-modal-grid{flex:1;min-height:0;overflow-y:auto;padding:20px;display:grid;grid-template-columns:repeat(auto-fill,minmax(min(210px,100%),1fr));gap:16px;align-content:start}
+.history-modal-grid .q-hist-tile{flex-direction:column;align-items:stretch;padding:8px;min-width:0}
+.history-modal-grid .job-thumb{width:100%;height:180px;flex:none}
+.history-modal-grid .job-thumb img{width:100%;height:100%;object-fit:contain}
+.history-modal-grid .job-info{width:100%;min-width:0}
+.history-modal-grid .job-status{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.history-modal-grid .q-hist-prompt{align-self:flex-start}
 </style>
 </head>
 <body>
@@ -9833,6 +9843,15 @@ body.q-overlay-dragging{user-select:none;-webkit-user-select:none;cursor:grabbin
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<dialog id="history_modal" aria-labelledby="history_modal_title">
+  <section class="history-modal-panel">
+    <header class="history-modal-head">
+      <span id="history_modal_title">YOUR GENERATIONS <span id="history_modal_count" class="q-count">0</span></span>
+      <button id="history_modal_close" type="button" aria-label="Close history" autofocus>✕</button>
+    </header>
+    <div id="history_modal_grid" class="history-modal-grid"></div>
+  </section>
+</dialog>
 <dialog id="input_image_viewer" aria-label="Full-screen input image">
   <button id="input_image_viewer_close" type="button" aria-label="Close image viewer" autofocus>✕ Close</button>
   <img id="input_image_viewer_image" alt="Input image">
@@ -11696,7 +11715,6 @@ function renderQueue(jobs,count,maxCount){
     tile.append(thumb,info,cancel);root.appendChild(tile);
   });
 }
-let historyFloatingExpanded=false;
 async function putHistoryPromptInInput(item,button=null){
   const filename=String(item?.filename||'').trim();
   if(!filename)return;
@@ -11737,12 +11755,10 @@ async function putHistoryPromptInInput(item,button=null){
     if(button){button.disabled=false;button.textContent=originalLabel}
   }
 }
-function renderFloatingHistory(items){
-  $('historySidebarCount').textContent=String((items||[]).length);
-  const root=$('qHistoryList');root.innerHTML='';
-  if(!items||!items.length){root.innerHTML='<div class="q-empty">No generations yet.</div>';return}
-  const visible=historyFloatingExpanded ? items : items.slice(0,6);
-  visible.forEach(item=>{
+function renderHistoryTiles(root,items,modalView=false){
+  root.innerHTML='';
+  if(!items.length){root.innerHTML='<div class="q-empty">No generations yet.</div>';return}
+  items.forEach(item=>{
     const tile=document.createElement('div');tile.className='q-hist-tile';tile.title='Load onto stage';
     const thumb=document.createElement('div');thumb.className='job-thumb';
     const img=document.createElement('img');img.src=item.url;img.loading='lazy';img.decoding='async';thumb.appendChild(img);
@@ -11765,26 +11781,39 @@ function renderFloatingHistory(items){
     tile.addEventListener('click',ev=>{
       ev.preventDefault();
       ev.stopPropagation();
+      if(modalView)closeHistoryModal();
       loadHistoryImageToStage(item);
     });
     root.appendChild(tile);
   });
+}function renderFloatingHistory(items){
+  items=items||[];
+  $('historySidebarCount').textContent=String(items.length);
+  renderHistoryTiles($('qHistoryList'),items.slice(0,6));
+  if($('history_modal').open)renderHistoryModal(items);
 }
-function toggleHistoryExpand(){
-  historyFloatingExpanded=!historyFloatingExpanded;
-  const overlay=$('historyOverlay');
-  if(overlay) overlay.classList.toggle('expanded',historyFloatingExpanded);
-  const btn=$('historyExpandBtn');
-  if(btn) btn.textContent=historyFloatingExpanded?'↙ Normal':'⛶ Expand';
-  renderFloatingHistory(lastHistoryItems);
+function renderHistoryModal(items){
+  $('history_modal_count').textContent=String(items.length);
+  renderHistoryTiles($('history_modal_grid'),items,true);
 }
+function openHistoryModal(){
+  renderHistoryModal(lastHistoryItems||[]);
+  if(!$('history_modal').open)$('history_modal').showModal();
+  refreshHistory(true);
+}
+function closeHistoryModal(){$('history_modal').close()}
+$('history_modal_close').onclick=closeHistoryModal;
+$('history_modal').addEventListener('click',ev=>{
+  if(ev.target===$('history_modal'))closeHistoryModal();
+});
+$('history_modal').addEventListener('keydown',ev=>ev.stopPropagation());
 async function cancelJob(jid){
   try{await fetchJson('/api/jobs/'+jid+'/cancel',{method:'POST'});pollJobs()}catch(e){console.error(e)}
 }
 $('queueClearAllBtn').onclick=async()=>{
   try{await fetchJson('/api/jobs/cancel_all',{method:'POST'});pollJobs()}catch(e){console.error(e)}
 };
-$('historyExpandBtn').onclick=toggleHistoryExpand;
+$('historyExpandBtn').onclick=openHistoryModal;
 
 function togglePanelMin(sectionId,buttonId,key){
   const sec=$(sectionId);const minimized=!sec.classList.contains('minimized');
