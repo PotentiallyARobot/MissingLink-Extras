@@ -9205,6 +9205,105 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
     LORA_DOWNLOADS = {}
     LORA_DOWNLOAD_LOCK = threading.Lock()
 
+    def _civitai_lora_request(url, token=""):
+        """Authenticate the CivitAI endpoint without forwarding auth to signed storage."""
+        from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
+        parsed = urlsplit(url)
+        first_party = (
+            parsed.scheme == "https"
+            and (parsed.hostname or "").lower()
+            in {"civitai.com", "www.civitai.com", "civitai.red", "www.civitai.red"}
+            and parsed.port in (None, 443)
+            and parsed.username is None
+            and parsed.password is None
+        )
+        if token and first_party:
+            query = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+                     if key != "token"]
+            query.append(("token", token))
+            url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
+                             urlencode(query), parsed.fragment))
+        # urllib forwards ordinary headers on redirects. The CivitAI token belongs
+        # only in the first-party query; a signed CDN URL must remain byte-for-byte
+        # unchanged and must not receive an Authorization header.
+        return urllib.request.Request(url, headers={
+            "User-Agent": "MissingLink-H3-LoRA/3",
+            "Accept": "application/octet-stream",
+        })
+
+    def _civitai_lora_error(error, token=""):
+        """Expose a bounded server explanation without leaking authentication data."""
+        import html
+        import re
+        from urllib.parse import urlsplit, parse_qsl, quote, quote_plus
+
+        code = int(getattr(error, "code", 0) or 0)
+        error_url = str(getattr(error, "url", "") or "")
+        try:
+            parts = urlsplit(error_url)
+            host = parts.hostname or "download server"
+            query_values = parse_qsl(parts.query, keep_blank_values=True)
+        except ValueError:
+            host, query_values = "download server", []
+        try:
+            raw = error.read(4096).decode("utf-8", "replace")
+        except Exception:
+            raw = ""
+        finally:
+            try:
+                error.close()
+            except Exception:
+                pass
+
+        detail = raw.strip()
+        try:
+            payload = json.loads(detail)
+            if isinstance(payload, dict):
+                detail = payload.get("message") or payload.get("error") or payload.get("detail") or payload
+            else:
+                detail = payload
+            if not isinstance(detail, str):
+                detail = json.dumps(detail, ensure_ascii=False)
+        except (ValueError, TypeError):
+            if detail.startswith("<"):
+                # Storage XML can echo credentials in ArgumentValue. Show only
+                # Code/Message, and never dump HTML error pages into the popup.
+                messages = re.findall(
+                    r"<(?:\w+:)?(?:Code|Message)\b[^>]*>(.*?)</(?:\w+:)?(?:Code|Message)\s*>",
+                    detail, flags=re.IGNORECASE | re.DOTALL,
+                )
+                detail = " · ".join(re.sub(r"<[^>]+>", "", value) for value in messages)
+                if not detail:
+                    detail = "The server returned an HTML/XML error page."
+
+        detail = html.unescape(detail)
+        secret_keys = {"token", "api_key", "apikey", "key", "signature", "authorization"}
+        secrets = {str(token)} if token else set()
+        for key, value in query_values:
+            if value and (key.lower() in secret_keys or key.lower().startswith(("x-amz-", "x-goog-"))):
+                secrets.add(value)
+        for secret in sorted(secrets, key=len, reverse=True):
+            for encoded in {secret, quote(secret, safe=""), quote_plus(secret)}:
+                detail = detail.replace(encoded, "[REDACTED]")
+        detail = re.sub(r"(?i)\bBearer\s+[^\s<>\"']+", "Bearer [REDACTED]", detail)
+        detail = re.sub(r"https?://[^\s<>\"']+", "[URL omitted]", detail, flags=re.IGNORECASE)
+        detail = re.sub(
+            r"(?i)((?:token|api_?key|authorization|signature|x-amz-[\w-]+|x-goog-[\w-]+)"
+            r"[\"']?\s*[:=]\s*[\"']?)[^\s&<>\"',}]+",
+            r"\1[REDACTED]", detail,
+        )
+        detail = " ".join(detail.split())[:700]
+        message = f"CivitAI LoRA download failed (HTTP {code}) at {host}."
+        if code in (401, 403):
+            if token:
+                message += " Check that CIVITAI_API_KEY is valid and your account can download this file."
+            else:
+                message += " Add CIVITAI_API_KEY in Colab Secrets, allow notebook access, and retry."
+        if detail:
+            message += " Server response: " + detail
+        return message
+
     def _lora_candidate_size(file_obj):
         try:
             size_kb = float((file_obj or {}).get("sizeKB") or 0)
@@ -9219,7 +9318,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
 
     def _inspect_lora_source(source, revision_hint="main"):
         """Accept flexible HF input or CivitAI model/version/download URLs."""
-        from urllib.parse import urlsplit, parse_qs
+        from urllib.parse import urlsplit, urlunsplit, parse_qs, parse_qsl, urlencode
 
         raw = str(source or "").strip()
         revision_hint = str(revision_hint or "main").strip() or "main"
@@ -9299,7 +9398,14 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
                 pass
             return download_url
 
-        q = parse_qs(parts.query)
+        q = parse_qs(parts.query, keep_blank_values=True)
+        requested_file_id = ""
+        if "fileId" in q:
+            values = q["fileId"]
+            if (len(values) != 1 or not values[0].isascii()
+                    or not values[0].isdigit() or int(values[0]) <= 0):
+                raise ValueError("CivitAI fileId must be a positive integer.")
+            requested_file_id = str(int(values[0]))
         seg = [x for x in parts.path.split("/") if x]
         tok = _civitai_token()
         versions = []
@@ -9354,6 +9460,18 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
                 if not download_url:
                     continue
                 file_id = str((fobj or {}).get("id") or filename)
+                download_parts = urlsplit(download_url)
+                if (file_id.isascii() and file_id.isdigit()
+                        and (download_parts.hostname or "").lower()
+                        in {"civitai.com", "www.civitai.com", "civitai.red", "www.civitai.red"}
+                        and download_parts.path.rstrip("/") == f"/api/download/models/{version_id}"):
+                    # Pin every candidate to its own file, including when the API
+                    # supplies only a version-level fallback downloadUrl.
+                    query = [(key, value) for key, value in parse_qsl(download_parts.query, keep_blank_values=True)
+                             if key != "fileId"]
+                    query.append(("fileId", file_id))
+                    download_url = urlunsplit((download_parts.scheme, download_parts.netloc,
+                                              download_parts.path, urlencode(query), download_parts.fragment))
                 key = f"civitai::{version_id}::{file_id}"
                 candidates.append({
                     "key": key,
@@ -9362,6 +9480,7 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
                     "filename": filename,
                     "size": _lora_candidate_size(fobj),
                     "version_id": version_id,
+                    "file_id": file_id,
                     "model_id": int((v or {}).get("modelId") or model_id or 0),
                     "download_url": download_url,
                     "friendly_source_url": (
@@ -9374,7 +9493,16 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
             raise ValueError("No .safetensors files were found for that source.")
 
         preferred_key = ""
-        if preferred_version_id:
+        if requested_file_id:
+            preferred_key = next(
+                (item["key"] for item in candidates if item["file_id"] == requested_file_id), ""
+            )
+            if not preferred_key:
+                raise ValueError(
+                    f"CivitAI fileId {requested_file_id} was not found among the available "
+                    ".safetensors files for that source. Copy a current download link from CivitAI."
+                )
+        elif preferred_version_id:
             for item in candidates:
                 if int(item.get("version_id") or 0) == preferred_version_id:
                     preferred_key = item["key"]
@@ -9389,7 +9517,6 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
         }
 
     def _lora_download_worker(download_id, source, revision_hint, candidate_key):
-        from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
         started = time.time()
         part = None
         temp_root = None
@@ -9462,30 +9589,12 @@ Set pass=true only at >= {NEXT_SCENE_STILL_AUDIT_THRESHOLD}/100 and production u
                 part = dest + f".{download_id}.part"
                 url = selected["download_url"]
                 token = _civitai_token()
-                headers = {
-                    "User-Agent": "MissingLink-H3-LoRA/2",
-                    "Accept": "application/octet-stream",
-                }
-                if token:
-                    parsed = urlsplit(url)
-                    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-                    query["token"] = token
-                    url = urlunsplit(
-                        (parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment)
-                    )
-                    headers["Authorization"] = "Bearer " + token
-
-                req = urllib.request.Request(url, headers=headers)
+                req = _civitai_lora_request(url, token)
                 downloaded = 0
                 try:
                     response = urllib.request.urlopen(req, timeout=180)
                 except urllib.error.HTTPError as e:
-                    if e.code in {401, 403} and not _civitai_token():
-                        raise RuntimeError(
-                            "This CivitAI file requires authentication. "
-                            "Add CIVITAI_API_KEY in Colab Secrets and retry this download."
-                        ) from e
-                    raise
+                    raise RuntimeError(_civitai_lora_error(e, token)) from e
 
                 with response as resp, open(part, "wb") as fh:
                     content_length = int(resp.headers.get("Content-Length") or 0)
